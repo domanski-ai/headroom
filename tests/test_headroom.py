@@ -185,6 +185,44 @@ class Redaction(unittest.TestCase):
             collect.fingerprint(None)
 
 
+class ClaudeIdentity(unittest.TestCase):
+    def _make_runner(self, payload):
+        import subprocess
+        class FakeResult:
+            returncode = 0
+            stdout = __import__("json").dumps(payload)
+        def runner(cmd, **_kwargs):
+            return FakeResult()
+        return runner
+
+    def test_null_org_id_returns_none_fingerprint(self):
+        """Personal Max accounts return orgId=null from claude auth status.
+        This must not raise — account_fingerprint should be None so the
+        trust-on-first-use usage-org binding can proceed."""
+        runner = self._make_runner({
+            "loggedIn": True,
+            "email": "user@example.com",
+            "orgId": None,
+            "subscriptionType": "max",
+        })
+        result = collect.claude_identity("/nonexistent", runner=runner)
+        self.assertIsNone(result["account_fingerprint"])
+        self.assertEqual(result["method"], "claude_auth_status")
+        self.assertTrue(result["verified"])
+
+    def test_valid_org_id_fingerprinted(self):
+        """Accounts with orgId still get a proper fingerprint."""
+        runner = self._make_runner({
+            "loggedIn": True,
+            "email": "user@example.com",
+            "orgId": "org-abc123",
+            "subscriptionType": "max",
+        })
+        result = collect.claude_identity("/nonexistent", runner=runner)
+        self.assertIsNotNone(result["account_fingerprint"])
+        self.assertEqual(result["method"], "claude_auth_status")
+
+
 class PublicSnapshot(unittest.TestCase):
     def test_error_never_leaks_to_public_note(self):
         snap = {"schema_version": 1, "run_id": "t", "generated": 1,

@@ -232,10 +232,11 @@ def claude_identity(home, runner=subprocess.run):
             if process.returncode == 0:
                 status = json.loads(process.stdout)
                 if status.get("loggedIn"):
+                    org_id = status.get("orgId")
                     return {
                         "verified": True,
                         "email": status.get("email"),
-                        "account_fingerprint": fingerprint(status.get("orgId")),
+                        "account_fingerprint": fingerprint(org_id) if org_id else None,
                         "method": "claude_auth_status",
                         "plan_type": status.get("subscriptionType"),
                     }
