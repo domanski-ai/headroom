@@ -567,6 +567,7 @@ class HandoffSafety(unittest.TestCase):
         os.chdir(self.cwd)
         self.source_home = os.path.join(self.temp.name, "source")
         self.target_home = os.path.join(self.temp.name, "target")
+        os.makedirs(self.target_home)
         self.accounts = [
             {"name": "source", "provider": "claude", "home": self.source_home,
              "expected_email": "one@example.com"},
@@ -701,10 +702,11 @@ class HandoffSafety(unittest.TestCase):
                 mock.patch.object(handoff, "stage_transcript",
                                   side_effect=collision) as stage, \
                 redirect_stderr(errors):
-            result = handoff.cmd_handoff(["--session", self.SID, "--print"])
+            result = handoff.cmd_handoff(
+                ["--session", self.SID, "--model", "sonnet", "--print"])
         self.assertEqual(result, 2)
-        stage.assert_called_once_with(self.transcript, destination, mock.ANY)
-        self.assertIn("atomic collision sentinel", errors.getvalue())
+        stage.assert_not_called()
+        self.assertIn("does not overwrite", errors.getvalue())
 
     def test_symlink_source_refused(self):
         link = os.path.join(self.temp.name, "link.jsonl")
@@ -791,7 +793,8 @@ class HandoffSafety(unittest.TestCase):
                 mock.patch.object(handoff, "guard_source_stable"), \
                 mock.patch.object(handoff.route, "mark") as mark, \
                 redirect_stdout(output), redirect_stderr(errors):
-            result = handoff.cmd_handoff(["--session", self.SID, "--print"])
+            result = handoff.cmd_handoff(
+                ["--session", self.SID, "--model", "sonnet", "--print"])
         self.assertEqual(result, 0, errors.getvalue())
         ledger = os.path.join(os.environ["HEADROOM_DIR"], "state", "handoffs.jsonl")
         with open(ledger) as handle:
@@ -809,13 +812,11 @@ class HandoffSafety(unittest.TestCase):
                       output.getvalue())
         self.assertIn("data boundary", output.getvalue())
         self.assertEqual(os.stat(ledger).st_mode & 0o777, 0o600)
-        mark.assert_called_once_with("source", "claude", mock.ANY,
+        mark.assert_called_once_with("source", "sonnet", mock.ANY,
                                      account_wide=True, window="5h")
 
-    def test_decline_repeats_resume_command_after_staging(self):
+    def test_decline_happens_before_any_mutation(self):
         output = io.StringIO()
-        expected = (f"CLAUDE_CONFIG_DIR={self.target_home} claude --resume "
-                    f"{self.SID} --fork-session")
         stdin = mock.Mock()
         stdin.isatty.return_value = True
         with mock.patch.object(handoff.sys, "stdin", stdin), \
@@ -829,12 +830,14 @@ class HandoffSafety(unittest.TestCase):
                 mock.patch.object(handoff, "guard_source_stable"), \
                 mock.patch.object(handoff.route, "mark"), \
                 redirect_stdout(output):
-            result = handoff.cmd_handoff(["--session", self.SID])
+            result = handoff.cmd_handoff(
+                ["--session", self.SID, "--model", "sonnet"])
         self.assertEqual(result, 0)
-        lines = output.getvalue().splitlines()
-        self.assertEqual(lines[-2], "handoff staged; resume command not run")
-        self.assertEqual(lines[-1], expected)
-        self.assertEqual(lines.count(expected), 2)
+        self.assertIn("nothing copied or cooled", output.getvalue())
+        destination = handoff.destination_path(
+            self.target_home, self.transcript, self.SID)
+        self.assertFalse(os.path.exists(destination))
+        self.assertFalse(os.path.exists(handoff._ledger_path()))
 
 
 if __name__ == "__main__":
