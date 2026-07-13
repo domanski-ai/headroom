@@ -585,6 +585,25 @@ class HookProof(unittest.TestCase):
         self.assertEqual(proof.family, "fable")
         self.assertIsNone(self.child.pending_cap)
 
+    def test_message_level_sidechain_cap_candidate_is_skipped(self):
+        # A sidechain assistant API-error (message.isSidechain) after a
+        # successful main-chain turn must not be selected as the cap: the
+        # main session is not capped, so evidence is refused entirely.
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({
+                "type": "assistant",
+                "message": {"model": "claude-opus-4-8", "content": [
+                    {"type": "text", "text": "successful main turn"}]}}) + "\n")
+            out.write(json.dumps({
+                "type": "assistant", "isApiErrorMessage": True,
+                "message": {"isSidechain": True, "model": "<synthetic>",
+                            "content": [{
+                                "type": "text",
+                                "text": "You've hit your session limit"}]}})
+                + "\n")
+        self.assertIsNone(
+            supervisor._last_transcript_cap_evidence(self.transcript))
+
     def test_successful_assistant_turn_after_cap_refuses_evidence(self):
         with open(self.transcript, "w", encoding="utf-8") as out:
             out.write(json.dumps({

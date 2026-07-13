@@ -369,11 +369,15 @@ def _last_transcript_cap_evidence(path):
         cap_index = len(lines)
         for index in range(len(lines) - 1, -1, -1):
             candidate = json.loads(lines[index].decode("utf-8"))
-            if isinstance(candidate, dict) \
-                    and candidate.get("type") == "assistant" \
-                    and candidate.get("isSidechain") is not True:
-                event, cap_index = candidate, index
-                break
+            if not isinstance(candidate, dict) \
+                    or candidate.get("type") != "assistant" \
+                    or candidate.get("isSidechain") is True:
+                continue
+            message = candidate.get("message")
+            if isinstance(message, dict) and message.get("isSidechain") is True:
+                continue
+            event, cap_index = candidate, index
+            break
         lines = lines[:cap_index + 1]
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
         return None
