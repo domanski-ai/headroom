@@ -63,28 +63,36 @@ snapshot and on the dashboard). This keeps offline/air-gapped setups usable.
 If you want provider-verified-only routing, treat `verified_local` as held —
 open an issue if you want this as a config flag.
 
-## macOS Keychain (Claude) — read directly, with one caveat
+## macOS Keychain (Claude) — read directly; multi-account depends on CLI version
 
-On recent Claude Code for **macOS**, the OAuth token is stored in the login
-**Keychain**, not in `~/.claude/.credentials.json`. Importantly, setting
-`CLAUDE_CONFIG_DIR` does **not** move it to a file on macOS the way it does on
-Linux/Windows — the credential stays in a single, system-wide Keychain item
-shared across logins.
+On Claude Code for **macOS**, the OAuth token is stored in the login
+**Keychain**, not in `~/.claude/.credentials.json` (and `CLAUDE_CONFIG_DIR`
+never moves it to a file on macOS the way it does on Linux/Windows).
 
-headroom reads that item directly (via the `security` CLI, item name
-`Claude Code-credentials`) whenever the file is absent, so a normal macOS
+headroom reads the Keychain directly via the `security` CLI, so a normal macOS
 Claude login is tracked with no extra steps. If your Keychain is locked, macOS
-will prompt to allow access the first time; approve it (choose *Always Allow*
-to avoid repeat prompts). Override the item name with the
-`HEADROOM_CLAUDE_KEYCHAIN_SERVICE` environment variable if a future CLI version
-changes it.
+prompts to allow access the first time; approve it (*Always Allow* avoids
+repeat prompts).
 
-- **The caveat: one Keychain item = one Claude account on macOS.** Because the
-  item is shared across all logins, you can't isolate *multiple* Claude
-  accounts on one Mac by config directory — a second `claude` login overwrites
-  the first. For multi-account rotation on macOS, run the extra accounts on a
-  Linux host/server (file-based, fully isolated) or keep them in Codex; a
-  single Mac Claude account tracks and routes fine.
+**Multi-account on macOS — the good news.** Current Claude Code builds
+namespace their Keychain item **per config directory**
+(`Claude Code-credentials-<hash of CLAUDE_CONFIG_DIR>`), which means each
+headroom slot gets its own isolated item and multiple Claude accounts can
+coexist on one Mac. headroom probes for this at connect time:
+
+- **Namespaced items found** (current CLI) → additional Claude accounts
+  connect normally, each isolated in its own Keychain item.
+- **Legacy shared item** (older CLI, or the default no-config-dir login) →
+  a second `claude` login would *overwrite* the existing login's token
+  machine-wide, so `headroom connect` refuses it up front and tells you to
+  update Claude Code. One Claude account per Mac in that case; extra accounts
+  belong on a Linux host, and Codex accounts are isolated everywhere.
+
+The namespacing was verified against the official 2.1.207 macOS binary but is
+undocumented upstream and could change; headroom fails closed (holds the
+account) rather than guessing if the probe stops matching. Override the base
+item name with `HEADROOM_CLAUDE_KEYCHAIN_SERVICE` if a future CLI renames it.
+
 - **Codex `cli_auth_credentials_store = "keyring"`** and other non-file stores
   are likewise invisible; such slots show as not logged in.
 

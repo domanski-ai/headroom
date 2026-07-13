@@ -38,31 +38,43 @@ def login_argv(provider, binary):
     return [binary, "auth", "login"] if provider == "claude" else [binary, "login"]
 
 
-def darwin_keychain_guard(config, provider, quiet=False):
-    """macOS stores every Claude CLI login in ONE shared login-Keychain item —
-    CLAUDE_CONFIG_DIR does not isolate it — so a second `claude` login
-    OVERWRITES the first login's token machine-wide. Refuse a fresh Claude
-    login when an existing Claude slot already depends on that Keychain item
-    (i.e. has no file-based credentials): proceeding would silently break the
-    connected slot. Returns True when the login may proceed."""
+def darwin_keychain_guard(config, provider, quiet=False, runner=None):
+    """Protect existing macOS Claude slots from a login that could clobber them.
+
+    Current Claude CLI builds namespace their Keychain item per config
+    directory ("Claude Code-credentials-<hash(CLAUDE_CONFIG_DIR)>"), so
+    multiple isolated accounts coexist safely. LEGACY builds keep one shared
+    item, where a second `claude` login OVERWRITES the first login's token
+    machine-wide. This gate checks capability instead of assuming either way:
+    a fresh Claude login is allowed only when every existing Keychain-backed
+    Claude slot resolves to its OWN namespaced item; any slot still on the
+    shared legacy item (or unprobeable) refuses the login — fail closed,
+    because refusing afterwards would be too late to undo the clobber.
+    Returns True when the login may proceed."""
     if provider != "claude" or sys.platform != "darwin":
         return True
+    kwargs = {"runner": runner} if runner is not None else {}
     at_risk = []
     for account in config.get("accounts") or []:
         if not isinstance(account, dict) or account.get("provider") != "claude":
             continue
         home = os.path.expanduser(str(account.get("home") or ""))
-        if home and not os.path.exists(os.path.join(home, ".credentials.json")):
-            at_risk.append(str(account.get("name") or "?"))
+        if not home or os.path.exists(os.path.join(home, ".credentials.json")):
+            continue  # file-isolated slot — a new login can't touch it
+        if collector.claude_keychain_item_exists(home, **kwargs):
+            continue  # namespaced item — isolated per config dir, safe
+        at_risk.append(str(account.get("name") or "?"))
     if not at_risk:
         return True
     print(
-        "REFUSED: macOS keeps every Claude CLI login in ONE shared Keychain\n"
-        f"item, and slot(s) {', '.join(sorted(at_risk))} already use it — a new\n"
-        "`claude` login here would overwrite that token and break the slot.\n"
-        "One Claude account per Mac is a platform limit (see\n"
-        "docs/KNOWN-LIMITS.md). Run additional Claude accounts on a Linux\n"
-        "host/server, or connect Codex accounts (fully isolated everywhere).",
+        "REFUSED: this Claude CLI appears to keep logins in ONE shared macOS\n"
+        f"Keychain item, and slot(s) {', '.join(sorted(at_risk))} depend on\n"
+        "it — a new `claude` login would overwrite that token and break the\n"
+        "slot. Update Claude Code to a current version (recent builds keep a\n"
+        "separate Keychain item per account, which headroom supports), then\n"
+        "re-run this connect. Otherwise: one Claude account per Mac (see\n"
+        "docs/KNOWN-LIMITS.md); extra accounts belong on a Linux host, and\n"
+        "Codex accounts are fully isolated everywhere.",
         file=sys.stderr)
     return False
 

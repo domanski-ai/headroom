@@ -378,50 +378,122 @@ class ClaudeKeychain(unittest.TestCase):
 
 
 class DarwinKeychainGuard(unittest.TestCase):
-    """On macOS every claude login shares ONE Keychain item — a second login
-    overwrites the first. The guard must refuse BEFORE the login runs."""
+    """macOS Keychain capability gate: current CLI builds namespace their
+    Keychain item per config dir (multi-account safe); legacy builds share one
+    item where a second login clobbers the first. The guard allows a login
+    only when every Keychain-backed slot has its own namespaced item."""
 
     def setUp(self):
         self._platform = connect.sys.platform
+        self._col_platform = collect.sys.platform
+        self._which = collect.shutil.which
+        connect.sys.platform = "darwin"
+        collect.sys.platform = "darwin"
+        collect.shutil.which = lambda name: "/usr/bin/security"
 
     def tearDown(self):
         connect.sys.platform = self._platform
+        collect.sys.platform = self._col_platform
+        collect.shutil.which = self._which
 
     def cfg(self, homes):
         return {"schema_version": 1, "accounts": [
             {"name": f"c{i}", "provider": "claude", "home": h}
             for i, h in enumerate(homes)]}
 
-    def test_refuses_second_claude_when_slot_is_keychain_backed(self):
-        connect.sys.platform = "darwin"
+    @staticmethod
+    def probe(found):
+        def run(cmd, **kwargs):
+            return FakeCompleted(returncode=0 if found else 44)
+        return run
+
+    def test_refuses_when_slot_is_on_legacy_shared_item(self):
         with tempfile.TemporaryDirectory() as home:  # no .credentials.json
             self.assertFalse(connect.darwin_keychain_guard(
-                self.cfg([home]), "claude", quiet=True))
+                self.cfg([home]), "claude", quiet=True,
+                runner=self.probe(found=False)))
+
+    def test_allows_when_slot_has_namespaced_item(self):
+        with tempfile.TemporaryDirectory() as home:
+            self.assertTrue(connect.darwin_keychain_guard(
+                self.cfg([home]), "claude", quiet=True,
+                runner=self.probe(found=True)))
 
     def test_allows_when_existing_slot_has_file_credentials(self):
-        connect.sys.platform = "darwin"
         with tempfile.TemporaryDirectory() as home:
             with open(os.path.join(home, ".credentials.json"), "w") as fh:
                 fh.write("{}")
             self.assertTrue(connect.darwin_keychain_guard(
-                self.cfg([home]), "claude", quiet=True))
+                self.cfg([home]), "claude", quiet=True,
+                runner=self.probe(found=False)))
 
     def test_allows_first_claude_account(self):
-        connect.sys.platform = "darwin"
         self.assertTrue(connect.darwin_keychain_guard(
-            self.cfg([]), "claude", quiet=True))
+            self.cfg([]), "claude", quiet=True,
+            runner=self.probe(found=False)))
 
     def test_never_blocks_codex(self):
-        connect.sys.platform = "darwin"
         with tempfile.TemporaryDirectory() as home:
             self.assertTrue(connect.darwin_keychain_guard(
-                self.cfg([home]), "codex", quiet=True))
+                self.cfg([home]), "codex", quiet=True,
+                runner=self.probe(found=False)))
 
     def test_never_blocks_off_macos(self):
         connect.sys.platform = "linux"
         with tempfile.TemporaryDirectory() as home:
             self.assertTrue(connect.darwin_keychain_guard(
-                self.cfg([home]), "claude", quiet=True))
+                self.cfg([home]), "claude", quiet=True,
+                runner=self.probe(found=False)))
+
+
+class KeychainNamespacing(unittest.TestCase):
+    """Service-name derivation must match the CLI: base name for no home,
+    base + '-' + sha256(NFC(home))[:8] per config dir."""
+
+    def test_legacy_service_without_home(self):
+        self.assertEqual(collect.claude_keychain_service(),
+                         "Claude Code-credentials")
+
+    def test_namespaced_service_is_stable_and_distinct(self):
+        a = collect.claude_keychain_service("/Users/x/.headroom/homes/a")
+        b = collect.claude_keychain_service("/Users/x/.headroom/homes/b")
+        self.assertTrue(a.startswith("Claude Code-credentials-"))
+        self.assertEqual(len(a), len("Claude Code-credentials-") + 8)
+        self.assertNotEqual(a, b)
+        self.assertEqual(a, collect.claude_keychain_service(
+            "/Users/x/.headroom/homes/a"))
+
+    def test_matches_sha256_derivation(self):
+        import hashlib as h
+        import unicodedata
+        home = "/Users/x/.headroom/homes/a"
+        expected = "Claude Code-credentials-" + h.sha256(
+            unicodedata.normalize("NFC", home).encode()).hexdigest()[:8]
+        self.assertEqual(collect.claude_keychain_service(home), expected)
+
+    def test_oauth_probes_namespaced_before_legacy(self):
+        platform, which = collect.sys.platform, collect.shutil.which
+        collect.sys.platform = "darwin"
+        collect.shutil.which = lambda name: "/usr/bin/security"
+        try:
+            home = "/Users/x/.headroom/homes/a"
+            namespaced = collect.claude_keychain_service(home)
+            calls = []
+
+            def run(cmd, **kwargs):
+                service = cmd[cmd.index("-s") + 1]
+                calls.append(service)
+                if service == namespaced:
+                    return FakeCompleted(
+                        stdout=json.dumps(
+                            {"claudeAiOauth": {"accessToken": "ns-tok"}}),
+                        returncode=0)
+                return FakeCompleted(returncode=44)
+            oauth = collect.claude_keychain_oauth(runner=run, home=home)
+            self.assertEqual(oauth["accessToken"], "ns-tok")
+            self.assertEqual(calls[0], namespaced)
+        finally:
+            collect.sys.platform, collect.shutil.which = platform, which
 
 
 if __name__ == "__main__":

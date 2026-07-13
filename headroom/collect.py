@@ -167,57 +167,107 @@ def claude_local_identity(home):
 
 
 # The macOS login Keychain item the Claude CLI stores its OAuth token in.
-# On recent macOS the token lives here, NOT in `.credentials.json`, and — unlike
-# Linux/Windows — setting CLAUDE_CONFIG_DIR does NOT relocate it to a file (the
-# item is single and shared across logins). Override the item name with
-# HEADROOM_CLAUDE_KEYCHAIN_SERVICE if a future CLI version changes it.
+# On macOS the token lives in the Keychain, NOT in `.credentials.json`.
+# Current CLI builds (verified against the official 2.1.207 darwin binary)
+# NAMESPACE the item per config directory: with CLAUDE_CONFIG_DIR set, the
+# service is "Claude Code-credentials-<sha256(NFC(config_dir))[:8]>"; with no
+# CLAUDE_CONFIG_DIR it is the legacy shared item below. That namespacing is
+# what makes multiple isolated Claude accounts possible on one Mac. Override
+# the base name with HEADROOM_CLAUDE_KEYCHAIN_SERVICE if a future CLI changes it.
 CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 
 
-def claude_keychain_oauth(service=None, runner=subprocess.run):
+def claude_keychain_service(home=None):
+    """The Keychain service name the Claude CLI uses for a given config home:
+    namespaced per-directory when a home is given, legacy shared otherwise."""
+    base = os.environ.get("HEADROOM_CLAUDE_KEYCHAIN_SERVICE",
+                          CLAUDE_KEYCHAIN_SERVICE)
+    if not home:
+        return base
+    import unicodedata
+    normalized = unicodedata.normalize("NFC", str(home))
+    return base + "-" + hashlib.sha256(normalized.encode()).hexdigest()[:8]
+
+
+def claude_keychain_oauth(service=None, runner=subprocess.run, home=None):
     """Read the `claudeAiOauth` blob out of the macOS login Keychain, or None.
 
-    Only meaningful on macOS; returns None everywhere else (and on any error, a
-    missing `security` binary, a locked Keychain, or an absent item) so callers
-    degrade to the existing fail-closed 'held' behaviour."""
+    Tries the per-home namespaced item first (current CLI builds), then the
+    legacy shared item. Only meaningful on macOS; returns None everywhere else
+    (and on any error, a missing `security` binary, a locked Keychain, or an
+    absent item) so callers degrade to the fail-closed 'held' behaviour."""
     if sys.platform != "darwin":
         return None
-    service = service or os.environ.get(
-        "HEADROOM_CLAUDE_KEYCHAIN_SERVICE", CLAUDE_KEYCHAIN_SERVICE)
     security = shutil.which("security")
     if not security:
         return None
+    services = [service] if service else []
+    if not services:
+        if home:
+            # the CLI hashes the exact CLAUDE_CONFIG_DIR string it was launched
+            # with — cover both the given form and its resolved form (symlinked
+            # base dirs would otherwise miss the item)
+            for variant in (str(home), os.path.realpath(str(home))):
+                candidate = claude_keychain_service(variant)
+                if candidate not in services:
+                    services.append(candidate)
+        services.append(claude_keychain_service())
+    for name in services:
+        try:
+            completed = runner([security, "find-generic-password", "-s", name,
+                                "-w"], capture_output=True, text=True,
+                               timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        raw = (getattr(completed, "stdout", "") or "").strip()
+        if getattr(completed, "returncode", 1) != 0 or not raw:
+            continue
+        try:
+            blob = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(blob, dict):
+            continue
+        # The item stores the same shape as the file
+        # (`{"claudeAiOauth": {...}}`); tolerate a bare credential object too.
+        oauth = blob.get("claudeAiOauth")
+        if isinstance(oauth, dict):
+            return oauth
+        if blob.get("accessToken"):
+            return blob
+    return None
+
+
+def claude_keychain_item_exists(home, runner=subprocess.run):
+    """True when the per-home NAMESPACED Keychain item exists (no secret read:
+    `-w` omitted). Distinguishes a CLI that namespaces per config dir from a
+    legacy build sharing one item — the capability gate for multi-account
+    Claude on macOS. False on any error (fail closed)."""
+    if sys.platform != "darwin":
+        return False
+    security = shutil.which("security")
+    if not security:
+        return False
     try:
-        completed = runner([security, "find-generic-password", "-s", service,
-                            "-w"], capture_output=True, text=True, timeout=10)
+        completed = runner([security, "find-generic-password", "-s",
+                            claude_keychain_service(home)],
+                           capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
-        return None
-    raw = (getattr(completed, "stdout", "") or "").strip()
-    if getattr(completed, "returncode", 1) != 0 or not raw:
-        return None
-    try:
-        blob = json.loads(raw)
-    except ValueError:
-        return None
-    if not isinstance(blob, dict):
-        return None
-    # The item stores the same shape as the file (`{"claudeAiOauth": {...}}`);
-    # tolerate a bare credential object too.
-    oauth = blob.get("claudeAiOauth")
-    if isinstance(oauth, dict):
-        return oauth
-    return blob if blob.get("accessToken") else None
+        return False
+    return getattr(completed, "returncode", 1) == 0
 
 
 def claude_oauth(home, runner=subprocess.run):
     """The `claudeAiOauth` credential the Claude CLI will actually use for this
     home — from `.credentials.json` when present (Linux/Windows, or an isolated
-    CLAUDE_CONFIG_DIR home), otherwise the macOS login Keychain."""
+    CLAUDE_CONFIG_DIR home), otherwise the macOS Keychain (per-home namespaced
+    item first, legacy shared item as fallback)."""
     oauth = (paths.load_json(os.path.join(home, ".credentials.json"))
              or {}).get("claudeAiOauth")
     if isinstance(oauth, dict) and oauth.get("accessToken"):
         return oauth
-    return claude_keychain_oauth(runner=runner) or (oauth if isinstance(oauth, dict) else {})
+    return claude_keychain_oauth(runner=runner, home=home) \
+        or (oauth if isinstance(oauth, dict) else {})
 
 
 def credential_digest(provider, home):
