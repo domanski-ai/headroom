@@ -5,6 +5,7 @@ Run:  python3 -m unittest discover -s tests   (from the repo root)
 Covers the load-bearing safety logic: config validation, the fail-closed
 router (`block_reason`), redaction, and the public-snapshot projection.
 """
+import hashlib
 import json
 import os
 import sys
@@ -315,6 +316,8 @@ class ClaudeKeychain(unittest.TestCase):
     CLAUDE_CONFIG_DIR does not relocate it — headroom must read it via
     `security`. All tests force the darwin path so they run on any host."""
 
+    HOME = "/tmp/headroom-test-home"
+
     def setUp(self):
         self._platform = collect.sys.platform
         self._which = collect.shutil.which
@@ -333,24 +336,31 @@ class ClaudeKeychain(unittest.TestCase):
             return FakeCompleted(stdout=payload, returncode=returncode)
         return run
 
+    def _service_for(self, home):
+        digest = hashlib.sha256(os.path.realpath(home).encode()).hexdigest()[:8]
+        return f"Claude Code-credentials-{digest}"
+
     def test_reads_wrapped_credential(self):
         blob = json.dumps({"claudeAiOauth": {"accessToken": "tok-abc",
                                              "subscriptionType": "max"}})
-        oauth = collect.claude_keychain_oauth(runner=self._runner(blob))
+        oauth = collect.claude_keychain_oauth(self.HOME,
+                                              runner=self._runner(blob))
         self.assertEqual(oauth["accessToken"], "tok-abc")
 
     def test_tolerates_bare_credential(self):
         blob = json.dumps({"accessToken": "tok-bare"})
-        oauth = collect.claude_keychain_oauth(runner=self._runner(blob))
+        oauth = collect.claude_keychain_oauth(self.HOME,
+                                              runner=self._runner(blob))
         self.assertEqual(oauth["accessToken"], "tok-bare")
 
     def test_absent_item_returns_none(self):
         oauth = collect.claude_keychain_oauth(
-            runner=self._runner("", returncode=44))
+            self.HOME, runner=self._runner("", returncode=44))
         self.assertIsNone(oauth)
 
     def test_garbage_returns_none(self):
-        oauth = collect.claude_keychain_oauth(runner=self._runner("not-json"))
+        oauth = collect.claude_keychain_oauth(self.HOME,
+                                              runner=self._runner("not-json"))
         self.assertIsNone(oauth)
 
     def test_non_darwin_never_shells_out(self):
@@ -358,7 +368,42 @@ class ClaudeKeychain(unittest.TestCase):
 
         def explode(*a, **k):
             raise AssertionError("security must not run off-macOS")
-        self.assertIsNone(collect.claude_keychain_oauth(runner=explode))
+        self.assertIsNone(collect.claude_keychain_oauth(self.HOME,
+                                                        runner=explode))
+
+    def test_per_home_hashed_service_preferred(self):
+        expected = self._service_for(self.HOME)
+        services = []
+        def runner(cmd, **kwargs):
+            service = cmd[cmd.index("-s") + 1]
+            services.append(service)
+            if service == expected:
+                return FakeCompleted(stdout=json.dumps(
+                    {"claudeAiOauth": {"accessToken": "per-acct"}}))
+            return FakeCompleted(stdout="", returncode=44)
+
+        oauth = collect.claude_keychain_oauth(self.HOME, runner=runner)
+        self.assertEqual(oauth["accessToken"], "per-acct")
+        self.assertEqual(services[0], expected)
+
+    def test_empty_token_skips_to_fallback(self):
+        hashed = self._service_for(self.HOME)
+        def runner(cmd, **kwargs):
+            service = cmd[cmd.index("-s") + 1]
+            if service == hashed:
+                return FakeCompleted(stdout=json.dumps(
+                    {"claudeAiOauth": {"accessToken": ""}}))
+            return FakeCompleted(stdout=json.dumps(
+                {"claudeAiOauth": {"accessToken": "base-tok"}}))
+
+        oauth = collect.claude_keychain_oauth(self.HOME, runner=runner)
+        self.assertEqual(oauth["accessToken"], "base-tok")
+
+    def test_both_empty_returns_none(self):
+        empty = json.dumps({"claudeAiOauth": {"accessToken": ""}})
+        oauth = collect.claude_keychain_oauth(self.HOME,
+                                              runner=self._runner(empty))
+        self.assertIsNone(oauth)
 
     def test_oauth_prefers_file_over_keychain(self):
         with tempfile.TemporaryDirectory() as home:

@@ -166,47 +166,55 @@ def claude_local_identity(home):
     }
 
 
-# The macOS login Keychain item the Claude CLI stores its OAuth token in.
-# On recent macOS the token lives here, NOT in `.credentials.json`, and — unlike
-# Linux/Windows — setting CLAUDE_CONFIG_DIR does NOT relocate it to a file (the
-# item is single and shared across logins). Override the item name with
-# HEADROOM_CLAUDE_KEYCHAIN_SERVICE if a future CLI version changes it.
+# The macOS login Keychain stores the Claude CLI's OAuth token.  Claude Code 2.x
+# writes a per-account entry whose service name includes a hash of the
+# CLAUDE_CONFIG_DIR path (``<base>-<sha256(realpath)[:8]>``); older/single-login
+# installs use a single shared entry (``Claude Code-credentials``).  Override the
+# base service name with HEADROOM_CLAUDE_KEYCHAIN_SERVICE.
 CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 
 
-def claude_keychain_oauth(service=None, runner=subprocess.run):
+def claude_keychain_oauth(home, runner=subprocess.run):
     """Read the `claudeAiOauth` blob out of the macOS login Keychain, or None.
+
+    Claude Code 2.x stores tokens per CLAUDE_CONFIG_DIR under a hashed service
+    name; the shared base item is kept as a fallback.  An entry whose
+    ``accessToken`` is empty (common for the shared item when per-account
+    entries exist) is skipped.
 
     Only meaningful on macOS; returns None everywhere else (and on any error, a
     missing `security` binary, a locked Keychain, or an absent item) so callers
     degrade to the existing fail-closed 'held' behaviour."""
     if sys.platform != "darwin":
         return None
-    service = service or os.environ.get(
+    base = os.environ.get(
         "HEADROOM_CLAUDE_KEYCHAIN_SERVICE", CLAUDE_KEYCHAIN_SERVICE)
     security = shutil.which("security")
     if not security:
         return None
-    try:
-        completed = runner([security, "find-generic-password", "-s", service,
-                            "-w"], capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    raw = (getattr(completed, "stdout", "") or "").strip()
-    if getattr(completed, "returncode", 1) != 0 or not raw:
-        return None
-    try:
-        blob = json.loads(raw)
-    except ValueError:
-        return None
-    if not isinstance(blob, dict):
-        return None
-    # The item stores the same shape as the file (`{"claudeAiOauth": {...}}`);
-    # tolerate a bare credential object too.
-    oauth = blob.get("claudeAiOauth")
-    if isinstance(oauth, dict):
-        return oauth
-    return blob if blob.get("accessToken") else None
+    digest = hashlib.sha256(os.path.realpath(home).encode()).hexdigest()[:8]
+    for service in (f"{base}-{digest}", base):
+        try:
+            completed = runner([security, "find-generic-password", "-s",
+                                service, "-w"],
+                               capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        raw = (getattr(completed, "stdout", "") or "").strip()
+        if getattr(completed, "returncode", 1) != 0 or not raw:
+            continue
+        try:
+            blob = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(blob, dict):
+            continue
+        oauth = blob.get("claudeAiOauth")
+        if isinstance(oauth, dict) and oauth.get("accessToken"):
+            return oauth
+        if not isinstance(oauth, dict) and blob.get("accessToken"):
+            return blob
+    return None
 
 
 def claude_oauth(home, runner=subprocess.run):
@@ -217,7 +225,7 @@ def claude_oauth(home, runner=subprocess.run):
              or {}).get("claudeAiOauth")
     if isinstance(oauth, dict) and oauth.get("accessToken"):
         return oauth
-    return claude_keychain_oauth(runner=runner) or (oauth if isinstance(oauth, dict) else {})
+    return claude_keychain_oauth(home, runner=runner) or (oauth if isinstance(oauth, dict) else {})
 
 
 def credential_digest(provider, home):
