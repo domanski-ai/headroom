@@ -14,7 +14,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from headroom import collect, registry, route  # noqa: E402
+from headroom import collect, connect, registry, route  # noqa: E402
 
 
 def _claude_row(name="a", used5h=10.0, used7d=20.0, ok=True, **over):
@@ -375,6 +375,53 @@ class ClaudeKeychain(unittest.TestCase):
             blob = json.dumps({"claudeAiOauth": {"accessToken": "from-keychain"}})
             oauth = collect.claude_oauth(home, runner=self._runner(blob))
             self.assertEqual(oauth["accessToken"], "from-keychain")
+
+
+class DarwinKeychainGuard(unittest.TestCase):
+    """On macOS every claude login shares ONE Keychain item — a second login
+    overwrites the first. The guard must refuse BEFORE the login runs."""
+
+    def setUp(self):
+        self._platform = connect.sys.platform
+
+    def tearDown(self):
+        connect.sys.platform = self._platform
+
+    def cfg(self, homes):
+        return {"schema_version": 1, "accounts": [
+            {"name": f"c{i}", "provider": "claude", "home": h}
+            for i, h in enumerate(homes)]}
+
+    def test_refuses_second_claude_when_slot_is_keychain_backed(self):
+        connect.sys.platform = "darwin"
+        with tempfile.TemporaryDirectory() as home:  # no .credentials.json
+            self.assertFalse(connect.darwin_keychain_guard(
+                self.cfg([home]), "claude", quiet=True))
+
+    def test_allows_when_existing_slot_has_file_credentials(self):
+        connect.sys.platform = "darwin"
+        with tempfile.TemporaryDirectory() as home:
+            with open(os.path.join(home, ".credentials.json"), "w") as fh:
+                fh.write("{}")
+            self.assertTrue(connect.darwin_keychain_guard(
+                self.cfg([home]), "claude", quiet=True))
+
+    def test_allows_first_claude_account(self):
+        connect.sys.platform = "darwin"
+        self.assertTrue(connect.darwin_keychain_guard(
+            self.cfg([]), "claude", quiet=True))
+
+    def test_never_blocks_codex(self):
+        connect.sys.platform = "darwin"
+        with tempfile.TemporaryDirectory() as home:
+            self.assertTrue(connect.darwin_keychain_guard(
+                self.cfg([home]), "codex", quiet=True))
+
+    def test_never_blocks_off_macos(self):
+        connect.sys.platform = "linux"
+        with tempfile.TemporaryDirectory() as home:
+            self.assertTrue(connect.darwin_keychain_guard(
+                self.cfg([home]), "claude", quiet=True))
 
 
 if __name__ == "__main__":

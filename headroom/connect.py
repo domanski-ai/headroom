@@ -38,6 +38,35 @@ def login_argv(provider, binary):
     return [binary, "auth", "login"] if provider == "claude" else [binary, "login"]
 
 
+def darwin_keychain_guard(config, provider, quiet=False):
+    """macOS stores every Claude CLI login in ONE shared login-Keychain item —
+    CLAUDE_CONFIG_DIR does not isolate it — so a second `claude` login
+    OVERWRITES the first login's token machine-wide. Refuse a fresh Claude
+    login when an existing Claude slot already depends on that Keychain item
+    (i.e. has no file-based credentials): proceeding would silently break the
+    connected slot. Returns True when the login may proceed."""
+    if provider != "claude" or sys.platform != "darwin":
+        return True
+    at_risk = []
+    for account in config.get("accounts") or []:
+        if not isinstance(account, dict) or account.get("provider") != "claude":
+            continue
+        home = os.path.expanduser(str(account.get("home") or ""))
+        if home and not os.path.exists(os.path.join(home, ".credentials.json")):
+            at_risk.append(str(account.get("name") or "?"))
+    if not at_risk:
+        return True
+    print(
+        "REFUSED: macOS keeps every Claude CLI login in ONE shared Keychain\n"
+        f"item, and slot(s) {', '.join(sorted(at_risk))} already use it — a new\n"
+        "`claude` login here would overwrite that token and break the slot.\n"
+        "One Claude account per Mac is a platform limit (see\n"
+        "docs/KNOWN-LIMITS.md). Run additional Claude accounts on a Linux\n"
+        "host/server, or connect Codex accounts (fully isolated everywhere).",
+        file=sys.stderr)
+    return False
+
+
 def slot_identity(provider, home):
     """Best-effort identity read for a slot; None when nothing is bound."""
     try:
@@ -152,6 +181,11 @@ def connect_fresh(config, name, provider, quiet=False):
         print("slot name resolves outside the homes directory; refused",
               file=sys.stderr)
         return None
+    # BEFORE the login runs: on macOS a new claude login clobbers the shared
+    # Keychain token that an existing slot may depend on — refusing afterwards
+    # would be too late to undo the damage.
+    if not darwin_keychain_guard(config, provider, quiet=quiet):
+        return None
     os.makedirs(home, mode=0o700, exist_ok=True)
     backup_dir, saved = backup_credentials(home, provider)
     duplicates = existing_fingerprints(config, provider)
@@ -192,6 +226,12 @@ def connect_fresh(config, name, provider, quiet=False):
         completed = True
         if not quiet:
             print(f"connected: {name} -> {identity['email']} ({provider})")
+            if provider == "claude" and sys.platform == "darwin" \
+                    and not os.path.exists(os.path.join(home, ".credentials.json")):
+                print("note: this login is stored in the macOS Keychain (shared "
+                      "machine-wide).\nheadroom reads it directly — but it is "
+                      "the ONE Claude account this Mac\ncan hold; connecting a "
+                      "second Claude account here is refused to protect it.")
         return entry
     finally:
         if not completed:
