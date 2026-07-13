@@ -48,10 +48,10 @@ headroom fixes all three problems:
 
 ## New in v0.2: automatic Claude conversation handoff
 
-Automatic handoff is an explicit opt-in, off by default. When enabled,
-`headroom claude` stays resident around an interactive Claude process. If that
-exact session reaches a subscription cap, headroom requires three independent
-proofs before it acts: a current-session `StopFailure` hook matched as
+Automatic handoff is **on by default** — uninterrupted continuation is the
+point of headroom. `headroom claude` stays resident around an interactive
+Claude process. If that exact session reaches a subscription cap, headroom
+requires three independent proofs before it acts: a current-session `StopFailure` hook matched as
 `rate_limit`, a narrow session/weekly-cap message, and a new identity-bound
 usage read showing at least 99% used in the corresponding account or model
 window. The active model family comes from the final API-error transcript
@@ -66,13 +66,13 @@ never modified. If post-stop validation fails, the source session is relaunched
 with automation disabled. Three automatic handoffs in any rolling ten minutes
 trips the loop guard; the fourth child stays alive.
 
-Enable it in `headroom setup`, or explicitly in config:
+Turn it off in `headroom setup`, or explicitly in config:
 
 ```json
 {
   "routing": {
     "reserve_percent": 0,
-    "auto_handoff": true
+    "auto_handoff": false
   }
 }
 ```

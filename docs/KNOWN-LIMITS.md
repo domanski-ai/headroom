@@ -6,13 +6,16 @@ here so users can judge them for their own threat model.
 
 ## Auto-handoff is not yet release-proven on macOS
 
-The one-`SIGTERM` child-stop contract has been exercised live against Claude
-Code 2.1.x on Linux: an idle interactive process exited promptly and left a
-complete JSONL transcript. The equivalent end-to-end signal, foreground
-process-group, terminal restoration, descendant-cleanup, and resume test has
-not yet been completed on macOS. v0.2 therefore remains `0.2.0-dev`; do not
-treat automatic termination as macOS-release-proven until that E2E gate passes.
-Headroom never escalates to `SIGKILL`.
+The full auto-handoff path (real cap -> stop -> copy -> same-terminal resume
+with history intact) is proven live end-to-end against Claude Code 2.1.x on
+Linux. The equivalent end-to-end signal, foreground process-group, terminal
+restoration, descendant-cleanup, and resume test has not yet been completed on
+macOS. Auto-handoff is on by default on both platforms because every guard
+fails closed — missing or ambiguous evidence means headroom leaves the session
+alone — but macOS users should know the SIGTERM/TTY contract there rests on
+Linux evidence until a real-Mac run confirms it (reports welcome). Set
+`routing.auto_handoff: false` to opt out. Headroom never escalates to
+`SIGKILL`.
 
 ## Managed Claude policy can override injected hooks
 

@@ -158,9 +158,10 @@ def run_setup():
     routing["reserve_percent"] = reserve
 
     auto_handoff = ask_yes_no(
-        "Enable automatic Claude handoff? This permits headroom to terminate "
-        "a proven-capped Claude process and copy its conversation into another "
-        "configured Claude account", False)
+        "Keep automatic Claude handoff on? When a `headroom claude` session "
+        "hits its cap, headroom stops the proven-capped process, copies the "
+        "conversation to a fresh account, and continues it in the same "
+        "terminal (default: on)", True)
     routing["auto_handoff"] = auto_handoff
 
     registry.save(config)

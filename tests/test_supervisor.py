@@ -61,16 +61,17 @@ def reserve_worker(plan, now, queue):
 
 
 class ConfigAndScope(unittest.TestCase):
-    def test_auto_handoff_is_strict_opt_in(self):
+    def test_auto_handoff_defaults_on_and_only_explicit_false_disables(self):
         base = {"schema_version": 1, "accounts": [
             {"name": "a", "provider": "claude", "home": "/tmp/a"}]}
-        self.assertFalse(registry.auto_handoff(base))
-        for value in (False, "true", 1, None, [], {}):
+        self.assertTrue(registry.auto_handoff(base))
+        self.assertFalse(registry.auto_handoff(
+            dict(base, routing={"auto_handoff": False})))
+        for value in (True, "false", "true", 1, 0, None, [], {}):
             cfg = dict(base, routing={"auto_handoff": value})
-            self.assertFalse(registry.auto_handoff(cfg), value)
-        self.assertTrue(registry.auto_handoff(
-            dict(base, routing={"auto_handoff": True})))
-        self.assertFalse(registry.auto_handoff(dict(base, routing="broken")))
+            expected = value is not False
+            self.assertEqual(registry.auto_handoff(cfg), expected, value)
+        self.assertTrue(registry.auto_handoff(dict(base, routing="broken")))
         self.assertEqual(registry.reserve_percent(
             dict(base, routing="broken")), 0.0)
 
