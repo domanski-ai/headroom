@@ -11,7 +11,10 @@ resets and retries the next candidate.
 """
 import contextlib
 import datetime
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # Windows: no fcntl
 import json
 import math
 import os
@@ -73,6 +76,9 @@ def save_cooldowns(value):
 def _cooldown_lock():
     """Exclusive lock so concurrent mark()/clear() can't clobber each other's
     limits (a lost cooldown routes an exhausted account = fail-open)."""
+    if fcntl is None:
+        yield  # Windows: no file locking
+        return
     lock_path = paths.cooldowns_path() + ".lock"
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     handle = open(lock_path, "w")

@@ -7,7 +7,11 @@ while [ -L "$SOURCE" ]; do  # resolve symlinks (install.sh links from ~/.local/b
   SOURCE="$(readlink "$SOURCE")"
   [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
 done
-HEADROOM_REPO="$(cd "$(dirname "$SOURCE")/.." && pwd)" \
+HEADROOM_REPO="$(cd "$(dirname "$SOURCE")/.." && pwd)"
+# Convert to Windows path when running under MSYS/Git Bash
+if command -v cygpath >/dev/null 2>&1; then
+  HEADROOM_REPO="$(cygpath -w "$HEADROOM_REPO")"
+fi
 exec python3 -c 'import os, sys
 sys.path.insert(0, os.environ["HEADROOM_REPO"])
 from headroom.__main__ import main

@@ -20,7 +20,10 @@ Config shape (schema_version 1)::
     }
 """
 import contextlib
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # Windows: no fcntl, locking is a no-op
 import os
 import re
 
@@ -154,6 +157,9 @@ def save(config):
 
 @contextlib.contextmanager
 def config_lock():
+    if fcntl is None:
+        yield  # Windows: no file locking
+        return
     lock_path = paths.config_path() + ".lock"
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     handle = open(lock_path, "w")
