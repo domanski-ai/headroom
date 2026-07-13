@@ -124,6 +124,73 @@ headroom claude            # launch Claude Code on the best account
 headroom rotate            # limit hit? cool this login, switch to the next
 ```
 
+## Widgets
+
+![Placeholder: Mac menu bar and compact dashboard capture will be added after E2E](marketing/hr-widgets.png)
+
+Widgets are display-only views of the same fail-closed public snapshot. The
+mini dashboard app is the existing dashboard in a compact layout: open
+`http://127.0.0.1:8377/widget`, or add `?compact=1` to the normal dashboard URL.
+It keeps stale, held, limited, and offline state visible; it does not rotate or
+select accounts.
+
+### SwiftBar on macOS
+
+Install [SwiftBar](https://swiftbar.app/), make sure the installed `headroom`
+binary is on SwiftBar's `PATH`, then copy the one-minute plugin into SwiftBar's
+plugin folder:
+
+```bash
+mkdir -p "$HOME/Library/Application Support/SwiftBar/Plugins"
+cp integrations/swiftbar/headroom.1m.sh \
+  "$HOME/Library/Application Support/SwiftBar/Plugins/headroom.1m.sh"
+chmod +x "$HOME/Library/Application Support/SwiftBar/Plugins/headroom.1m.sh"
+headroom serve
+```
+
+Local mode runs `headroom widget-feed --swiftbar`, which renders the last
+published snapshot and never initiates collection. The live server's
+`/usage.json`, `/widget.json`, and `/widget.txt` feeds share one refresh gate.
+The menu shows the fullest current 5-hour tank plus both windows and reset times
+for every account. Its only actions are Refresh and Open dashboard.
+
+For a headroom server on another machine, keep the server bound to loopback and
+forward it over SSH. This is the only supported remote pattern for live widget
+feeds:
+
+```bash
+ssh -N -L 8377:127.0.0.1:8377 user@headroom-host
+launchctl setenv HEADROOM_WIDGET_URL http://127.0.0.1:8377
+```
+
+Restart SwiftBar after setting the environment variable. Do not expose
+`headroom serve` on a LAN, public interface, or reverse proxy. It remains
+loopback-only, validates the `Host` header, sends no CORS allowance, and marks
+all responses `no-store` and `nosniff`. Remote plugin fetches have a three-second
+timeout and 64 KB cap. The exact `headroom_widget_txt@1` sentinel is version
+validation, not authentication; the plugin never evaluates, sources, or
+executes fetched bytes. Server-rendered menu text is centrally sanitized and
+contains no SwiftBar shell-execution parameters.
+
+### Windows tray — EXPERIMENTAL
+
+The Windows tray client is **EXPERIMENTAL**, not stable or supported as a
+production integration. Make the server available at loopback (for example,
+with the SSH tunnel above), preserve the four files under
+`experimental/windows/icons/`, and launch it from the repository root with
+Windows PowerShell 5.1:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File experimental/windows/headroom-tray.ps1
+```
+
+It uses bundled green, amber, red, and gray icons, caps the Windows tooltip at
+63 characters, and offers Refresh and Open dashboard. Any HTTP, JSON, schema,
+or clock failure becomes gray `OFFLINE`. A real Windows 10/11 PowerShell 5.1
+E2E pass is still required before the experimental label can be reconsidered;
+Windows requesters are invited to validate startup, all four transitions, both
+menu actions, and clean exit.
+
 ## The commands
 
 | command | what it does |
@@ -140,6 +207,7 @@ headroom rotate            # limit hit? cool this login, switch to the next
 | `headroom handoff` | transactional manual handoff (`--yes`, `--print`, `--model FAMILY`) |
 | `headroom serve [--open]` | local live dashboard (auto-refreshes stale data) |
 | `headroom serve --demo` | preview the dashboard with bundled sample data — no accounts needed |
+| `headroom widget-feed --swiftbar` | render the last published snapshot for SwiftBar; never collects |
 | `headroom statusline` | color-coded capacity for your Claude Code status line |
 | `headroom doctor` | environment + config health check (handy for bug reports) |
 
@@ -219,9 +287,11 @@ shows exactly why). `0` (the default) keeps today's use-to-the-limit behaviour.
 Usage is read **per account, from the provider's side** — so it's correct no
 matter how many machines a given login is signed in on, and the reads are
 token-safe: checking your headroom never disturbs or logs out your other
-sessions. Run headroom on each machine against the logins it has, or run it on
-one box and point the others at the same dashboard. Each machine keeps its own
-cooldown ledger; there's no central coordinator to stand up.
+sessions. Run headroom on each machine against the logins it has. To view a
+live server from another machine, use the Widgets section's `ssh -L` loopback
+forward; for ordinary static hosting, use `headroom dashboard` as described
+below. Each machine keeps its own cooldown ledger; there's no central
+coordinator to stand up.
 
 ## Hosting the dashboard somewhere else
 

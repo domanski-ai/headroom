@@ -162,7 +162,8 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
 .fbar { flex: 1; min-width: 6px; max-width: 22px; border-radius: var(--cell-radius);
         background: var(--tone, var(--unknown)); height: var(--h, 4%);
         box-shadow: var(--cell-glow) var(--tone, transparent); }
-.fbar.is-unknown { background: var(--cell-bg); height: 100%; opacity: .55; }
+.fbar.is-unknown { background: var(--unknown); height: 100%; opacity: .55;
+                   box-shadow: none; }
 
 .provider { margin-top: 26px; }
 .provider-head { display: flex; align-items: baseline; gap: 12px; margin: 0 0 8px; }
@@ -248,6 +249,25 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
   .toolbar { align-items: flex-start; }
   .snapshot { text-align: left; }
 }
+/* Compact mode is this same dashboard, sized as a pinnable mini app. */
+/* compact = a true glance widget: headline + fleet bars + slim account rows.
+   Everything interactive or explanatory is hidden; staleness stays visible. */
+body.is-compact .shell { width: min(100% - 16px, 400px); padding: 8px 0 10px; }
+body.is-compact .toolbar { gap: 4px 10px; padding-bottom: 6px; }
+body.is-compact .toolbar .brand { min-width: 0; }
+body.is-compact .subtitle, body.is-compact .controls,
+body.is-compact .legend, body.is-compact .credit,
+body.is-compact .summary-item:not(.is-widget-keep) { display: none; }
+body.is-compact .title { font-size: 15px; }
+body.is-compact .snapshot { font-size: 10px; text-align: right; }
+body.is-compact .summary { grid-template-columns: 1fr; gap: 6px; margin-top: 4px; }
+body.is-compact .summary-item.is-widget-keep { min-height: 58px; padding: 7px 10px; }
+body.is-compact .provider { margin-top: 8px; }
+body.is-compact .provider-head { margin-bottom: 4px; }
+body.is-compact .account { grid-template-columns: 1fr; gap: 4px; padding: 6px 10px; }
+body.is-compact .acct-identity, body.is-compact .state { grid-column: 1; text-align: left; }
+body.is-compact .statusline { font-size: 10px; margin-top: 6px; }
+body.is-compact .statusline:not(.is-error) { display: none; }
 </style>
 </head>
 <body>
@@ -290,7 +310,7 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
         <strong class="summary-value" id="lowest">–</strong></div>
       <div class="viz" id="lowest-viz"></div>
       <p class="summary-note" id="lowest-account">waiting for data</p></div>
-    <div class="summary-item">
+    <div class="summary-item is-widget-keep">
       <div class="summary-head"><span class="summary-label">Fleet · session left</span>
         <strong class="summary-value" id="account-count">–</strong></div>
       <div class="viz"><div class="fleet-bars" id="fleet-viz" role="img"
@@ -326,8 +346,8 @@ function capacity(w){return w&&Number.isFinite(w.used_percent)?clamp(100-w.used_
 function tone(left){if(left==null)return"unknown";if(left<=10)return"red";if(left<=30)return"orange";if(left<=50)return"yellow";return"green";}
 function age(epoch){if(!Number.isFinite(epoch))return"time unknown";const s=Math.max(0,Math.floor(Date.now()/1e3-epoch));if(s<60)return s+"s ago";if(s<3600)return Math.floor(s/60)+"m ago";if(s<86400)return Math.floor(s/3600)+"h "+Math.floor(s%3600/60)+"m ago";return Math.floor(s/86400)+"d ago";}
 function untilReset(epoch){if(!Number.isFinite(epoch))return"reset not reported";const s=epoch-Math.floor(Date.now()/1e3);if(s<=0)return"reset due";if(s<86400){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return"resets in "+(h?h+"h ":"")+m+"m";}return"resets "+new Intl.DateTimeFormat(undefined,{weekday:"short",hour:"2-digit",minute:"2-digit"}).format(new Date(1e3*epoch));}
-let snapStale=false; /* set per-render: an old snapshot demotes every row */
-function isCurrent(a){return Boolean(!snapStale&&a&&a.ok===true&&a.routable===true&&a.stale!==true);}
+let snapStale=false,sourceFailed=false; /* old/failed sources demote every row */
+function isCurrent(a){return Boolean(!snapStale&&!sourceFailed&&a&&a.ok===true&&a.routable===true&&a.stale!==true);}
 
 function windowLabel(key){
   if(key==="5h")return"Session 5h";
@@ -353,7 +373,8 @@ function meterMarkup(left){
 }
 function windowMarkup(account,key){
   const w=(account.windows||{})[key]||null;
-  const left=capacity(w);
+  /* Held/stale rows retain labels and resets, but never capacity colours. */
+  const left=isCurrent(account)?capacity(w):null;
   const unknown=left==null;
   const value=unknown?"n/a":Math.round(left)+"% left";
   const note=unknown?(w?"reading unavailable":(key.startsWith("scoped:")?"no scoped cap":"no reading yet")):untilReset(w.resets_at);
@@ -416,6 +437,7 @@ function validate(data){
 }
 function render(data){
   snapStale=!Number.isFinite(data.generated)||Date.now()/1e3-data.generated>1800;
+  sourceFailed=data.refresh_failed===true;
   const accounts=data.accounts;
   const current=accounts.filter(isCurrent);
   const readings=[];
@@ -440,7 +462,7 @@ function render(data){
   document.getElementById("lowest-viz").innerHTML=meterMarkup(lowest?lowest.left:null);
   document.getElementById("fleet-viz").innerHTML=accounts.map(a=>{
     const left=capacity((a.windows||{})["5h"]);
-    if(left==null)return'<span class="fbar is-unknown" title="'+esc(a.name)+': unknown"></span>';
+    if(!isCurrent(a)||left==null)return'<span class="fbar is-unknown" title="'+esc(a.name)+': unknown"></span>';
     return'<span class="fbar tone-'+tone(left)+'" style="--h:'+Math.max(4,left)+'%" title="'+esc(a.name)+": "+Math.round(left)+'% session left"></span>';
   }).join("");
   set("snapshot-age","snapshot "+age(data.generated));
@@ -448,6 +470,7 @@ function render(data){
   document.getElementById("providers").innerHTML=
     providerMarkup("claude",claude)+providerMarkup("codex",codex);
   const warnings=(data.integrity_warnings||[]).slice();
+  if(sourceFailed)warnings.unshift("refresh failed — readings shown as held until collection succeeds");
   if(snapStale)warnings.unshift("snapshot is over 30 minutes old — readings shown as held until a fresh collect");
   const status=document.getElementById("status");
   status.textContent=warnings.length?("⚠ "+warnings.join(" — ")):"Full meters are available capacity. Colors show what's left, not what's used.";
@@ -516,6 +539,8 @@ picker.addEventListener("change",()=>applyTheme(picker.value));
   let stored=null;
   try{stored=localStorage.getItem("headroom-theme");}catch(e){}
   const params=new URLSearchParams(location.search);
+  const compact=location.pathname.replace(/\/+$/,"")==="/widget"||params.get("compact")==="1";
+  document.body.classList.toggle("is-compact",compact);
   applyTheme(params.get("theme")||stored||configured||"midnight");
   if(CONFIG&&CONFIG.title){set("title",CONFIG.title);document.title=CONFIG.title;}
   document.getElementById("refresh").addEventListener("click",()=>load(true));

@@ -10,12 +10,15 @@ current with zero cron setup.
 import http.server
 import ipaddress
 import json
+import math
 import os
 import shutil
 import sys
 import threading
 import time
+import urllib.parse
 import webbrowser
+from dataclasses import dataclass
 
 from . import collect as collector
 from . import paths, registry
@@ -23,6 +26,94 @@ from . import paths, registry
 TEMPLATE = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "dashboard", "template.html")
 SERVE_MAX_AGE = int(os.environ.get("HEADROOM_SERVE_MAX_AGE", "300"))
+FAILURE_BACKOFF_BASE = int(os.environ.get(
+    "HEADROOM_SERVE_FAILURE_BACKOFF_BASE", "5"))
+FAILURE_BACKOFF_CAP = int(os.environ.get(
+    "HEADROOM_SERVE_FAILURE_BACKOFF_CAP", "300"))
+
+
+@dataclass(frozen=True)
+class RefreshResult:
+    snapshot: object
+    refresh_failed: bool = False
+    reason: object = None
+
+
+class RefreshGate:
+    """Single-flight collection with success TTL and bounded failure retry."""
+
+    def __init__(self, success_ttl=SERVE_MAX_AGE,
+                 failure_base=FAILURE_BACKOFF_BASE,
+                 failure_cap=FAILURE_BACKOFF_CAP, clock=None):
+        self.success_ttl = success_ttl
+        self.failure_base = failure_base
+        self.failure_cap = failure_cap
+        self.clock = clock or time.time
+        self.failure_count = 0
+        self.retry_at = 0.0
+        self.last_delay = 0.0
+        self._last_success_at = None
+        self._collecting = False
+        self._condition = threading.Condition()
+
+    @staticmethod
+    def _generated(snapshot):
+        value = snapshot.get("generated") if isinstance(snapshot, dict) else None
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value)):
+            return value
+        return None
+
+    def _published_current(self, snapshot, now):
+        generated = self._generated(snapshot)
+        return (generated is not None and 0 <= now - generated
+                <= self.success_ttl)
+
+    def get(self, load_snapshot, collect_snapshot):
+        """Return one snapshot result; only the admitted caller may collect."""
+        while True:
+            with self._condition:
+                now = self.clock()
+                snapshot = load_snapshot()
+                if self._last_success_at is None \
+                        and self._published_current(snapshot, now):
+                    self._last_success_at = self._generated(snapshot)
+                if (self._last_success_at is not None
+                        and now - self._last_success_at < self.success_ttl):
+                    return RefreshResult(snapshot)
+                if now < self.retry_at:
+                    return RefreshResult(snapshot, True, "refresh_failed")
+                if self._collecting:
+                    self._condition.wait()
+                    continue
+                self._collecting = True
+                break
+
+        try:
+            collect_snapshot()
+            completed = self.clock()
+            snapshot = load_snapshot()
+            if not self._published_current(snapshot, completed):
+                raise RuntimeError("collector did not publish a current snapshot")
+        except Exception:  # noqa: BLE001 — callers receive stale/503, never live
+            with self._condition:
+                self.failure_count += 1
+                self.last_delay = min(
+                    self.failure_base if self.last_delay <= 0
+                    else self.last_delay * 2,
+                    self.failure_cap)
+                self.retry_at = self.clock() + self.last_delay
+                self._collecting = False
+                self._condition.notify_all()
+                return RefreshResult(load_snapshot(), True, "refresh_failed")
+        with self._condition:
+            self.failure_count = 0
+            self.retry_at = 0.0
+            self.last_delay = 0.0
+            self._last_success_at = self.clock()
+            self._collecting = False
+            self._condition.notify_all()
+            return RefreshResult(snapshot)
 
 
 def _repo_root():
@@ -95,12 +186,20 @@ def build(config=None, out_dir=None, snapshot_file=None):
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     demo = False
+    refresh_gate = RefreshGate()
 
     def __init__(self, *args, directory=None, **kwargs):
         super().__init__(*args, directory=directory, **kwargs)
 
     def log_message(self, format, *args):  # noqa: A002 — stdlib signature
         pass
+
+    def end_headers(self):
+        # Every response, including static errors and Host rejections, carries
+        # the same browser hardening and cannot be cached as a live reading.
+        self.send_header("cache-control", "no-store")
+        self.send_header("x-content-type-options", "nosniff")
+        super().end_headers()
 
     def _host_ok(self):
         # reject anything but a loopback Host, so a remote page can't reach the
@@ -121,38 +220,94 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         except ValueError:
             return False
 
+    def _dashboard_href(self):
+        # the port this server is actually bound to, so a tunneled client's
+        # "Open dashboard" link points at the same tunnel it fetched through
+        try:
+            return f"http://127.0.0.1:{self.server.server_address[1]}/"
+        except (AttributeError, IndexError, TypeError):
+            return None
+
     def do_GET(self):
         if not self._host_ok():
             self.send_response(403)
+            self.send_header("content-type", "text/plain; charset=utf-8")
             self.end_headers()
             self.wfile.write(b"forbidden: non-loopback Host")
             return
-        # in demo mode the sample usage.json is a static file in the served dir;
-        # never try to re-collect (there are no real accounts)
-        if self.path.split("?")[0] == "/usage.json" and not self.demo:
-            snapshot = paths.load_json(paths.public_snapshot_path())
-            generated = (snapshot or {}).get("generated", 0)
-            if not snapshot or time.time() - generated > SERVE_MAX_AGE:
-                try:
-                    collector.run_collect(quiet=True)
-                    snapshot = paths.load_json(paths.public_snapshot_path())
-                except Exception:  # noqa: BLE001 — serve the last good snapshot
-                    pass
-            if not snapshot:
-                self.send_response(503)
-                self.send_header("content-type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"error": "no usage snapshot yet"}')
-                return
-            body = json.dumps(snapshot).encode()
-            self.send_response(200)
-            self.send_header("content-type", "application/json")
-            self.send_header("cache-control", "no-store")
-            self.send_header("content-length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        route = urllib.parse.urlsplit(self.path).path
+        if route in ("/usage.json", "/widget.json", "/widget.txt"):
+            self._serve_feed(route)
+            return
+        if route == "/widget":
+            original = self.path
+            self.path = "/index.html"
+            try:
+                super().do_GET()
+            finally:
+                self.path = original
             return
         super().do_GET()
+
+    def _snapshot_result(self):
+        if self.demo:
+            snapshot = paths.load_json(os.path.join(self.directory, "usage.json"))
+            return RefreshResult(snapshot)
+        return self.refresh_gate.get(
+            lambda: paths.load_json(paths.public_snapshot_path()),
+            lambda: collector.run_collect(quiet=True))
+
+    def _send_body(self, status, content_type, body):
+        self.send_response(status)
+        self.send_header("content-type", content_type)
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_feed(self, route):
+        from . import widget
+
+        result = self._snapshot_result()
+        if not isinstance(result.snapshot, dict):
+            if route == "/widget.txt":
+                body = widget.render_swiftbar(
+                    None, dashboard_href=self._dashboard_href()).encode("utf-8")
+                content_type = "text/plain; charset=utf-8"
+            else:
+                body = b'{"error":"no usage snapshot yet"}'
+                content_type = "application/json"
+            self._send_body(503, content_type, body)
+            return
+        reason = result.reason if result.refresh_failed else None
+        try:
+            if route == "/usage.json":
+                value = dict(result.snapshot)
+                if result.refresh_failed:
+                    value["refresh_failed"] = True
+                body = json.dumps(value, allow_nan=False,
+                                  separators=(",", ":")).encode("utf-8")
+                content_type = "application/json"
+            elif route == "/widget.json":
+                value = widget.project(result.snapshot,
+                                       force_noncurrent_reason=reason)
+                body = json.dumps(value, allow_nan=False,
+                                  separators=(",", ":")).encode("utf-8")
+                content_type = "application/json"
+            else:
+                body = widget.render_swiftbar(
+                    result.snapshot, force_noncurrent_reason=reason,
+                    dashboard_href=self._dashboard_href()).encode("utf-8")
+                content_type = "text/plain; charset=utf-8"
+        except (TypeError, ValueError, OverflowError):
+            body = (widget.render_swiftbar(
+                None, dashboard_href=self._dashboard_href()).encode("utf-8")
+                    if route == "/widget.txt"
+                    else b'{"error":"invalid usage snapshot"}')
+            content_type = ("text/plain; charset=utf-8"
+                            if route == "/widget.txt" else "application/json")
+            self._send_body(503, content_type, body)
+            return
+        self._send_body(200, content_type, body)
 
 
 def serve(open_browser=False, port=None, demo=False):
@@ -165,7 +320,8 @@ def serve(open_browser=False, port=None, demo=False):
         port = settings["port"] if port is None else port
         out_dir = paths.public_dir()
         build(config, out_dir)
-    handler_cls = type("HeadroomHandler", (Handler,), {"demo": demo})
+    handler_cls = type("HeadroomHandler", (Handler,),
+                       {"demo": demo, "refresh_gate": RefreshGate()})
     handler = lambda *args, **kwargs: handler_cls(*args, directory=out_dir, **kwargs)  # noqa: E731
     try:
         server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)

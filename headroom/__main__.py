@@ -22,6 +22,7 @@ usage:
   headroom repin <name>             re-bind a Claude slot's usage org
   headroom dashboard [--demo]       (re)build the static dashboard
   headroom serve [--open] [--port N] [--demo]   local live dashboard
+  headroom widget-feed --swiftbar  render the last snapshot (never collects)
   headroom statusline               Claude Code status line output
   headroom accounts                 list connected accounts
   headroom doctor                   environment + config health check
@@ -248,6 +249,21 @@ def _dispatch(argv):
                 return 2
         return dashboard.serve(open_browser="--open" in args, port=port,
                                demo="--demo" in args) or 0
+    if command == "widget-feed":
+        if args != ["--swiftbar"]:
+            print("usage: headroom widget-feed --swiftbar", file=sys.stderr)
+            return 2
+        from . import paths, widget
+        snapshot = paths.load_json(paths.public_snapshot_path())
+        if snapshot is None:
+            output = widget.render_swiftbar(None)
+        else:
+            try:
+                output = widget.render_swiftbar(snapshot)
+            except Exception:  # noqa: BLE001 — a display feed must fail closed
+                output = widget.render_swiftbar(None)
+        print(output, end="")
+        return 0
     if command == "statusline":
         from . import statusline
         return statusline.main()
