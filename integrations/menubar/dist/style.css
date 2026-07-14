@@ -1,0 +1,170 @@
+/* Offline fallback for the headroom popover. The window itself is
+   transparent; this page draws its own dark-glass card so the failure state
+   still looks like the liquid-glass widget it stands in for. */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  background: transparent;
+}
+
+body {
+  display: flex;
+  align-items: stretch;
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+    sans-serif;
+  color: rgba(235, 240, 255, 0.92);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+.card {
+  flex: 1;
+  margin: 10px;
+  padding: 28px 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  text-align: center;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: linear-gradient(
+    160deg,
+    rgba(30, 33, 46, 0.96),
+    rgba(16, 18, 27, 0.96)
+  );
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+h1 {
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+/* battery mark, echoing the tray glyph */
+.mark {
+  opacity: 0.9;
+}
+
+.battery {
+  position: relative;
+  display: inline-block;
+  width: 46px;
+  height: 24px;
+  border: 3px solid rgba(235, 240, 255, 0.85);
+  border-radius: 7px;
+}
+
+.battery::after {
+  content: "";
+  position: absolute;
+  top: 4px;
+  right: -9px;
+  width: 5px;
+  height: 10px;
+  border-radius: 2px;
+  background: rgba(235, 240, 255, 0.85);
+}
+
+.battery-fill {
+  position: absolute;
+  inset: 3px auto 3px 3px;
+  width: 42%;
+  border-radius: 3px;
+  background: rgba(235, 240, 255, 0.85);
+}
+
+.card[data-state="probing"] .battery-fill {
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.95;
+  }
+}
+
+/* state switching */
+.status {
+  display: none;
+}
+
+.card[data-state="probing"] .status-probing,
+.card[data-state="down"] .status-down {
+  display: block;
+}
+
+.status-probing {
+  color: rgba(235, 240, 255, 0.65);
+}
+
+.status-down .headline {
+  font-weight: 600;
+  color: rgba(255, 190, 130, 0.95);
+}
+
+.status-down .detail {
+  margin-top: 6px;
+  color: rgba(235, 240, 255, 0.6);
+  overflow-wrap: anywhere;
+}
+
+code {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.hint {
+  margin: 14px auto 0;
+  padding: 8px 12px;
+  max-width: 100%;
+  overflow-x: auto;
+  text-align: left;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: rgba(180, 225, 255, 0.8);
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 8px;
+}
+
+button {
+  margin-top: 16px;
+  padding: 7px 22px;
+  font: inherit;
+  font-weight: 600;
+  color: rgba(235, 240, 255, 0.95);
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 9px;
+  cursor: pointer;
+}
+
+button:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+button:active {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.auto {
+  margin-top: 10px;
+  font-size: 11px;
+  color: rgba(235, 240, 255, 0.4);
+}

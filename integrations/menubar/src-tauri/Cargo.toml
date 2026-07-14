@@ -1,0 +1,26 @@
+[package]
+name = "headroom-menubar"
+version = "0.1.0"
+description = "headroom menu-bar / system-tray popover: the liquid-glass /widget page as a native click-down panel"
+license = "MIT"
+repository = "https://github.com/domanski-ai/headroom"
+edition = "2021"
+rust-version = "1.88"
+
+[lib]
+name = "headroom_menubar_lib"
+
+# Exact pins (repeatability for the OSS build; bump deliberately).
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+tauri = { version = "=2.11.5", features = ["tray-icon", "image-png", "macos-private-api"] }
+tauri-plugin-positioner = { version = "=2.3.3", features = ["tray-icon"] }
+open = "=5.4.0"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

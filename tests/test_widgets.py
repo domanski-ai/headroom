@@ -516,6 +516,16 @@ class DashboardHttpTests(unittest.TestCase):
         for _, headers, _ in responses:
             self.assertEqual(headers.get("cache-control"), "no-store")
             self.assertEqual(headers.get("x-content-type-options"), "nosniff")
+            # containment even inside an embedding webview: same-origin
+            # fetches + inline style/script only — no frames, objects,
+            # forms, popup targets, or external subresources. Pinned as the
+            # EXACT policy so no directive can silently loosen or vanish.
+            self.assertEqual(
+                headers.get("content-security-policy"),
+                "default-src 'none'; script-src 'unsafe-inline'; "
+                "style-src 'unsafe-inline'; img-src 'self' data:; "
+                "connect-src 'self'; frame-src 'none'; object-src 'none'; "
+                "form-action 'none'; base-uri 'none'")
 
     def test_no_response_enables_cors(self):
         with mock.patch.object(widget.time, "time", return_value=NOW):

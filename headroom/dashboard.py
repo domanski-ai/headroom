@@ -205,11 +205,23 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, format, *args):  # noqa: A002 — stdlib signature
         pass
 
+    # The dashboard and /widget pages are single self-contained documents:
+    # inline style/script, same-origin feed fetches, no frames, objects,
+    # forms, or external subresources — the CSP pins exactly that, so the
+    # pages stay contained even inside an embedding webview (the menu-bar
+    # popover) where the app's own top-level navigation gate cannot see
+    # subresource or frame loads.
+    _CSP = ("default-src 'none'; script-src 'unsafe-inline'; "
+            "style-src 'unsafe-inline'; img-src 'self' data:; "
+            "connect-src 'self'; frame-src 'none'; object-src 'none'; "
+            "form-action 'none'; base-uri 'none'")
+
     def end_headers(self):
         # Every response, including static errors and Host rejections, carries
         # the same browser hardening and cannot be cached as a live reading.
         self.send_header("cache-control", "no-store")
         self.send_header("x-content-type-options", "nosniff")
+        self.send_header("content-security-policy", self._CSP)
         super().end_headers()
 
     def _host_ok(self):
