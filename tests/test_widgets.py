@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -18,6 +19,8 @@ from headroom import __main__, dashboard, paths, widget
 
 NOW = 2_000_000_000
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+NODE = shutil.which("node")
+UBERSICHT = os.path.join(ROOT, "integrations", "ubersicht")
 PLUGIN = os.path.join(ROOT, "integrations", "swiftbar", "headroom.1m.sh")
 WINDOWS_SCRIPT = os.path.join(ROOT, "experimental", "windows",
                               "headroom-tray.ps1")
@@ -943,6 +946,450 @@ class LiquidGlassWidgetTests(unittest.TestCase):
         script = self.widget_script()
         for state in ("current", "limited", "stale", "held"):
             self.assertIn('"%s"' % state, script)
+
+
+class UbersichtWidgetTests(unittest.TestCase):
+    """The Übersicht desktop port and the shared fail-closed guards.
+
+    The state mapping is one contract in four copies (dashboard/template.html
+    is the source; headroom-small.jsx, headroom-medium.jsx and preview.html
+    are the ports).  These tests execute the real JS of every copy under node
+    and drive the guard FAILURE cases — an expired-but-current snapshot, a
+    future evaluated_at, missing timing, a lying headline, and structurally
+    malformed feeds — asserting each renders held/grey/offline, never live.
+    """
+
+    SMALL = os.path.join(UBERSICHT, "headroom-small.jsx")
+    MEDIUM = os.path.join(UBERSICHT, "headroom-medium.jsx")
+    PREVIEW = os.path.join(UBERSICHT, "preview.html")
+    UB_README = os.path.join(UBERSICHT, "README.md")
+    _battery_cache = {}
+
+    @staticmethod
+    def read(path):
+        with open(path) as handle:
+            return handle.read()
+
+    @classmethod
+    def sources(cls):
+        return {"template": dashboard.TEMPLATE, "small": cls.SMALL,
+                "medium": cls.MEDIUM, "preview": cls.PREVIEW}
+
+    @classmethod
+    def guard_js(cls, path):
+        """Extract the executable state-mapping JS from one of the copies."""
+        text = cls.read(path)
+        if path.endswith("template.html"):
+            code = text.split(
+                "/* =================================================== liquid-glass widget */",
+                1)[1].split(
+                "/* --------------------------------------------------------------- theme */",
+                1)[0]
+            return ('const SNAPSHOT_MAX_AGE=900;\n'
+                    'function clamp(v,lo,hi){return Math.min(hi,Math.max(lo,v));}\n'
+                    'function esc(v){return String(v==null?"":v);}\n'
+                    'function untilReset(v){return "resets soon";}\n'
+                    'function age(v){return "just now";}\n') + code
+        if path.endswith("preview.html"):
+            return text.split('"use strict";', 1)[1].split(
+                "document.querySelectorAll", 1)[0]
+        body = text.split(
+            "/* ------------------------------------------------------------- helpers",
+            1)[1].split(
+            "/* --------------------------------------------------------------- styles",
+            1)[0]
+        return "const SNAPSHOT_MAX_AGE=900;\n/*" + body
+
+    # Scenario battery run against every copy: the three happy-path render
+    # states plus every guard failure case from the adversarial review.
+    GUARD_TAIL = r"""
+;(function () {
+  const NOW = Date.now() / 1e3;
+  function mkWin(state, left) {
+    return { state: state,
+      left_percent: state === "current" ? left : null,
+      last_observed_left_percent:
+        state === "current" || state === "held" ? null : left,
+      resets_at: NOW + 3600,
+      observed_at: state === "held" ? null : NOW - 40 };
+  }
+  function mkAcct(state, left, w5, w7) {
+    return { name: "acct-" + state, provider: "claude", state: state,
+      windows: { "5h": w5 || mkWin(state, left),
+                 "7d": w7 || mkWin(state, left) } };
+  }
+  function mkFeed(fresh, accounts, headline) {
+    return { schema: "headroom_widget@1", freshness: fresh,
+      accounts: accounts, headline: headline };
+  }
+  const scenarios = {
+    cruising: mkFeed(
+      { state: "current", age_seconds: 41, reason: "snapshot_current",
+        evaluated_at: NOW },
+      [mkAcct("current", 82), mkAcct("current", 47)],
+      { current_accounts: 2, total_accounts: 2, fullest_5h_left_percent: 82 }),
+    limit_hit: mkFeed(
+      { state: "current", age_seconds: 41, reason: "snapshot_current",
+        evaluated_at: NOW },
+      [mkAcct("current", 82),
+       mkAcct("limited", 0, mkWin("limited", 0), mkWin("current", 31))],
+      { current_accounts: 1, total_accounts: 2, fullest_5h_left_percent: 82 }),
+    feed_stale: mkFeed(
+      { state: "stale", age_seconds: 2400, reason: "snapshot_expired",
+        evaluated_at: NOW },
+      [mkAcct("stale", 58), mkAcct("stale", 71)],
+      { current_accounts: 0, total_accounts: 2,
+        fullest_5h_left_percent: null }),
+    expired: mkFeed(
+      { state: "current", age_seconds: 41, reason: "snapshot_current",
+        evaluated_at: NOW - 4000 },
+      [mkAcct("current", 82)],
+      { current_accounts: 1, total_accounts: 1, fullest_5h_left_percent: 82 }),
+    future: mkFeed(
+      { state: "current", age_seconds: 41, reason: "snapshot_current",
+        evaluated_at: NOW + 600 },
+      [mkAcct("current", 82)],
+      { current_accounts: 1, total_accounts: 1, fullest_5h_left_percent: 82 }),
+    missing_timing: mkFeed(
+      { state: "current", reason: "snapshot_current" },
+      [mkAcct("current", 82)],
+      { current_accounts: 1, total_accounts: 1, fullest_5h_left_percent: 82 }),
+    lying_headline: mkFeed(
+      { state: "current", age_seconds: 5, reason: "snapshot_current",
+        evaluated_at: NOW },
+      [mkAcct("held", null), mkAcct("held", null)],
+      { current_accounts: 3, total_accounts: 2,
+        fullest_5h_left_percent: 82 }),
+  };
+  const okHead = { current_accounts: 1, total_accounts: 1,
+                   fullest_5h_left_percent: 50 };
+  const okFresh = { state: "current", age_seconds: 5,
+                    reason: "snapshot_current", evaluated_at: NOW };
+  const badCurrent = mkAcct("current", 50);
+  badCurrent.windows["5h"].left_percent = null;
+  const badStale = mkAcct("stale", 50);
+  badStale.windows["5h"].left_percent = 55;
+  const badTyped = mkAcct("current", 50);
+  badTyped.windows["5h"].left_percent = "50";
+  const noSeven = mkAcct("current", 50);
+  delete noSeven.windows["7d"];
+  // strictness battery: MISSING fields are not null, reason must be a string,
+  // headline counts are integers and percentages live in 0-100
+  const bareWindows = mkAcct("current", 50);
+  bareWindows.windows["5h"] = { state: "current", left_percent: 50 };
+  bareWindows.windows["7d"] = { state: "current", left_percent: 50 };
+  const numericReason = Object.assign({}, okFresh, { reason: 7 });
+  const overHead = Object.assign({}, okHead,
+    { fullest_5h_left_percent: 101 });
+  const fractionalHead = Object.assign({}, okHead, { current_accounts: 1.5 });
+  const negativeAge = Object.assign({}, okFresh, { age_seconds: -5 });
+  const malformed = [
+    "", "not json", "[]",
+    JSON.stringify(Object.assign({}, scenarios.cruising,
+      { schema: "headroom_widget@2" })),
+    JSON.stringify(Object.assign({}, scenarios.cruising,
+      { accounts: "not-an-array" })),
+    JSON.stringify(Object.assign({}, scenarios.cruising,
+      { freshness: { state: "live", age_seconds: 5, evaluated_at: NOW } })),
+    JSON.stringify(Object.assign({}, scenarios.cruising, { headline: null })),
+    JSON.stringify(mkFeed(okFresh,
+      [{ name: 7, provider: "claude", state: "current",
+         windows: { "5h": mkWin("current", 50),
+                    "7d": mkWin("current", 50) } }], okHead)),
+    JSON.stringify(mkFeed(okFresh, [badCurrent], okHead)),
+    JSON.stringify(mkFeed(okFresh, [badStale], okHead)),
+    JSON.stringify(mkFeed(okFresh, [badTyped], okHead)),
+    JSON.stringify(mkFeed(okFresh, [noSeven], okHead)),
+    JSON.stringify(mkFeed(okFresh, [bareWindows], okHead)),
+    JSON.stringify(mkFeed(numericReason, [mkAcct("current", 50)], okHead)),
+    JSON.stringify(mkFeed(okFresh, [mkAcct("current", 50)], overHead)),
+    JSON.stringify(mkFeed(okFresh, [mkAcct("current", 50)], fractionalHead)),
+    JSON.stringify(mkFeed(negativeAge, [mkAcct("current", 50)], okHead)),
+  ];
+  const usesParse = typeof parseFeed === "function";
+  const markupFor = (v) => (typeof hrSmallMarkup === "function"
+    ? hrSmallMarkup(v) : hrMediumMarkup(v));
+  const results = { has_small: typeof hrSmallMarkup === "function",
+                    views: {}, rejected: [] };
+  for (const name of Object.keys(scenarios)) {
+    const feed = scenarios[name];
+    const v = hrView(feed);
+    const markup = markupFor(v);
+    results.views[name] = {
+      fresh: v.fresh.state, value: v.hl.value, tone: v.hl.tone,
+      line: v.liveLine,
+      accepted: usesParse ? parseFeed(JSON.stringify(feed)) !== null
+                          : hrValidFeed(feed),
+      live_tones: /hr-tone-(green|yellow|orange)/.test(markup),
+      red_tone: markup.indexOf("hr-tone-red") !== -1,
+      dot_live: markup.indexOf("is-live") !== -1,
+    };
+  }
+  for (const raw of malformed) {
+    if (usesParse) results.rejected.push(parseFeed(raw) === null);
+    else {
+      let rejected = true;
+      try { rejected = !hrValidFeed(JSON.parse(raw)); }
+      catch (error) { rejected = true; }
+      results.rejected.push(rejected);
+    }
+  }
+  console.log(JSON.stringify(results));
+})();
+"""
+
+    @classmethod
+    def battery(cls, name):
+        if name not in cls._battery_cache:
+            script = cls.guard_js(cls.sources()[name]) + cls.GUARD_TAIL
+            proc = subprocess.run([NODE, "-"], input=script,
+                                  capture_output=True, text=True, timeout=60)
+            if proc.returncode != 0:
+                raise AssertionError("node battery failed for %s:\n%s"
+                                     % (name, proc.stderr))
+            cls._battery_cache[name] = json.loads(
+                proc.stdout.strip().splitlines()[-1])
+        return cls._battery_cache[name]
+
+    # -------------------------------------------- guard failure cases (node)
+    @unittest.skipUnless(NODE, "node runtime required to execute widget JS")
+    def test_expired_current_snapshot_demotes_to_stale_grey(self):
+        for name in self.sources():
+            with self.subTest(source=name):
+                view = self.battery(name)["views"]["expired"]
+                self.assertEqual(view["fresh"], "stale")
+                self.assertEqual(view["value"], "—")
+                self.assertEqual(view["tone"], "dim")
+                self.assertEqual(view["line"], "0/1 live · feed stale")
+                self.assertFalse(view["live_tones"])
+                self.assertFalse(view["red_tone"])
+                self.assertFalse(view["dot_live"])
+
+    @unittest.skipUnless(NODE, "node runtime required to execute widget JS")
+    def test_future_evaluated_at_holds_never_current(self):
+        for name in self.sources():
+            with self.subTest(source=name):
+                view = self.battery(name)["views"]["future"]
+                self.assertEqual(view["fresh"], "held")
+                self.assertEqual(view["value"], "—")
+                self.assertEqual(view["line"], "0/1 live · feed held")
+                self.assertFalse(view["live_tones"])
+                self.assertFalse(view["dot_live"])
+
+    @unittest.skipUnless(NODE, "node runtime required to execute widget JS")
+    def test_missing_timing_is_held_and_structurally_rejected(self):
+        for name in self.sources():
+            with self.subTest(source=name):
+                view = self.battery(name)["views"]["missing_timing"]
+                # defence in depth: the freshness guard holds it AND the
+                # structural validation refuses to accept the feed at all
+                self.assertEqual(view["fresh"], "held")
+                self.assertEqual(view["value"], "—")
+                self.assertFalse(view["live_tones"])
+                self.assertFalse(view["accepted"])
+
+    @unittest.skipUnless(NODE, "node runtime required to execute widget JS")
+    def test_headline_is_derived_never_trusted(self):
+        # a current snapshot whose accounts are all held but whose headline
+        # claims 82% must render the held "—", not a green 82%
+        for name in self.sources():
+            with self.subTest(source=name):
+                view = self.battery(name)["views"]["lying_headline"]
+                self.assertEqual(view["fresh"], "current")
+                self.assertEqual(view["value"], "—")
+                self.assertEqual(view["tone"], "dim")
+                self.assertEqual(view["line"], "0/2 accounts live")
+                self.assertFalse(view["live_tones"])
+                self.assertFalse(view["red_tone"])
+
+    @unittest.skipUnless(NODE, "node runtime required to execute widget JS")
+    def test_malformed_feeds_reject_to_offline(self):
+        for name in self.sources():
+            with self.subTest(source=name):
+                rejected = self.battery(name)["rejected"]
+                self.assertEqual(len(rejected), 17)
+                self.assertTrue(all(rejected),
+                                "a malformed feed was accepted: %s" % rejected)
+        # a rejected parse selects the offline view in the widget render
+        for path in (self.SMALL, self.MEDIUM):
+            text = self.read(path)
+            self.assertIn("const data = error ? null : parseFeed(output);",
+                          text)
+            self.assertIn("const v = data ? hrView(data) : hrOfflineView();",
+                          text)
+
+    @unittest.skipUnless(NODE, "node runtime required to execute widget JS")
+    def test_happy_path_render_states_are_unchanged(self):
+        for name in self.sources():
+            with self.subTest(source=name):
+                views = self.battery(name)["views"]
+                has_small = self.battery(name)["has_small"]
+                cruising = views["cruising"]
+                self.assertEqual(cruising["fresh"], "current")
+                self.assertEqual(cruising["value"], "82%")
+                self.assertEqual(cruising["tone"], "green")
+                self.assertEqual(cruising["line"], "2/2 accounts live")
+                self.assertTrue(cruising["accepted"])
+                self.assertTrue(cruising["live_tones"])
+                if has_small:
+                    self.assertTrue(cruising["dot_live"])
+                limit = views["limit_hit"]
+                self.assertEqual(limit["value"], "82%")
+                self.assertEqual(limit["tone"], "green")
+                self.assertEqual(limit["line"], "1/2 live · 1 at limit")
+                # design intent: a really-capped window stays RED, not dimmed
+                self.assertTrue(limit["red_tone"])
+                self.assertTrue(limit["accepted"])
+                stale = views["feed_stale"]
+                self.assertEqual(stale["fresh"], "stale")
+                self.assertEqual(stale["value"], "—")
+                self.assertEqual(stale["tone"], "dim")
+                self.assertEqual(stale["line"], "0/2 live · feed stale")
+                self.assertTrue(stale["accepted"])
+                self.assertFalse(stale["live_tones"])
+                self.assertFalse(stale["red_tone"])
+                self.assertFalse(stale["dot_live"])
+
+    # ------------------------------------------------- static port contract
+    @classmethod
+    def command_script(cls, path):
+        """The executable shell of one widget's `command` export."""
+        text = cls.read(path)
+        command = text.split("export const command = `", 1)[1].split(
+            "`;", 1)[0]
+        # the JSX template literal escapes `${...}` — undo for real sh
+        return command.replace("\\$", "$")
+
+    def run_command(self, path, url):
+        """Run the widget command under /bin/sh with curl stubbed out.
+
+        Returns (returncode, curl_argv or None) — None when the guard
+        rejected the URL before any fetch could happen.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            log = os.path.join(directory, "curl-args.log")
+            stub = os.path.join(directory, "curl")
+            with open(stub, "w") as handle:
+                handle.write('#!/bin/sh\nprintf \'%s\\n\' "$@" > "$CURL_LOG"\n')
+            os.chmod(stub, 0o755)
+            env = os.environ.copy()
+            env["PATH"] = directory + os.pathsep + env["PATH"]
+            env["CURL_LOG"] = log
+            env.pop("HEADROOM_WIDGET_URL", None)
+            if url is not None:
+                env["HEADROOM_WIDGET_URL"] = url
+            proc = subprocess.run(
+                ["/bin/sh", "-c", self.command_script(path)], env=env,
+                capture_output=True, text=True, timeout=30)
+            argv = None
+            if os.path.exists(log):
+                with open(log) as handle:
+                    argv = handle.read().splitlines()
+            return proc.returncode, argv
+
+    def test_ubersicht_command_is_hermetic_and_fail_closed(self):
+        for path in (self.SMALL, self.MEDIUM):
+            with self.subTest(path=os.path.basename(path)):
+                text = self.read(path)
+                command = text.split("export const command = `", 1)[1].split(
+                    "`;", 1)[0]
+                # the port is the EXACT remainder of an accepted loopback
+                # prefix — never a substring parse that can be smuggled past
+                self.assertIn('http://127.0.0.1:*) '
+                              'port="\\${url#http://127.0.0.1:}" ;;', command)
+                self.assertIn('http://localhost:*) '
+                              'port="\\${url#http://localhost:}" ;;', command)
+                self.assertIn('""|0*|*[!0-9]*)', command)
+                self.assertIn('[ "$port" -ge 1 ] && [ "$port" -le 65535 ] '
+                              "|| exit 1", command)
+                self.assertIn("exec curl -q --fail --silent --show-error "
+                              "--noproxy '*' --max-time 4 "
+                              '"http://127.0.0.1:$port/widget.json"', command)
+                self.assertNotIn("curl -s ", command)
+
+    def test_ubersicht_command_rejects_hostile_urls_executably(self):
+        hostile = [
+            "http://127.0.0.1:8377@evil.example:80",
+            "http://127.0.0.1:8377/path:80",
+            "http://localhost:8377;ignored:80",
+            "http://127.0.0.1:8377?x=1:80",
+            "http://127.0.0.1.evil.example:8377",
+            "http://evil.example:8377",
+            "https://127.0.0.1:8377",
+            "ftp://127.0.0.1:8377",
+            "http://127.0.0.1:",
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:080",
+            "http://127.0.0.1:65536",
+            "http://127.0.0.1:99999999999999999999",
+            "http://localhost:8377 http://evil.example",
+        ]
+        for path in (self.SMALL, self.MEDIUM):
+            for url in hostile:
+                with self.subTest(path=os.path.basename(path), url=url):
+                    code, argv = self.run_command(path, url)
+                    self.assertNotEqual(code, 0, "guard accepted %r" % url)
+                    self.assertIsNone(argv, "curl ran for %r: %r"
+                                      % (url, argv))
+
+    def test_ubersicht_command_accepts_only_canonical_loopback(self):
+        accepted = {
+            None: "http://127.0.0.1:8377/widget.json",
+            "http://127.0.0.1:9000": "http://127.0.0.1:9000/widget.json",
+            "http://localhost:8377": "http://127.0.0.1:8377/widget.json",
+            "http://localhost:8377/": "http://127.0.0.1:8377/widget.json",
+        }
+        for path in (self.SMALL, self.MEDIUM):
+            for url, fetch in accepted.items():
+                with self.subTest(path=os.path.basename(path), url=url):
+                    code, argv = self.run_command(path, url)
+                    self.assertEqual(code, 0)
+                    self.assertIsNotNone(argv)
+                    # curl fetches ONLY the canonically rebuilt loopback URL
+                    self.assertEqual(argv[-1], fetch)
+
+    def test_ubersicht_state_mapping_is_byte_identical_across_ports(self):
+        functions = ("hrTone", "hrPct", "hrWindow", "hrDemoteWindow",
+                     "hrFreshness", "hrAccount", "hrView", "hrOfflineView",
+                     "hrFiniteOrNull", "hrValidWindow", "hrValidFeed",
+                     "parseFeed")
+        texts = {path: self.read(path)
+                 for path in (self.SMALL, self.MEDIUM, self.PREVIEW)}
+        for name in functions:
+            bodies = set()
+            for path, text in texts.items():
+                self.assertIn("function %s(" % name, text,
+                              "%s missing from %s" % (name, path))
+                bodies.add(text.split("function %s(" % name, 1)[1].split(
+                    "\n}", 1)[0])
+            self.assertEqual(len(bodies), 1,
+                             "%s drifted between the Übersicht copies" % name)
+
+    def test_ubersicht_readme_reconciles_expired_future_as_held(self):
+        readme = self.read(self.UB_README)
+        self.assertIn("expired, future-dated, or timing-less snapshot",
+                      readme)
+        self.assertIn("grey stale/held card", readme)
+        self.assertIn("headline % is derived, not trusted", readme)
+        # "feed unreachable" is reserved for transport/shape failures
+        unreachable = readme.split('renders the grey "feed unreachable"', 1)[0]
+        self.assertIn("`headroom_widget@1` shape check",
+                      unreachable.rsplit("- ", 1)[1])
+        for flag in ("-q", "--fail", "--noproxy '*'", "--show-error"):
+            self.assertIn(flag, readme)
+
+    def test_preview_carries_guard_failure_fixtures(self):
+        preview = self.read(self.PREVIEW)
+        for fixture in ("expired", "future", "missing-timing",
+                        "inconsistent-headline", "malformed"):
+            self.assertIn('data-fixture="%s"' % fixture, preview)
+        for constant in ("const EXPIRED", "const FUTURE",
+                         "const MISSING_TIMING", "const INCONSISTENT",
+                         "const MALFORMED"):
+            self.assertIn(constant, preview)
+        # the malformed fixture must flow through the real parseFeed gate
+        wiring = preview.split('if (kind === "malformed")', 1)[1]
+        self.assertIn("parseFeed(MALFORMED)", wiring.split("}", 1)[0])
 
 
 class SwiftBarPluginTests(unittest.TestCase):

@@ -794,7 +794,7 @@ async function load(manual){
    `st==="current"` branch of hrWindow(); stale/held/offline readings render
    the unknown grey with the last-observed value (or n/a), never a live color. */
 const HR_URL="widget.json";
-let hrData=null,hrFetchedAt=0,hrSize="popup",hrLastOffline=false,hrRequest=0;
+let hrData=null,hrSize="popup",hrLastOffline=false,hrRequest=0;
 function hrTone(left){return left==null?"unknown":left<=10?"red":left<=30?"orange":left<=50?"yellow":"green";}
 function hrPct(v){return Number.isFinite(v)?clamp(v,0,100):null;}
 function hrAgeText(s){if(!Number.isFinite(s))return"age unknown";s=Math.max(0,Math.floor(s));if(s<60)return s+"s ago";if(s<3600)return Math.floor(s/60)+"m ago";return Math.floor(s/3600)+"h "+Math.floor(s%3600/60)+"m ago";}
@@ -821,13 +821,59 @@ function hrDemoteWindow(w){
   if(last!=null)return{tone:"unknown",fill:last,value:Math.round(last)+"%",live:false};
   return{tone:"unknown",fill:null,value:"n/a",live:false};
 }
+/* headroom_widget@1 structural validation: anything missing or mistyped is
+   rejected before it can render — the OFFLINE view, never a live card.
+   Strict by design: a MISSING field is not null — the projection always emits
+   every contract field explicitly, so absence means a foreign/broken feed. */
+function hrFiniteOrNull(v){return v===null||(typeof v==="number"&&Number.isFinite(v));}
+function hrValidWindow(w){
+  if(!w||typeof w!=="object"||Array.isArray(w))return false;
+  if(!["current","limited","stale","held"].includes(w.state))return false;
+  if(!hrFiniteOrNull(w.left_percent)||!hrFiniteOrNull(w.last_observed_left_percent)
+    ||!hrFiniteOrNull(w.resets_at)||!hrFiniteOrNull(w.observed_at))return false;
+  if(w.left_percent!=null&&(w.left_percent<0||w.left_percent>100))return false;
+  if(w.last_observed_left_percent!=null&&(w.last_observed_left_percent<0||w.last_observed_left_percent>100))return false;
+  /* value invariant: only a current window may carry a live left_percent */
+  return w.state==="current"?Number.isFinite(w.left_percent):w.left_percent==null;
+}
+function hrValidFeed(data){
+  if(!data||typeof data!=="object"||Array.isArray(data))return false;
+  if(data.schema!=="headroom_widget@1")return false;
+  const f=data.freshness;
+  if(!f||typeof f!=="object"||Array.isArray(f))return false;
+  if(!["current","stale","held"].includes(f.state))return false;
+  if(typeof f.reason!=="string")return false;
+  if(!Number.isFinite(f.evaluated_at))return false;
+  if(f.age_seconds!==null&&!(Number.isInteger(f.age_seconds)&&f.age_seconds>=0))return false;
+  if(f.state!=="held"&&f.age_seconds===null)return false;
+  if(!Array.isArray(data.accounts))return false;
+  if(!data.accounts.every(a=>a&&typeof a==="object"&&!Array.isArray(a)
+    &&typeof a.name==="string"&&typeof a.provider==="string"
+    &&["current","limited","stale","held"].includes(a.state)
+    &&a.windows&&typeof a.windows==="object"&&!Array.isArray(a.windows)
+    &&hrValidWindow(a.windows["5h"])&&hrValidWindow(a.windows["7d"])))return false;
+  const h=data.headline;
+  if(!h||typeof h!=="object"||Array.isArray(h))return false;
+  if(!Number.isInteger(h.current_accounts)||h.current_accounts<0)return false;
+  if(!Number.isInteger(h.total_accounts)||h.total_accounts<0)return false;
+  return h.fullest_5h_left_percent===null
+    ||(Number.isFinite(h.fullest_5h_left_percent)
+    &&h.fullest_5h_left_percent>=0&&h.fullest_5h_left_percent<=100);
+}
 function hrFreshness(data,offline){
   const f=data&&data.freshness&&typeof data.freshness==="object"?data.freshness:{};
-  const drift=hrFetchedAt?Math.max(0,(Date.now()-hrFetchedAt)/1e3):0;
-  const age=Number.isFinite(f.age_seconds)?f.age_seconds+drift:null;
+  /* fail-closed: "current" is trusted ONLY with complete timing — a finite,
+     non-negative age inside the budget. Client clock drift only ever ADDS
+     age (a future-dated evaluation can never subtract age or stay current). */
+  const now=Date.now()/1e3;
+  const evaluatedAt=Number.isFinite(f.evaluated_at)?f.evaluated_at:null;
+  let age=Number.isFinite(f.age_seconds)&&f.age_seconds>=0?f.age_seconds:null;
+  if(age!=null&&evaluatedAt!=null)age+=Math.max(0,now-evaluatedAt);
   let state=f.state==="current"||f.state==="stale"?f.state:"held";
   if(offline&&state==="current")state="stale";
-  if(state==="current"&&age!=null&&age>SNAPSHOT_MAX_AGE)state="stale"; /* client-side fail-closed guard between polls */
+  if(state==="current"&&(age==null||evaluatedAt==null))state="held"; /* missing timing: hold, never trust */
+  if(state==="current"&&age>SNAPSHOT_MAX_AGE)state="stale"; /* client-side fail-closed guard between polls */
+  if(evaluatedAt!=null&&evaluatedAt>now)state="held"; /* future evaluation: hold, never current */
   return{state:state,age:age};
 }
 function hrAccount(raw,demote){
@@ -858,15 +904,17 @@ function hrView(data,offline){
   const demote=offline||fresh.state!=="current";
   const rawAccounts=Array.isArray(data.accounts)?data.accounts:[];
   const accts=rawAccounts.map(a=>hrAccount(a,demote));
-  const h=data.headline&&typeof data.headline==="object"?data.headline:{};
-  const total=Number.isFinite(h.total_accounts)?h.total_accounts:accts.length;
-  const cur=demote?0:(Number.isFinite(h.current_accounts)?h.current_accounts:0);
-  const fullest=demote?null:hrPct(h.fullest_5h_left_percent);
+  /* headline: never trust the feed's number — derive the fullest tank from an
+     account whose state AND 5h window are BOTH current with a finite reading;
+     if none qualifies the headline is the held "—", whatever the feed claims. */
+  const total=accts.length;
+  const cur=demote?0:accts.filter(a=>a.state==="current").length;
   let owner=null;
-  if(fullest!=null)rawAccounts.forEach(a=>{
+  if(!demote)rawAccounts.forEach(a=>{
     const w=a&&a.windows&&a.windows["5h"]||{};
     const l=a&&a.state==="current"&&w.state==="current"?hrPct(w.left_percent):null;
     if(l!=null&&(owner==null||l>owner.left))owner={left:l,name:a.name,resets:w.resets_at};});
+  const fullest=owner?owner.left:null;
   const hl=fullest!=null
     ?{value:Math.round(fullest)+"%",tone:hrTone(fullest),fill:fullest,
       sub:owner?esc(owner.name)+" · "+esc(untilReset(owner.resets)):"fullest current 5h window"}
@@ -1001,10 +1049,9 @@ async function hrLoad(manual){
     clearTimeout(timer);
     if(!response.ok)throw new Error("widget feed returned HTTP "+response.status);
     const data=await response.json();
-    if(!data||data.schema!=="headroom_widget@1"||!data.freshness
-        ||typeof data.freshness.state!=="string"||!Array.isArray(data.accounts))
+    if(!hrValidFeed(data))
       throw new Error("widget feed invalid");
-    if(requestId===hrRequest){hrData=data;hrFetchedAt=Date.now();hrRender(false);}
+    if(requestId===hrRequest){hrData=data;hrRender(false);}
   }catch(error){
     /* fail closed: whatever we still hold renders grey, nothing is promoted */
     if(requestId===hrRequest)hrRender(true);
