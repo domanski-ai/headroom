@@ -291,6 +291,69 @@ class ClaudeIdentity(unittest.TestCase):
         self.assertEqual(result["method"], "claude_auth_status")
 
 
+class ClaudeLimits(unittest.TestCase):
+    """The direct usage probe: cached-token expiry and auth rejection must
+    hold with distinct, actionable codes — never a raw HTTPError that would
+    surface as a permanent, opaque 'collector error'."""
+
+    def _oauth(self, **extra):
+        return dict({"accessToken": "tok-abc"}, **extra)
+
+    def _with_oauth(self, oauth):
+        return mock.patch.object(collect, "claude_oauth",
+                                 return_value=oauth)
+
+    @staticmethod
+    def _http_error(code):
+        import urllib.error
+        return urllib.error.HTTPError("https://api.anthropic.com/api/oauth/"
+                                      "usage", code, "denied", {}, None)
+
+    def test_expired_cached_token_holds_without_network(self):
+        opener = mock.Mock(side_effect=AssertionError("probe must not run"))
+        expired_ms = (time.time() - 60) * 1000
+        with self._with_oauth(self._oauth(expiresAt=expired_ms)):
+            with self.assertRaises(collect.IdentityBindingError) as caught:
+                collect.claude_limits("/h", None, opener=opener)
+        self.assertEqual(caught.exception.code, "claude_usage_token_expired")
+        opener.assert_not_called()
+
+    def test_expired_token_in_plain_seconds_also_holds(self):
+        opener = mock.Mock(side_effect=AssertionError("probe must not run"))
+        with self._with_oauth(self._oauth(expiresAt=time.time() - 60)):
+            with self.assertRaises(collect.IdentityBindingError) as caught:
+                collect.claude_limits("/h", None, opener=opener)
+        self.assertEqual(caught.exception.code, "claude_usage_token_expired")
+
+    def test_future_or_absent_expiry_probes_normally(self):
+        for oauth in (self._oauth(),  # no expiresAt recorded
+                      self._oauth(expiresAt=(time.time() + 3600) * 1000),
+                      self._oauth(expiresAt="soon")):  # mistyped: not proof
+            opener = mock.Mock(side_effect=self._http_error(500))
+            with self._with_oauth(oauth):
+                # the probe RAN (reached the opener) — a 500 propagates raw
+                with self.assertRaises(Exception) as caught:
+                    collect.claude_limits("/h", None, opener=opener)
+            self.assertNotIsInstance(caught.exception,
+                                     collect.IdentityBindingError)
+            opener.assert_called_once()
+
+    def test_http_401_and_403_hold_as_token_rejected(self):
+        for code in (401, 403):
+            opener = mock.Mock(side_effect=self._http_error(code))
+            with self._with_oauth(self._oauth()):
+                with self.assertRaises(collect.IdentityBindingError) as caught:
+                    collect.claude_limits("/h", None, opener=opener)
+            self.assertEqual(caught.exception.code,
+                             "claude_usage_token_rejected")
+
+    def test_http_429_still_maps_to_provider_throttle(self):
+        opener = mock.Mock(side_effect=self._http_error(429))
+        with self._with_oauth(self._oauth()):
+            with self.assertRaises(collect.ProviderThrottleError):
+                collect.claude_limits("/h", None, opener=opener)
+
+
 class PublicSnapshot(unittest.TestCase):
     def test_error_never_leaks_to_public_note(self):
         snap = {"schema_version": 1, "run_id": "t", "generated": 1,

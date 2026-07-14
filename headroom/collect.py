@@ -695,6 +695,18 @@ def claude_limits(home, expected_fingerprint, opener=open_authenticated):
     oauth = claude_oauth(home) or {}
     if not oauth.get("accessToken"):
         raise IdentityBindingError("claude_credentials_missing")
+    # The CACHED access token may have expired since the CLI last refreshed
+    # it (headroom never refreshes credentials itself — racing the CLI's own
+    # rotation could invalidate its session). An expired token would 401
+    # below and read as an opaque collector error; hold with an actionable
+    # code instead. expiresAt is milliseconds in current CLI builds — accept
+    # a plain-seconds value too, so a unit change can never mark every fresh
+    # token as expired.
+    expires_at = oauth.get("expiresAt")
+    if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
+        expires_epoch = expires_at / 1000.0 if expires_at > 1e11 else expires_at
+        if expires_epoch <= time.time():
+            raise IdentityBindingError("claude_usage_token_expired")
     request = urllib.request.Request(
         "https://api.anthropic.com/api/oauth/usage",
         headers={
@@ -710,6 +722,11 @@ def claude_limits(home, expected_fingerprint, opener=open_authenticated):
             raise ProviderThrottleError(
                 retry_after_epoch(error.headers), provider_response=True
             ) from error
+        if error.code in (401, 403):
+            # auth rejection is not capacity and not a rate limit: hold the
+            # slot with a distinct, actionable code instead of letting a raw
+            # HTTPError surface as a generic collector error
+            raise IdentityBindingError("claude_usage_token_rejected") from error
         raise
     with response:
         response_org = response.headers.get("anthropic-organization-id")
@@ -1072,6 +1089,17 @@ def collect(accounts, backoff=None, persist_backoff=None):
             result["error_code"] = error.code
             if error.code in CODEX_HOLD_NOTES:
                 result["note"] = CODEX_HOLD_NOTES[error.code]
+            elif error.code in ("claude_usage_token_expired",
+                                "claude_usage_token_rejected"):
+                what = ("has expired" if error.code.endswith("expired")
+                        else "was rejected by the usage API (expired or "
+                             "revoked)")
+                result["note"] = (
+                    f"cached Claude token {what} — headroom never refreshes "
+                    "credentials itself. Run one Claude Code turn on this "
+                    "account (the CLI refreshes its token) or `headroom "
+                    f"connect {account['name']}` to re-login; readings held "
+                    "until then.")
             elif error.code == "claude_credentials_missing":
                 # verified identity but the token couldn't be read. On macOS the
                 # token is in the login Keychain (headroom reads it via
