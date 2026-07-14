@@ -720,6 +720,14 @@ class Supervisor:
         argv.extend(args)
         environment = self._environment(account, self.generation, automatic)
         launched_at = self.now()
+        # the wrapper handshake means "launch committed": it must be the LAST
+        # thing before the spawn, after every piece of preparation that could
+        # still fail (settings file, argv, env) — a marker with no child
+        # would suppress the wrapper's bare-CLI fallback
+        if self.generation == 1 and not route.write_launch_marker(
+                "supervised", account):
+            raise SupervisorError(
+                "launch marker could not be written; nothing was started")
         try:
             if plan is not None:
                 handoff.verify_target_binding(plan)
@@ -1382,10 +1390,8 @@ def cmd_claude(family, args):
         return 2
     print(f"[headroom] {family} -> {account['name']} ({account['home']})",
           file=sys.stderr)
-    # the wrapper handshake is written BEFORE the spawn: past this point any
-    # launch failure would equally afflict a bare `claude` (see
-    # route.write_launch_marker); a marker that cannot be written aborts here,
-    # while nothing has started yet
-    if not route.write_launch_marker("supervised", account):
-        return 2
+    # the wrapper handshake (route.write_launch_marker) is written inside
+    # _spawn, immediately before the first Popen — after settings/argv/env
+    # preparation, so a marker can never exist without a child having been
+    # given its chance to start
     return Supervisor(family, args, account).run()

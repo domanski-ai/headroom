@@ -59,6 +59,9 @@ const PANEL_RADIUS: f64 = 14.0;
 /// Reject a runaway feed body instead of buffering it (the real feed is a
 /// few KB).
 const FEED_MAX_BYTES: usize = 256 * 1024;
+/// Wall-clock bound for one whole feed exchange — a drip-feeding endpoint
+/// must not hold a worker thread open indefinitely.
+const FEED_DEADLINE: Duration = Duration::from_secs(6);
 
 struct AppState {
     /// Validated loopback widget URL. Never changes after startup.
@@ -229,7 +232,9 @@ fn server_reachable(url: &Url) -> bool {
 /// GET a small same-origin document from the widget server over the same
 /// numeric-loopback-only raw socket the reachability probe uses (never a
 /// resolver lookup, never a non-loopback address). Returns the response body
-/// for a 200 with no transfer-encoding tricks; None on anything else.
+/// for an exact 200 with no transfer-encoding tricks; None on anything else.
+/// The whole exchange is bounded by a wall-clock deadline — a drip-feeding
+/// endpoint can't hold the worker beyond it.
 fn fetch_loopback(url: &Url, path: &str) -> Option<String> {
     let host = url.host_str()?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
@@ -238,17 +243,27 @@ fn fetch_loopback(url: &Url, path: &str) -> Option<String> {
         return None;
     }
     let port = url.port_or_known_default().unwrap_or(80);
+    let deadline = Instant::now() + FEED_DEADLINE;
     let mut stream =
         TcpStream::connect_timeout(&std::net::SocketAddr::new(ip, port), PROBE_TIMEOUT).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
     stream.set_write_timeout(Some(PROBE_TIMEOUT)).ok()?;
+    // bracket IPv6 literals: an unbracketed `Host: ::1:8377` is malformed
+    let host_header = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n"
     );
     stream.write_all(request.as_bytes()).ok()?;
     let mut raw = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
+        if Instant::now() >= deadline {
+            return None;
+        }
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
@@ -257,13 +272,19 @@ fn fetch_loopback(url: &Url, path: &str) -> Option<String> {
                     return None;
                 }
             }
+            // a 1s read timeout loops back to the deadline check above
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.kind() == std::io::ErrorKind::TimedOut => {}
             Err(_) => return None,
         }
     }
     let text = String::from_utf8(raw).ok()?;
     let (head, body) = text.split_once("\r\n\r\n")?;
     let status_line = head.lines().next()?;
-    if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
+    // exact status parse: "HTTP/1.x 200 ..." — not a prefix match
+    let mut parts = status_line.split(' ');
+    let version_ok = matches!(parts.next(), Some("HTTP/1.1") | Some("HTTP/1.0"));
+    if !version_ok || parts.next() != Some("200") {
         return None;
     }
     if head.to_ascii_lowercase().contains("transfer-encoding") {
@@ -273,17 +294,46 @@ fn fetch_loopback(url: &Url, path: &str) -> Option<String> {
 }
 
 /// The fleet's average 5h battery as a fraction, from `/widget.json` on the
-/// widget server: a current 5h window contributes its left_percent, a
-/// limited one contributes an honest 0, held/stale windows never count.
-/// `None` when the server is unreachable, the feed is malformed, or no
-/// window has a live reading.
+/// widget server — applying the SAME fail-closed feed contract as the
+/// JavaScript clients before trusting a single number: exact schema, a
+/// current freshness block with sane timing (no future evaluation beyond a
+/// small NTP tolerance, age within the snapshot window), and only live
+/// (current/limited) accounts' 5h windows. A current window contributes its
+/// left_percent, a limited one an honest 0; held/stale never count. `None`
+/// when anything is off — the icon then shows the no-reading dash.
 fn fetch_avg_battery(widget: &Url) -> Option<f32> {
     let body = fetch_loopback(widget, "/widget.json")?;
     let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+    if value.get("schema").and_then(|s| s.as_str()) != Some("headroom_widget@1") {
+        return None;
+    }
+    let freshness = value.get("freshness")?;
+    if freshness.get("state").and_then(|s| s.as_str()) != Some("current") {
+        return None;
+    }
+    let evaluated_at = freshness.get("evaluated_at").and_then(|v| v.as_f64())?;
+    let age = freshness.get("age_seconds").and_then(|v| v.as_f64())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs_f64();
+    if !evaluated_at.is_finite() || !age.is_finite() || age < 0.0 {
+        return None;
+    }
+    if evaluated_at > now + 10.0 {
+        return None; // future evaluation beyond NTP tolerance: never trust
+    }
+    if age + (now - evaluated_at).max(0.0) > 900.0 {
+        return None; // outside the snapshot freshness window: held, not live
+    }
     let accounts = value.get("accounts")?.as_array()?;
     let mut sum = 0.0f64;
     let mut count = 0u32;
     for account in accounts {
+        let account_state = account.get("state").and_then(|s| s.as_str());
+        if !matches!(account_state, Some("current") | Some("limited")) {
+            continue;
+        }
         let window = account.get("windows").and_then(|w| w.get("5h"));
         let state = window.and_then(|w| w.get("state")).and_then(|s| s.as_str());
         match state {
@@ -308,12 +358,20 @@ fn fetch_avg_battery(widget: &Url) -> Option<f32> {
     (count > 0).then(|| (sum / f64::from(count) / 100.0) as f32)
 }
 
+/// One icon fetch in flight at a time: manual Refresh spam and a slow feed
+/// must not accumulate worker threads.
+static ICON_FETCH_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// Redraw the tray icon (and tooltip) from the latest feed reading.
 fn update_tray_icon(app: &AppHandle) {
+    if ICON_FETCH_ACTIVE.swap(true, Ordering::SeqCst) {
+        return; // a fetch is already running; it will paint the result
+    }
+    let level = fetch_avg_battery(&app.state::<AppState>().widget_url);
+    ICON_FETCH_ACTIVE.store(false, Ordering::SeqCst);
     let Some(tray) = app.tray_by_id("headroom-tray") else {
         return;
     };
-    let level = fetch_avg_battery(&app.state::<AppState>().widget_url);
     let (rgba, width, height) = icon::tray_icon_rgba(level);
     let _ = tray.set_icon(Some(Image::new_owned(rgba, width, height)));
     let _ = tray.set_icon_as_template(true);
@@ -452,7 +510,11 @@ fn anchor_below_tray(window: &WebviewWindow, app: &AppHandle) -> bool {
     let (tray_w, tray_h) = to_logical_size(rect.size);
     let mut x = tray_x + tray_w - WINDOW_WIDTH; // right edges aligned
     let y = tray_y + tray_h + 5.0; // just below the menu bar
-    if let Ok(Some(monitor)) = window.current_monitor() {
+    // clamp against the monitor that CONTAINS the tray icon — the hidden
+    // window's current monitor may be a different display entirely
+    let monitor = monitor_containing(window, tray_x, tray_y)
+        .or_else(|| window.current_monitor().ok().flatten());
+    if let Some(monitor) = monitor {
         let monitor_scale = monitor.scale_factor();
         let position = monitor.position().to_logical::<f64>(monitor_scale);
         let size = monitor.size().to_logical::<f64>(monitor_scale);
@@ -463,6 +525,28 @@ fn anchor_below_tray(window: &WebviewWindow, app: &AppHandle) -> bool {
     window
         .set_position(tauri::LogicalPosition::new(x, y))
         .is_ok()
+}
+
+/// The monitor whose logical bounds contain the given point, if any.
+#[cfg(target_os = "macos")]
+fn monitor_containing(
+    window: &WebviewWindow,
+    x: f64,
+    y: f64,
+) -> Option<tauri::Monitor> {
+    for monitor in window.available_monitors().ok()? {
+        let scale = monitor.scale_factor();
+        let position = monitor.position().to_logical::<f64>(scale);
+        let size = monitor.size().to_logical::<f64>(scale);
+        if x >= position.x
+            && x < position.x + size.width
+            && y >= position.y
+            && y < position.y + size.height
+        {
+            return Some(monitor);
+        }
+    }
+    None
 }
 
 /// Build the hidden popover webview window.

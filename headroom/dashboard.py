@@ -324,6 +324,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     result.snapshot, force_noncurrent_reason=reason)
                 if stale_failed:
                     value["refresh_failed"] = True
+                if result.refresh_failed:
+                    # non-demoting diagnostic: a failing collector should be
+                    # VISIBLE (warning) long before the freshness window
+                    # finally demotes the data
+                    value["refresh_attempt_failed"] = True
                 body = json.dumps(value, allow_nan=False,
                                   separators=(",", ":")).encode("utf-8")
                 content_type = "application/json"

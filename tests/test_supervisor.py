@@ -958,18 +958,37 @@ class CliWiring(unittest.TestCase):
         self.assertEqual(chosen["name"], "other")
         self.assertIn("not routable", errors.getvalue())
 
-    def test_cmd_claude_aborts_before_spawn_when_marker_unwritable(self):
+    def test_spawn_aborts_when_marker_unwritable_and_marker_is_last(self):
+        # the marker means "launch committed": it is written after every
+        # piece of spawn preparation, immediately before Popen — and a
+        # marker that cannot be written aborts with nothing started
         account = {"name": "a", "provider": "claude", "home": "/tmp/a"}
-        with mock.patch.object(supervisor, "_initial_account",
-                               return_value=account), \
-                mock.patch.object(route, "write_launch_marker",
-                                  return_value=False) as marker, \
-                mock.patch.object(supervisor, "Supervisor") as spawned, \
+        popen = mock.Mock()
+        supervisor_under_test = supervisor.Supervisor(
+            "sonnet", [], account, popen=popen)
+        with mock.patch.object(route, "write_launch_marker",
+                               return_value=False) as marker, \
+                mock.patch.object(supervisor_under_test, "_settings_file",
+                                  return_value=""), \
                 redirect_stderr(io.StringIO()):
-            code = supervisor.cmd_claude("sonnet", [])
-        self.assertEqual(code, 2)
+            with self.assertRaises(supervisor.SupervisorError):
+                supervisor_under_test._spawn(account, [], "/tmp", False)
         marker.assert_called_once_with("supervised", account)
-        spawned.assert_not_called()  # nothing started before the refusal
+        popen.assert_not_called()  # nothing started before the refusal
+
+    def test_spawn_writes_marker_only_for_the_first_generation(self):
+        account = {"name": "a", "provider": "claude", "home": "/tmp/a"}
+        popen = mock.Mock(return_value=mock.Mock())
+        supervisor_under_test = supervisor.Supervisor(
+            "sonnet", [], account, popen=popen)
+        with mock.patch.object(route, "write_launch_marker",
+                               return_value=True) as marker, \
+                mock.patch.object(supervisor_under_test, "_settings_file",
+                                  return_value=""):
+            supervisor_under_test._spawn(account, [], "/tmp", False)
+            supervisor_under_test._spawn(account, [], "/tmp", False)
+        marker.assert_called_once_with("supervised", account)
+        self.assertEqual(popen.call_count, 2)
 
     def test_statusline_distinguishes_armed_supervisor(self):
         snapshot = {"accounts": [{"name": "source", "provider": "claude",

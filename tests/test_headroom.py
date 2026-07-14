@@ -362,6 +362,9 @@ class ThrottleCarryover(unittest.TestCase):
     def _account(self):
         return {"name": "a", "provider": "claude", "home": "/tmp/h"}
 
+    FRESH_IDENTITY = {"account_fingerprint": "AAAA",
+                      "credential_digest": "BBBB"}
+
     def _previous_row(self, captured_at=1_000_000, **over):
         base = captured_at if isinstance(captured_at, int) \
             and not isinstance(captured_at, bool) else 1_000_000
@@ -388,14 +391,15 @@ class ThrottleCarryover(unittest.TestCase):
 
     def test_fresh_verified_row_carries(self):
         carried = collect._throttle_carryover(
-            self.previous(), self._account(), now=1_000_060)
+            self.previous(), self._account(), 1_000_060,
+            self.FRESH_IDENTITY)
         self.assertIsNotNone(carried)
         self.assertEqual(carried["windows"]["5h"]["used_percent"], 10.0)
 
     def test_carried_row_is_a_copy(self):
         previous = self.previous()
         carried = collect._throttle_carryover(
-            previous, self._account(), now=1_000_060)
+            previous, self._account(), 1_000_060, self.FRESH_IDENTITY)
         carried["windows"]["5h"]["used_percent"] = 99.0
         self.assertEqual(
             previous["accounts"][0]["windows"]["5h"]["used_percent"], 10.0)
@@ -403,7 +407,7 @@ class ThrottleCarryover(unittest.TestCase):
     def test_expired_row_does_not_carry(self):
         now = 1_000_000 + collect.OBSERVATION_MAX_AGE + 1
         self.assertIsNone(collect._throttle_carryover(
-            self.previous(), self._account(), now))
+            self.previous(), self._account(), now, self.FRESH_IDENTITY))
 
     def test_less_than_verified_success_does_not_carry(self):
         for over in ({"ok": False}, {"routable": False},
@@ -412,17 +416,35 @@ class ThrottleCarryover(unittest.TestCase):
                      {"captured_at": None}, {"captured_at": True},
                      {"captured_at": 2_000_000}):  # future = clock skew
             self.assertIsNone(collect._throttle_carryover(
-                self.previous(**over), self._account(), 1_000_060), over)
+                self.previous(**over), self._account(), 1_000_060,
+                self.FRESH_IDENTITY), over)
 
     def test_missing_or_malformed_previous_does_not_carry(self):
         for previous in (None, {}, {"accounts": None}, {"accounts": "x"},
                          {"accounts": []},
                          {"accounts": [{"name": "other", "ok": True}]}):
             self.assertIsNone(collect._throttle_carryover(
-                previous, self._account(), 1_000_060), previous)
+                previous, self._account(), 1_000_060,
+                self.FRESH_IDENTITY), previous)
+
+    def test_changed_identity_or_credential_does_not_carry(self):
+        # a relogged slot must never republish the prior identity's reading
+        for fresh in ({"account_fingerprint": "ZZZZ",
+                       "credential_digest": "BBBB"},
+                      {"account_fingerprint": "AAAA",
+                       "credential_digest": "YYYY"},
+                      {"account_fingerprint": "AAAA"},
+                      {}, None):
+            self.assertIsNone(collect._throttle_carryover(
+                self.previous(), self._account(), 1_000_060, fresh), fresh)
+        mismatched = self.previous()
+        mismatched["accounts"][0]["provider"] = "codex"
+        self.assertIsNone(collect._throttle_carryover(
+            mismatched, self._account(), 1_000_060, self.FRESH_IDENTITY))
 
     def _throttled_collect(self, previous):
-        identity = {"verified": False, "method": "local", "email": "e@x.com"}
+        identity = {"verified": False, "method": "local", "email": "e@x.com",
+                    "account_fingerprint": "AAAA"}
         throttle = collect.ProviderThrottleError(
             int(time.time()) + 300, provider_response=True)
         with mock.patch.object(collect, "claude_identity",
@@ -1900,6 +1922,16 @@ class LaunchMarker(unittest.TestCase):
         self.assertEqual(payload["mode"], "supervised")
         self.assertEqual(payload["account"], "a")
         self.assertEqual(payload["note"], "why not")
+
+    def test_marker_never_clobbers_an_existing_file(self):
+        destination = os.path.join(self.temp.name, "precious.json")
+        with open(destination, "w", encoding="utf-8") as handle:
+            handle.write("do not lose me")
+        with self.marker_env(destination), \
+                redirect_stderr(io.StringIO()):
+            self.assertFalse(route.write_launch_marker("exec", self.account))
+        with open(destination, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "do not lose me")
 
     def test_relative_marker_path_refuses_launch(self):
         with self.marker_env("relative/marker.json"), \

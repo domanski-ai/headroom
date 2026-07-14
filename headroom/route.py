@@ -498,12 +498,35 @@ def write_launch_marker(mode, account, note=""):
         "pid": os.getpid(),
         "written_at": time.time(),
     }
+    # No-clobber install: the marker destination must not exist (the wrapper
+    # hands us a fresh path). An env-controlled path must never be able to
+    # replace an existing file — write an O_EXCL|O_NOFOLLOW temp next to the
+    # destination, then hard-link it in (link fails on an existing target),
+    # so readers only ever observe a complete document and nothing existing
+    # is ever overwritten.
+    temporary = f"{destination}.{os.getpid()}.tmp"
     try:
-        paths.write_json_atomic(destination, payload, mode=0o600)
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600)
+        try:
+            with os.fdopen(descriptor, "w") as handle:
+                json.dump(payload, handle, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(temporary, destination)
+        finally:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
     except OSError as error:
         print(f"[headroom] cannot write HEADROOM_LAUNCH_MARKER "
               f"({destination}): {error} — refusing to launch without the "
-              f"requested handshake", file=sys.stderr)
+              f"requested handshake (the marker path must be a fresh, "
+              f"non-existent file)", file=sys.stderr)
         return False
     return True
 

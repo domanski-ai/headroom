@@ -876,7 +876,7 @@ function hrFreshness(data,offline){
   if(offline&&state==="current")state="stale";
   if(state==="current"&&(age==null||evaluatedAt==null))state="held"; /* missing timing: hold, never trust */
   if(state==="current"&&age>SNAPSHOT_MAX_AGE)state="stale"; /* client-side fail-closed guard between polls */
-  if(evaluatedAt!=null&&evaluatedAt>now+120)state="held"; /* future evaluation beyond NTP-skew tolerance: hold, never current (sub-second clock drift must not hold a live fleet) */
+  if(evaluatedAt!=null&&evaluatedAt>now+10)state="held"; /* future evaluation beyond NTP-skew tolerance: hold, never current (sub-second clock drift must not hold a live fleet; tolerance kept tight so a future-dated feed can only freeze the age briefly) */
   return{state:state,age:age};
 }
 function hrAccount(raw,demote){

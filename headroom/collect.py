@@ -956,7 +956,7 @@ def apply_integrity(accounts):
     return warnings
 
 
-def _throttle_carryover(previous, account, now):
+def _throttle_carryover(previous, account, now, fresh_identity):
     """The account's row from the previous snapshot, if it is still a live,
     verified, in-age reading worth serving through a usage-source throttle.
 
@@ -965,7 +965,10 @@ def _throttle_carryover(previous, account, now):
     stranding launches (every consumer still age-bounds it via captured_at
     against OBSERVATION_MAX_AGE, so this can never outlive a real reading's
     normal service window). Returns a copy, or None (fail-closed) when the
-    previous row is anything less than a fresh verified success."""
+    previous row is anything less than a fresh verified success — including
+    when the slot's CURRENT identity/credential binding (read locally moments
+    ago, no network) no longer matches the old row: a relogged slot must
+    never republish the prior identity's reading."""
     rows = previous.get("accounts") if isinstance(previous, dict) else None
     if not isinstance(rows, list):
         return None
@@ -974,8 +977,17 @@ def _throttle_carryover(previous, account, now):
     if row is None or row.get("ok") is not True \
             or row.get("routable") is not True:
         return None
+    if row.get("provider") != account.get("provider"):
+        return None
     if row.get("trust_state") not in ("verified", "verified_local"):
         return None
+    old_identity = row.get("identity")
+    old_identity = old_identity if isinstance(old_identity, dict) else {}
+    fresh_identity = fresh_identity if isinstance(fresh_identity, dict) else {}
+    for key in ("account_fingerprint", "credential_digest"):
+        if not old_identity.get(key) or not fresh_identity.get(key) \
+                or old_identity[key] != fresh_identity[key]:
+            return None
     captured = row.get("captured_at")
     if isinstance(captured, bool) or not isinstance(captured, (int, float)):
         return None
@@ -1113,7 +1125,8 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
             claude_backoff_until = max(claude_backoff_until, error.retry_at)
             if error.provider_response and persist_backoff is not None:
                 persist_backoff(claude_backoff_until)
-            carried = _throttle_carryover(previous, account, now)
+            carried = _throttle_carryover(previous, account, now,
+                                          result.get("identity"))
             if carried is not None:
                 # the rate-limit CHECK being rate-limited is not evidence of
                 # missing capacity: keep serving the last verified reading
