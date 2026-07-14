@@ -605,6 +605,25 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertTrue(emitted <= allowed,
                         f"DOM allowlist {allowed} misses {emitted - allowed}")
 
+    def test_lowest_tank_label_identifies_provider_and_window(self):
+        template = self.template_text()
+        render_body = template.split(
+            "function render(data,forceNoncurrent){", 1)[1].split(
+                "\n}", 1)[0]
+        provider_label = template.split(
+            "function providerLabel(provider){", 1)[1].split("\n}", 1)[0]
+
+        self.assertIn('provider==="claude"', provider_label)
+        self.assertIn('return"Claude"', provider_label)
+        self.assertIn('provider==="codex"', provider_label)
+        self.assertIn('return"Codex"', provider_label)
+        self.assertIn(
+            'source:providerLabel(a.provider)+" · "+windowLabel(k)',
+            render_body)
+        self.assertIn(
+            'set("lowest-account",lowest?lowest.source:', render_body)
+        self.assertNotIn("a.email||a.name", render_body)
+
     def test_static_dashboard_injects_shared_thresholds_and_projection(self):
         config = {"schema_version": 1,
                   "dashboard": {"theme": "midnight", "title": "test"},
