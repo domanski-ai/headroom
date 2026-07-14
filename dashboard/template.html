@@ -612,6 +612,11 @@ function windowLabel(key){
   if(key.startsWith("scoped:"))return"Weekly "+key.slice(7);
   return key;
 }
+function providerLabel(provider){
+  if(provider==="claude")return"Claude";
+  if(provider==="codex")return"Codex";
+  return"Unknown provider";
+}
 function windowColumns(accounts){
   const keys=["5h","7d"];
   accounts.forEach(a=>Object.keys(a.windows||{}).forEach(k=>{
@@ -703,7 +708,8 @@ function render(data,forceNoncurrent){
   const current=accounts.filter(isCurrent);
   const readings=[];
   current.forEach(a=>["5h","7d"].forEach(k=>{
-    const left=windowView(a,k).left;if(left!=null)readings.push({left,who:a.email||a.name});}));
+    const left=windowView(a,k).left;
+    if(left!=null)readings.push({left,source:providerLabel(a.provider)+" · "+windowLabel(k)});}));
   const avg=readings.length?Math.round(readings.reduce((s,r)=>s+r.left,0)/readings.length):null;
   const lowest=readings.length?readings.reduce((b,r)=>r.left<b.left?r:b):null;
   const claude=accounts.filter(a=>a.provider==="claude");
@@ -711,7 +717,7 @@ function render(data,forceNoncurrent){
   set("verified",current.length+"/"+accounts.length);
   set("average",avg==null?"n/a":avg+"%");
   set("lowest",lowest?Math.round(lowest.left)+"%":"n/a");
-  set("lowest-account",lowest?lowest.who:"no current readings");
+  set("lowest-account",lowest?lowest.source:"no current readings");
   set("account-count",String(accounts.length));
   set("account-note",(claude.length?("Claude "+claude.length):"")+(claude.length&&codex.length?" · ":"")+(codex.length?("Codex "+codex.length):""));
   /* top-bar instruments */
