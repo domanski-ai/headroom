@@ -107,7 +107,7 @@ function hrFreshness(data) {
   let state = f.state === "current" || f.state === "stale" ? f.state : "held";
   if (state === "current" && (age == null || evaluatedAt == null)) state = "held";
   if (state === "current" && age > SNAPSHOT_MAX_AGE) state = "stale";
-  if (evaluatedAt != null && evaluatedAt > now) state = "held";
+  if (evaluatedAt != null && evaluatedAt > now + 120) state = "held";
   return { state: state, age: age };
 }
 function hrAccount(raw, demote) {

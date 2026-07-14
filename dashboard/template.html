@@ -876,7 +876,7 @@ function hrFreshness(data,offline){
   if(offline&&state==="current")state="stale";
   if(state==="current"&&(age==null||evaluatedAt==null))state="held"; /* missing timing: hold, never trust */
   if(state==="current"&&age>SNAPSHOT_MAX_AGE)state="stale"; /* client-side fail-closed guard between polls */
-  if(evaluatedAt!=null&&evaluatedAt>now)state="held"; /* future evaluation: hold, never current */
+  if(evaluatedAt!=null&&evaluatedAt>now+120)state="held"; /* future evaluation beyond NTP-skew tolerance: hold, never current (sub-second clock drift must not hold a live fleet) */
   return{state:state,age:age};
 }
 function hrAccount(raw,demote){
