@@ -21,7 +21,10 @@ Fail-closed rules:
 """
 import base64
 import email.utils
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # Windows: no fcntl
 import glob
 import hashlib
 import json
@@ -1226,12 +1229,13 @@ def run_collect(quiet=False):
     lock_path = paths.collect_lock_path()
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     with open(lock_path, "w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            if not quiet:
-                print("collector already running; skipped")
-            return paths.load_json(paths.private_snapshot_path())
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                if not quiet:
+                    print("collector already running; skipped")
+                return paths.load_json(paths.private_snapshot_path())
         backoff = paths.load_json(paths.backoff_path()) or empty_backoff()
 
         def persist(retry_at, provider="anthropic_usage_api"):
