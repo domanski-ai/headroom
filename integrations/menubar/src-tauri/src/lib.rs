@@ -561,19 +561,20 @@ fn build_popover(app: &AppHandle, widget_url: &Url) -> tauri::Result<WebviewWind
     // real material, like a system popover. Elsewhere the page keeps its
     // bundled wall.
     let embed_css = if cfg!(target_os = "macos") {
-        // NO painted background at all: the system's own popover material
-        // (applied at the window layer, dark-themed, corner-masked via the
-        // contentView layer) IS the panel — the page only overlays bars and
-        // text, exactly like the built-in menu-bar dropdowns.
-        // backdrop-filter must stay off — it forces an opaque layer in
-        // WKWebView and blacks out window transparency.
+        // The system's popover material provides the frost; the page lays a
+        // dark tint OVER it so the panel stays legible on light content
+        // behind the window — the same trick the built-in dark panels use
+        // (pure vibrancy alone washes out ~40% white-through on a white
+        // page). Tint alpha tuned to match the system Bluetooth/Wi-Fi
+        // panels' density. backdrop-filter must stay off — it forces an
+        // opaque layer in WKWebView and blacks out window transparency.
         "html,body{background:transparent !important}\
          .hr{background:transparent !important;padding:0 !important}\
          .hr-wall{display:none !important}\
          .hr-pop{width:100% !important;max-width:none !important;\
                  min-height:100vh;border:0 !important;\
                  border-radius:0 !important;\
-                 background:transparent !important;\
+                 background:rgba(13,16,24,.62) !important;\
                  backdrop-filter:none !important;\
                  -webkit-backdrop-filter:none !important;\
                  box-shadow:none !important}"
