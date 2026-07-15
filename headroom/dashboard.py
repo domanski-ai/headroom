@@ -24,11 +24,9 @@ from . import paths, registry, widget
 
 TEMPLATE = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "dashboard", "template.html")
-SERVE_MAX_AGE = int(os.environ.get("HEADROOM_SERVE_MAX_AGE", "300"))
-FAILURE_BACKOFF_BASE = int(os.environ.get(
-    "HEADROOM_SERVE_FAILURE_BACKOFF_BASE", "5"))
-FAILURE_BACKOFF_CAP = int(os.environ.get(
-    "HEADROOM_SERVE_FAILURE_BACKOFF_CAP", "300"))
+SERVE_MAX_AGE = paths.env_int("HEADROOM_SERVE_MAX_AGE", 300)
+FAILURE_BACKOFF_BASE = paths.env_int("HEADROOM_SERVE_FAILURE_BACKOFF_BASE", 5)
+FAILURE_BACKOFF_CAP = paths.env_int("HEADROOM_SERVE_FAILURE_BACKOFF_CAP", 300)
 
 
 def display_snapshot(snapshot, evaluated_at=None, force_noncurrent_reason=None):

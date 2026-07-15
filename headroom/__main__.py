@@ -14,7 +14,10 @@ usage:
   headroom env <model>              print the export line for the best account
   headroom claude [args...]         launch Claude; supervise opted-in auto-handoff
     --headroom-auto-handoff / --headroom-no-auto-handoff   one-run override
+    --headroom-launch-fallback      exec the bare CLI if the launch fails
+                                    before the CLI ever started (opt-in)
   headroom codex [args...]          launch Codex on the best account
+  headroom caps                     print scripting capability flags as JSON
   headroom run <model> -- <cmd...>  headless run with auto-rotation on limit-hit
   headroom rotate [model]           cool the current account down, pick the next
   headroom handoff [--session UUID] [--to SLOT] [--model FAMILY]
@@ -38,6 +41,7 @@ usage:
 
 Try it with no accounts:  headroom serve --demo   (bundled sample data)
 """
+import os
 import sys
 
 from . import __version__, registry
@@ -67,6 +71,194 @@ def main(argv=None):
         return 1
 
 
+def _strip_launch_fallback(args):
+    """Remove --headroom-launch-fallback from a codex option segment.
+
+    Codex value-taking flags aren't modelled here (they're the codex CLI's
+    business), so only exact pre-`--` matches are stripped — the flag is
+    headroom's own and never a legitimate codex flag value."""
+    separator = args.index("--") if "--" in args else len(args)
+    head = [arg for arg in args[:separator]
+            if arg != "--headroom-launch-fallback"]
+    return head + args[separator:], len(head) != separator
+
+
+# headroom-owned flags, needed to compute a "bare" fallback argv WITHOUT
+# importing supervisor (whose import chain is exactly what can fail before the
+# fallback boundary — P1-8a).
+_OWNED_LAUNCH_FLAGS = frozenset({
+    "--headroom-launch-fallback", "--headroom-auto-handoff",
+    "--headroom-no-auto-handoff"})
+
+# Claude value-taking options — a LOCAL mirror of supervisor.CLAUDE_VALUE_FLAGS
+# kept here so the pre-import fallback can be value-aware WITHOUT importing
+# supervisor (the very import that may have failed). Keep in sync with
+# supervisor.CLAUDE_VALUE_FLAGS. Used only to avoid mistaking an option VALUE
+# that happens to look like a headroom flag for the flag itself (P2-3).
+_CLAUDE_VALUE_FLAGS = frozenset({
+    "--model", "--settings", "--system-prompt", "--append-system-prompt",
+    "--agents", "--allowedTools", "--disallowedTools", "--permission-mode",
+    "--permission-prompt-tool", "--mcp-config", "--add-dir", "--ide",
+    "--fallback-model", "--json-schema", "--max-budget-usd",
+    "--input-format", "--output-format", "--debug-file", "--betas",
+    "--plugin-dir", "--session-id", "--resume", "-r",
+})
+
+
+def _fallback_intent(args):
+    """Whether the launch fallback is requested, decided WITHOUT importing
+    route/supervisor so it survives an import/preprocessing failure."""
+    if os.environ.get("HEADROOM_LAUNCH_FALLBACK", "") == "1":
+        return True
+    separator = args.index("--") if "--" in args else len(args)
+    return "--headroom-launch-fallback" in args[:separator]
+
+
+def _crude_bare_argv(command, args):
+    """Best-effort bare CLI argv for the pre-import disaster fallback: strip
+    headroom-owned flags before `--`, but value-aware — the argument that
+    FOLLOWS a Claude value-taking option (e.g. `--system-prompt`) is that
+    option's value and is preserved even if it happens to look like a headroom
+    flag (P2-3). The normal path uses supervisor.split_headroom_flags; this is
+    the reduced parser used only when supervisor could not be imported."""
+    separator = args.index("--") if "--" in args else len(args)
+    head = []
+    value_expected = False
+    for arg in args[:separator]:
+        if value_expected:
+            head.append(arg)  # an option value — never a headroom flag
+            value_expected = False
+            continue
+        if arg in _OWNED_LAUNCH_FLAGS:
+            continue
+        head.append(arg)
+        if arg in _CLAUDE_VALUE_FLAGS:
+            value_expected = True
+    return [command] + head + args[separator:]
+
+
+def _bare_cli_fallback(bare_argv, reason):
+    """Exec the bare CLI with the ORIGINAL (unmutated) environment when the
+    launch aborts before headroom could route. Used only by the pre-import
+    guard; the routed paths use route.bare_fallback_exec (which also releases
+    committed leases). notify is best-effort and must not itself break the
+    fallback."""
+    try:
+        from . import notify
+        notify.emit({"event": "fallback", "reason": str(reason)})
+    except Exception:  # noqa: BLE001 — the observer can never block the fallback
+        pass
+    print(f"[headroom] launch fallback: {reason} — running bare "
+          f"`{bare_argv[0]}` without routing", file=sys.stderr)
+    try:
+        os.execvp(bare_argv[0], bare_argv)  # os.environ is still unmutated here
+    except OSError as error:
+        print(f"[headroom] fallback exec of {bare_argv[0]} failed: {error}",
+              file=sys.stderr)
+        return 127
+    return 0  # unreachable outside tests: a successful exec never returns
+
+
+def _launch(command, args):
+    """Launch branch with a pre-import fallback boundary (P1-8a).
+
+    Fallback INTENT is decided before any heavy import; the risky region —
+    importing route/supervisor and preprocessing the args — is wrapped so that
+    ANY failure there (e.g. a malformed HEADROOM_* env crashing a module
+    import) still execs the bare CLI when the fallback was requested. Once
+    preprocessing succeeds, the launch functions themselves own the
+    before/after-spawn fallback decision (they alone can see whether a child
+    started), so their exceptions are NOT re-wrapped here."""
+    intent = _fallback_intent(args)
+    try:
+        prepared = _prepare_launch(command, args)
+    except Exception as error:  # noqa: BLE001 — pre-boundary: bare-exec if asked
+        if intent:
+            return _bare_cli_fallback(
+                _crude_bare_argv(command, args),
+                f"launch preprocessing failed: {error}")
+        raise
+    if isinstance(prepared, int):
+        return prepared  # a usage refusal (exit code), not a launch plan
+    return _dispatch_launch(*prepared)
+
+
+def _prepare_launch(command, args):
+    """Import + preprocess. Returns either an int (usage refusal) or a launch
+    plan tuple consumed by _dispatch_launch. Runs inside _launch's fallback
+    guard, so it may freely raise on a broken environment."""
+    from . import route  # noqa: F401 — imported so an import-time failure is
+    #                                     caught by the fallback guard
+    provider_cmd = "claude" if command == "claude" else "codex"
+    auto_flag = no_auto_flag = fallback_flag = False
+    supervisor = None
+    if command == "claude":
+        from . import supervisor
+        args, headroom_flags = supervisor.split_headroom_flags(args)
+        auto_flag = "--headroom-auto-handoff" in headroom_flags
+        no_auto_flag = "--headroom-no-auto-handoff" in headroom_flags
+        fallback_flag = "--headroom-launch-fallback" in headroom_flags
+    else:
+        args, fallback_flag = _strip_launch_fallback(args)
+    fallback = fallback_flag or \
+        os.environ.get("HEADROOM_LAUNCH_FALLBACK", "") == "1"
+    # honour an explicit model flag (both `--model X` and `--model=X`) so a
+    # scoped weekly cap (e.g. Opus) gates the routing decision
+    model = None
+    option_args = args[:args.index("--")] if "--" in args else args
+    for index, arg in enumerate(option_args):
+        if arg == "--model" and index + 1 < len(option_args):
+            model = option_args[index + 1]
+        elif arg.startswith("--model="):
+            model = arg.split("=", 1)[1]
+    fam = registry.family(model) if model else provider_cmd
+    if registry.family_provider(fam) != provider_cmd:
+        print(f"headroom: `headroom {command}` can't run a "
+              f"{registry.family_provider(fam)} model ({model}) — use "
+              f"`headroom {registry.family_provider(fam)}`", file=sys.stderr)
+        return 2
+    use_supervisor = False
+    launch_note = ""
+    if command == "claude":
+        if auto_flag and no_auto_flag:
+            print("headroom: auto-handoff overrides are mutually exclusive",
+                  file=sys.stderr)
+            return 2
+        configured = registry.auto_handoff()
+        enabled = auto_flag or (configured and not no_auto_flag)
+        if enabled:
+            incompatible = supervisor.incompatible_args(args)
+            all_tty = (sys.stdin.isatty() and sys.stdout.isatty()
+                       and sys.stderr.isatty())
+            if all_tty and not incompatible:
+                use_supervisor = True
+            else:
+                why = incompatible or "stdin/stdout/stderr are not all TTYs"
+                print(f"[headroom] auto-handoff disabled for this run: {why}",
+                      file=sys.stderr)
+                launch_note = f"auto-handoff disabled: {why}"
+        else:
+            launch_note = "auto-handoff not enabled"
+    return command, args, fam, fallback, use_supervisor, launch_note, supervisor
+
+
+def _dispatch_launch(command, args, fam, fallback, use_supervisor,
+                     launch_note, supervisor):
+    """Call the launch function. The before/after-spawn fallback boundary is
+    owned inside cmd_claude/cmd_exec, so exceptions here are NOT caught for a
+    bare fallback (a post-spawn crash must never duplicate a live child)."""
+    from . import route
+    if command == "claude" and use_supervisor:
+        if fallback:
+            return supervisor.cmd_claude(
+                fam, args, fallback_argv=["claude"] + args)
+        return supervisor.cmd_claude(fam, args)
+    if fallback:
+        return route.cmd_exec(fam, [command] + args,
+                              launch_note=launch_note, fallback=True)
+    return route.cmd_exec(fam, [command] + args, launch_note=launch_note)
+
+
 def _dispatch(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__)
@@ -79,6 +271,45 @@ def _dispatch(argv):
 
     if command in ("-V", "--version", "version"):
         print(f"headroom {__version__}")
+        return 0
+    if command == "caps":
+        # capability probe for launchers: COMMAND-SCOPED, so a wrapper can see
+        # which launch surface each feature is actually wired into and never
+        # assume an operational guarantee a symbol's mere existence can't
+        # prove. Each flag is confirmed against an implemented symbol; the
+        # per-command map records where it is genuinely wired (e.g. `run` is
+        # deliberately NOT covered by fallback/lease). (P2-10)
+        #
+        # caps must ALWAYS emit its JSON — a launcher relies on it to decide
+        # whether this binary supports a feature. Module-level env parsing is
+        # now tolerant (paths.env_int), so the heavy import no longer breaks on
+        # a stray HEADROOM_* value; if introspection fails for any other
+        # reason we still emit the declared capabilities of this build. (P2-6)
+        import json
+
+        has_marker = has_fallback = has_lease = has_notify = True
+        try:
+            from . import notify, route
+            has_marker = callable(getattr(route, "write_launch_marker", None))
+            has_fallback = callable(getattr(route, "bare_fallback_exec", None))
+            has_lease = callable(getattr(route, "acquire_slot_lease", None))
+            has_notify = callable(getattr(notify, "emit", None))
+        except Exception:  # noqa: BLE001 — caps must never fail to emit
+            pass
+        capabilities = {
+            "schema": 2,
+            "launch_marker": {"claude": has_marker, "codex": has_marker},
+            "launch_fallback": {"claude": has_fallback,
+                                "codex": has_fallback, "run": False},
+            "notify_cmd": has_notify,
+            "slot_lease": {"claude": has_lease, "codex": has_lease,
+                           "run": False,
+                           # fail-closed acquisition (P1-9): with
+                           # HEADROOM_SLOT_LEASE=1 headroom refuses rather than
+                           # silently launching unleased
+                           "fail_closed": has_lease},
+        }
+        print(json.dumps(capabilities, sort_keys=True))
         return 0
     if command == "setup":
         from . import wizard
@@ -119,49 +350,7 @@ def _dispatch(argv):
               f"  # account={account['name']}")
         return 0
     if command in ("claude", "codex"):
-        from . import route
-        provider_cmd = "claude" if command == "claude" else "codex"
-        auto_flag = no_auto_flag = False
-        if command == "claude":
-            from . import supervisor
-            args, auto_flag, no_auto_flag = \
-                supervisor.strip_headroom_overrides(args)
-        # honour an explicit model flag (both `--model X` and `--model=X`) so a
-        # scoped weekly cap (e.g. Opus) gates the routing decision
-        model = None
-        option_args = args[:args.index("--")] if "--" in args else args
-        for index, arg in enumerate(option_args):
-            if arg == "--model" and index + 1 < len(option_args):
-                model = option_args[index + 1]
-            elif arg.startswith("--model="):
-                model = arg.split("=", 1)[1]
-        fam = registry.family(model) if model else provider_cmd
-        if registry.family_provider(fam) != provider_cmd:
-            print(f"headroom: `headroom {command}` can't run a "
-                  f"{registry.family_provider(fam)} model ({model}) — use "
-                  f"`headroom {registry.family_provider(fam)}`", file=sys.stderr)
-            return 2
-        launch_note = ""
-        if command == "claude":
-            if auto_flag and no_auto_flag:
-                print("headroom: auto-handoff overrides are mutually exclusive",
-                      file=sys.stderr)
-                return 2
-            configured = registry.auto_handoff()
-            enabled = auto_flag or (configured and not no_auto_flag)
-            if enabled:
-                incompatible = supervisor.incompatible_args(args)
-                all_tty = (sys.stdin.isatty() and sys.stdout.isatty()
-                           and sys.stderr.isatty())
-                if all_tty and not incompatible:
-                    return supervisor.cmd_claude(fam, args)
-                why = incompatible or "stdin/stdout/stderr are not all TTYs"
-                print(f"[headroom] auto-handoff disabled for this run: {why}",
-                      file=sys.stderr)
-                launch_note = f"auto-handoff disabled: {why}"
-            else:
-                launch_note = "auto-handoff not enabled"
-        return route.cmd_exec(fam, [command] + args, launch_note=launch_note)
+        return _launch(command, args)
     if command == "run":
         from . import route
         if not args or "--" not in args or args.index("--") == len(args) - 1:

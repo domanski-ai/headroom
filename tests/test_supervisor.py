@@ -855,6 +855,14 @@ class HookProof(unittest.TestCase):
 
 
 class CliWiring(unittest.TestCase):
+    def setUp(self):
+        # a direct _spawn call installs the signal guard and leaves it for
+        # _monitor; with no _monitor here, restore handlers after each test
+        saved = {s: signal.getsignal(s)
+                 for s in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM)}
+        self.addCleanup(
+            lambda: [signal.signal(s, h) for s, h in saved.items()])
+
     def test_plain_claude_with_auto_off_keeps_exec_path(self):
         with mock.patch.object(registry, "auto_handoff", return_value=False), \
                 mock.patch("headroom.route.cmd_exec", return_value=17) as execute:
@@ -968,6 +976,8 @@ class CliWiring(unittest.TestCase):
             "sonnet", [], account, popen=popen)
         with mock.patch.object(route, "write_launch_marker",
                                return_value=False) as marker, \
+                mock.patch.object(supervisor.shutil, "which",
+                                  return_value="/x/claude"), \
                 mock.patch.object(supervisor_under_test, "_settings_file",
                                   return_value=""), \
                 redirect_stderr(io.StringIO()):
@@ -983,6 +993,8 @@ class CliWiring(unittest.TestCase):
             "sonnet", [], account, popen=popen)
         with mock.patch.object(route, "write_launch_marker",
                                return_value=True) as marker, \
+                mock.patch.object(supervisor.shutil, "which",
+                                  return_value="/x/claude"), \
                 mock.patch.object(supervisor_under_test, "_settings_file",
                                   return_value=""):
             supervisor_under_test._spawn(account, [], "/tmp", False)
@@ -1229,20 +1241,81 @@ class SupervisorIntegration(unittest.TestCase):
             self.assertIn("--resume", source.read())
 
     def test_post_commit_target_spawn_failure_recovers_source(self):
+        # r5: source recovery fires on a POSITIVE pre-spawn failure of the
+        # target (a SupervisorError raised BEFORE the spawn window, e.g. the
+        # binary not resolving), NOT on a raising Popen (which is now ambiguous
+        # — see test_ambiguous_target_spawn_does_not_recover).
+        real_spawn = supervisor.Supervisor._spawn
+        calls = {"n": 0}
+
+        def spawn(runner, account, args, cwd, automatic, plan=None):
+            calls["n"] += 1
+            if calls["n"] == 2:  # the target spawn: positive pre-spawn failure
+                raise supervisor.SupervisorError(
+                    "`claude` not found on PATH; nothing was started")
+            return real_spawn(runner, account, args, cwd, automatic, plan)
+
+        with mock.patch.object(supervisor.Supervisor, "_spawn", spawn):
+            result = supervisor.Supervisor(
+                "sonnet", [], self.accounts[0],
+                collect_fn=self.snapshot).run()
+        self.assertEqual(result, 0)
+        self.assertEqual(calls["n"], 3)  # source, target, recovery
+        with open(os.path.join(self.fake_state, "recovered"),
+                  encoding="utf-8") as source:
+            self.assertIn("--resume", source.read())
+
+    def test_ambiguous_target_spawn_does_not_recover(self):
+        # r5: a raising Popen on the target is AMBIGUOUS (a child may be live),
+        # so the supervisor must NOT recover the source (never double-spawn) —
+        # it stops with 127 and writes no recovery.
         real_popen = supervisor.subprocess.Popen
         attempts = {"count": 0}
 
-        def fail_target(argv, **kwargs):
+        def raising_target(argv, **kwargs):
             attempts["count"] += 1
             if attempts["count"] == 2:
-                raise OSError("target spawn exploded")
+                raise RuntimeError("async/trace failure in the Popen window")
             return real_popen(argv, **kwargs)
 
-        result = supervisor.Supervisor(
-            "sonnet", [], self.accounts[0], collect_fn=self.snapshot,
-            popen=fail_target).run()
+        with redirect_stderr(io.StringIO()):
+            result = supervisor.Supervisor(
+                "sonnet", [], self.accounts[0], collect_fn=self.snapshot,
+                popen=raising_target).run()
+        self.assertEqual(result, 127)
+        self.assertEqual(attempts["count"], 2)  # NO third spawn (no recovery)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.fake_state, "recovered")))
+
+    def test_real_which_target_missing_recovers_source(self):
+        # r6 P2-b: phase-aware, REAL shutil.which (not a stubbed _spawn).
+        # Planning sees claude present; the TARGET _spawn's real which()
+        # returns None (positive pre-spawn failure -> recover source);
+        # recovery sees it present again. Keyed on the target transcript that
+        # commit_handoff writes just before the target spawn, so planning
+        # (before commit) sees present and only the first post-commit which
+        # (the target spawn) fails.
+        source_sid = str(__import__("uuid").uuid5(
+            __import__("uuid").NAMESPACE_DNS, "headroom-fake-source-1"))
+        target_transcript = os.path.join(
+            self.accounts[1]["home"], "projects", "fake-project",
+            source_sid + ".jsonl")
+        real_which = supervisor.shutil.which
+        state = {"target_failed": False}
+
+        def which(name):
+            if (name == "claude" and os.path.exists(target_transcript)
+                    and not state["target_failed"]):
+                state["target_failed"] = True  # only the target spawn fails
+                return None
+            return real_which(name)
+
+        with mock.patch.object(supervisor.shutil, "which", side_effect=which):
+            result = supervisor.Supervisor(
+                "sonnet", [], self.accounts[0],
+                collect_fn=self.snapshot).run()
         self.assertEqual(result, 0)
-        self.assertEqual(attempts["count"], 3)
+        self.assertTrue(state["target_failed"])  # the real target which failed
         with open(os.path.join(self.fake_state, "recovered"),
                   encoding="utf-8") as source:
             self.assertIn("--resume", source.read())
@@ -1273,20 +1346,25 @@ class SupervisorIntegration(unittest.TestCase):
             self.assertIn("--resume", source.read())
 
     def test_failed_source_recovery_prints_both_manual_resume_commands(self):
-        real_popen = supervisor.subprocess.Popen
-        attempts = {"count": 0}
+        # r5: both the target spawn AND the source recovery spawn fail their
+        # POSITIVE pre-spawn validation, so the recovery-failed path prints the
+        # two manual resume commands.
+        real_spawn = supervisor.Supervisor._spawn
+        calls = {"n": 0}
 
-        def fail_target_and_recovery(argv, **kwargs):
-            attempts["count"] += 1
-            if attempts["count"] in (2, 3):
-                raise OSError(f"spawn {attempts['count']} exploded")
-            return real_popen(argv, **kwargs)
+        def spawn(runner, account, args, cwd, automatic, plan=None):
+            calls["n"] += 1
+            if calls["n"] in (2, 3):  # target + source recovery both fail
+                raise supervisor.SupervisorError(
+                    "`claude` not found on PATH; nothing was started")
+            return real_spawn(runner, account, args, cwd, automatic, plan)
 
         errors = io.StringIO()
-        with redirect_stderr(errors):
+        with redirect_stderr(errors), \
+                mock.patch.object(supervisor.Supervisor, "_spawn", spawn):
             result = supervisor.Supervisor(
-                "sonnet", [], self.accounts[0], collect_fn=self.snapshot,
-                popen=fail_target_and_recovery).run()
+                "sonnet", [], self.accounts[0],
+                collect_fn=self.snapshot).run()
         self.assertEqual(result, 127)
         source_sid = str(__import__("uuid").uuid5(
             __import__("uuid").NAMESPACE_DNS, "headroom-fake-source-1"))

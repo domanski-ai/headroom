@@ -4,6 +4,28 @@ Findings from an adversarial cross-model review (GPT-5.6, x-high effort,
 2026-07-11) that are deliberate tradeoffs or blocked on upstream, documented
 here so users can judge them for their own threat model.
 
+## Supervised-launch residuals (opt-in launch safety)
+
+The opt-in launch-safety features (`--headroom-launch-fallback` /
+`HEADROOM_LAUNCH_FALLBACK`, `HEADROOM_SLOT_LEASE`, `HEADROOM_NOTIFY_CMD`; all
+off by default) went through ten rounds of adversarial cross-model review.
+Two accepted residuals remain, both requiring a signal delivered inside a
+sub-millisecond window and both fail-safe in the direction that never
+double-books a *monitored* session:
+
+- **Ambiguous spawn with no child handle.** If an asynchronous exception
+  interrupts the `Popen` fork window, headroom treats the spawn as ambiguous
+  (a child *may* be live), suppresses fallback and rotation, and exits without
+  starting a second session — but the possibly-live child was never returned,
+  so it cannot be monitored or signalled. Prefer bare-CLI launch if you need a
+  supervisor-orphan to be impossible.
+- **Signal during handler restore.** A shutdown signal delivered in the exact
+  instant CPython swaps the signal-handler table on a pre-spawn failure could,
+  in principle, have its Python callback deferred past the point where headroom
+  samples the latch. Restore is best-effort per-signal and the latch is sampled
+  after restore, so the ordinary before/during-restore cases replay the kill;
+  the residual is the untestable sub-instruction delivery race only.
+
 ## Auto-handoff is not yet release-proven on macOS
 
 The full auto-handoff path (real cap -> stop -> copy -> same-terminal resume

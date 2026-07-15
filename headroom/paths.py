@@ -13,6 +13,18 @@ import os
 import tempfile
 
 
+def env_int(name, default):
+    """Tolerant module-level env int: a malformed value degrades to the
+    default instead of raising at import time. Import-time strictness would
+    make a stray env var (e.g. HEADROOM_IDENTITY_TIMEOUT=bad) crash the whole
+    binary — including read-only commands like `headroom caps` — so every
+    module-level HEADROOM_* numeric parse routes through here."""
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def base_dir():
     raw = os.environ.get("HEADROOM_DIR") or "~/.headroom"
     expanded = os.path.expanduser(raw)

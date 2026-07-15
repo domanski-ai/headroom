@@ -21,7 +21,7 @@ import time
 import uuid
 from dataclasses import dataclass, field, replace
 
-from . import collect, handoff, paths, registry, route
+from . import collect, handoff, notify, paths, registry, route
 
 POLL_SECONDS = 0.25
 BIND_TIMEOUT = 30.0
@@ -53,7 +53,8 @@ CLAUDE_VALUE_FLAGS = {
 # is the boolean complement.  Unknown flags are boolean too; only this known
 # value-taking list may consume the following argument.
 HEADROOM_OVERRIDE_FLAGS = {
-    "--headroom-auto-handoff", "--headroom-no-auto-handoff"}
+    "--headroom-auto-handoff", "--headroom-no-auto-handoff",
+    "--headroom-launch-fallback"}
 
 
 class SupervisorError(RuntimeError):
@@ -121,6 +122,7 @@ class Child:
     session_epochs: dict = field(default_factory=dict)
     last_received_at: float = 0.0
     pending_cap: PendingCap = None
+    supervision_loss_notified: bool = False
 
 
 @dataclass(frozen=True)
@@ -131,6 +133,20 @@ class Relaunch:
     automatic: bool
     handoff_id: str = ""
     plan: object = None
+
+
+def _lose_supervision(child, reason):
+    """Turn automation off for this child and (once per child) notify the
+    loss. Post-spawn supervision loss is exactly what an external dispatcher
+    cannot see on its own: the launch looked supervised, but auto-handoff
+    will silently not fire. The notify is a no-op unless HEADROOM_NOTIFY_CMD
+    is set; the stderr diagnostics at each call site are unchanged."""
+    child.automation = False
+    if not child.supervision_loss_notified:
+        child.supervision_loss_notified = True
+        notify.emit({"event": "supervision_lost",
+                     "account": child.account.get("name", ""),
+                     "reason": str(reason)})
 
 
 def _supervisors_dir():
@@ -260,11 +276,14 @@ def incompatible_args(args):
     return ""
 
 
-def strip_headroom_overrides(args):
-    """Remove only real headroom options from Claude's option segment."""
+def split_headroom_flags(args):
+    """Remove every headroom-owned flag from Claude's option segment.
+
+    Returns (cleaned_args, flags_found). Values of known value-taking Claude
+    flags and everything after `--` pass through untouched, exactly like the
+    original override stripping."""
     cleaned = []
-    auto = False
-    no_auto = False
+    found = set()
     value_expected = False
     after_separator = False
     for arg in args:
@@ -279,16 +298,20 @@ def strip_headroom_overrides(args):
             cleaned.append(arg)
             after_separator = True
             continue
-        if arg == "--headroom-auto-handoff":
-            auto = True
-            continue
-        if arg == "--headroom-no-auto-handoff":
-            no_auto = True
+        if arg in HEADROOM_OVERRIDE_FLAGS:
+            found.add(arg)
             continue
         cleaned.append(arg)
         if arg in CLAUDE_VALUE_FLAGS:
             value_expected = True
-    return cleaned, auto, no_auto
+    return cleaned, found
+
+
+def strip_headroom_overrides(args):
+    """Remove only real headroom options from Claude's option segment."""
+    cleaned, found = split_headroom_flags(args)
+    return (cleaned, "--headroom-auto-handoff" in found,
+            "--headroom-no-auto-handoff" in found)
 
 
 def _strings(value):
@@ -631,16 +654,43 @@ def _source_row_is_bound(account, family, snapshot, collect_started):
 
 
 class _SignalGuard:
-    def __init__(self):
+    def __init__(self, process=None):
         self.original = {}
         self.shutdown_signal = None
-        self.polls = 0
         self.forwarded = False
+        # the child to forward a shutdown signal to; forwarding happens the
+        # INSTANT the signal is latched (in _shutdown), not on a later poll,
+        # so no notifier-bearing work can run between latch and forward (P1, r6)
+        self._process = process
+
+    def _forward(self, signum):
+        # os.kill + int attribute reads only — async-signal-safe, so this is
+        # correct to call directly from the signal handler
+        if self.forwarded or self._process is None:
+            return
+        self.forwarded = True
+        try:
+            os.kill(self._process.pid, signum)
+        except (ProcessLookupError, OSError):
+            pass
 
     def _shutdown(self, signum, _frame):
         if self.shutdown_signal is None:
             self.shutdown_signal = signum
-            self.polls = 0
+            self._forward(signum)  # forward immediately, before returning
+
+    def attach(self, process):
+        """Bind the live child to this already-installed guard (P1, r7).
+
+        Called the instant Popen returns a child, BEFORE any post-spawn work.
+        Idempotent. Set _process FIRST so a signal delivered during attach is
+        forwarded by the handler; then forward any signal that was already
+        latched while there was no child (e.g. during the Popen fork window)."""
+        if self._process is not None:
+            return
+        self._process = process
+        if self.shutdown_signal is not None and not self.forwarded:
+            self._forward(self.shutdown_signal)
 
     def install(self):
         for signum in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
@@ -650,19 +700,28 @@ class _SignalGuard:
         signal.signal(signal.SIGTERM, self._shutdown)
 
     def poll(self, process):
+        # backstop only: forwarding is normally done in _shutdown. If a signal
+        # was latched without a process handle, forward it here once.
         if self.shutdown_signal is None or process.poll() is not None:
             return
-        self.polls += 1
-        if self.polls >= 2 and not self.forwarded:
+        if not self.forwarded:
+            self.forwarded = True
             try:
                 os.kill(process.pid, self.shutdown_signal)
-            except ProcessLookupError:
+            except (ProcessLookupError, OSError):
                 pass
-            self.forwarded = True
 
     def restore(self):
         for signum, handler in self.original.items():
-            signal.signal(signum, handler)
+            try:
+                signal.signal(signum, handler)
+            except OSError:
+                # CPython raises "signal ignored due to race condition" if a
+                # signal is delivered during this handler swap. Restoring the
+                # remaining signals must still proceed, and _spawn samples our
+                # latch AFTER restore() returns — so this best-effort restore
+                # can never skip the requested-kill replay (r9/r10).
+                pass
 
 
 class Supervisor:
@@ -678,6 +737,21 @@ class Supervisor:
         self.supervisor_id = supervisor_id or str(uuid.uuid4())
         self.generation = 0
         self.settings_files = []
+        # True once ANY child CLI process has been successfully spawned —
+        # the hard boundary for the opt-in launch fallback (see cmd_claude):
+        # a failure after this point is normal supervision/exit, never a
+        # "no CLI was ever started" condition
+        self.spawned_any = False
+        # True only inside the Popen window (P0-3): while set, the spawn
+        # outcome is unknown and the launch fallback must be suppressed
+        self.spawn_ambiguous = False
+        # the account whose most recent spawn was left ambiguous — its lease
+        # must NOT be released on unwind, since a live child may hold it (P0-1)
+        self._ambiguous_account = None
+        # the signal guard for the CURRENT spawn cycle: installed by _spawn
+        # BEFORE the spawn window and reused by _monitor, so no instant after a
+        # child exists is ever unguarded (P1, r7)
+        self._signals = None
 
     def _settings_file(self, generation):
         directory = paths.ensure_private(_supervisors_dir())
@@ -720,22 +794,109 @@ class Supervisor:
         argv.extend(args)
         environment = self._environment(account, self.generation, automatic)
         launched_at = self.now()
-        # the wrapper handshake means "launch committed": it must be the LAST
-        # thing before the spawn, after every piece of preparation that could
-        # still fail (settings file, argv, env) — a marker with no child
-        # would suppress the wrapper's bare-CLI fallback
-        if self.generation == 1 and not route.write_launch_marker(
-                "supervised", account):
-            raise SupervisorError(
-                "launch marker could not be written; nothing was started")
+        # Install the signal guard BEFORE the spawn window and reuse it in
+        # _monitor, so no instant after a child could exist is ever unguarded
+        # (P1, r7). A signal before any child attaches just latches with
+        # nothing to forward; if a child then attaches it is forwarded then,
+        # and if the spawn fails the guard is restored below with no orphan.
+        guard = _SignalGuard()
+        guard.install()
+        self._signals = guard
         try:
-            if plan is not None:
-                handoff.verify_target_binding(plan)
-            process = self.popen(argv, env=environment, cwd=cwd)
-        except handoff.HandoffError as error:
-            raise SupervisorError(str(error)) from error
-        except OSError as error:
-            raise SupervisorError(f"cannot start Claude: {error}") from error
+            # ---- PRE-SPAWN validation (OUTSIDE the ambiguous window) ----
+            # Everything that can POSITIVELY prove "no child will exist" is
+            # checked here, synchronously, BEFORE spawn_ambiguous is set. A
+            # failure here is an unambiguous pre-spawn failure: no fork has
+            # happened, so run() may safely recover / the caller may fall back.
+            try:
+                if plan is not None:
+                    handoff.verify_target_binding(plan)
+            except handoff.HandoffError as error:
+                raise SupervisorError(str(error)) from error
+            # resolve the executable up-front so a missing binary is a POSITIVE
+            # pre-spawn failure (preserving the missing-binary fallback nicety)
+            # instead of being inferred from catching Popen's OSError inside the
+            # window. (r5)
+            if shutil.which(argv[0]) is None:
+                raise SupervisorError(
+                    f"`{argv[0]}` not found on PATH; nothing was started")
+            # the wrapper handshake means "launch committed": it must be the
+            # LAST fallible pre-spawn operation, AFTER every other pre-spawn
+            # check (settings/argv/env, verify_target_binding, which) — so an
+            # external marker-based wrapper sees a marker only when the spawn is
+            # truly imminent (P2-a, r6). A marker with no child would suppress
+            # the wrapper's bare-CLI fallback.
+            if self.generation == 1:
+                if not route.write_launch_marker("supervised", account):
+                    raise SupervisorError(
+                        "launch marker could not be written; nothing was "
+                        "started")
+            # hand the account's lease fd to the child so the flock rides on
+            # the child (survives an ambiguous spawn / a supervisor exit);
+            # no-op unless HEADROOM_SLOT_LEASE=1 (then held_lease_fd is None and
+            # no pass_fds kwarg is added, so legacy-off Popen calls are
+            # byte-identical) (P0-1)
+            popen_kwargs = {}
+            lease_fd = route.held_lease_fd(account.get("name"))
+            if lease_fd is not None:
+                popen_kwargs["pass_fds"] = (lease_fd,)
+            # ---- the ambiguous window: ONLY the Popen call (r5) ----
+            # Conservative by type-INDEPENDENCE: set spawn_ambiguous=True right
+            # before Popen and, on ANY exception escaping Popen (OSError,
+            # KeyboardInterrupt, a trace/profile hook raising, anything), LEAVE
+            # it True — a child MAY be live, so the run() gate must suppress
+            # fallback and source recovery and retain the lease. We do NOT
+            # classify the exception; nothing inside this window ever clears the
+            # flag. No signal masking, no preexec_fn — trace hooks and signals
+            # are both moot.
+            #
+            # Accepted tiny trade: if the binary vanishes in the microsecond
+            # between which() and Popen (TOCTOU), the launch exits 127 without
+            # falling back. That is SAFE (never a double-brain), just a missed
+            # fallback in an astronomically rare case — safety beats the nicety.
+            self.spawn_ambiguous = True
+            process = self.popen(argv, env=environment, cwd=cwd,
+                                 **popen_kwargs)
+        except BaseException:
+            # No child was attached to this guard (a pre-spawn failure, or an
+            # ambiguous Popen exception whose possible orphan we have no handle
+            # for — the accepted r5 trade). Restore the handlers so run()'s
+            # recovery / fallback / stop runs with normal signal disposition.
+            guard.restore()
+            # Sample the latch AFTER restore(): the guard's handler stays
+            # installed until restore() reinstalls the originals, so a SIGTERM
+            # arriving DURING restore still latches into the guard — reading
+            # shutdown_signal before restore() would miss it (P1, r9). Once
+            # restored, a further signal reaches the original disposition, not
+            # the guard, so this read captures exactly what the guard latched.
+            latched = guard.shutdown_signal
+            self._signals = None
+            # If a shutdown was requested DURING the pre-spawn window (which()
+            # / marker write) and that op then failed, honour the kill with the
+            # now-restored disposition instead of propagating into fallback /
+            # source recovery — a requested kill must never result in a NEW
+            # launch. Replay it before re-raising (P1, r8).
+            if latched is not None:
+                signal.raise_signal(latched)
+            raise
+        # Popen succeeded: a child IS live. ATTACH it to the already-installed
+        # guard IMMEDIATELY, before ANY post-spawn work (the notify below, the
+        # Child construction) — so from this instant a delivered signal is
+        # forwarded to the child, closing the r6 attach gap (P1, r7).
+        guard.attach(process)
+        # Do NOT clear spawn_ambiguous or set spawned_any here — leave the
+        # window OPEN across the ENTIRE successful return. run() closes it only
+        # once it has safely received this Child and taken ownership, so any
+        # failure between Popen-success and run()-holds-Child (e.g. Child
+        # construction) keeps spawn_ambiguous True → the run() gate suppresses
+        # source recovery and retains the lease. (P0-1)
+        # launch notify only AFTER a real child exists, so a lost `fallback`
+        # event can never leave a dispatcher believing "supervised and started"
+        # when nothing did (P1-5)
+        if self.generation == 1:
+            notify.emit({"event": "launch", "mode": "supervised",
+                         "account": account.get("name", ""),
+                         "model": self.family, "note": ""})
         return Child(process, account, self.generation,
                      event_path(self.supervisor_id), settings, launched_at,
                      automatic)
@@ -810,11 +971,11 @@ class Supervisor:
                 print("[headroom] rate-limit hook was not a subscription cap; "
                       "child continues", file=sys.stderr)
         except PendingCapTimeout as error:
-            child.automation = False
+            _lose_supervision(child, f"cap-time model unavailable: {error}")
             print(f"[headroom] {error}; automatic handoff disabled — /exit then "
                   "`headroom handoff` to move manually", file=sys.stderr)
         except PermanentSupervisorError as error:
-            child.automation = False
+            _lose_supervision(child, f"cap not corroborated: {error}")
             child.pending_cap = None
             print(f"[headroom] cap not corroborated ({error}); automatic "
                   "handoff disabled for this child", file=sys.stderr)
@@ -1012,6 +1173,29 @@ class Supervisor:
         except Exception:  # recovery must proceed even if the ledger is broken
             pass
 
+    def _lease_target(self, plan):
+        """Acquire the TARGET account's flock BEFORE stopping the source, so a
+        concurrent launch can't double-book the account we're moving to. The
+        source lease is deliberately kept until the target child spawns (run()
+        reconciliation drops it), and on any failure here the handoff is held
+        with the source still running AND still leased. No-op unless
+        HEADROOM_SLOT_LEASE=1. (P0-2)"""
+        try:
+            if not route.acquire_slot_lease(plan.target, plan.family):
+                raise SupervisorError(
+                    "target slot is leased by another live launch")
+        except route.LeaseError as error:
+            raise SupervisorError(
+                f"target slot lease unavailable: {error}") from error
+
+    def _reconcile_leases(self, active_name):
+        """Hold exactly the ACTIVE child's lease: release every other lease
+        this supervisor took (the old source after a rotation, or a target we
+        acquired for a handoff that then failed). No-op unless leasing is on."""
+        for name in route.held_lease_names():
+            if name != active_name:
+                route.release_slot_lease(name)
+
     @staticmethod
     def _source_relaunch(plan):
         return Relaunch(plan.source.account,
@@ -1054,6 +1238,10 @@ class Supervisor:
             raise SupervisorError("cap reset elapsed before stop")
         print(f"[headroom] cap confirmed; {plan.source.account['name']} -> "
               f"{plan.target['name']}", file=sys.stderr)
+        # take the target lease before we stop the source (P0-2); on failure
+        # this raises SupervisorError and the caller keeps the source running
+        # and leased
+        self._lease_target(plan)
         saved = self._save_terminal()
         stop_error = None
         stop_sent_at = 0.0
@@ -1090,7 +1278,7 @@ class Supervisor:
             self._failure(plan, "stop_failed: " + reason)
             print("[headroom] Claude did not exit after one SIGTERM; automatic "
                   "handoff disabled for this child", file=sys.stderr)
-            child.automation = False
+            _lose_supervision(child, "Claude did not exit after one SIGTERM")
             return None
         try:
             if stop_error is not None:
@@ -1117,6 +1305,10 @@ class Supervisor:
             self._failure(plan, "post_stop_failed: " + str(error))
             print(f"[headroom] handoff failed after Claude exited ({error}); "
                   "relaunching the source with automation off", file=sys.stderr)
+            # the source will be relaunched UNsupervised — notify the loss once
+            # so an observer that saw the initial supervised launch knows (P1-5)
+            _lose_supervision(
+                child, f"handoff failed after Claude exited: {error}")
             return self._source_relaunch(plan)
 
     def _handle_events(self, child, pending_handoff_id, proof=None):
@@ -1125,7 +1317,7 @@ class Supervisor:
         except SupervisorError as error:
             print(f"[headroom] {error}; automatic handoff disabled for this child",
                   file=sys.stderr)
-            child.automation = False
+            _lose_supervision(child, f"hook event journal unreadable: {error}")
             child.pending_cap = None
             return None
         _remember_binding(child)
@@ -1152,7 +1344,7 @@ class Supervisor:
             except SupervisorError as error:
                 print(f"[headroom] malformed hook event ({error}); automatic "
                       "handoff disabled for this child", file=sys.stderr)
-                child.automation = False
+                _lose_supervision(child, f"malformed hook event: {error}")
                 child.pending_cap = None
                 return None
             if hook_name == "SessionStart":
@@ -1176,7 +1368,7 @@ class Supervisor:
                         child.resume_bound = True
                 except (SupervisorError, handoff.HandoffError, RuntimeError,
                         OSError) as error:
-                    child.automation = False
+                    _lose_supervision(child, f"session binding failed: {error}")
                     print(f"[headroom] {error}; automatic handoff disabled for "
                           "this child", file=sys.stderr)
                     return None
@@ -1191,7 +1383,8 @@ class Supervisor:
                         child.pending_cap.session_id, child.pending_cap.epoch):
                     child.pending_cap = None
                 if epoch is None:
-                    child.automation = False
+                    _lose_supervision(
+                        child, "SessionEnd has no known session epoch")
                     print("[headroom] SessionEnd has no known session epoch; "
                           "automatic handoff disabled for this child",
                           file=sys.stderr)
@@ -1215,23 +1408,48 @@ class Supervisor:
                 and child.automation:
             proof = self._attempt_cap(child, child.pending_cap.event)
         if _binding_key(child.binding) in child.dead_sessions:
-            child.automation = False
             child.pending_cap = None
             print("[headroom] current session ended without a replacement "
                   "SessionStart; automatic handoff disabled for this child",
                   file=sys.stderr)
+            _lose_supervision(
+                child, "current session ended without a replacement "
+                "SessionStart")
             return None
         return proof
 
     def _monitor(self, child, pending_handoff_id=""):
-        signals = _SignalGuard()
-        signals.install()
+        # REUSE the guard _spawn installed+attached before/around the spawn
+        # window, so there is no unguarded instant between spawn-success and
+        # here (P1, r7). Fall back to constructing one only for a direct call
+        # that did not go through _spawn (tests).
+        signals = self._signals
+        if signals is None:
+            signals = _SignalGuard(child.process)
+            signals.install()
+            self._signals = signals
         proof = None
         try:
             while True:
                 signals.poll(child.process)
                 if signals.shutdown_signal is not None:
+                    # A shutdown signal disarms auto-handoff immediately. But
+                    # NO notifier-bearing work may run before the signal is
+                    # forwarded to the child (forwarding happens on
+                    # _SignalGuard's second poll) — a slow HEADROOM_NOTIFY_CMD,
+                    # whether from the loss notice OR from _handle_events'
+                    # own supervision_lost paths, must never delay forwarding
+                    # (P1-4). So until forwarded, skip _handle_events entirely:
+                    # just check for exit and keep polling.
                     child.automation = False
+                    if not signals.forwarded:
+                        returncode = child.process.poll()
+                        if returncode is not None:
+                            return returncode
+                        self.sleep(POLL_SECONDS)
+                        continue
+                    # forwarded: safe to run notifiers now — record the loss once
+                    _lose_supervision(child, "shutdown signal received")
                 proof = self._handle_events(
                     child, pending_handoff_id, proof)
                 returncode = child.process.poll()
@@ -1244,7 +1462,9 @@ class Supervisor:
                               "automatic handoff disabled for this child",
                               file=sys.stderr)
                         child.hint_printed = True
-                    child.automation = False
+                    _lose_supervision(
+                        child, "SessionStart hook never bound within "
+                        f"{BIND_TIMEOUT:g}s — auto-handoff is not armed")
                 if proof is not None and child.automation:
                     try:
                         plan = self._preflight(child, proof)
@@ -1254,14 +1474,17 @@ class Supervisor:
                         if "changed recently" not in str(error):
                             print(f"[headroom] automatic handoff held: {error}; "
                                   "child continues", file=sys.stderr)
-                            child.automation = False
+                            _lose_supervision(
+                                child, f"automatic handoff held: {error}")
                             proof = None
                     except SupervisorError as error:
                         print(f"[headroom] automatic handoff held: {error}; child "
                               "continues", file=sys.stderr)
-                        child.automation = False
+                        _lose_supervision(
+                            child, f"automatic handoff held: {error}")
                         proof = None
                     else:
+                        relaunch = None
                         try:
                             relaunch = self._stop_and_commit(child, plan, proof)
                         except Exception as error:
@@ -1269,15 +1492,24 @@ class Supervisor:
                             print(f"[headroom] automatic handoff held: {error}; "
                                   "automatic handoff disabled for this child",
                                   file=sys.stderr)
-                            child.automation = False
+                            _lose_supervision(
+                                child, f"handoff stop failed: {error}")
                             proof = None
-                            relaunch = None
+                        # P1-2: unless we are actually moving to the target
+                        # (an automatic relaunch), the source keeps running and
+                        # the target we leased in _lease_target was never
+                        # spawned — release its unused lease so a third launcher
+                        # isn't wrongly blocked. (release is a no-op if the
+                        # target was never leased or the source is recovering.)
+                        if not (relaunch is not None and relaunch.automatic):
+                            route.release_slot_lease(plan.target["name"])
                         if relaunch is not None:
                             return relaunch
                         proof = None
                 self.sleep(POLL_SECONDS)
         finally:
             signals.restore()
+            self._signals = None
 
     def run(self):
         account = self.account
@@ -1295,13 +1527,50 @@ class Supervisor:
                     child = self._spawn(
                         account, args, cwd, automatic, pending_plan)
                 except Exception as error:  # every post-commit spawn must recover
+                    if self.spawn_ambiguous:
+                        # P0-1: the Popen window was interrupted, so a child
+                        # MAY be live on `account`. We have no handle to
+                        # monitor it, and starting ANOTHER process (source
+                        # recovery) would double-run the session. Stop here and
+                        # keep this account's lease bound to the possibly-live
+                        # child — never release it, never spawn again.
+                        self._ambiguous_account = account["name"]
+                        if pending_plan is not None:
+                            self._failure(
+                                pending_plan,
+                                "target_spawn_ambiguous: " + str(error))
+                        print(f"headroom: spawn outcome for {account['name']} "
+                              f"is ambiguous ({error}); a child may be running "
+                              f"— not starting another process. If no claude "
+                              f"is running, retry.", file=sys.stderr)
+                        # the possibly-live child is unmonitored — notify the
+                        # loss directly with the known account name (no Child
+                        # handle exists on this path) so observers get more than
+                        # stderr+exit127 (P2, r4)
+                        notify.emit({
+                            "event": "supervision_lost",
+                            "account": account["name"],
+                            "reason": f"spawn outcome ambiguous ({error}); a "
+                            "child may be live but is unmonitored"})
+                        return 127
                     if pending_plan is not None:
+                        # positively no child (OSError cleared spawn_ambiguous):
+                        # the target relaunch started nothing — recover source
                         failed_plan = pending_plan
                         self._failure(
                             failed_plan, "target_relaunch_failed: " + str(error))
                         print(f"[headroom] target relaunch failed ({error}); "
                               "relaunching the source with automation off",
                               file=sys.stderr)
+                        # the recovered session is unsupervised — tell any
+                        # observer, since it saw the initial supervised launch
+                        # (P1-5)
+                        notify.emit({
+                            "event": "supervision_lost",
+                            "account": failed_plan.source.account["name"],
+                            "reason": f"target relaunch failed: {error}"})
+                        # the target never started — release its unused lease
+                        route.release_slot_lease(failed_plan.target["name"])
                         relaunch = self._source_relaunch(failed_plan)
                         account, args, cwd = (relaunch.account, relaunch.argv,
                                               relaunch.cwd)
@@ -1315,8 +1584,21 @@ class Supervisor:
                         self._print_manual_recovery(recovery_plan)
                     clean_exit = True
                     return 127
+                # run() has now safely RECEIVED the child and taken ownership:
+                # close the ambiguity window HERE (P0-1), outside the recovery
+                # try/except above, so any failure between Popen-success and
+                # this point kept spawn_ambiguous True and suppressed recovery.
+                # spawned_any flips at the same safe point.
+                self.spawned_any = True
+                self.spawn_ambiguous = False
                 pending_plan = None
                 recovery_plan = None
+                # the active child now exists on `child.account`: hold exactly
+                # its lease. After a rotation this releases the OLD source
+                # lease (kept until the target spawned, per _lease_target);
+                # after a failed rotation it releases the unused target lease.
+                # (P0-2)
+                self._reconcile_leases(child.account["name"])
                 if pending_handoff_id:
                     try:
                         handoff.append_action(
@@ -1327,7 +1609,8 @@ class Supervisor:
                     except handoff.HandoffError as error:
                         print(f"[headroom] could not ledger resume spawn: {error}; "
                               "automatic handoff disabled", file=sys.stderr)
-                        child.automation = False
+                        _lose_supervision(
+                            child, f"resume spawn could not be ledgered: {error}")
                         automatic = False
                 outcome = self._monitor(child, pending_handoff_id)
                 if isinstance(outcome, Relaunch):
@@ -1352,6 +1635,20 @@ class Supervisor:
                 clean_exit = True
                 return last_exit
         finally:
+            # defensively restore signal handlers if a guard was installed by
+            # _spawn but _monitor never got to restore it (P1, r7); normal
+            # flow already restored it in _monitor's finally.
+            if self._signals is not None:
+                self._signals.restore()
+                self._signals = None
+            # the supervised launch is ending: release every lease this
+            # supervisor holds so a waiting launch can take the account —
+            # EXCEPT an account whose spawn was left ambiguous, whose lease
+            # stays bound to the possibly-live child (P0-1). Crash exits rely
+            # on the kernel dropping the flock instead.
+            for name in route.held_lease_names():
+                if name != self._ambiguous_account:
+                    route.release_slot_lease(name)
             if clean_exit:
                 self._cleanup_files()
 
@@ -1382,16 +1679,84 @@ def _initial_account(family):
     return account if reason is None else None
 
 
-def cmd_claude(family, args):
-    account = _initial_account(family)
+def cmd_claude(family, args, fallback_argv=None):
+    """Supervised launch. `fallback_argv` (opt-in, from
+    --headroom-launch-fallback / HEADROOM_LAUNCH_FALLBACK=1) is the bare CLI
+    argv to exec in-process when ANYTHING fails strictly BEFORE the first
+    child CLI process was successfully spawned. Once a child has started
+    (Supervisor.spawned_any) — or while the spawn outcome is even AMBIGUOUS
+    (Supervisor.spawn_ambiguous, P0-3) — a later exit or crash is a normal
+    supervision/exit path and NEVER triggers the fallback, so a live child is
+    never duplicated by a bare relaunch."""
+    # EVERYTHING after the fallback intent is established runs inside the
+    # pre-spawn guard — account selection, lease commit, the diagnostic, and
+    # Supervisor construction — so any pre-spawn failure (including a
+    # constructor error) still bare-execs when the fallback was requested
+    # (P1-4). The guard is only for BEFORE the first spawn; runner.run() owns
+    # the after-spawn boundary via spawned_any/spawn_ambiguous.
+    runner = None
+    try:
+        account = _initial_account(family)
+        # commit: take the slot flock (no-op unless HEADROOM_SLOT_LEASE=1);
+        # on the rare claim race, re-pick once — the lease check inside
+        # block_reason now skips the account the other launch holds. A
+        # LeaseError (infra failure) propagates to fail closed below.
+        if account is not None \
+                and not route.acquire_slot_lease(account, family):
+            print(f"[headroom] {account['name']} is leased by another live "
+                  f"launch — picking another", file=sys.stderr)
+            account = _initial_account(family)
+            if account is not None \
+                    and not route.acquire_slot_lease(account, family):
+                account = None
+        if account is not None:
+            print(f"[headroom] {family} -> {account['name']} "
+                  f"({account['home']})", file=sys.stderr)
+            # the wrapper handshake (route.write_launch_marker) is written
+            # inside _spawn, immediately before the first Popen — after
+            # settings/argv/env preparation, so a marker can never exist
+            # without a child having been given its chance to start
+            runner = Supervisor(family, args, account)
+    except route.LeaseError as error:
+        # HEADROOM_SLOT_LEASE=1 fails closed: refuse the routed launch. With
+        # the explicit fallback opt-in, still degrade to a bare CLI (the
+        # caller asked to always run something).
+        print(f"[headroom] slot lease unavailable ({error}); refusing to "
+              f"launch — HEADROOM_SLOT_LEASE=1 fails closed", file=sys.stderr)
+        if fallback_argv is not None:
+            return route.bare_fallback_exec(
+                fallback_argv, f"slot lease unavailable: {error}")
+        return 2
+    except Exception as error:  # noqa: BLE001 — opt-in: pre-spawn failures fall back
+        if fallback_argv is not None:
+            return route.bare_fallback_exec(
+                fallback_argv, f"launch preparation failed: {error}")
+        raise
     if account is None:
+        if fallback_argv is not None:
+            return route.bare_fallback_exec(
+                fallback_argv,
+                f"no account for '{family}' has proven headroom")
         print(f"[headroom] no account for '{family}' has proven headroom; "
               f"try `headroom status {family}`", file=sys.stderr)
         return 2
-    print(f"[headroom] {family} -> {account['name']} ({account['home']})",
-          file=sys.stderr)
-    # the wrapper handshake (route.write_launch_marker) is written inside
-    # _spawn, immediately before the first Popen — after settings/argv/env
-    # preparation, so a marker can never exist without a child having been
-    # given its chance to start
-    return Supervisor(family, args, account).run()
+
+    def _may_fall_back():
+        # strictly before-first-spawn AND the spawn outcome is unambiguous:
+        # a live-but-unacknowledged child (spawn_ambiguous) must NOT fall back
+        return (fallback_argv is not None and not runner.spawned_any
+                and not runner.spawn_ambiguous)
+
+    try:
+        result = runner.run()
+    except Exception as error:  # noqa: BLE001 — opt-in: pre-spawn failures fall back
+        if _may_fall_back():
+            return route.bare_fallback_exec(
+                fallback_argv, f"failed before Claude started: {error}")
+        raise
+    if _may_fall_back():
+        # run() returned without ever spawning a child (e.g. the very first
+        # spawn failed) — strictly before-first-spawn, so fall back
+        return route.bare_fallback_exec(
+            fallback_argv, "Claude never started (details on stderr)")
+    return result

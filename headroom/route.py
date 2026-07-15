@@ -9,8 +9,10 @@ stale, out of range, at 100%, or inside a cooldown from a previous limit-hit.
 limit errors; on a hit it cools that account down until the relevant window
 resets and retries the next candidate.
 """
+import atexit
 import contextlib
 import datetime
+import errno
 import fcntl
 import json
 import math
@@ -22,11 +24,12 @@ import sys
 import time
 
 from . import collect as collector
-from . import paths, registry
+from . import notify, paths, registry
 
-SNAPSHOT_MAX_AGE = int(os.environ.get("HEADROOM_SNAPSHOT_MAX_AGE", "900"))
-OBSERVATION_MAX_AGE = int(os.environ.get("HEADROOM_OBSERVATION_MAX_AGE", "1800"))
-CLOCK_SKEW = int(os.environ.get("HEADROOM_CLOCK_SKEW", "300"))
+
+SNAPSHOT_MAX_AGE = paths.env_int("HEADROOM_SNAPSHOT_MAX_AGE", 900)
+OBSERVATION_MAX_AGE = paths.env_int("HEADROOM_OBSERVATION_MAX_AGE", 1800)
+CLOCK_SKEW = paths.env_int("HEADROOM_CLOCK_SKEW", 300)
 
 LIMIT_RE = re.compile(
     r"(hit your (?:session|weekly|usage|5[- ]?hour|five[- ]?hour)[^.\n]*limit"
@@ -213,6 +216,197 @@ def remove_slot_state(name):
                 paths.write_json_atomic(paths.quarantine_path(), quarantine)
 
 
+# --- flock slot leases (opt-in: HEADROOM_SLOT_LEASE=1) ----------------------
+#
+# At the moment routing COMMITS to an account (just before spawn) the launcher
+# takes an exclusive, non-blocking flock() on a per-account lock file and
+# holds it for the LIFETIME of the launch. flock is race-free by construction
+# (the kernel arbitrates; there is no read/decide/write TOCTOU and no stale
+# file to delete) and is released automatically when the last holding process
+# dies — so a crash frees the slot and there is no pid to reuse. On the exec
+# path the locked fd is made inheritable and survives execvp, so the CLI holds
+# the lease for its own lifetime; on the supervised path the resident
+# supervisor holds it and MOVES it to the active account across an automatic
+# handoff (acquire target before stopping source; release source after the
+# target child spawns).
+#
+# A candidate account is unavailable iff a non-blocking flock probe fails
+# (another live launch holds it). The flock is authoritative — acquire
+# re-checks it atomically — so the probe in block_reason is only a hint: a
+# probe error degrades to "not blocked" and can never crash routing.
+# Acquisition, by contrast, FAILS CLOSED: when leasing is requested but the
+# lock cannot be operated for an infrastructure reason, routing raises
+# LeaseError and the launch refuses rather than double-booking one account.
+
+_HELD_LEASES = {}       # account name -> open fd holding the exclusive flock
+_RELEASE_REGISTERED = False
+
+_LEASE_CONTENDED = (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES)
+
+
+class LeaseError(RuntimeError):
+    """The slot-lease layer could not operate. With HEADROOM_SLOT_LEASE=1 an
+    opt-in coordination feature must FAIL CLOSED — never launch unleased."""
+
+
+def _lease_enabled():
+    return os.environ.get("HEADROOM_SLOT_LEASE", "") == "1"
+
+
+def _leases_dir():
+    return os.path.join(paths.state_dir(), "leases")
+
+
+def _lease_path(name):
+    # registry names match ^[a-z0-9][a-z0-9_-]{0,31}$, so they are safe
+    # single-component filenames
+    return os.path.join(_leases_dir(), f"{name}.lock")
+
+
+def held_lease_names():
+    """Account names whose flock THIS process currently holds."""
+    return list(_HELD_LEASES)
+
+
+def holds_slot_lease(name):
+    return name in _HELD_LEASES
+
+
+def _account_leased_by_other(name):
+    """True iff a DIFFERENT live launch holds this account's flock.
+
+    False for: leasing disabled, our own lease, no lock file, or any probe
+    error (acquire is the authoritative gate, so a hint that fails open is
+    corrected there). The probe is non-blocking, always releases what it
+    opened, and never raises — it must never crash routing."""
+    if not _lease_enabled() or not isinstance(name, str) or not name:
+        return False
+    if name in _HELD_LEASES:
+        return False  # our own commitment never blocks us
+    try:
+        fd = os.open(_lease_path(name), os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            return error.errno in _LEASE_CONTENDED
+        # nobody holds it — release the probe lock immediately
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def _write_lease_metadata(fd, name, fam):
+    """Informational only (diagnostics/dashboards). Decisions use the flock,
+    never these contents, so a failed write is non-fatal."""
+    try:
+        payload = json.dumps({"account": name, "pid": os.getpid(),
+                              "family": fam, "written_at": time.time()},
+                             allow_nan=False)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, (payload + "\n").encode("utf-8"))
+    except OSError:
+        pass
+
+
+def acquire_slot_lease(account, fam):
+    """Take (and keep) the exclusive flock for `account` at commit time.
+
+    True  -> this process now holds the lease (or leasing is disabled: a
+             no-op success, so legacy behaviour is byte-unchanged).
+    False -> a DIFFERENT live launch holds the account; pick another.
+    raises LeaseError -> leasing was requested but the lock could not be
+             operated for an infrastructure reason; the launch must fail
+             closed, never proceed unleased."""
+    global _RELEASE_REGISTERED
+    if not _lease_enabled():
+        return True
+    name = account.get("name") if isinstance(account, dict) else None
+    if not isinstance(name, str) or not name:
+        # requested leasing on a nameless account can't be honoured; fail
+        # closed rather than silently launch unleased
+        raise LeaseError("account has no name to lease")
+    if name in _HELD_LEASES:
+        return True  # already ours (e.g. a pre-launch recheck of our slot)
+    try:
+        paths.ensure_private(paths.state_dir())
+        os.makedirs(_leases_dir(), exist_ok=True)
+        fd = os.open(_lease_path(name), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as error:
+        raise LeaseError(
+            f"cannot open slot lease for {name}: {error}") from error
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        os.close(fd)
+        if error.errno in _LEASE_CONTENDED:
+            return False
+        raise LeaseError(
+            f"cannot lock slot lease for {name}: {error}") from error
+    # keep the lock across execvp so the exec'd CLI holds it for its lifetime
+    # (and so a supervised child can inherit it via Popen pass_fds). If the fd
+    # cannot be made inheritable, execvp would CLOSE it and silently free the
+    # account — that is a fail-OPEN leak, so fail closed instead. (P1-3)
+    try:
+        os.set_inheritable(fd, True)
+        if not os.get_inheritable(fd):
+            raise OSError("slot lease fd did not become inheritable")
+    except OSError as error:
+        _close_lease_fd(fd)
+        raise LeaseError(
+            f"cannot make slot lease for {name} inheritable: {error}") \
+            from error
+    _write_lease_metadata(fd, name, fam)
+    _HELD_LEASES[name] = fd
+    if not _RELEASE_REGISTERED:
+        atexit.register(release_slot_leases)
+        _RELEASE_REGISTERED = True
+    return True
+
+
+def _close_lease_fd(fd):
+    """Drop this process's hold on a lease by CLOSING the fd — never
+    fcntl.LOCK_UN. flock lives on the open file DESCRIPTION, which a supervised
+    child shares via Popen pass_fds; an explicit LOCK_UN would release that
+    shared lock out from under a still-live child. Closing releases the lock
+    only when the LAST fd on the description closes, so the lease correctly
+    rides on the child under an ambiguous spawn and frees on true last-close."""
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def held_lease_fd(name):
+    """The open flock fd this process holds for `account`, or None. Used to
+    hand the fd to a supervised child (Popen pass_fds) so the lease can ride
+    on the child under an ambiguous spawn."""
+    return _HELD_LEASES.get(name)
+
+
+def release_slot_lease(name):
+    """Release one held lease (used when a handoff moves to a new account, or
+    before falling back to a bare CLI that uses no routed account). Close-only,
+    so a lease a live child inherited stays held by that child."""
+    fd = _HELD_LEASES.pop(name, None)
+    if fd is None:
+        return
+    _close_lease_fd(fd)
+
+
+def release_slot_leases():
+    """Release every lease this process holds (normal-exit / fallback path).
+    Crashes and exec'd CLIs are covered by the kernel dropping the flock."""
+    for name in list(_HELD_LEASES):
+        release_slot_lease(name)
+
+
 def _snapshot_fresh(snapshot, now, max_age):
     if not isinstance(snapshot, dict):
         return False
@@ -280,6 +474,12 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     if account.get("provider") == "codex" and not CODEX_ROUTING_ENABLED:
         return ("Codex routing disabled (HEADROOM_CODEX_ROUTING=0) — "
                 "headroom refuses to route Codex work")
+    # opt-in slot lease (HEADROOM_SLOT_LEASE=1): an account whose flock is
+    # held by another LIVE launch is unavailable, so concurrent launches
+    # diverge; a lease held by THIS process never blocks (it is our own
+    # commitment). The flock at acquire is authoritative; this is a hint.
+    if _account_leased_by_other(account.get("name")):
+        return "slot leased by another live launch"
     if cool is None:
         return "cooldown ledger unreadable — inspect/delete state/cooldowns.json"
     if snapshot_row is None:
@@ -824,12 +1024,67 @@ def _codex_run_failure(fam, account, snapshot, process):
     return process.returncode
 
 
-def cmd_exec(fam, command, launch_note=""):
+def bare_fallback_exec(command, reason, env=None):
+    """Opt-in last resort (--headroom-launch-fallback / HEADROOM_LAUNCH_FALLBACK=1):
+    exec the BARE CLI in this process after a failure that happened strictly
+    BEFORE any child CLI was started, so a caller never needs an external
+    fallback to guarantee "a CLI runs". `command` is the CLI argv with
+    headroom's own flags already removed. This must never run once a CLI has
+    been spawned — a later child exit, clean or capped, is a normal exit.
+
+    Falling back means using NO routed account, so any lease this process
+    committed is released (a concurrent launch may take that account) and the
+    bare CLI is exec'd with the ORIGINAL environment (`env`) — never the
+    routed env with its scrubbed auth vars and pinned CLAUDE_CONFIG_DIR."""
+    release_slot_leases()
+    notify.emit({"event": "fallback", "reason": str(reason)})
+    print(f"[headroom] launch fallback: {reason} — running bare "
+          f"`{command[0]}` without routing", file=sys.stderr)
+    environment = os.environ if env is None else env
+    try:
+        os.execvpe(command[0], command, environment)
+    except OSError as error:
+        print(f"[headroom] fallback exec of {command[0]} failed: {error}",
+              file=sys.stderr)
+        return 127
+    return 0  # unreachable outside tests: a successful exec never returns
+
+
+def cmd_exec(fam, command, launch_note="", fallback=False):
     """Interactive launch: pick once, exec with the account's env, no capture.
 
     `launch_note` is recorded in the launch marker (see write_launch_marker)
     so a wrapper can see WHY this run is exec-only (e.g. an auto-handoff
-    downgrade reason); it changes nothing else."""
+    downgrade reason); it changes nothing else.
+
+    `fallback` (opt-in) execs the bare CLI in-process when the launch fails
+    strictly BEFORE the CLI was started. Reaching exec is the boundary: a
+    successful exec replaces this process, so any return from the routed
+    path (other than the test-only 0 sentinel) proves no CLI ever started.
+    The bare fallback preserves the ORIGINAL environment captured here,
+    before _exec_routed scrubs/pins anything."""
+    if not fallback:
+        return _exec_routed(fam, command, launch_note)
+    # everything after the fallback intent is established runs inside the
+    # guard — including the environment snapshot — so even an env-copy failure
+    # still bare-execs when the fallback was requested (P1-4)
+    original_env = None
+    try:
+        original_env = dict(os.environ)
+        result = _exec_routed(fam, command, launch_note)
+    except Exception as error:  # noqa: BLE001 — opt-in: pre-spawn failures fall back
+        return bare_fallback_exec(command, f"launch failed: {error}",
+                                  env=original_env)
+    if result == 0:
+        # only reachable when exec was stubbed under test — a real exec never
+        # returns; the CLI is running, so there is nothing to fall back from
+        return 0
+    return bare_fallback_exec(
+        command, f"headroom exited {result} before the CLI started",
+        env=original_env)
+
+
+def _exec_routed(fam, command, launch_note=""):
     if registry.family_provider(fam) == "codex" and not CODEX_ROUTING_ENABLED:
         # fail-closed: disabled routing means headroom REFUSES to launch a
         # Codex seat it cannot prove capacity for — never "just take the
@@ -875,6 +1130,26 @@ def cmd_exec(fam, command, launch_note=""):
                       "other has proven headroom — try again in a moment",
                       file=sys.stderr)
                 return 2
+    # commit: take the slot flock (no-op unless HEADROOM_SLOT_LEASE=1) so a
+    # concurrent launch deterministically picks a different account; on the
+    # rare claim race, re-pick once — block_reason now sees the foreign lease.
+    # A LeaseError (infrastructure failure) FAILS CLOSED: refuse rather than
+    # launch unleased. With --headroom-launch-fallback the cmd_exec wrapper
+    # then turns that refusal into a bare-CLI last resort (the caller's
+    # explicit opt-in to "run something over nothing").
+    try:
+        if not acquire_slot_lease(account, fam):
+            print(f"[headroom] {account['name']} is leased by another live "
+                  f"launch — picking another", file=sys.stderr)
+            account = pick(fam)
+            if account is None or not acquire_slot_lease(account, fam):
+                print(f"[headroom] no unleased account for '{fam}' has proven "
+                      f"headroom", file=sys.stderr)
+                return 2
+    except LeaseError as error:
+        print(f"[headroom] slot lease unavailable ({error}); refusing to "
+              f"launch — HEADROOM_SLOT_LEASE=1 fails closed", file=sys.stderr)
+        return 2
     for var in collector.AUTH_OVERRIDE_VARS:
         os.environ.pop(var, None)
     os.environ[env_key(account)] = account["home"]
@@ -882,6 +1157,14 @@ def cmd_exec(fam, command, launch_note=""):
           file=sys.stderr)
     if not write_launch_marker("exec", account, note=launch_note):
         return 2
+    if launch_note:
+        # supervision was requested/configured but this run is exec-only —
+        # tell the observer WHY, bound to the account actually launched
+        notify.emit({"event": "downgrade", "account": account["name"],
+                     "reason": launch_note})
+    notify.emit({"event": "launch", "mode": "exec",
+                 "account": account["name"], "model": fam,
+                 "note": launch_note})
     try:
         os.execvp(command[0], command)
     except FileNotFoundError:
@@ -892,6 +1175,7 @@ def cmd_exec(fam, command, launch_note=""):
     except OSError as error:
         print(f"[headroom] cannot exec {command[0]}: {error}", file=sys.stderr)
         return 127
+    return 0  # unreachable outside tests: a successful exec never returns
 
 
 def current_account(fam):

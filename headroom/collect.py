@@ -40,13 +40,12 @@ from datetime import datetime, timezone
 
 from . import paths, registry
 
-IDENTITY_TIMEOUT = int(os.environ.get("HEADROOM_IDENTITY_TIMEOUT", "15"))
-CODEX_STALE_AFTER = int(os.environ.get("HEADROOM_CODEX_STALE_AFTER", "1800"))
+IDENTITY_TIMEOUT = paths.env_int("HEADROOM_IDENTITY_TIMEOUT", 15)
+CODEX_STALE_AFTER = paths.env_int("HEADROOM_CODEX_STALE_AFTER", 1800)
 # how long a past reading stays serviceable — keep in sync with route.py,
 # which enforces the same bound at routing time (collect must not import
 # route: route imports collect)
-OBSERVATION_MAX_AGE = int(os.environ.get("HEADROOM_OBSERVATION_MAX_AGE",
-                                         "1800"))
+OBSERVATION_MAX_AGE = paths.env_int("HEADROOM_OBSERVATION_MAX_AGE", 1800)
 SCHEMA_VERSION = 1
 
 PUBLIC_FIELDS = {

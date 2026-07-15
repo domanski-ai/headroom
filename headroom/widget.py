@@ -11,13 +11,14 @@ import time
 import unicodedata
 from urllib.parse import urlsplit
 
+from . import paths
+
 
 SCHEMA = "headroom_widget@1"
 TEXT_SCHEMA = "headroom_widget_txt@1"
 WINDOW_KEYS = ("5h", "7d")
-SNAPSHOT_MAX_AGE = int(os.environ.get("HEADROOM_SNAPSHOT_MAX_AGE", "900"))
-OBSERVATION_MAX_AGE = int(os.environ.get(
-    "HEADROOM_OBSERVATION_MAX_AGE", "1800"))
+SNAPSHOT_MAX_AGE = paths.env_int("HEADROOM_SNAPSHOT_MAX_AGE", 900)
+OBSERVATION_MAX_AGE = paths.env_int("HEADROOM_OBSERVATION_MAX_AGE", 1800)
 DASHBOARD_HREF = "http://127.0.0.1:8377/"
 
 
