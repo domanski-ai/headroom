@@ -1415,6 +1415,9 @@ class R3ShutdownSignalNotifiesLoss(TempDirCase):
             shutdown_signal = 15          # SIGTERM already latched
             forwarded = True              # ...and already forwarded to child
 
+            def __init__(self, process=None):
+                pass
+
             def install(self):
                 pass
 
@@ -1485,6 +1488,101 @@ class R3CrudeBareArgvValueAware(TempDirCase):
 
 
 # ==========================================================================
+# Round-6: forward the shutdown signal the instant it is latched
+# ==========================================================================
+class R6SignalForwardOnLatch(TempDirCase):
+    """P1(r6): _SignalGuard forwards the shutdown signal to the child inside
+    _shutdown (the instant it latches), so no notifier-bearing work can run
+    between latch and forward."""
+
+    def test_guard_forwards_immediately_on_latch(self):
+        process = mock.Mock()
+        process.pid = 424242
+        guard = supervisor._SignalGuard(process)
+        kills = []
+        with mock.patch.object(supervisor.os, "kill",
+                               side_effect=lambda pid, sig: kills.append(
+                                   (pid, sig))):
+            # the OS would invoke this handler on delivery
+            guard._shutdown(signal.SIGTERM, None)
+        self.assertTrue(guard.forwarded)                 # forwarded in-handler
+        self.assertEqual(kills, [(424242, signal.SIGTERM)])
+        self.assertEqual(guard.shutdown_signal, signal.SIGTERM)
+
+    def test_guard_forwards_only_once_across_repeat_signals(self):
+        process = mock.Mock()
+        process.pid = 111
+        guard = supervisor._SignalGuard(process)
+        kills = []
+        with mock.patch.object(supervisor.os, "kill",
+                               side_effect=lambda pid, sig: kills.append(sig)):
+            guard._shutdown(signal.SIGTERM, None)
+            guard._shutdown(signal.SIGHUP, None)  # second signal: ignored
+        self.assertEqual(kills, [signal.SIGTERM])  # forwarded exactly once
+
+    def test_signal_during_handle_events_forwards_before_any_notify(self):
+        # the real risk: a signal arrives WHILE _handle_events runs and calls
+        # a (blocking) notifier. The forward must have already happened in the
+        # signal handler, so it can never be delayed by the notify.
+        account = self.account()
+        runner = supervisor.Supervisor(
+            "sonnet", [], account, now=lambda: 1000.0,
+            sleep=lambda seconds: None)
+        process = mock.Mock()
+        process.pid = 777777
+        poll_seq = iter([None, None, 0])
+        process.poll.side_effect = lambda: next(poll_seq)
+        child = mock.Mock()
+        child.account = account
+        child.process = process
+        child.automation = True
+        child.binding = object()
+        child.launched_at = 0.0
+        child.supervision_loss_notified = False
+        order = []
+        captured = {}
+        real_guard = supervisor._SignalGuard
+
+        class CapturingGuard(real_guard):
+            def __init__(self, proc=None):
+                super().__init__(proc)
+                captured["guard"] = self
+
+        def handle_events(c, phid, pr=None):
+            if "signalled" not in captured:
+                captured["signalled"] = True
+                # a shutdown signal arrives mid-_handle_events (as the OS would
+                # deliver it): the guard forwards synchronously here
+                captured["guard"]._shutdown(signal.SIGTERM, None)
+                # ...and _handle_events then does its own (blocking) notify
+                notify.emit({"event": "supervision_lost",
+                             "reason": "from _handle_events"})
+            return None
+
+        def record_kill(pid, sig):
+            order.append("forward")
+
+        def record_emit(event):
+            order.append("notify")
+            return True
+
+        with mock.patch.object(supervisor, "_SignalGuard", CapturingGuard), \
+                mock.patch.object(supervisor.os, "kill",
+                                  side_effect=record_kill), \
+                mock.patch.object(runner, "_handle_events",
+                                  side_effect=handle_events), \
+                mock.patch.object(notify, "emit", side_effect=record_emit), \
+                redirect_stderr(io.StringIO()):
+            returncode = runner._monitor(child)
+        self.assertEqual(returncode, 0)
+        self.assertIn("forward", order)
+        self.assertIn("notify", order)
+        # the forward happened BEFORE the first notify, despite the notify
+        # being invoked from inside _handle_events
+        self.assertLess(order.index("forward"), order.index("notify"))
+
+
+# ==========================================================================
 # Round-4 red-team fixes  (the r4 signal-masking + preexec_fn machinery was
 # REMOVED in r5 in favour of pre-validate-then-conservative-ambiguity; the
 # mask/preexec tests are gone. The notify-deferral and ambiguous-stop tests
@@ -1514,11 +1612,16 @@ class R4ShutdownNotifyDeferredUntilForwarded(TempDirCase):
 
         child.process.poll.side_effect = child_poll
 
-        # a fake guard that mirrors _SignalGuard's two-poll forwarding
+        # a fake guard that mirrors the poll backstop forwarding (this test
+        # pre-latches, then forwards on the poll — the r6 immediate-forward
+        # path is covered by the _SignalGuard unit + mid-_handle_events tests)
         class Guard:
             shutdown_signal = signal.SIGTERM
             polls = 0
             forwarded = False
+
+            def __init__(self, process=None):
+                pass
 
             def install(self):
                 pass

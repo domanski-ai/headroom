@@ -654,16 +654,30 @@ def _source_row_is_bound(account, family, snapshot, collect_started):
 
 
 class _SignalGuard:
-    def __init__(self):
+    def __init__(self, process=None):
         self.original = {}
         self.shutdown_signal = None
-        self.polls = 0
         self.forwarded = False
+        # the child to forward a shutdown signal to; forwarding happens the
+        # INSTANT the signal is latched (in _shutdown), not on a later poll,
+        # so no notifier-bearing work can run between latch and forward (P1, r6)
+        self._process = process
+
+    def _forward(self, signum):
+        # os.kill + int attribute reads only — async-signal-safe, so this is
+        # correct to call directly from the signal handler
+        if self.forwarded or self._process is None:
+            return
+        self.forwarded = True
+        try:
+            os.kill(self._process.pid, signum)
+        except (ProcessLookupError, OSError):
+            pass
 
     def _shutdown(self, signum, _frame):
         if self.shutdown_signal is None:
             self.shutdown_signal = signum
-            self.polls = 0
+            self._forward(signum)  # forward immediately, before returning
 
     def install(self):
         for signum in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
@@ -673,15 +687,16 @@ class _SignalGuard:
         signal.signal(signal.SIGTERM, self._shutdown)
 
     def poll(self, process):
+        # backstop only: forwarding is normally done in _shutdown. If a signal
+        # was latched without a process handle, forward it here once.
         if self.shutdown_signal is None or process.poll() is not None:
             return
-        self.polls += 1
-        if self.polls >= 2 and not self.forwarded:
+        if not self.forwarded:
+            self.forwarded = True
             try:
                 os.kill(process.pid, self.shutdown_signal)
-            except ProcessLookupError:
+            except (ProcessLookupError, OSError):
                 pass
-            self.forwarded = True
 
     def restore(self):
         for signum, handler in self.original.items():
@@ -754,14 +769,6 @@ class Supervisor:
         argv.extend(args)
         environment = self._environment(account, self.generation, automatic)
         launched_at = self.now()
-        # the wrapper handshake means "launch committed": it must be the LAST
-        # thing before the spawn, after every piece of preparation that could
-        # still fail (settings file, argv, env) — a marker with no child
-        # would suppress the wrapper's bare-CLI fallback
-        if self.generation == 1:
-            if not route.write_launch_marker("supervised", account):
-                raise SupervisorError(
-                    "launch marker could not be written; nothing was started")
         # ---- PRE-SPAWN validation (OUTSIDE the ambiguous window) ----
         # Everything that can POSITIVELY prove "no child will exist" is checked
         # here, synchronously, BEFORE spawn_ambiguous is set. A failure here is
@@ -779,6 +786,16 @@ class Supervisor:
         if shutil.which(argv[0]) is None:
             raise SupervisorError(
                 f"`{argv[0]}` not found on PATH; nothing was started")
+        # the wrapper handshake means "launch committed": it must be the LAST
+        # fallible pre-spawn operation, AFTER every other pre-spawn check
+        # (settings/argv/env, verify_target_binding, which) — so an external
+        # marker-based wrapper sees a marker only when the spawn is truly
+        # imminent (P2-a, r6). A marker with no child would suppress the
+        # wrapper's bare-CLI fallback.
+        if self.generation == 1:
+            if not route.write_launch_marker("supervised", account):
+                raise SupervisorError(
+                    "launch marker could not be written; nothing was started")
         # hand the account's lease fd to the child so the flock rides on the
         # child (survives an ambiguous spawn / a supervisor exit); no-op unless
         # HEADROOM_SLOT_LEASE=1 (then held_lease_fd is None and no pass_fds
@@ -1338,7 +1355,9 @@ class Supervisor:
         return proof
 
     def _monitor(self, child, pending_handoff_id=""):
-        signals = _SignalGuard()
+        # give the guard the child handle so a shutdown signal is forwarded the
+        # instant it is latched (P1, r6)
+        signals = _SignalGuard(child.process)
         signals.install()
         proof = None
         try:

@@ -1279,6 +1279,39 @@ class SupervisorIntegration(unittest.TestCase):
         self.assertFalse(os.path.exists(
             os.path.join(self.fake_state, "recovered")))
 
+    def test_real_which_target_missing_recovers_source(self):
+        # r6 P2-b: phase-aware, REAL shutil.which (not a stubbed _spawn).
+        # Planning sees claude present; the TARGET _spawn's real which()
+        # returns None (positive pre-spawn failure -> recover source);
+        # recovery sees it present again. Keyed on the target transcript that
+        # commit_handoff writes just before the target spawn, so planning
+        # (before commit) sees present and only the first post-commit which
+        # (the target spawn) fails.
+        source_sid = str(__import__("uuid").uuid5(
+            __import__("uuid").NAMESPACE_DNS, "headroom-fake-source-1"))
+        target_transcript = os.path.join(
+            self.accounts[1]["home"], "projects", "fake-project",
+            source_sid + ".jsonl")
+        real_which = supervisor.shutil.which
+        state = {"target_failed": False}
+
+        def which(name):
+            if (name == "claude" and os.path.exists(target_transcript)
+                    and not state["target_failed"]):
+                state["target_failed"] = True  # only the target spawn fails
+                return None
+            return real_which(name)
+
+        with mock.patch.object(supervisor.shutil, "which", side_effect=which):
+            result = supervisor.Supervisor(
+                "sonnet", [], self.accounts[0],
+                collect_fn=self.snapshot).run()
+        self.assertEqual(result, 0)
+        self.assertTrue(state["target_failed"])  # the real target which failed
+        with open(os.path.join(self.fake_state, "recovered"),
+                  encoding="utf-8") as source:
+            self.assertIn("--resume", source.read())
+
     def test_spawn_time_target_identity_swap_recovers_source(self):
         source_sid = str(__import__("uuid").uuid5(
             __import__("uuid").NAMESPACE_DNS, "headroom-fake-source-1"))
