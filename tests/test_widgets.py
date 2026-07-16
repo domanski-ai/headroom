@@ -964,6 +964,41 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertIn('id="stats-tab"', html)
         self.assertFalse(os.path.exists(os.path.join(output, "history.json")))
 
+    def test_stats_template_navigation_reload_focus_and_color_contracts(self):
+        template = self.template_text()
+        nav = template.split('<nav class="side-nav"', 1)[1].split(
+            "</nav>", 1)[0]
+        self.assertNotIn('role="tablist"', nav)
+        self.assertNotIn('role="tab"', nav)
+        self.assertNotIn("aria-controls", nav)
+        self.assertNotIn("aria-selected", template)
+        self.assertIn('aria-current="page"', nav)
+        self.assertIn('.side-nav a[aria-current="page"]', template)
+
+        chart = template.split("function renderHistoryChart(data,key){",
+                               1)[1].split("\n}", 1)[0]
+        self.assertIn("const active=document.activeElement;", chart)
+        self.assertIn("legend.contains(active)", chart)
+        self.assertIn('item.getAttribute("data-series")===focusedSeries', chart)
+        self.assertIn("if(replacement)replacement.focus();", chart)
+        self.assertLess(chart.index("color:SERIES_COLORS[index"),
+                        chart.index(")).filter(account=>account.points.length)"))
+        self.assertIn("color:account.color", chart)
+
+        history_script = template.split("async function loadHistory(",
+                                        1)[1].split(
+            "/* =================================================== liquid-glass widget */",
+            1)[0]
+        self.assertIn("manual,background=false", history_script)
+        self.assertIn("const replaceView=!background;", history_script)
+        self.assertIn("requestId===historyRequest&&replaceView", history_script)
+        self.assertIn('if(active==="stats")loadHistory(false);', history_script)
+        self.assertIn('history-range").addEventListener("change",()=>loadHistory(false))',
+                      history_script)
+        self.assertIn('loadHistory(false,true);},6e4)', history_script)
+        self.assertIn('link.setAttribute("aria-current","page")', history_script)
+        self.assertIn('link.removeAttribute("aria-current")', history_script)
+
     def test_widget_href_uses_actual_server_address_port(self):
         port = 49152
         with mock.patch.object(widget.time, "time", return_value=NOW), \

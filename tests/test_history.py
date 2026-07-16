@@ -177,7 +177,7 @@ class HistoryPersistenceTests(unittest.TestCase):
         replace.assert_called_once()
         with open(paths.history_path(), encoding="utf-8") as handle:
             timestamps = [json.loads(line)["ts"] for line in handle]
-        self.assertNotIn(NOW - 2 * 86400 - 1, timestamps)
+        self.assertEqual(timestamps, [NOW])
 
     def test_kill_switch_returns_before_filesystem_access(self):
         with mock.patch.dict(os.environ, {"HEADROOM_HISTORY": "0"}), \
@@ -255,21 +255,26 @@ class HistoryPersistenceTests(unittest.TestCase):
                 self.assertRaisesRegex(OSError, "read budget"):
             history._read_rows(paths.history_path())
 
-    def test_unreadable_history_refuses_rewrite_but_allows_append(self):
+    def test_unreadable_over_cap_history_skips_append_and_rewrite(self):
         paths.ensure_private(paths.history_dir())
         with open(paths.history_path(), "wb") as handle:
             handle.write(json.dumps(row(NOW - 10, 10)).encode("utf-8") + b"\n")
+        with open(paths.history_path(), "rb") as handle:
+            before = handle.read()
         with mock.patch.object(history, "_file_size",
                                return_value=history.max_bytes() + 1), \
                 mock.patch.object(history, "_read_rows",
                                   side_effect=PermissionError("unreadable")), \
                 mock.patch.object(history, "_write_rows_atomic") as rewrite, \
-                mock.patch.object(history, "_tail_row", return_value=None), \
-                mock.patch.object(history, "_append_row") as append:
-            self.assertTrue(history.append_snapshot(snapshot(20), now=NOW))
+                self.assertRaisesRegex(
+                    RuntimeError, "byte cap.*append skipped.*unreadable"):
+            history.append_snapshot(snapshot(20), now=NOW)
         rewrite.assert_not_called()
-        append.assert_called_once()
+        with open(paths.history_path(), "rb") as handle:
+            self.assertEqual(handle.read(), before)
 
+    def test_unreadable_history_refuses_account_rewrite(self):
+        history.append_snapshot(snapshot(), now=NOW)
         with mock.patch.object(history, "_read_rows",
                                side_effect=PermissionError("unreadable")), \
                 mock.patch.object(history, "_write_rows_atomic") as rewrite:
@@ -502,7 +507,7 @@ class CollectHistoryHookTests(unittest.TestCase):
     def test_history_warning_write_failure_does_not_fail_collection(self):
         class BrokenStderr:
             def write(self, _value):
-                raise BrokenPipeError("closed")
+                raise ValueError("closed")
 
             def flush(self):
                 pass

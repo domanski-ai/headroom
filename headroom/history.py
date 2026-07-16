@@ -329,13 +329,25 @@ def append_snapshot(snapshot, now=None):
         cutoff = now - retention_days() * 86400
         try:
             loaded = _read_rows(path)
-        except OSError:
+        except OSError as error:
+            if over_cap:
+                raise RuntimeError(
+                    "history exceeds its byte cap; append skipped because "
+                    f"pruning failed: {error}") from error
             loaded = None
         if loaded is not None:
-            rows = [old for old in loaded if old["ts"] >= cutoff]
+            rows = [old for old in loaded
+                    if cutoff <= old["ts"] <= now + 300]
             if over_cap and sum(_row_size(old) for old in rows) > cap:
                 rows = _rows_within_bytes(rows, int(cap * .8))
-            _write_rows_atomic(rows)
+            try:
+                _write_rows_atomic(rows)
+            except Exception as error:
+                if over_cap:
+                    raise RuntimeError(
+                        "history exceeds its byte cap; append skipped because "
+                        f"pruning failed: {error}") from error
+                raise
             newest = rows[-1] if rows else None
         else:
             newest = _tail_row(path)

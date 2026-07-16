@@ -10,6 +10,9 @@ here so users can judge them for their own threat model.
   resets, so the count can be low when a reset occurs during an episode.
 - Retention pruning is amortized and can keep up to one extra grace day before
   rewriting the history file.
+- After a clock rollback, an old-timestamped row appended behind a fresh head
+  row can delay time-based pruning until the head row ages past the grace day
+  or the byte cap triggers. The delay is byte-cap bounded and self-heals.
 - `/history.json` rebuilds its aggregations for every request, which is
   acceptable at the current history scale.
 - Dashboards with six or more series repeat legend colours.

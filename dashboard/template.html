@@ -132,8 +132,8 @@ body::before {
 .side-nav a svg { width: 12px; height: 12px; flex: none; opacity: .75; }
 .side-nav a:hover { color: var(--ink); background: var(--panel-2); }
 .side-nav a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.side-nav a[aria-selected="true"] { border-left-color: var(--accent);
-                                    color: var(--ink); background: var(--panel-2); }
+.side-nav a[aria-current="page"] { border-left-color: var(--accent);
+                                   color: var(--ink); background: var(--panel-2); }
 .side-note { margin: auto 5px 0; padding-top: 14px; border-top: 1px solid var(--line);
              color: var(--ink-3); font: 500 8.5px/1.55 var(--mono); }
 .tab-view[hidden] { display: none; }
@@ -380,7 +380,7 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
   .wordmark { padding: 7px 8px; }
   .side-nav { display: flex; margin-left: auto; }
   .side-nav a { padding: 8px 12px; border-left: 0; border-bottom: 2px solid transparent; }
-  .side-nav a[aria-selected="true"] { border-bottom-color: var(--accent); }
+  .side-nav a[aria-current="page"] { border-bottom-color: var(--accent); }
   .side-note { display: none; }
   .shell { padding-top: 12px; }
   .stats-accounts { grid-template-columns: 1fr; }
@@ -639,9 +639,9 @@ body.is-widget .shell { display: none; }
 <div class="app-shell">
 <aside class="side-panel" aria-label="Dashboard sections">
   <div class="wordmark"><svg viewBox="0 0 16 16" aria-hidden="true"><rect class="wm-a" x="1" y="9" width="3.4" height="6" rx="1.1"/><rect class="wm-b" x="6.3" y="5" width="3.4" height="10" rx="1.1"/><rect class="wm-c" x="11.6" y="1" width="3.4" height="14" rx="1.1"/></svg>headroom</div>
-  <nav class="side-nav" role="tablist" aria-label="Dashboard views">
-    <a id="usage-nav" href="#usage" data-tab="usage" role="tab" aria-controls="usage-tab"><svg viewBox="0 0 12 12" fill="currentColor" aria-hidden="true"><rect x="0" y="2" width="2.4" height="8" rx=".6"/><rect x="3.2" y="2" width="2.4" height="8" rx=".6"/><rect x="6.4" y="2" width="2.4" height="8" rx=".6" opacity=".45"/><rect x="9.6" y="2" width="2.4" height="8" rx=".6" opacity=".2"/></svg>Usage</a>
-    <a id="stats-nav" href="#stats" data-tab="stats" role="tab" aria-controls="stats-tab"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 9.5 4.2 6l2.4 2L11 3.5"/></svg>Stats</a>
+  <nav class="side-nav" aria-label="Dashboard views">
+    <a id="usage-nav" href="#usage" data-tab="usage" aria-current="page"><svg viewBox="0 0 12 12" fill="currentColor" aria-hidden="true"><rect x="0" y="2" width="2.4" height="8" rx=".6"/><rect x="3.2" y="2" width="2.4" height="8" rx=".6"/><rect x="6.4" y="2" width="2.4" height="8" rx=".6" opacity=".45"/><rect x="9.6" y="2" width="2.4" height="8" rx=".6" opacity=".2"/></svg>Usage</a>
+    <a id="stats-nav" href="#stats" data-tab="stats"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 9.5 4.2 6l2.4 2L11 3.5"/></svg>Stats</a>
   </nav>
   <p class="side-note">Window percentage only.<br>No token counts stored.</p>
 </aside>
@@ -1097,9 +1097,12 @@ const hiddenSeries=new Set();
 function renderHistoryChart(data,key){
   const chart=document.getElementById("history-chart");
   const legend=document.getElementById("history-legend");
-  const series=data.series.map(account=>({
+  const active=document.activeElement;
+  const focusedSeries=active&&legend.contains(active)?active.getAttribute("data-series"):null;
+  const series=data.series.map((account,index)=>({
     name:account.name,provider:account.provider,
     key:account.provider+"/"+account.name,
+    color:SERIES_COLORS[index%SERIES_COLORS.length],
     points:(account.windows||{})[key]||[]
   })).filter(account=>account.points.length);
   if(!series.length){
@@ -1111,17 +1114,21 @@ function renderHistoryChart(data,key){
   data.series.forEach(account=>{
     allNames[account.name]=(allNames[account.name]||0)+1;
   });
-  legend.innerHTML=series.map((account,index)=>'<button type="button" class="legend-item" data-series="'+
+  legend.innerHTML=series.map(account=>'<button type="button" class="legend-item" data-series="'+
     esc(account.key)+'" aria-pressed="'+(hiddenSeries.has(account.key)?"false":"true")+
-    '" style="--series:'+SERIES_COLORS[index%SERIES_COLORS.length]+'"><i></i>'+esc(account.name+
+    '" style="--series:'+account.color+'"><i></i>'+esc(account.name+
       (allNames[account.name]>1?" · "+account.provider:""))+"</button>").join("");
   legend.querySelectorAll(".legend-item").forEach(item=>item.addEventListener("click",()=>{
     const identity=item.getAttribute("data-series");
     if(hiddenSeries.has(identity))hiddenSeries.delete(identity);else hiddenSeries.add(identity);
     renderHistoryChart(historyData,document.getElementById("history-window").value);
   }));
-  const visible=series.map((account,index)=>({account:account,
-    color:SERIES_COLORS[index%SERIES_COLORS.length]}))
+  if(focusedSeries){
+    const replacement=Array.from(legend.querySelectorAll(".legend-item")).find(
+      item=>item.getAttribute("data-series")===focusedSeries);
+    if(replacement)replacement.focus();
+  }
+  const visible=series.map(account=>({account:account,color:account.color}))
     .filter(entry=>!hiddenSeries.has(entry.account.key));
   if(!visible.length){
     chart.innerHTML='<div class="stats-inline-empty">All accounts hidden — click a legend item to show it.</div>';
@@ -1251,9 +1258,9 @@ function showHistoryFailure(error){
   else
     showStatsState("History is unavailable here","The history feed could not be reached. Static builds still show Usage; use headroom serve for Stats.",false);
 }
-async function loadHistory(manual){
+async function loadHistory(manual,background=false){
   const requestId=++historyRequest,button=document.getElementById("history-refresh");
-  const replaceView=manual||document.getElementById("stats-content").hidden;
+  const replaceView=!background;
   if(manual){button.disabled=true;button.textContent="Refreshing…";}
   if(replaceView)showStatsState("Loading history","Reading saved window percentages.",true);
   let timer=null;
@@ -1284,7 +1291,8 @@ function syncTabs(){
   document.getElementById("stats-tab").hidden=active!=="stats";
   document.querySelectorAll("[data-tab]").forEach(link=>{
     const selected=link.getAttribute("data-tab")===active;
-    link.setAttribute("aria-selected",selected?"true":"false");
+    if(selected)link.setAttribute("aria-current","page");
+    else link.removeAttribute("aria-current");
   });
   if(active==="stats")loadHistory(false);
 }
@@ -1294,7 +1302,7 @@ function initTabs(){
   document.getElementById("history-window").addEventListener("change",renderStats);
   document.getElementById("history-refresh").addEventListener("click",()=>loadHistory(true));
   syncTabs();
-  setInterval(()=>{if(location.hash==="#stats")loadHistory(false);},6e4);
+  setInterval(()=>{if(location.hash==="#stats")loadHistory(false,true);},6e4);
 }
 
 /* =================================================== liquid-glass widget */

@@ -2308,24 +2308,53 @@ class RemoveCommand(unittest.TestCase):
             self.assertEqual(collect.cmd_remove(["a", "--yes"]), 2)
         self.assertEqual(len(registry.load()["accounts"]), 1)
 
-    def test_history_purge_failure_aborts_and_successful_rerun_purges(self):
+    def test_history_purge_runs_after_registry_and_snapshots_commit(self):
         self._write_state()
-        with mock.patch.object(history.os, "replace",
+        def assert_committed(name):
+            self.assertEqual(name, "a")
+            self.assertEqual([entry["name"] for entry in
+                              registry.load()["accounts"]], ["b"])
+            for path in (paths.private_snapshot_path(),
+                         paths.public_snapshot_path()):
+                self.assertEqual([entry["name"] for entry in
+                                  paths.load_json(path)["accounts"]], ["b"])
+
+        with mock.patch.object(history, "remove_account",
+                               side_effect=assert_committed) as purge:
+            removed = collect.remove_slot("a")
+        self.assertEqual(removed["name"], "a")
+        purge.assert_called_once_with("a")
+
+    def test_history_purge_failure_reports_committed_remediation(self):
+        self._write_state()
+        history_file = paths.history_path()
+        with mock.patch.object(history, "remove_account",
                                side_effect=OSError("disk full")):
-            with self.assertRaisesRegex(
-                    RuntimeError, "history purge failed.*disk full"):
+            with self.assertRaises(RuntimeError) as raised:
                 collect.remove_slot("a")
+        message = str(raised.exception)
+        self.assertIn("the slot is removed", message)
+        self.assertIn(history_file, message)
+        self.assertIn("purge account 'a' rows", message)
+        self.assertIn("manually or re-add+remove", message)
         self.assertEqual([entry["name"] for entry in registry.load()["accounts"]],
-                         ["a", "b"])
+                         ["b"])
+        for path in (paths.private_snapshot_path(),
+                     paths.public_snapshot_path()):
+            self.assertEqual([entry["name"] for entry in
+                              paths.load_json(path)["accounts"]], ["b"])
+
+    def test_concurrent_removal_revalidates_before_history_purge(self):
+        self._write_state()
+        registry.remove_account("a")
+        with mock.patch.object(history, "remove_account") as purge, \
+                self.assertRaisesRegex(
+                    registry.RegistryError, "no connected account named 'a'"):
+            collect.remove_slot("a")
+        purge.assert_not_called()
         self.assertTrue(any(account["name"] == "a"
                             for value in history.load_series(1)
                             for account in value["accounts"]))
-
-        removed = collect.remove_slot("a")
-        self.assertEqual(removed["name"], "a")
-        self.assertFalse(any(account["name"] == "a"
-                             for value in history.load_series(1)
-                             for account in value["accounts"]))
 
 
 class DashboardRemovalOrdering(unittest.TestCase):

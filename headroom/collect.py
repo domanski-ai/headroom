@@ -1335,7 +1335,7 @@ def run_collect(quiet=False):
             try:
                 print(f"headroom: history append failed: {error}",
                       file=sys.stderr)
-            except OSError:
+            except Exception:
                 pass
         if not quiet:
             print_snapshot(snapshot)
@@ -1391,17 +1391,23 @@ def remove_slot(name):
         # Refuse before mutating the registry if a protective ledger cannot be
         # read and therefore cannot be safely scrubbed.
         route.preflight_remove_slot_state()
-        # The registry mutation runs before the cooldown/quarantine scrub,
-        # preserving the established config -> cooldown -> quarantine order.
-        # The collection lock covers the full sequence, so a collector cannot
-        # start from the old registry and later overwrite these pruned feeds.
-        history.remove_account(name)
+        # remove_account reloads under the registry lock, revalidating that the
+        # slot still exists before the first mutation.  The collection lock
+        # covers the full sequence, so a collector cannot later republish it.
         removed = registry.remove_account(name)
         if _prune_snapshot_slot(private, name):
             paths.write_json_atomic(paths.private_snapshot_path(), private)
         if _prune_snapshot_slot(public, name):
             paths.write_json_atomic(paths.public_snapshot_path(), public,
                                     mode=0o644)
+        try:
+            history.remove_account(name)
+        except Exception as error:
+            raise RuntimeError(
+                f"the slot is removed; history purge failed for "
+                f"{paths.history_path()}: {error}; purge account {name!r} "
+                "rows from the named history file manually or re-add+remove "
+                "the slot") from error
         route.remove_slot_state(name)
         return removed
 
