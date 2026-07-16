@@ -29,7 +29,7 @@ MIN_MAX_BYTES = 1024 * 1024
 MAX_LINE_BYTES = 1024 * 1024
 MAX_CHART_POINTS = 200
 READ_DRAIN_BYTES = 64 * 1024
-ID_RE = re.compile(r"^[0-9a-f]{12}$")
+ID_RE = re.compile(r"^[0-9a-f]{12,32}$")
 
 
 def enabled():

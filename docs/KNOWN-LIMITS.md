@@ -13,6 +13,10 @@ here so users can judge them for their own threat model.
 - Removed-slot rows may persist on disk as private `0600` state until retention
   or an amortized prune removes them. They are never served after removal, and
   a fresh slot generation can never merge with rows from a reused name.
+- A `/history.json` request already in flight when a slot removal commits may
+  reflect the pre-removal state — a linearizable concurrent read (the response
+  is as-of a moment when the slot existed), the same property every feed
+  endpoint has against changing state.
 - After a clock rollback, an old-timestamped row appended behind a fresh head
   row can delay time-based pruning until the head row ages past the grace day
   or the byte cap triggers. The delay is byte-cap bounded and self-heals.

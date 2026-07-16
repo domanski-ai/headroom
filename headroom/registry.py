@@ -35,7 +35,7 @@ from . import paths
 
 PROVIDERS = ("claude", "codex")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
-ID_RE = re.compile(r"^[0-9a-f]{12}$")
+ID_RE = re.compile(r"^[0-9a-f]{12,32}$")
 DEFAULT_DASHBOARD = {
     "theme": "midnight",
     "title": "AI Fleet",
@@ -110,7 +110,7 @@ def validate(config):
         if slot_id is not None:
             if not isinstance(slot_id, str) or not ID_RE.fullmatch(slot_id):
                 raise RegistryError(
-                    f"account {name}: id must be 12 lowercase hex characters")
+                    f"account {name}: id must be 12-32 lowercase hex characters")
             if slot_id in ids:
                 raise RegistryError(f"account {name}: duplicate id {slot_id!r}")
             ids.add(slot_id)
@@ -163,7 +163,7 @@ def new_slot_id(config):
     """Return a generation ID not already present in this registry view."""
     existing = {account.get("id") for account in config.get("accounts", [])}
     while True:
-        candidate = uuid.uuid4().hex[:12]
+        candidate = uuid.uuid4().hex
         if candidate not in existing:
             return candidate
 

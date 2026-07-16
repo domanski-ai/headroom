@@ -565,7 +565,7 @@ class CollectHistoryHookTests(unittest.TestCase):
             collect.run_collect(quiet=True)
         stored = registry.load()["accounts"][0]
         rows = history._read_rows(paths.history_path())
-        self.assertRegex(stored["id"], r"^[0-9a-f]{12}$")
+        self.assertRegex(stored["id"], r"^[0-9a-f]{12,32}$")
         self.assertEqual(registry.accounts()[0]["id"], stored["id"])
         self.assertEqual(rows[0]["accounts"][0]["id"], stored["id"])
         self.assertEqual(paths.load_json(paths.public_snapshot_path())[

@@ -2421,7 +2421,7 @@ class RemoveCommand(unittest.TestCase):
         old_id = registry.remove_account("a")["id"]
         added = connect.add_account(
             registry.load(), "a", "claude", self.home_a, "a@example.test")
-        self.assertRegex(added["id"], r"^[0-9a-f]{12}$")
+        self.assertRegex(added["id"], r"^[0-9a-f]{12,32}$")
         self.assertNotEqual(added["id"], old_id)
         self.assertEqual(route.cooldowns(), {"b:*": 300})
         self.assertEqual(route.quarantines(), {"b": {"reason": "other"}})
