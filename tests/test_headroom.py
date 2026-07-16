@@ -2364,7 +2364,7 @@ class RemoveCommand(unittest.TestCase):
         self.assertIn("ledger locked", message)
         self.assertEqual(paths.load_json(paths.purge_pending_path()), ["a"])
 
-    def test_snapshot_crash_tombstone_hides_same_name_until_retry_succeeds(self):
+    def test_snapshot_failure_still_attempts_route_cleanup(self):
         self._write_state()
         original_write = paths.write_json_atomic
 
@@ -2375,54 +2375,54 @@ class RemoveCommand(unittest.TestCase):
 
         with mock.patch.object(paths, "write_json_atomic",
                                side_effect=fail_private), \
-                self.assertRaisesRegex(OSError, "snapshot crash"):
+                mock.patch.object(route, "remove_slot_state",
+                                  wraps=route.remove_slot_state) as cleanup, \
+                self.assertRaisesRegex(
+                    RuntimeError, "private snapshot cleanup.*snapshot crash"):
             collect.remove_slot("a")
+        cleanup.assert_called_once_with("a")
         self.assertEqual([entry["name"] for entry in registry.load()["accounts"]],
                          ["b"])
-        self.assertEqual(paths.load_json(paths.purge_pending_path()), ["a"])
-        self.assertFalse(any(account["name"] == "a"
-                             for value in history.load_series(1)
-                             for account in value["accounts"]))
+        self.assertEqual(paths.load_json(paths.purge_pending_path()), [])
+        self.assertEqual(route.cooldowns(), {"b:*": 300})
+        self.assertEqual(route.quarantines(), {"b": {"reason": "other"}})
 
-        config = registry.load()
-        config["accounts"].append({
-            "name": "a", "provider": "claude", "home": self.home_a})
-        registry.save(config)
-        reconnected = {"schema_version": 1, "accounts": [_claude_row("a")]}
-        now = int(time.time())
-        with mock.patch.dict(os.environ,
-                             {"HEADROOM_HISTORY_MIN_INTERVAL": "0"}), \
-                mock.patch.object(history, "remove_account",
-                                  side_effect=OSError("purge still blocked")):
-            self.assertTrue(history.append_snapshot(reconnected, now=now))
-        self.assertEqual(paths.load_json(paths.purge_pending_path()), ["a"])
-        self.assertFalse(any(account["name"] == "a"
-                             for value in history.load_series(1)
-                             for account in value["accounts"]))
+    def test_concurrent_removal_refusal_drops_survivor_tombstone(self):
+        self._write_state()
+        registry.remove_account("a")
+        with mock.patch.object(history, "remove_account") as purge, \
+                self.assertRaisesRegex(
+                    registry.RegistryError, "final connected account"):
+            collect.remove_slot("b")
+        purge.assert_not_called()
+        self.assertEqual(paths.load_json(paths.purge_pending_path()), [])
+        self.assertTrue(any(account["name"] == "b"
+                            for value in history._read_rows(paths.history_path())
+                            for account in value["accounts"]))
+        self.assertTrue(any(account["name"] == "b"
+                            for value in history.load_series(1)
+                            for account in value["accounts"]))
 
-        with mock.patch.dict(os.environ,
-                             {"HEADROOM_HISTORY_MIN_INTERVAL": "0"}):
-            self.assertTrue(history.append_snapshot(reconnected, now=now))
+    def test_registry_mutation_failure_rolls_back_tombstone(self):
+        self._write_state()
+        with mock.patch.object(registry, "remove_account",
+                               side_effect=OSError("config write failed")), \
+                mock.patch.object(history, "remove_account") as purge, \
+                self.assertRaisesRegex(OSError, "config write failed"):
+            collect.remove_slot("a")
+        purge.assert_not_called()
         self.assertEqual(paths.load_json(paths.purge_pending_path()), [])
         self.assertTrue(any(account["name"] == "a"
                             for value in history.load_series(1)
                             for account in value["accounts"]))
 
-    def test_concurrent_removal_revalidates_before_history_purge(self):
+    def test_same_name_add_clears_leftover_route_state(self):
         self._write_state()
         registry.remove_account("a")
-        with mock.patch.object(history, "remove_account") as purge, \
-                self.assertRaisesRegex(
-                    registry.RegistryError, "no connected account named 'a'"):
-            collect.remove_slot("a")
-        purge.assert_not_called()
-        self.assertEqual(paths.load_json(paths.purge_pending_path()), ["a"])
-        self.assertTrue(any(account["name"] == "a"
-                            for value in history._read_rows(paths.history_path())
-                            for account in value["accounts"]))
-        self.assertFalse(any(account["name"] == "a"
-                             for value in history.load_series(1)
-                             for account in value["accounts"]))
+        connect.add_account(
+            registry.load(), "a", "claude", self.home_a, "a@example.test")
+        self.assertEqual(route.cooldowns(), {"b:*": 300})
+        self.assertEqual(route.quarantines(), {"b": {"reason": "other"}})
 
 
 class DashboardRemovalOrdering(unittest.TestCase):

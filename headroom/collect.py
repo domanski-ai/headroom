@@ -1330,7 +1330,11 @@ def run_collect(quiet=False):
             mode=0o644,
         )
         try:
-            history.append_snapshot(public)
+            history.append_snapshot(
+                public,
+                registered_names={account["name"]
+                                  for account in registry.accounts(config)},
+            )
         except Exception as error:  # history must never break collection
             try:
                 print(f"headroom: history append failed: {error}",
@@ -1395,18 +1399,43 @@ def remove_slot(name):
         # remove_account reloads under the registry lock, revalidating that the
         # slot still exists before the first mutation.  The collection lock
         # covers the full sequence, so a collector cannot later republish it.
-        removed = registry.remove_account(name)
-        if _prune_snapshot_slot(private, name):
-            paths.write_json_atomic(paths.private_snapshot_path(), private)
-        if _prune_snapshot_slot(public, name):
-            paths.write_json_atomic(paths.public_snapshot_path(), public,
-                                    mode=0o644)
-        failures = []
         try:
-            history.remove_account(name)
+            removed = registry.remove_account(name)
         except Exception as error:
-            failures.append((
-                f"history purge for {paths.history_path()}", error))
+            try:
+                history.clear_purge_pending(name)
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    f"registry mutation failed for account {name!r}: {error}; "
+                    f"purge tombstone rollback failed: {rollback_error}"
+                ) from error
+            raise
+        failures = []
+        tombstone_cleared = False
+        try:
+            try:
+                if _prune_snapshot_slot(private, name):
+                    paths.write_json_atomic(
+                        paths.private_snapshot_path(), private)
+            except Exception as error:
+                failures.append(("private snapshot cleanup", error))
+            try:
+                if _prune_snapshot_slot(public, name):
+                    paths.write_json_atomic(
+                        paths.public_snapshot_path(), public, mode=0o644)
+            except Exception as error:
+                failures.append(("public snapshot cleanup", error))
+            try:
+                history.remove_account(name)
+            except Exception as error:
+                failures.append((
+                    f"history purge for {paths.history_path()}", error))
+            else:
+                try:
+                    history.clear_purge_pending(name)
+                    tombstone_cleared = True
+                except Exception as error:
+                    failures.append(("purge tombstone clear", error))
         finally:
             try:
                 route.remove_slot_state(name)
@@ -1417,15 +1446,9 @@ def remove_slot(name):
                 f"{operation}: {error}" for operation, error in failures)
             raise RuntimeError(
                 f"the slot is removed; cleanup failed for account {name!r}: "
-                f"{details}; purge remains pending in "
-                f"{paths.purge_pending_path()}") from failures[0][1]
-        try:
-            history.clear_purge_pending(name)
-        except Exception as error:
-            raise RuntimeError(
-                f"the slot is removed; purge tombstone clear failed for "
-                f"account {name!r}: {error}; purge remains pending in "
-                f"{paths.purge_pending_path()}") from error
+                f"{details}" + ("; purge remains pending in "
+                f"{paths.purge_pending_path()}" if not tombstone_cleared else "")
+            ) from failures[0][1]
         return removed
 
 

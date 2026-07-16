@@ -157,9 +157,13 @@ def add_account(config, name, provider, home, expected_email=None):
     if expected_email:
         entry["expected_email"] = expected_email
 
+    added = False
+
     def _append(cfg):
+        nonlocal added
         if not any(a.get("name") == name for a in cfg.get("accounts", [])):
             cfg.setdefault("accounts", []).append(dict(entry))
+            added = True
 
     try:
         # locked reload-append against the latest on-disk config, so a
@@ -169,10 +173,14 @@ def add_account(config, name, provider, home, expected_email=None):
         # config doesn't exist yet (wizard building a fresh one) — create it
         config.setdefault("accounts", []).append(entry)
         registry.save(config)
-        return entry
-    # reflect into the caller's in-memory config too (the wizard keeps using it)
-    if not any(a.get("name") == name for a in config.get("accounts", [])):
-        config.setdefault("accounts", []).append(entry)
+        added = True
+    else:
+        # reflect into the caller's in-memory config too (the wizard keeps using it)
+        if not any(a.get("name") == name for a in config.get("accounts", [])):
+            config.setdefault("accounts", []).append(entry)
+    if added:
+        from . import route
+        route.remove_slot_state(name)
     return entry
 
 

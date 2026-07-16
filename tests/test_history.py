@@ -181,10 +181,27 @@ class HistoryPersistenceTests(unittest.TestCase):
 
     def test_kill_switch_returns_before_filesystem_access(self):
         with mock.patch.dict(os.environ, {"HEADROOM_HISTORY": "0"}), \
+                mock.patch.object(history, "_pending_purges") as pending, \
                 mock.patch.object(history, "_read_rows",
                                   side_effect=AssertionError("filesystem read")):
             self.assertFalse(history.append_snapshot(snapshot(), now=NOW))
+        pending.assert_not_called()
         self.assertFalse(os.path.exists(paths.history_dir()))
+
+    def test_kill_switch_leaves_pending_purge_for_later(self):
+        history.append_snapshot(snapshot(), now=NOW)
+        history.mark_purge_pending("alpha")
+        with open(paths.history_path(), "rb") as handle:
+            before = handle.read()
+        with mock.patch.dict(os.environ, {"HEADROOM_HISTORY": "0"}), \
+                mock.patch.object(history, "_pending_purges") as pending, \
+                mock.patch.object(history, "remove_account") as purge:
+            self.assertFalse(history.append_snapshot(snapshot(), now=NOW + 60))
+        pending.assert_not_called()
+        purge.assert_not_called()
+        self.assertEqual(paths.load_json(paths.purge_pending_path()), ["alpha"])
+        with open(paths.history_path(), "rb") as handle:
+            self.assertEqual(handle.read(), before)
 
     def test_malformed_lines_are_ignored_and_loaded_rows_are_sanitized(self):
         paths.ensure_private(paths.history_dir())
@@ -327,6 +344,50 @@ class HistoryPersistenceTests(unittest.TestCase):
                          [NOW - 2, NOW - 1])
         self.assertTrue(all([account["name"] for account in value["accounts"]]
                             == ["b"] for value in loaded))
+
+    def test_registered_tombstone_is_dropped_without_purging_history(self):
+        history.append_snapshot(snapshot(name="alpha"), now=NOW)
+        history.mark_purge_pending("alpha")
+        with mock.patch.dict(os.environ, {
+                "HEADROOM_HISTORY_MIN_INTERVAL": "0"}), \
+                mock.patch.object(history, "remove_account") as purge:
+            self.assertTrue(history.append_snapshot(
+                snapshot(20, name="alpha"), now=NOW + 1,
+                registered_names={"alpha"}))
+        purge.assert_not_called()
+        self.assertEqual(paths.load_json(paths.purge_pending_path()), [])
+        rows = history._read_rows(paths.history_path())
+        self.assertEqual([value["ts"] for value in rows], [NOW, NOW + 1])
+        self.assertTrue(all(account["name"] == "alpha" for value in rows
+                            for account in value["accounts"]))
+
+    def test_unregistered_tombstone_is_purged_and_cleared(self):
+        history.append_snapshot(snapshot(name="alpha"), now=NOW)
+        history.mark_purge_pending("alpha")
+        with mock.patch.dict(os.environ, {
+                "HEADROOM_HISTORY_MIN_INTERVAL": "0"}):
+            self.assertTrue(history.append_snapshot(
+                snapshot(20, name="bravo"), now=NOW + 1,
+                registered_names={"bravo"}))
+        self.assertEqual(paths.load_json(paths.purge_pending_path()), [])
+        rows = history._read_rows(paths.history_path())
+        self.assertEqual([account["name"] for value in rows
+                          for account in value["accounts"]], ["bravo"])
+
+    def test_load_series_filters_tombstone_read_before_rows(self):
+        history._write_rows_atomic([row(NOW - 1, 20, name="alpha")])
+        history.mark_purge_pending("alpha")
+        read_rows = history._read_rows
+
+        def clear_then_read(path):
+            history.clear_purge_pending("alpha")
+            return read_rows(path)
+
+        with mock.patch.object(history, "_read_rows",
+                               side_effect=clear_then_read), \
+                mock.patch.object(history.time, "time", return_value=NOW):
+            self.assertEqual(history.load_series(1), [])
+        self.assertEqual(paths.load_json(paths.purge_pending_path()), [])
 
     def test_remove_account_raises_clear_error_and_keeps_original(self):
         history.append_snapshot(snapshot(), now=NOW)
@@ -481,8 +542,9 @@ class CollectHistoryHookTests(unittest.TestCase):
         )
 
     def test_hook_receives_exact_public_snapshot_after_publish(self):
-        def verify(public):
+        def verify(public, registered_names=None):
             self.assertEqual(paths.load_json(paths.public_snapshot_path()), public)
+            self.assertEqual(registered_names, set())
 
         patches = self._patch_collect()
         with patches[0], patches[1], patches[2], patches[3], patches[4], \

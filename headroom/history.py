@@ -3,7 +3,9 @@
 Ordinary writes are O(1) appends. Retention rewrites are amortized by waiting
 until the oldest row exceeds retention by a full day, while a configurable
 ``HEADROOM_HISTORY_MAX_BYTES`` cap (32 MiB by default, 1 MiB minimum) forces
-an earlier prune and trims an oversized retained set to 80%.
+an earlier prune and trims an oversized retained set to 80%. The history kill
+switch stops background history access; an explicit slot removal still purges
+history directly as an operator-requested action.
 """
 import errno
 import fcntl
@@ -346,22 +348,24 @@ def _append_row(row):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def append_snapshot(snapshot, now=None):
+def append_snapshot(snapshot, now=None, registered_names=None):
     """Append one public snapshot, returning False when disabled/throttled."""
+    if not enabled():
+        return False
     try:
         pending = _pending_purges()
     except Exception:
         pending = None
-    if pending is not None:
+    if pending is not None and registered_names is not None:
+        registered_names = set(registered_names)
         for name in sorted(pending):
             try:
-                remove_account(name)
+                if name not in registered_names:
+                    remove_account(name)
                 clear_purge_pending(name)
             except Exception:
                 continue
             pending.discard(name)
-    if not enabled():
-        return False
     now = int(time.time() if now is None else now)
     path = paths.history_path()
     cap = max_bytes()
@@ -439,6 +443,13 @@ def remove_account(name):
 def load_series(days):
     """Load sanitized rows from the requested trailing-day range."""
     try:
+        pending = _pending_purges()
+    except Exception:
+        return []
+    # Removal rewrites history before clearing its tombstone, so a reader that
+    # sees the cleared state must read purged rows. A reader that checked
+    # tombstones before removal began may see old rows and linearizes before it.
+    try:
         days = max(1, int(days))
     except (TypeError, ValueError):
         days = 1
@@ -446,10 +457,6 @@ def load_series(days):
     cutoff = now - days * 86400
     rows = [row for row in _read_rows(paths.history_path())
             if cutoff <= row["ts"] <= now]
-    try:
-        pending = _pending_purges()
-    except Exception:
-        return []
     if not pending:
         return rows
     filtered = []
