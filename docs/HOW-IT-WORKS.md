@@ -59,6 +59,27 @@ The dashboard and router treat *remaining* capacity (100 − used) as the
 primary number. The router additionally honours provider `severity` flags and
 holds anything at 100%.
 
+## Stats history
+
+Immediately after each public snapshot publication, the collector may append a
+private row to `state/history/usage-history.jsonl`. Each row is built through a
+strict whitelist: timestamp, account name, provider, plan/state flags, and each
+window's `used_percent` and `resets_at`. It never stores token counts, emails,
+raw identities, fingerprints, or credentials, even when dashboard email
+redaction is disabled.
+
+Writes are throttled to one sample per 60 seconds by default. On append,
+history older than 30 days is pruned with an atomic same-directory rewrite;
+the amortized prune may retain up to one extra grace day before it runs.
+`HEADROOM_HISTORY_MIN_INTERVAL` and `HEADROOM_HISTORY_RETENTION_DAYS` change
+those defaults; `HEADROOM_HISTORY=0` disables both writes and the history feed.
+Any history failure is reduced to one warning and cannot fail collection.
+
+`headroom serve` exposes the read-only `/history.json` feed without invoking
+collection. The normal static build intentionally remains `index.html` plus
+`usage.json`, so its Usage tab keeps working while Stats shows an unavailable
+message when no live history endpoint exists.
+
 ## Cooldowns
 
 A limit-hit writes `"<account>:<scope>": <reset-epoch>` into
@@ -94,6 +115,7 @@ picked on unproven capacity.
 | `~/.headroom/homes/<name>/` | provider-managed | isolated CLI credentials |
 | `~/.headroom/state/usage-private.json` | 0600 | full snapshot incl. identity fingerprints |
 | `~/.headroom/state/public/usage.json` | 0644 | sanitized dashboard feed |
+| `~/.headroom/state/history/usage-history.jsonl` | 0600 | rolling window percentages; no emails or tokens |
 | `~/.headroom/state/cooldowns.json` | 0600 | active cooldowns |
 | `~/.headroom/state/provider-backoff.json` | 0600 | usage-endpoint 429 backoff |
 
@@ -102,4 +124,7 @@ picked on unproven capacity.
 Everything is overridable for testing or custom layouts: `HEADROOM_DIR`,
 `HEADROOM_SNAPSHOT_MAX_AGE`, `HEADROOM_OBSERVATION_MAX_AGE`,
 `HEADROOM_CLOCK_SKEW`, `HEADROOM_CODEX_STALE_AFTER`,
-`HEADROOM_IDENTITY_TIMEOUT`, `HEADROOM_SERVE_MAX_AGE`, `HEADROOM_BIN_DIR`.
+`HEADROOM_IDENTITY_TIMEOUT`, `HEADROOM_SERVE_MAX_AGE`, `HEADROOM_HISTORY`,
+`HEADROOM_HISTORY_MIN_INTERVAL`, `HEADROOM_HISTORY_RETENTION_DAYS`,
+`HEADROOM_HISTORY_MAX_BYTES` (32 MiB default, 1 MiB floor),
+`HEADROOM_BIN_DIR`.

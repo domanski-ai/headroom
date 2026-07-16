@@ -59,6 +59,14 @@ def public_dir():
     return os.path.join(state_dir(), "public")
 
 
+def history_dir():
+    return os.path.join(state_dir(), "history")
+
+
+def history_path():
+    return os.path.join(history_dir(), "usage-history.jsonl")
+
+
 def private_snapshot_path():
     return os.path.join(state_dir(), "usage-private.json")
 

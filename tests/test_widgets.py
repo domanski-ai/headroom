@@ -1,4 +1,5 @@
 """Widget contract, refresh gate, integrations, and release artifact tests."""
+import hashlib
 import io
 import json
 import math
@@ -14,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stdout
 from unittest import mock
 
-from headroom import __main__, dashboard, paths, widget
+from headroom import __main__, dashboard, history, paths, registry, widget
 
 
 NOW = 2_000_000_000
@@ -27,8 +28,13 @@ WINDOWS_SCRIPT = os.path.join(ROOT, "experimental", "windows",
 WINDOWS_ICONS = os.path.join(ROOT, "experimental", "windows", "icons")
 
 
+def slot_id(name):
+    return hashlib.sha256(name.encode()).hexdigest()[:12]
+
+
 def usage_account(name="alpha", used5=20.0, used7=40.0, **overrides):
     account = {
+        "id": slot_id(name),
         "name": name,
         "provider": "claude",
         "ok": True,
@@ -622,6 +628,124 @@ class RefreshGateTests(unittest.TestCase):
         self.assertIn(b"no usage snapshot", body)
 
 
+class HistoryHttpTests(unittest.TestCase):
+    @contextmanager
+    def live_server(self, with_history=True):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(os.environ, {
+                    "HEADROOM_DIR": directory,
+                    "HEADROOM_HISTORY": "1",
+                    "HEADROOM_HISTORY_MIN_INTERVAL": "0",
+                    "HEADROOM_HISTORY_RETENTION_DAYS": "30",
+                }):
+            account = usage_account()
+            registry.save({"schema_version": 1, "accounts": [{
+                "id": account["id"], "name": account["name"],
+                "provider": account["provider"], "home": "/tmp/alpha"}]})
+            if with_history:
+                history.append_snapshot(
+                    usage_snapshot(account), now=int(time.time()))
+
+            class NoRefreshGate:
+                def get(self, *_args):
+                    raise AssertionError("history touched refresh gate")
+
+            class LiveHandler(dashboard.Handler):
+                demo = False
+                refresh_gate = NoRefreshGate()
+
+            yield LiveHandler, directory
+
+    def test_days_default_invalid_and_bounds(self):
+        expected = (("/history.json", 7),
+                    ("/history.json?days=invalid", 7),
+                    ("/history.json?days=0", 1),
+                    ("/history.json?days=999", 30))
+        with self.live_server() as server:
+            responses = [(json.loads(memory_get(*server, route)[2])["days"],
+                          days) for route, days in expected]
+        self.assertTrue(all(actual == wanted
+                            for actual, wanted in responses))
+
+    def test_empty_and_malformed_only_history_return_503(self):
+        with self.live_server(with_history=False) as server:
+            empty = memory_get(*server, "/history.json")
+            paths.ensure_private(paths.history_dir())
+            with open(paths.history_path(), "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "ts": int(time.time()),
+                    "accounts": [{"name": "bad", "provider": "claude",
+                                  "windows": [{}]}],
+                }) + "\n")
+            malformed = memory_get(*server, "/history.json")
+        self.assertEqual(empty[0], 503)
+        self.assertEqual(json.loads(empty[2]), {"error": "no history yet"})
+        self.assertEqual(malformed[0], 503)
+        self.assertEqual(json.loads(malformed[2]), {"error": "no history yet"})
+
+    def test_binary_garbage_is_skipped_when_valid_history_follows(self):
+        with self.live_server(with_history=False) as server:
+            paths.ensure_private(paths.history_dir())
+            valid = history.project_snapshot(
+                usage_snapshot(usage_account()), ts=int(time.time()))
+            with open(paths.history_path(), "wb") as handle:
+                handle.write(b"\xff\xfe corrupt\n")
+                handle.write(b"[" * 2000 + b"]" * 2000 + b"\n")
+                handle.write(json.dumps(valid).encode("utf-8") + b"\n")
+            status, headers, body = memory_get(*server, "/history.json")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["content-type"], "application/json")
+        self.assertTrue(json.loads(body)["series"])
+
+    def test_provider_labels_with_emails_never_reach_history_feed(self):
+        with self.live_server(with_history=False) as server:
+            account = usage_account()
+            account["plan"] = "owner@example.test"
+            account["windows"]["scoped:acct@example.test"] = {
+                "used_percent": 75, "resets_at": int(time.time()) + 3600}
+            history.append_snapshot(
+                usage_snapshot(account), now=int(time.time()))
+            with open(paths.history_path(), "rb") as handle:
+                raw = handle.read()
+            status, _, body = memory_get(*server, "/history.json")
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"@", raw)
+        self.assertNotIn(b"@", body)
+
+    def test_unexpected_history_error_returns_json_503(self):
+        with self.live_server() as server, \
+                mock.patch.object(history, "load_series",
+                                  side_effect=RecursionError("corrupt")) as load:
+            status, headers, body = memory_get(*server, "/history.json")
+        load.assert_called_once()
+        self.assertEqual(status, 503)
+        self.assertEqual(headers["content-type"], "application/json")
+        self.assertEqual(json.loads(body), {"error": "invalid history"})
+
+    def test_disabled_wins_even_when_history_exists(self):
+        with self.live_server() as server, \
+                mock.patch.dict(os.environ, {"HEADROOM_HISTORY": "0"}), \
+                mock.patch.object(
+                    history, "_read_rows",
+                    side_effect=AssertionError("history filesystem touched")):
+            status, _, body = memory_get(*server, "/history.json")
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body), {"error": "history_disabled"})
+
+    def test_history_route_never_collects_or_uses_refresh_gate(self):
+        with self.live_server() as server, \
+                mock.patch.object(dashboard.collector, "run_collect",
+                                  side_effect=AssertionError("collected")), \
+                mock.patch.object(registry, "apply_pins",
+                                  side_effect=AssertionError("registry mutated")), \
+                mock.patch.object(registry, "load",
+                                  wraps=registry.load) as load:
+            status, _, body = memory_get(*server, "/history.json?days=7")
+        load.assert_called_once_with()
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["schema_version"], 1)
+
+
 class DashboardHttpTests(unittest.TestCase):
     @contextmanager
     def demo_server(self, snapshot=None, index=None):
@@ -698,11 +822,30 @@ class DashboardHttpTests(unittest.TestCase):
                             ("/usage.json", "/widget.json", "/widget.txt")]
         self.assertEqual(statuses, [200, 200, 200])
 
+    def test_demo_history_is_synthesized_without_collecting(self):
+        with mock.patch.object(dashboard.collector, "run_collect",
+                               side_effect=AssertionError("demo collected")):
+            with self.demo_server() as server:
+                status, _, body = memory_get(*server, "/history.json?days=7")
+        payload = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["days"], 7)
+        self.assertTrue(payload["series"])
+        self.assertTrue(payload["summary"])
+
+    def test_demo_history_respects_kill_switch(self):
+        with self.demo_server() as server, \
+                mock.patch.dict(os.environ, {"HEADROOM_HISTORY": "0"}):
+            status, _, body = memory_get(*server, "/history.json")
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body), {"error": "history_disabled"})
+
     def test_all_responses_have_security_headers(self):
         with mock.patch.object(widget.time, "time", return_value=NOW):
             with self.demo_server() as server:
                 responses = [memory_get(*server, route) for route in
-                             ("/", "/widget.json", "/missing")]
+                             ("/", "/widget.json", "/history.json",
+                              "/missing")]
                 responses.append(memory_get(*server, "/", "evil.example"))
         for _, headers, _ in responses:
             self.assertEqual(headers.get("cache-control"), "no-store")
@@ -723,7 +866,7 @@ class DashboardHttpTests(unittest.TestCase):
             with self.demo_server() as server:
                 responses = [memory_get(*server, route) for route in
                              ("/", "/usage.json", "/widget.json",
-                              "/widget.txt", "/missing")]
+                              "/widget.txt", "/history.json", "/missing")]
         for _, headers, _ in responses:
             self.assertNotIn("access-control-allow-origin", headers)
 
@@ -731,8 +874,9 @@ class DashboardHttpTests(unittest.TestCase):
         with self.demo_server() as server:
             statuses = [memory_get(*server, route, "attacker.example")[0]
                         for route in ("/", "/widget", "/usage.json",
-                                      "/widget.json", "/widget.txt", "/missing")]
-        self.assertEqual(statuses, [403] * 6)
+                                      "/widget.json", "/widget.txt",
+                                      "/history.json", "/missing")]
+        self.assertEqual(statuses, [403] * 7)
 
     def test_dashboard_dom_projection_uses_widget_trust_and_freshness(self):
         held = usage_account(routable=True, trust_state="held")
@@ -835,6 +979,56 @@ class DashboardHttpTests(unittest.TestCase):
                          widget.OBSERVATION_MAX_AGE)
         self.assertEqual(payload["_headroom_display"]["accounts"][0][
             "windows"]["5h"]["tone"], "green")
+        self.assertIn('id="stats-tab"', html)
+        self.assertFalse(os.path.exists(os.path.join(output, "history.json")))
+
+    def test_stats_template_navigation_reload_focus_and_color_contracts(self):
+        template = self.template_text()
+        nav = template.split('<nav class="side-nav"', 1)[1].split(
+            "</nav>", 1)[0]
+        self.assertNotIn('role="tablist"', nav)
+        self.assertNotIn('role="tab"', nav)
+        self.assertNotIn("aria-controls", nav)
+        self.assertNotIn("aria-selected", template)
+        self.assertNotIn('role="tabpanel"', template)
+        self.assertNotIn('aria-labelledby="usage-nav"', template)
+        self.assertNotIn('aria-labelledby="stats-nav"', template)
+        self.assertIn('aria-current="page"', nav)
+        self.assertIn('.side-nav a[aria-current="page"]', template)
+
+        chart = template.split("function renderHistoryChart(data,key){",
+                               1)[1].split("\n}", 1)[0]
+        self.assertIn("const active=document.activeElement;", chart)
+        self.assertIn("key:account.id", chart)
+        self.assertIn("legend.contains(active)", chart)
+        self.assertIn('item.getAttribute("data-series")===focusedSeries', chart)
+        self.assertIn("if(replacement)replacement.focus({preventScroll:true});",
+                      chart)
+        self.assertLess(chart.index("color:SERIES_COLORS[index"),
+                        chart.index(")).filter(account=>account.points.length)"))
+        self.assertIn("color:account.color", chart)
+
+        history_script = template.split("async function loadHistory(",
+                                        1)[1].split(
+            "/* =================================================== liquid-glass widget */",
+            1)[0]
+        self.assertIn("manual,background=false", history_script)
+        self.assertIn("const replaceView=!background;", history_script)
+        self.assertIn("if(background&&historyForegroundLoads)return;",
+                      history_script)
+        self.assertIn("++historyBackgroundRequest:++historyForegroundRequest",
+                      history_script)
+        self.assertIn("foregroundAtStart===historyForegroundRequest",
+                      history_script)
+        self.assertIn("isCurrent()&&replaceView", history_script)
+        self.assertIn("if(!background)historyForegroundLoads--;",
+                      history_script)
+        self.assertIn('if(active==="stats")loadHistory(false);', history_script)
+        self.assertIn('history-range").addEventListener("change",()=>loadHistory(false))',
+                      history_script)
+        self.assertIn('loadHistory(false,true);},6e4)', history_script)
+        self.assertIn('link.setAttribute("aria-current","page")', history_script)
+        self.assertIn('link.removeAttribute("aria-current")', history_script)
 
     def test_widget_href_uses_actual_server_address_port(self):
         port = 49152

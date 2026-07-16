@@ -21,15 +21,20 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from headroom import (  # noqa: E402
-    __main__, collect, connect, dashboard, handoff, paths, registry, route,
-    statusline,
+    __main__, collect, connect, dashboard, handoff, history, paths, registry,
+    route, statusline,
 )
+
+
+def _slot_id(name):
+    return hashlib.sha256(name.encode()).hexdigest()[:12]
 
 
 def _claude_row(name="a", used5h=10.0, used7d=20.0, ok=True, **over):
     now = int(time.time())
     row = {
-        "name": name, "provider": "claude", "plan": "Max 20x", "ok": ok,
+        "id": _slot_id(name), "name": name, "provider": "claude",
+        "plan": "Max 20x", "ok": ok,
         "stale": False, "routable": ok, "identity_verified": True,
         "identity": {"account_fingerprint": "AAAA", "credential_digest": "BBBB"},
         "trust_state": "verified" if ok else "held", "captured_at": now - 10,
@@ -71,6 +76,17 @@ class RegistryValidation(unittest.TestCase):
         cfg = {"schema_version": 1, "accounts": [
             {"name": "personal", "provider": "claude", "home": "~/.claude"}]}
         self.assertEqual(registry.validate(cfg), cfg)
+
+    def test_rejects_invalid_or_duplicate_slot_ids(self):
+        invalid = {"schema_version": 1, "accounts": [
+            dict(_account("a"), id="NOT-HEX")]}
+        duplicate = {"schema_version": 1, "accounts": [
+            dict(_account("a"), id="aaaaaaaaaaaa"),
+            dict(_account("b"), id="aaaaaaaaaaaa")]}
+        for config in (invalid, duplicate):
+            with self.subTest(config=config), \
+                    self.assertRaises(registry.RegistryError):
+                registry.validate(config)
 
     def test_unknown_model_family_raises(self):
         with self.assertRaises(registry.RegistryError):
@@ -2131,7 +2147,9 @@ class CollectionLockOrdering(unittest.TestCase):
                 mock.patch.object(registry, "dashboard_settings",
                                   return_value={"redact_emails": True}):
             collect.run_collect(quiet=True)
-        self.assertEqual(observed, [True])
+        # Initial collection and the locked ID/pin merge both remain inside the
+        # collection lock, so neither can race a slot removal.
+        self.assertEqual(observed, [True, True])
 
 
 class AuthRefreshCommand(unittest.TestCase):
@@ -2237,8 +2255,10 @@ class RemoveCommand(unittest.TestCase):
             json.dump({"claudeAiOauth": {"accessToken": "kept"}}, handle)
         registry.save({"schema_version": 1, "dashboard": {"title": "keep"},
                        "accounts": [
-                           {"name": "a", "provider": "claude", "home": self.home_a},
-                           {"name": "b", "provider": "claude", "home": self.home_b},
+                           {"id": _slot_id("a"), "name": "a",
+                            "provider": "claude", "home": self.home_a},
+                           {"id": _slot_id("b"), "name": "b",
+                            "provider": "claude", "home": self.home_b},
                        ]})
 
     def tearDown(self):
@@ -2255,6 +2275,7 @@ class RemoveCommand(unittest.TestCase):
         public = collect.public_snapshot(private, redact_emails=True)
         paths.write_json_atomic(paths.private_snapshot_path(), private)
         paths.write_json_atomic(paths.public_snapshot_path(), public, mode=0o644)
+        history.append_snapshot(public, now=int(time.time()))
         paths.write_json_atomic(paths.cooldowns_path(), {
             "a:*": 100, "a:sonnet": 200, "b:*": 300})
         paths.write_json_atomic(paths.quarantine_path(), {
@@ -2285,6 +2306,10 @@ class RemoveCommand(unittest.TestCase):
         self.assertEqual(paths.load_json(paths.private_snapshot_path())["integrity_warnings"],
                          ["unrelated warning"])
         self.assertEqual(public["integrity_warnings"], ["unrelated warning"])
+        history_rows = history.load_series(1, {_slot_id("b")})
+        self.assertEqual(len(history_rows), 1)
+        self.assertEqual([row["name"] for row in history_rows[0]["accounts"]],
+                         ["b"])
         self.assertEqual(route.cooldowns(), {"b:*": 300})
         self.assertEqual(route.quarantines(), {"b": {"reason": "other"}})
         self.assertIn("anthropic_usage_api",
@@ -2302,6 +2327,104 @@ class RemoveCommand(unittest.TestCase):
                 redirect_stderr(io.StringIO()):
             self.assertEqual(collect.cmd_remove(["a", "--yes"]), 2)
         self.assertEqual(len(registry.load()["accounts"]), 1)
+
+    def test_history_hygiene_runs_after_registry_and_snapshots_commit(self):
+        self._write_state()
+        def assert_committed(slot_id, name):
+            self.assertEqual(slot_id, _slot_id("a"))
+            self.assertEqual(name, "a")
+            self.assertEqual([entry["name"] for entry in
+                              registry.load()["accounts"]], ["b"])
+            for path in (paths.private_snapshot_path(),
+                         paths.public_snapshot_path()):
+                self.assertEqual([entry["name"] for entry in
+                                  paths.load_json(path)["accounts"]], ["b"])
+
+        with mock.patch.object(history, "remove_account",
+                               side_effect=assert_committed) as purge:
+            removed = collect.remove_slot("a")
+        self.assertEqual(removed["name"], "a")
+        purge.assert_called_once_with(_slot_id("a"), "a")
+
+    def test_history_purge_failure_warns_but_removal_succeeds(self):
+        self._write_state()
+        history_file = paths.history_path()
+        errors = io.StringIO()
+        with mock.patch.object(
+                history, "remove_account", side_effect=OSError("disk full")), \
+                redirect_stderr(errors):
+            removed = collect.remove_slot("a")
+        message = errors.getvalue()
+        self.assertEqual(removed["name"], "a")
+        self.assertIn("the slot is removed", message)
+        self.assertIn(history_file, message)
+        self.assertIn("history purge", message)
+        self.assertEqual(route.cooldowns(), {"b:*": 300})
+        self.assertEqual(route.quarantines(), {"b": {"reason": "other"}})
+        self.assertEqual([entry["name"] for entry in registry.load()["accounts"]],
+                         ["b"])
+        for path in (paths.private_snapshot_path(),
+                     paths.public_snapshot_path()):
+            self.assertEqual([entry["name"] for entry in
+                              paths.load_json(path)["accounts"]], ["b"])
+
+    def test_removal_aggregates_history_and_route_cleanup_errors(self):
+        self._write_state()
+        with mock.patch.object(history, "remove_account",
+                               side_effect=OSError("disk full")) as purge, \
+                mock.patch.object(route, "remove_slot_state",
+                                  side_effect=OSError("ledger locked")) as cleanup:
+            with self.assertRaises(RuntimeError) as raised:
+                collect.remove_slot("a")
+        purge.assert_called_once_with(_slot_id("a"), "a")
+        cleanup.assert_called_once_with("a")
+        message = str(raised.exception)
+        self.assertIn("history purge", message)
+        self.assertIn("disk full", message)
+        self.assertIn("route cleanup", message)
+        self.assertIn("ledger locked", message)
+
+    def test_snapshot_failure_still_attempts_route_cleanup(self):
+        self._write_state()
+        original_write = paths.write_json_atomic
+
+        def fail_private(path, value, mode=0o600):
+            if path == paths.private_snapshot_path():
+                raise OSError("snapshot crash")
+            return original_write(path, value, mode=mode)
+
+        with mock.patch.object(paths, "write_json_atomic",
+                               side_effect=fail_private), \
+                mock.patch.object(route, "remove_slot_state",
+                                  wraps=route.remove_slot_state) as cleanup, \
+                self.assertRaisesRegex(
+                    RuntimeError, "private snapshot cleanup.*snapshot crash"):
+            collect.remove_slot("a")
+        cleanup.assert_called_once_with("a")
+        self.assertEqual([entry["name"] for entry in registry.load()["accounts"]],
+                         ["b"])
+        self.assertEqual(route.cooldowns(), {"b:*": 300})
+        self.assertEqual(route.quarantines(), {"b": {"reason": "other"}})
+
+    def test_registry_removal_without_purge_hides_dead_id_immediately(self):
+        self._write_state()
+        registry.remove_account("a")
+        self.assertTrue(any(account["name"] == "a"
+                            for value in history._read_rows(paths.history_path())
+                            for account in value["accounts"]))
+        served = history.load_series(1, {_slot_id("b")})
+        self.assertEqual({account["name"] for value in served
+                          for account in value["accounts"]}, {"b"})
+
+    def test_same_name_add_clears_leftover_route_state(self):
+        self._write_state()
+        old_id = registry.remove_account("a")["id"]
+        added = connect.add_account(
+            registry.load(), "a", "claude", self.home_a, "a@example.test")
+        self.assertRegex(added["id"], r"^[0-9a-f]{12,32}$")
+        self.assertNotEqual(added["id"], old_id)
+        self.assertEqual(route.cooldowns(), {"b:*": 300})
+        self.assertEqual(route.quarantines(), {"b": {"reason": "other"}})
 
 
 class DashboardRemovalOrdering(unittest.TestCase):

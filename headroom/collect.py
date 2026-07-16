@@ -38,7 +38,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-from . import paths, registry
+from . import history, paths, registry
 
 IDENTITY_TIMEOUT = paths.env_int("HEADROOM_IDENTITY_TIMEOUT", 15)
 CODEX_STALE_AFTER = paths.env_int("HEADROOM_CODEX_STALE_AFTER", 1800)
@@ -49,7 +49,8 @@ OBSERVATION_MAX_AGE = paths.env_int("HEADROOM_OBSERVATION_MAX_AGE", 1800)
 SCHEMA_VERSION = 1
 
 PUBLIC_FIELDS = {
-    "name", "email", "provider", "plan", "ok", "note", "error_code", "retry_at",
+    "id", "name", "email", "provider", "plan", "ok", "note", "error_code",
+    "retry_at",
     "captured_at", "source", "stale", "windows", "identity_verified",
     "identity_method", "trust_state", "routable", "subscription",
     "throttle_carryover",
@@ -1047,7 +1048,8 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
         "accounts": [],
     }
     for account in accounts:
-        result = {"name": account["name"], "provider": account["provider"]}
+        result = {"id": account.get("id"), "name": account["name"],
+                  "provider": account["provider"]}
         try:
             if account["provider"] == "claude":
                 identity = claude_identity(account["home"])
@@ -1306,9 +1308,15 @@ def run_collect(quiet=False):
                            previous=previous)
         pins = {a["name"]: a.pop("pin_usage_org")
                 for a in snapshot["accounts"] if a.get("pin_usage_org")}
-        # merge pins under the config lock against the LATEST config, so a
-        # concurrent `connect` account-add is never overwritten by our stale copy
-        registry.apply_pins(pins)
+        # Merge pins and backfill IDs under the config lock against the LATEST
+        # registry, so concurrent account additions are preserved. The returned
+        # view is also the authority for this collection's live history IDs.
+        live_accounts = registry.apply_pins(pins)
+        live_by_name = {account["name"]: account["id"]
+                        for account in live_accounts}
+        for account in snapshot["accounts"]:
+            if account["name"] in live_by_name:
+                account["id"] = live_by_name[account["name"]]
         # carryover rows count as throttled for the backoff ledger: only a
         # run with NO throttle evidence at all may clear the provider backoff
         if any(a.get("provider") == "claude" and a.get("ok")
@@ -1323,11 +1331,23 @@ def run_collect(quiet=False):
         # redaction change made mid-collect governs the published projection,
         # and default to redacted if unset
         settings = registry.dashboard_settings()
+        public = public_snapshot(snapshot, settings.get("redact_emails", True))
         paths.write_json_atomic(
             paths.public_snapshot_path(),
-            public_snapshot(snapshot, settings.get("redact_emails", True)),
+            public,
             mode=0o644,
         )
+        try:
+            history.append_snapshot(
+                public,
+                live_ids={account["id"] for account in live_accounts},
+            )
+        except Exception as error:  # history must never break collection
+            try:
+                print(f"headroom: history append failed: {error}",
+                      file=sys.stderr)
+            except Exception:
+                pass
         if not quiet:
             print_snapshot(snapshot)
         return snapshot
@@ -1382,17 +1402,50 @@ def remove_slot(name):
         # Refuse before mutating the registry if a protective ledger cannot be
         # read and therefore cannot be safely scrubbed.
         route.preflight_remove_slot_state()
-        # The registry mutation runs before the cooldown/quarantine scrub,
-        # preserving the established config -> cooldown -> quarantine order.
-        # The collection lock covers the full sequence, so a collector cannot
-        # start from the old registry and later overwrite these pruned feeds.
+        # remove_account reloads under the registry lock, revalidating that the
+        # slot still exists before the first mutation.  The collection lock
+        # covers the full sequence, so a collector cannot later republish it.
         removed = registry.remove_account(name)
-        if _prune_snapshot_slot(private, name):
-            paths.write_json_atomic(paths.private_snapshot_path(), private)
-        if _prune_snapshot_slot(public, name):
-            paths.write_json_atomic(paths.public_snapshot_path(), public,
-                                    mode=0o644)
-        route.remove_slot_state(name)
+        failures = []
+        warnings = []
+        try:
+            try:
+                if _prune_snapshot_slot(private, name):
+                    paths.write_json_atomic(
+                        paths.private_snapshot_path(), private)
+            except Exception as error:
+                failures.append(("private snapshot cleanup", error))
+            try:
+                if _prune_snapshot_slot(public, name):
+                    paths.write_json_atomic(
+                        paths.public_snapshot_path(), public, mode=0o644)
+            except Exception as error:
+                failures.append(("public snapshot cleanup", error))
+            try:
+                history.remove_account(removed.get("id"), name)
+            except Exception as error:
+                warnings.append((
+                    f"history purge for {paths.history_path()}", error))
+        finally:
+            try:
+                route.remove_slot_state(name)
+            except Exception as error:
+                failures.append(("route cleanup", error))
+        if failures:
+            details = "; ".join(
+                f"{operation}: {error}"
+                for operation, error in failures + warnings)
+            raise RuntimeError(
+                f"the slot is removed; cleanup failed for account {name!r}: "
+                f"{details}") from failures[0][1]
+        if warnings:
+            details = "; ".join(
+                f"{operation}: {error}" for operation, error in warnings)
+            try:
+                print(f"headroom: warning: the slot is removed; {details}",
+                      file=sys.stderr)
+            except Exception:
+                pass
         return removed
 
 

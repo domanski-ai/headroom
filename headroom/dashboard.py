@@ -20,7 +20,7 @@ import webbrowser
 from dataclasses import dataclass
 
 from . import collect as collector
-from . import paths, registry, widget
+from . import history, paths, registry, widget
 
 TEMPLATE = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "dashboard", "template.html")
@@ -145,7 +145,8 @@ def build_demo(out_dir=None):
     now = int(time.time())
     data["generated"] = now - 30
     resets = {"5h": now + 2 * 3600 + 11 * 60, "7d": now + 3 * 86400}
-    for account in data.get("accounts", []):
+    for index, account in enumerate(data.get("accounts", []), 1):
+        account["id"] = f"{index:012x}"
         account["captured_at"] = now - 30
         for key, window in (account.get("windows") or {}).items():
             window["resets_at"] = resets["5h"] if key == "5h" else resets["7d"]
@@ -159,7 +160,8 @@ def build_demo(out_dir=None):
     os.makedirs(out_dir, exist_ok=True)
     demo_config = {"schema_version": 1,
                    "dashboard": {"theme": "midnight", "title": "headroom (demo)"},
-                   "accounts": [{"name": a["name"], "provider": a["provider"],
+                   "accounts": [{"id": a["id"], "name": a["name"],
+                                 "provider": a["provider"],
                                  "home": "/tmp/demo/" + a["name"]}
                                 for a in data["accounts"]]}
     build(demo_config, out_dir)
@@ -267,6 +269,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(b"forbidden: non-loopback Host")
             return
         route = urllib.parse.urlsplit(self.path).path
+        if route == "/history.json":
+            self._serve_history()
+            return
         if route in ("/usage.json", "/widget.json", "/widget.txt"):
             self._serve_feed(route)
             return
@@ -294,6 +299,46 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _serve_history(self):
+        try:
+            if not history.enabled():
+                self._send_body(
+                    503, "application/json", b'{"error":"history_disabled"}')
+                return
+            query = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(self.path).query)
+            try:
+                days = int((query.get("days") or [7])[0])
+            except (TypeError, ValueError):
+                days = 7
+            days = min(history.retention_days(), max(1, days))
+            if self.demo:
+                snapshot = paths.load_json(
+                    os.path.join(self.directory, "usage.json"))
+                live_ids = {account.get("id")
+                            for account in (snapshot or {}).get("accounts", [])
+                            if account.get("id")}
+                rows = history.demo_rows(snapshot, days) \
+                    if isinstance(snapshot, dict) else []
+            else:
+                config = registry.load()
+                live_ids = {account["id"] for account in registry.accounts(config)
+                            if account.get("id")}
+                rows = history.load_series(days, live_ids)
+            if not rows:
+                self._send_body(
+                    503, "application/json", b'{"error":"no history yet"}')
+                return
+            value = history.response(
+                days, live_ids, rows=rows, generated=int(time.time()))
+            body = json.dumps(value, allow_nan=False,
+                              separators=(",", ":")).encode("utf-8")
+        except Exception:
+            self._send_body(
+                503, "application/json", b'{"error":"invalid history"}')
+            return
+        self._send_body(200, "application/json", body)
 
     def _serve_feed(self, route):
         result = self._snapshot_result()
