@@ -27,7 +27,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from headroom import collect, handoff, handoff_codex, paths, route  # noqa: E402
+from headroom import collect, handoff, handoff_codex, paths, route, tokens  # noqa: E402
 
 SID = "0199aaaa-bbbb-4ccc-8ddd-eeeeffff0001"
 OTHER_SID = "0199aaaa-bbbb-4ccc-8ddd-eeeeffff0002"
@@ -769,7 +769,8 @@ class CodexCommit(CodexHandoffBase):
         self.assertEqual(result.destination, destination)
         with open(destination, "rb") as handle:
             copied = handle.read()
-        self.assertEqual(copied, _rollout_bytes(SID))
+        self.assertEqual(copied,
+                         _rollout_bytes(SID) + tokens.handoff_marker_line())
         self.assertEqual(os.stat(destination).st_mode & 0o777, 0o600)
         # source rollout is immutable and both auth.json files are untouched
         with open(self.rollout, "rb") as handle:

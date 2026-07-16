@@ -33,11 +33,14 @@ def display_snapshot(snapshot, evaluated_at=None, force_noncurrent_reason=None,
                      config=None):
     """Attach the central display projection consumed by dashboard JavaScript."""
     value = dict(snapshot)
+    # The source snapshot is untrusted with respect to the current opt-in.
+    # Remove any stale/cached payload before consulting one exact config view.
+    value.pop("token_stats", None)
     value["_headroom_display"] = widget.project_dashboard(
         snapshot, evaluated_at, force_noncurrent_reason)
     try:
-        if registry.token_stats_enabled(config):
-            live_config = registry.load() if config is None else config
+        live_config = registry.load() if config is None else config
+        if registry.token_stats_enabled(live_config):
             token_stats = tokens.load_summary(
                 registry.accounts(live_config), now=evaluated_at)
             if token_stats is not None:

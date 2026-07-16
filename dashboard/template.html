@@ -308,6 +308,8 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
 .stats-content { display: grid; gap: 18px; margin-top: 16px; }
 .token-stats { display: grid; gap: 18px; margin-top: 16px; }
 .token-stats[hidden] { display: none; }
+.token-partial { margin: 0; color: var(--ink-3); font: 500 9px/1.4 var(--mono); }
+.token-partial[hidden] { display: none; }
 .token-summary { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 10px; }
 .token-tile { min-width: 0; padding: 15px 16px; border: 1px solid var(--line);
@@ -774,6 +776,7 @@ body.is-widget .shell { display: none; }
   </header>
 
   <div class="token-stats" id="token-stats" hidden>
+    <p class="token-partial" id="token-partial" hidden>Partial data</p>
     <section class="token-summary" aria-label="Token summary">
       <article class="token-tile"><span>Lifetime tokens</span>
         <strong id="token-lifetime">–</strong><small>all token traffic</small></article>
@@ -1013,6 +1016,10 @@ function validate(data){
   data.token_stats=validateTokenStats(data.token_stats);
   return data;
 }
+function withoutTokenStats(data){
+  if(!data||typeof data!=="object")return data;
+  const clean=Object.assign({},data);delete clean.token_stats;return clean;
+}
 function render(data,forceNoncurrent){
   const now=Date.now()/1e3,display=data._headroom_display;
   if(display.freshness.state==="held"||!Number.isFinite(data.generated)||data.generated>now) snapshotState="held";
@@ -1091,12 +1098,12 @@ async function load(manual){
       render(data);
       // key the cache by the redaction setting so a cache written while emails
       // were visible is never reused after privacy is turned on
-      try{localStorage.setItem(CACHE_KEY,JSON.stringify(data));}catch(e){}
+      try{localStorage.setItem(CACHE_KEY,JSON.stringify(withoutTokenStats(data)));}catch(e){}
     }
   }catch(error){
     if(requestId===requestNumber){
       let cached=null;
-      try{cached=validate(JSON.parse(localStorage.getItem(CACHE_KEY)||"null"));}catch(e){}
+      try{cached=withoutTokenStats(validate(JSON.parse(localStorage.getItem(CACHE_KEY)||"null")));}catch(e){}
       // Only reuse a RECENT, non-future cache. An old cache may predate a
       // privacy change or a limit change; beyond an hour (or dated in the
       // future) we refuse it rather than resurface stale data as a snapshot.
@@ -1140,6 +1147,8 @@ function validateTokenStats(value){
   if(!tokenNumber(peak.grand_total))peak.grand_total=peak.total;
   if(!tokenNumber(summary.total_sessions))summary.total_sessions=0;
   if(!tokenNumber(summary.active_days))summary.active_days=0;
+  value.partial=value.partial===true;
+  if(!tokenNumber(value.failed_file_count))value.failed_file_count=0;
   if(!summary.longest_session||typeof summary.longest_session!=="object")
     summary.longest_session={seconds:0,date:null,account:null};
   if(!tokenNumber(summary.longest_session.seconds))summary.longest_session.seconds=0;
@@ -1181,32 +1190,55 @@ function humanDuration(value){
   const minutes=Math.floor(value/60),hours=Math.floor(minutes/60),rest=minutes%60;
   return (hours?hours+"h ":"")+(rest||!hours?rest+"m":"");
 }
-function tokenWeeklySeries(days){
-  const buckets={};
-  Object.entries(days||{}).forEach(([day,counts])=>{
-    const date=new Date(day+"T00:00:00Z");
-    if(!Number.isFinite(date.getTime()))return;
-    date.setUTCDate(date.getUTCDate()-date.getUTCDay());
-    const key=utcDay(date);
-    buckets[key]=(buckets[key]||0)+(tokenNumber(counts.grand_total)?counts.grand_total:0);
-  });
-  return Object.keys(buckets).sort().map(date=>({date:date,total:buckets[date]}));
+const TOKEN_DAY_MS=864e5;
+function tokenDayEpoch(day){
+  const value=typeof day==="string"?Date.parse(day+"T00:00:00Z"):NaN;
+  return Number.isFinite(value)?value:null;
 }
-function tokenCumulativeSeries(days){
-  let running=0;
-  return Object.keys(days||{}).sort().map(date=>{
-    const counts=days[date]||{};
-    running+=tokenNumber(counts.grand_total)?counts.grand_total:0;
-    return{date:date,total:running};
+function tokenDenseSeries(days,endDay){
+  const entries=Object.entries(days||{}).map(([day,counts])=>({
+    date:day,ts:tokenDayEpoch(day),total:tokenNumber(counts&&counts.grand_total)?counts.grand_total:0
+  })).filter(point=>point.ts!=null).sort((a,b)=>a.ts-b.ts);
+  if(!entries.length)return[];
+  const totals=new Map(entries.map(point=>[point.ts,point.total]));
+  const requestedEnd=tokenDayEpoch(endDay),end=Math.max(entries[entries.length-1].ts,requestedEnd==null?0:requestedEnd);
+  const dense=[];
+  for(let ts=entries[0].ts;ts<=end;ts+=TOKEN_DAY_MS)
+    dense.push({date:utcDay(new Date(ts)),ts:ts,total:totals.get(ts)||0});
+  return dense;
+}
+function tokenWeeklySeries(days,endDay){
+  const dense=tokenDenseSeries(days,endDay);
+  if(!dense.length)return[];
+  const first=new Date(dense[0].ts);first.setUTCDate(first.getUTCDate()-first.getUTCDay());
+  const buckets=new Map();
+  for(let ts=first.getTime();ts<=dense[dense.length-1].ts;ts+=7*TOKEN_DAY_MS)buckets.set(ts,0);
+  dense.forEach(point=>{
+    const date=new Date(point.ts);date.setUTCDate(date.getUTCDate()-date.getUTCDay());
+    buckets.set(date.getTime(),(buckets.get(date.getTime())||0)+point.total);
   });
+  return Array.from(buckets,([ts,total])=>({date:utcDay(new Date(ts)),ts:ts,total:total}));
+}
+function tokenCumulativeSeries(days,endDay){
+  let running=0;
+  return tokenDenseSeries(days,endDay).map(point=>{
+    running+=point.total;
+    return{date:point.date,ts:point.ts,total:running};
+  });
+}
+function tokenHeatmapMaximum(days,start,today){
+  const low=start.getTime(),high=today.getTime();
+  const values=Object.entries(days||{}).filter(([day])=>{
+    const ts=tokenDayEpoch(day);return ts!=null&&ts>=low&&ts<=high;
+  }).map(([,counts])=>tokenNumber(counts&&counts.grand_total)?counts.grand_total:0);
+  return values.length?Math.max(...values):0;
 }
 function renderTokenHeatmap(){
   const target=document.getElementById("token-heatmap"),days=tokenStats.days||{};
   const now=new Date(),today=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate()));
   const weekStart=new Date(today);weekStart.setUTCDate(today.getUTCDate()-today.getUTCDay());
   const start=new Date(weekStart);start.setUTCDate(weekStart.getUTCDate()-51*7);
-  const values=Object.values(days).map(count=>count.grand_total).filter(value=>value>0);
-  const maximum=values.length?Math.max(...values):0;
+  const maximum=tokenHeatmapMaximum(days,start,today);
   const left=31,top=20,step=14,size=10,width=left+52*step,height=top+7*step+2;
   let labels='<text class="token-heat-label" x="0" y="'+(top+step+8)+'">Mon</text>'+
     '<text class="token-heat-label" x="0" y="'+(top+3*step+8)+'">Wed</text>'+
@@ -1240,22 +1272,24 @@ function renderTokenSeries(series,mode){
   const width=900,height=230,left=42,right=18,top=14,bottom=32;
   const plotWidth=width-left-right,plotHeight=height-top-bottom;
   const maximum=Math.max(...series.map(point=>point.total),1);
-  const x=index=>left+(series.length===1?plotWidth/2:index*plotWidth/(series.length-1));
+  const firstTs=series[0].ts,lastTs=series[series.length-1].ts;
+  const x=point=>left+(firstTs===lastTs?plotWidth/2:(point.ts-firstTs)*plotWidth/(lastTs-firstTs));
   const y=value=>top+(1-value/maximum)*plotHeight;
   const dates=[0,Math.floor((series.length-1)/2),series.length-1].map((index,labelIndex)=>
-    '<text class="chart-axis" x="'+x(index)+'" y="'+(height-9)+'" text-anchor="'+
+    '<text class="chart-axis" x="'+x(series[index])+'" y="'+(height-9)+'" text-anchor="'+
     (labelIndex===0?"start":labelIndex===2?"end":"middle")+'">'+esc(tokenDate(series[index].date))+"</text>").join("");
   let drawing="";
   if(mode==="weekly"){
-    const gap=series.length>1?plotWidth/series.length:plotWidth,bar=Math.max(2,gap*.68);
+    const gap=series.length>1?x(series[1])-x(series[0]):plotWidth,bar=Math.max(2,gap*.68);
     drawing=series.map((point,index)=>'<rect class="token-heat-cell" data-level="4" x="'+
-      (left+index*gap+(gap-bar)/2)+'" y="'+y(point.total)+'" width="'+bar+'" height="'+
-      Math.max(1,top+plotHeight-y(point.total))+'"><title>'+esc(point.date+": "+formatTokens(point.total)+" tokens")+
+      (x(point)-bar/2)+'" y="'+y(point.total)+'" width="'+bar+'" height="'+
+      Math.max(point.total>0?1:0,top+plotHeight-y(point.total))+'"><title>'+esc(point.date+": "+formatTokens(point.total)+" tokens")+
       "</title></rect>").join("");
   }else{
-    const line=series.map((point,index)=>(index?"L":"M")+x(index).toFixed(2)+" "+y(point.total).toFixed(2)).join(" ");
+    let line="M"+x(series[0]).toFixed(2)+" "+y(series[0].total).toFixed(2);
+    series.slice(1).forEach(point=>{line+=" H"+x(point).toFixed(2)+" V"+y(point.total).toFixed(2);});
     drawing='<path class="chart-line" stroke="var(--accent)" d="'+line+'"></path>'+
-      '<circle fill="var(--accent)" cx="'+x(series.length-1).toFixed(2)+'" cy="'+
+      '<circle fill="var(--accent)" cx="'+x(series[series.length-1]).toFixed(2)+'" cy="'+
       y(series[series.length-1].total).toFixed(2)+'" r="2.8"><title>'+esc(formatTokens(series[series.length-1].total)+
       " cumulative tokens")+"</title></circle>";
   }
@@ -1272,16 +1306,18 @@ function renderTokenActivity(){
     renderTokenHeatmap();
   }else if(tokenActivityMode==="weekly"){
     note.textContent="Grand-total tokens grouped into UTC Sunday-start 7-day buckets.";
-    renderTokenSeries(tokenWeeklySeries(tokenStats.days),"weekly");
+    renderTokenSeries(tokenWeeklySeries(tokenStats.days,utcDay(new Date())),"weekly");
   }else{
     note.textContent="Running grand-total tokens across the available daily history.";
-    renderTokenSeries(tokenCumulativeSeries(tokenStats.days),"cumulative");
+    renderTokenSeries(tokenCumulativeSeries(tokenStats.days,utcDay(new Date())),"cumulative");
   }
 }
 function renderTokenStats(){
-  const target=document.getElementById("token-stats"),leaderboard=document.getElementById("leaderboard-panel");
+  const target=document.getElementById("token-stats"),leaderboard=document.getElementById("leaderboard-panel"),
+    partial=document.getElementById("token-partial");
   if(!tokenStats){
     target.hidden=true;
+    partial.hidden=true;
     document.getElementById("stats-title").textContent="Usage history";
     document.getElementById("stats-intro").textContent="Window utilization over time. Percentages show each provider window consumed, never token volume.";
     document.getElementById("side-note").innerHTML="Window percentage only.<br>No token counts stored.";
@@ -1289,6 +1325,9 @@ function renderTokenStats(){
     return;
   }
   target.hidden=false;
+  partial.hidden=!tokenStats.partial;
+  partial.textContent=tokenStats.partial?"Partial data · "+tokenStats.failed_file_count+
+    (tokenStats.failed_file_count===1?" file could not be read.":" files could not be read."):"";
   document.getElementById("stats-title").textContent="Usage stats";
   document.getElementById("stats-intro").textContent="Local token activity and provider-window utilization in one view.";
   document.getElementById("side-note").innerHTML="Local token aggregates.<br>No message content stored.";

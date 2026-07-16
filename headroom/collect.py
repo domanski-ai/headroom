@@ -1348,18 +1348,20 @@ def run_collect(quiet=False):
                       file=sys.stderr)
             except Exception:
                 pass
+    # Session-log scanning can take seconds on a cold pass. It has its own
+    # flock and exact registry view, so it runs only after the collection lock
+    # is released and cannot block snapshot publication or race slot purges.
+    try:
+        tokens.collect()
+    except Exception as error:  # token telemetry must never break collection
         try:
-            if registry.token_stats_enabled(config):
-                tokens.collect(live_accounts, config=config)
-        except Exception as error:  # token telemetry must never break collection
-            try:
-                print(f"headroom: token stats scan failed: {error}",
-                      file=sys.stderr)
-            except Exception:
-                pass
-        if not quiet:
-            print_snapshot(snapshot)
-        return snapshot
+            print(f"headroom: token stats scan failed: {error}",
+                  file=sys.stderr)
+        except Exception:
+            pass
+    if not quiet:
+        print_snapshot(snapshot)
+    return snapshot
 
 
 def _warning_mentions_slot(warning, name):
@@ -1435,6 +1437,11 @@ def remove_slot(name):
             except Exception as error:
                 warnings.append((
                     f"history purge for {paths.history_path()}", error))
+            try:
+                tokens.remove_account(removed.get("id"))
+            except Exception as error:
+                warnings.append((
+                    f"token purge for {paths.tokens_dir()}", error))
         finally:
             try:
                 route.remove_slot_state(name)

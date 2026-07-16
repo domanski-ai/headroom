@@ -36,10 +36,15 @@ here so users can judge them for their own threat model.
   positive deltas to event days, ignores repeated totals, and treats a counter
   decrease as a reset. A future Codex schema that changes those semantics will
   require a parser update.
-- Claude duplicate suppression uses the request/message usage identity. For an
-  appended tail, only the boundary identity and identities in the new tail are
-  available; a future CLI that repeats an old usage record much later in the
-  same file could count it twice.
+- Claude duplicate suppression persists the most recent 512 hashed
+  request/message identities and their progressive maxima per file. A
+  duplicate repeated after it has fallen out of that bounded tail is accepted
+  and can count twice; the bound prevents transcript-sized scanner memory.
+- Handoffs created by this version carry a copied-prefix marker and are counted
+  exactly once across source and target slots. Historical target copies made
+  before that marker existed cannot be distinguished from native records and
+  may still double-count their copied prefix. Such copies are expected to be
+  rare and recent.
 - UTC timestamps define day boundaries and streaks. The current streak remains
   current through the following UTC day so an unfinished day does not erase a
   streak that was active yesterday.
@@ -94,8 +99,9 @@ headroom disables automation for that child and leaves the child running.
 
 A live cross-account test showed that Claude can resume a transcript ending in
 an unresolved `tool_use`: Claude re-drives the dangling call and reaches a
-usable prompt. Automatic handoff therefore copies the capped transcript
-byte-for-byte and prints `the interrupted tool call may re-run on resume`.
+usable prompt. Automatic handoff therefore preserves every source record,
+adds only the headroom copy-boundary record, and prints
+`the interrupted tool call may re-run on resume`.
 If the interrupted tool had an external side effect, that side effect may run
 twice. All manual handoffs require `--force` for a dangling call: a 99–100%
 usage snapshot alone is not an authenticated cap event and does not relax this

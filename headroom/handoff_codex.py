@@ -1,10 +1,11 @@
 """Codex provider adapter for the transactional conversation handoff.
 
 Codex persists sessions as ``$CODEX_HOME/sessions/YYYY/MM/DD/
-rollout-<timestamp>-<UUID>.jsonl``.  A handoff copies exactly that one rollout
-— never ``auth.json``, ``config.toml``, state databases, MCP credentials,
-memories, or shell state — to the SAME relative path inside another configured
-Codex home in the same ``handoff_group``, then resumes it there with
+rollout-<timestamp>-<UUID>.jsonl``.  A handoff copies that one rollout plus a
+content-free headroom boundary record — never ``auth.json``, ``config.toml``,
+state databases, MCP credentials, memories, or shell state — to the SAME
+relative path inside another configured Codex home in the same
+``handoff_group``, then resumes it there with
 ``CODEX_HOME=<target> codex resume <UUID>`` (or headlessly with ``codex exec
 resume``).  Every guard reuses the Claude handoff's transaction spine in
 :mod:`headroom.handoff` and fails closed.
@@ -354,14 +355,14 @@ def inspect_rollout(path, session_id, allow_dangling=False):
         raise HandoffError(
             "codex session stopped mid-tool-call (unresolved: %s); resume it "
             "once on the source account, or use --force for a manual "
-            "byte-for-byte fork" % ", ".join(unresolved))
+            "content-preserving fork" % ", ".join(unresolved))
     open_turn, dangling = _validate_lifecycle(records)
     if (open_turn or dangling) and not allow_dangling:
         raise HandoffError(
             "codex session stopped mid-turn (task_started without a real "
             "terminal boundary — task_complete/turn_complete/turn_aborted); "
             "resume it once on the source account, or use --force for a "
-            "manual byte-for-byte fork")
+            "manual content-preserving fork")
     return {
         "sha256": hashlib.sha256(data).hexdigest(),
         "bytes": len(data),

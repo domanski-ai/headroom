@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from headroom import (  # noqa: E402
     __main__, collect, connect, dashboard, handoff, history, paths, registry,
-    route, statusline,
+    route, statusline, tokens,
 )
 
 
@@ -1066,7 +1066,9 @@ class HandoffSafety(unittest.TestCase):
             self.assertEqual(handle.read(), self.bytes)
         with open(destination, "rb") as handle:
             copied = handle.read()
-        self.assertEqual(hashlib.sha256(copied).hexdigest(), digest)
+        self.assertTrue(copied.startswith(self.bytes))
+        self.assertTrue(copied.endswith(tokens.handoff_marker_line()))
+        self.assertEqual(hashlib.sha256(self.bytes).hexdigest(), digest)
         self.assertEqual(os.stat(destination).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(os.path.dirname(destination)).st_mode & 0o777,
                          0o700)
@@ -1129,6 +1131,11 @@ class HandoffSafety(unittest.TestCase):
                       output.getvalue())
         self.assertIn("data boundary", output.getvalue())
         self.assertEqual(os.stat(ledger).st_mode & 0o777, 0o600)
+        destination = handoff.destination_path(
+            self.target_home, self.transcript, self.SID)
+        with open(destination, "rb") as handle:
+            copied = handle.read()
+        self.assertEqual(copied, self.bytes + tokens.handoff_marker_line())
         mark.assert_called_once_with("source", "sonnet", mock.ANY,
                                      account_wide=True, window="5h")
 
@@ -2147,9 +2154,10 @@ class CollectionLockOrdering(unittest.TestCase):
                 mock.patch.object(registry, "dashboard_settings",
                                   return_value={"redact_emails": True}):
             collect.run_collect(quiet=True)
-        # Initial collection and the locked ID/pin merge both remain inside the
-        # collection lock, so neither can race a slot removal.
-        self.assertEqual(observed, [True, True])
+        # Initial collection and the locked ID/pin merge remain inside the
+        # collection lock. The third load belongs to the token scanner and is
+        # deliberately outside it (serialized by state/tokens/scan.lock).
+        self.assertEqual(observed, [True, True, False])
 
 
 class AuthRefreshCommand(unittest.TestCase):
@@ -2283,6 +2291,25 @@ class RemoveCommand(unittest.TestCase):
         paths.write_json_atomic(paths.backoff_path(), {
             "schema_version": 1, "providers": {"anthropic_usage_api": {
                 "retry_at": 500, "observed_at": 400}}})
+        paths.write_json_atomic(paths.token_scan_state_path(), {
+            "schema_version": tokens.SCHEMA_VERSION,
+            "last_scan": int(time.time()),
+            "files": {
+                _slot_id("a"): {"projects/a.jsonl": {
+                    "provider": "claude", "days": {}}},
+                _slot_id("b"): {"projects/b.jsonl": {
+                    "provider": "claude", "days": {}}},
+            },
+        })
+        paths.write_json_atomic(paths.token_daily_path(), {
+            "schema_version": tokens.SCHEMA_VERSION,
+            "generated": int(time.time()), "partial": False,
+            "failed_file_count": 0,
+            "accounts": {
+                _slot_id("a"): {"2026-07-15": {}},
+                _slot_id("b"): {"2026-07-15": {}},
+            },
+        })
 
     def test_remove_preserves_home_and_non_target_state(self):
         self._write_state()
@@ -2314,6 +2341,10 @@ class RemoveCommand(unittest.TestCase):
         self.assertEqual(route.quarantines(), {"b": {"reason": "other"}})
         self.assertIn("anthropic_usage_api",
                       paths.load_json(paths.backoff_path())["providers"])
+        token_state = paths.load_json(paths.token_scan_state_path())
+        token_daily = paths.load_json(paths.token_daily_path())
+        self.assertEqual(list(token_state["files"]), [_slot_id("b")])
+        self.assertEqual(list(token_daily["accounts"]), [_slot_id("b")])
 
     def test_remove_rejects_noninteractive_without_yes_unknown_and_final(self):
         with mock.patch.object(sys.stdin, "isatty", return_value=False), \
@@ -2346,6 +2377,25 @@ class RemoveCommand(unittest.TestCase):
         self.assertEqual(removed["name"], "a")
         purge.assert_called_once_with(_slot_id("a"), "a")
 
+    def test_token_purge_takes_token_lock_and_runs_after_registry_commit(self):
+        self._write_state()
+        original = tokens.remove_account
+
+        def assert_committed(slot_id):
+            self.assertEqual(slot_id, _slot_id("a"))
+            self.assertEqual([entry["name"] for entry in
+                              registry.load()["accounts"]], ["b"])
+            return original(slot_id)
+
+        with mock.patch.object(tokens, "remove_account",
+                               side_effect=assert_committed) as purge, \
+                mock.patch.object(tokens, "scan_lock",
+                                  wraps=tokens.scan_lock) as locked:
+            removed = collect.remove_slot("a")
+        self.assertEqual(removed["name"], "a")
+        purge.assert_called_once_with(_slot_id("a"))
+        locked.assert_called_once_with(blocking=True)
+
     def test_history_purge_failure_warns_but_removal_succeeds(self):
         self._write_state()
         history_file = paths.history_path()
@@ -2367,6 +2417,17 @@ class RemoveCommand(unittest.TestCase):
                      paths.public_snapshot_path()):
             self.assertEqual([entry["name"] for entry in
                               paths.load_json(path)["accounts"]], ["b"])
+
+    def test_token_purge_failure_warns_but_removal_succeeds(self):
+        self._write_state()
+        errors = io.StringIO()
+        with mock.patch.object(
+                tokens, "remove_account", side_effect=OSError("disk full")), \
+                redirect_stderr(errors):
+            removed = collect.remove_slot("a")
+        self.assertEqual(removed["name"], "a")
+        self.assertIn("token purge", errors.getvalue())
+        self.assertIn(paths.tokens_dir(), errors.getvalue())
 
     def test_removal_aggregates_history_and_route_cleanup_errors(self):
         self._write_state()

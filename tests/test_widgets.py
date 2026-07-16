@@ -398,6 +398,64 @@ class CodexLiftedFiveHourDashboardJS(unittest.TestCase):
         self.assertTrue(out["hr_bar_green"])
 
 
+class TokenChartMathJS(unittest.TestCase):
+    @staticmethod
+    def _harness():
+        with open(dashboard.TEMPLATE) as handle:
+            template = handle.read()
+        functions = "function tokenNumber" + template.split(
+            "function tokenNumber", 1)[1].split(
+                "function renderTokenStats", 1)[0]
+        tail = r"""
+const days={
+  "2026-01-01":{grand_total:10},
+  "2026-01-03":{grand_total:30},
+  "2027-01-01":{grand_total:999}
+};
+const windowDays={
+  "2026-01-01":{grand_total:10},
+  "2026-01-03":{grand_total:30}
+};
+const weekly=tokenWeeklySeries(windowDays,"2026-01-11");
+const cumulative=tokenCumulativeSeries(windowDays,"2026-01-05");
+const target={innerHTML:""};
+globalThis.document={getElementById:()=>target};
+renderTokenSeries(cumulative,"cumulative");
+console.log(JSON.stringify({
+  maximum:tokenHeatmapMaximum(days,new Date("2026-01-01T00:00:00Z"),new Date("2026-01-03T00:00:00Z")),
+  weekly:weekly,
+  cumulative:cumulative,
+  path:target.innerHTML
+}));
+"""
+        return ('"use strict";\nfunction esc(value){return String(value);}\n'
+                + functions + tail)
+
+    @unittest.skipUnless(NODE, "node runtime required to execute token charts")
+    def test_window_scale_dense_utc_buckets_and_step_cumulative(self):
+        proc = subprocess.run([NODE, "-"], input=self._harness(),
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        value = json.loads(proc.stdout.strip().splitlines()[-1])
+        # The out-of-window 999 value must not flatten the rendered heatmap.
+        self.assertEqual(value["maximum"], 30)
+        self.assertEqual([point["total"] for point in value["weekly"]],
+                         [40, 0, 0])
+        self.assertTrue(all(
+            right["ts"] - left["ts"] == 7 * 86400000
+            for left, right in zip(value["weekly"], value["weekly"][1:])))
+        self.assertEqual([point["total"] for point in value["cumulative"]],
+                         [10, 10, 40, 40, 40])
+        self.assertTrue(all(
+            right["ts"] - left["ts"] == 86400000
+            for left, right in zip(
+                value["cumulative"], value["cumulative"][1:])))
+        path_data = re.search(r' d="([^"]+)"', value["path"]).group(1)
+        self.assertIn(" H", path_data)
+        self.assertIn(" V", path_data)
+        self.assertNotIn(" L", path_data)
+
+
 class WidgetRendererTests(unittest.TestCase):
     def test_sanitizer_removes_newlines_and_controls(self):
         cleaned = widget.sanitize("a\r\nb\x00c\x1fd\x7fe\u200bf")
@@ -988,6 +1046,11 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertRegex(render_body,
                          r"sourceFailed=forceNoncurrent===true\|\|")
         self.assertRegex(fallback, r"render\(cached,true\)")
+        self.assertIn("JSON.stringify(withoutTokenStats(data))", fallback)
+        self.assertIn("cached=withoutTokenStats(validate(", fallback)
+        cache_strip = script.split("function withoutTokenStats(data){",
+                                   1)[1].split("\n}", 1)[0]
+        self.assertIn("delete clean.token_stats", cache_strip)
 
     def test_dom_tone_allowlist_covers_every_projected_tone(self):
         # every colour tone the Python projection can emit for a live window
@@ -1087,20 +1150,21 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertIn('link.removeAttribute("aria-current")', history_script)
 
         self.assertIn('id="token-stats" hidden', template)
+        self.assertIn('id="token-partial" hidden', template)
         self.assertIn('id="token-heatmap"', template)
         self.assertIn('class="token-heat-cell"', template)
         self.assertIn('data-token-mode="daily"', template)
         self.assertIn('data-token-mode="weekly"', template)
         self.assertIn('data-token-mode="cumulative"', template)
-        weekly = template.split("function tokenWeeklySeries(days){",
+        weekly = template.split("function tokenWeeklySeries(days,endDay){",
                                 1)[1].split("\n}", 1)[0]
-        self.assertIn("date.setUTCDate(date.getUTCDate()-date.getUTCDay())",
-                      weekly)
-        self.assertIn("counts.grand_total", weekly)
-        cumulative = template.split("function tokenCumulativeSeries(days){",
+        self.assertIn("tokenDenseSeries(days,endDay)", weekly)
+        self.assertIn("buckets.set", weekly)
+        cumulative = template.split(
+            "function tokenCumulativeSeries(days,endDay){",
                                     1)[1].split("\n}", 1)[0]
         self.assertIn("running+=", cumulative)
-        self.assertIn("counts.grand_total", cumulative)
+        self.assertIn("tokenDenseSeries(days,endDay)", cumulative)
         token_render = template.split("function renderTokenStats(){",
                                       1)[1].split("\n}", 1)[0]
         self.assertIn("if(!tokenStats)", token_render)
@@ -1110,6 +1174,8 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertIn("summary.peak.grand_total", token_render)
         self.assertIn('getElementById("token-longest-session")', token_render)
         self.assertIn('getElementById("token-insights")', token_render)
+        self.assertIn("tokenStats.partial", token_render)
+        self.assertIn("tokenStats.failed_file_count", token_render)
         leaderboard = template.split("function renderLeaderboard(data){",
                                      1)[1].split("\n}", 1)[0]
         self.assertIn("if(tokenStats)", leaderboard)

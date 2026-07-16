@@ -64,9 +64,10 @@ evidence leaves Claude running.
 
 After every non-mutating preflight succeeds, headroom sends Claude one
 `SIGTERM`, requires its `SessionEnd` cleanup hook, verifies the final transcript
-again, publishes a byte-identical copy without overwriting anything in the
-target account, and resumes with a forked session. The source transcript is
-never modified. If post-stop validation fails, the source session is relaunched
+again, publishes the source bytes plus one content-free headroom boundary
+record without overwriting anything in the target account, and resumes with a
+forked session. The source transcript is never modified. If post-stop
+validation fails, the source session is relaunched
 with automation disabled. Three automatic handoffs in any rolling ten minutes
 trips the loop guard; the fourth child stays alive.
 
