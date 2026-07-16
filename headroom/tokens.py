@@ -854,6 +854,11 @@ def _enforce_state_budgets(state, now):
         state["budget_dropped_files"] = dict(dropped)
         state["budget_partial"] = True
         size = _serialized_state_size(state)
+    # eviction only removes nested file entries; state that stays over
+    # budget for any other reason (e.g. a pathological number of slot
+    # mappings) must still be reported as partial rather than silently pass
+    if size > MAX_SERIALIZED_STATE_BYTES:
+        state["budget_partial"] = True
     return compacted, sum(dropped.values())
 
 

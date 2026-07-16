@@ -450,7 +450,6 @@ def _dispatch(argv):
                             private, settings.get("redact_emails", True)),
                         mode=0o644)
                 dashboard.build(snapshot_file=paths.public_snapshot_path())
-            collect._trigger_token_scan(synchronous=False)
         return 0
     if command == "serve":
         from . import dashboard
