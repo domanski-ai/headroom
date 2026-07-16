@@ -38,7 +38,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-from . import paths, registry
+from . import history, paths, registry
 
 IDENTITY_TIMEOUT = paths.env_int("HEADROOM_IDENTITY_TIMEOUT", 15)
 CODEX_STALE_AFTER = paths.env_int("HEADROOM_CODEX_STALE_AFTER", 1800)
@@ -1323,11 +1323,16 @@ def run_collect(quiet=False):
         # redaction change made mid-collect governs the published projection,
         # and default to redacted if unset
         settings = registry.dashboard_settings()
+        public = public_snapshot(snapshot, settings.get("redact_emails", True))
         paths.write_json_atomic(
             paths.public_snapshot_path(),
-            public_snapshot(snapshot, settings.get("redact_emails", True)),
+            public,
             mode=0o644,
         )
+        try:
+            history.append_snapshot(public)
+        except Exception as error:  # history must never break collection
+            print(f"headroom: history append failed: {error}", file=sys.stderr)
         if not quiet:
             print_snapshot(snapshot)
         return snapshot

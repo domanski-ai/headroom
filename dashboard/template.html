@@ -108,8 +108,35 @@ body::before {
     linear-gradient(90deg, var(--bg-grid) 1px, transparent 1px);
   background-size: 32px 32px;
 }
-.shell { position: relative; z-index: 1; width: min(100% - 36px, 1280px);
-         margin: 0 auto; padding: 22px 0 56px; }
+.app-shell { position: relative; z-index: 1; display: grid;
+             grid-template-columns: 176px minmax(0, 1fr); gap: 22px;
+             width: min(100% - 36px, 1480px); margin: 0 auto; }
+.shell { min-width: 0; padding: 22px 0 56px; }
+
+.side-panel { position: sticky; top: 22px; align-self: start; display: flex;
+              flex-direction: column; min-height: calc(100dvh - 44px);
+              margin-top: 22px; padding: 17px 13px;
+              border: 1px solid var(--line); border-radius: var(--radius);
+              background: var(--panel); box-shadow: var(--panel-shadow); }
+.wordmark { display: flex; align-items: center; gap: 9px; padding: 2px 5px 18px;
+            color: var(--ink); font: 800 15px/1 var(--mono);
+            letter-spacing: -.04em; }
+.wordmark-mark { display: grid; grid-template-columns: repeat(2, 5px); gap: 2px;
+                 width: 12px; height: 12px; }
+.wordmark-mark span { display: block; background: var(--accent); }
+.wordmark-mark span:nth-child(2) { opacity: .35; }
+.wordmark-mark span:nth-child(3) { grid-column: 1 / -1; }
+.side-nav { display: grid; gap: 4px; }
+.side-nav a { display: block; padding: 9px 10px; border-left: 2px solid transparent;
+              color: var(--ink-2); font: 650 11px/1.25 var(--mono);
+              text-decoration: none; }
+.side-nav a:hover { color: var(--ink); background: var(--panel-2); }
+.side-nav a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.side-nav a[aria-selected="true"] { border-left-color: var(--accent);
+                                    color: var(--ink); background: var(--panel-2); }
+.side-note { margin: auto 5px 0; padding-top: 14px; border-top: 1px solid var(--line);
+             color: var(--ink-3); font: 500 8.5px/1.55 var(--mono); }
+.tab-view[hidden] { display: none; }
 
 .toolbar { display: flex; flex-wrap: wrap; gap: 14px 24px; align-items: center;
            padding-bottom: 16px; border-bottom: 1px solid var(--line-strong); }
@@ -244,11 +271,115 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
   .state { grid-column: 1 / -1; text-align: left; }
 }
 @media (max-width: 560px) {
-  .shell { width: min(100% - 24px, 1280px); }
   .account { grid-template-columns: 1fr; }
   .toolbar { align-items: flex-start; }
   .snapshot { text-align: left; }
 }
+
+/* ============================================================= stats */
+.stats-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end;
+                 justify-content: space-between; gap: 18px;
+                 padding-bottom: 16px; border-bottom: 1px solid var(--line-strong); }
+.stats-title { margin: 0; font: 700 17px/1.2 var(--mono); letter-spacing: -.02em; }
+.stats-intro { max-width: 62ch; margin: 5px 0 0; color: var(--ink-3);
+               font: 500 10px/1.5 var(--mono); }
+.stats-controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
+.stats-control { display: grid; gap: 4px; color: var(--ink-3);
+                 font: 700 8px/1.2 var(--mono); letter-spacing: .08em;
+                 text-transform: uppercase; }
+.stats-control select { min-width: 94px; appearance: none; padding: 8px 28px 8px 10px;
+                        border: 1px solid var(--line-strong); border-radius: var(--radius);
+                        background: var(--panel); color: var(--ink);
+                        font: 600 11px var(--mono); cursor: pointer; }
+.stats-control select:focus-visible, .stats-controls button:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+.stats-state { margin-top: 16px; min-height: 190px; padding: 42px 24px;
+               border: 1px solid var(--line); border-radius: var(--radius);
+               background: var(--panel); box-shadow: var(--panel-shadow);
+               text-align: center; }
+.stats-state strong { display: block; font: 700 13px/1.4 var(--mono); }
+.stats-state small { display: block; max-width: 58ch; margin: 7px auto 0;
+                     color: var(--ink-3); font: 500 9.5px/1.55 var(--mono); }
+.stats-skeleton { display: grid; gap: 8px; width: min(100%, 420px); margin: 24px auto 0; }
+.stats-skeleton span { height: 7px; background: var(--cell-bg); }
+.stats-skeleton span:nth-child(2) { width: 78%; }
+.stats-skeleton span:nth-child(3) { width: 56%; }
+.stats-content { display: grid; gap: 18px; margin-top: 16px; }
+.stats-panel { padding: 16px; border: 1px solid var(--line);
+               border-radius: var(--radius); background: var(--panel);
+               box-shadow: var(--panel-shadow); }
+.stats-panel-head { display: flex; flex-wrap: wrap; align-items: baseline;
+                    justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+.stats-panel h2 { margin: 0; font: 700 12px/1.3 var(--mono); }
+.stats-panel-note { margin: 0; color: var(--ink-3); font: 500 9px/1.45 var(--mono); }
+.chart-wrap { min-height: 280px; overflow: hidden; }
+.chart-wrap svg { display: block; width: 100%; height: auto; min-height: 280px; }
+.chart-grid { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.chart-axis { fill: var(--ink-3); font: 500 9px var(--mono); }
+.chart-line { fill: none; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.chart-peak { fill: none; stroke-width: 1; opacity: .38;
+              vector-effect: non-scaling-stroke; }
+.chart-peak-dot { stroke: var(--panel); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.chart-legend { display: flex; flex-wrap: wrap; gap: 8px 14px; }
+.chart-legend span { display: inline-flex; align-items: center; gap: 6px;
+                     color: var(--ink-2); font: 600 9px var(--mono); }
+.chart-legend i { display: block; width: 14px; height: 2px; background: var(--series); }
+.stats-accounts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+                  gap: 10px; }
+.stats-account { padding: 14px; border: 1px solid var(--line);
+                 border-radius: var(--radius); background: var(--panel-2); }
+.stats-account-head { display: flex; justify-content: space-between; gap: 12px;
+                      margin-bottom: 12px; }
+.stats-account-name { font: 700 11px/1.3 var(--mono); }
+.stats-account-provider { color: var(--ink-3); font: 600 8.5px/1.3 var(--mono);
+                          text-transform: uppercase; letter-spacing: .06em; }
+.stats-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.stats-metric { min-width: 0; }
+.stats-metric span { display: block; color: var(--ink-3); font: 650 8px/1.3 var(--mono);
+                     text-transform: uppercase; letter-spacing: .06em; }
+.stats-metric strong { display: block; margin-top: 5px; color: var(--ink);
+                       font: 700 16px/1 var(--mono); }
+.stats-metric small { display: block; margin-top: 4px; overflow: hidden;
+                      color: var(--ink-3); font: 500 8px/1.35 var(--mono);
+                      text-overflow: ellipsis; white-space: nowrap; }
+.leaderboard-wrap { overflow-x: auto; }
+.leaderboard { width: 100%; border-collapse: collapse; font-family: var(--mono); }
+.leaderboard th { padding: 8px 10px; border-bottom: 1px solid var(--line-strong);
+                  color: var(--ink-3); font-size: 8px; letter-spacing: .06em;
+                  text-align: left; text-transform: uppercase; white-space: nowrap; }
+.leaderboard td { padding: 10px; border-bottom: 1px solid var(--line);
+                  color: var(--ink-2); font-size: 10px; white-space: nowrap; }
+.leaderboard tbody tr:last-child td { border-bottom: 0; }
+.leaderboard .rank { width: 38px; color: var(--ink-3); }
+.leaderboard .leader-name { color: var(--ink); font-weight: 700; }
+.stats-inline-empty { padding: 30px 12px; color: var(--ink-3);
+                      font: 500 10px/1.5 var(--mono); text-align: center; }
+
+@media (max-width: 780px) {
+  .app-shell { display: block; width: min(100% - 24px, 1280px); }
+  .side-panel { position: relative; top: auto; flex-direction: row;
+                align-items: center; min-height: 0; margin-top: 12px; padding: 8px 9px; }
+  .wordmark { padding: 7px 8px; }
+  .side-nav { display: flex; margin-left: auto; }
+  .side-nav a { padding: 8px 12px; border-left: 0; border-bottom: 2px solid transparent; }
+  .side-nav a[aria-selected="true"] { border-bottom-color: var(--accent); }
+  .side-note { display: none; }
+  .shell { padding-top: 12px; }
+  .stats-accounts { grid-template-columns: 1fr; }
+}
+@media (max-width: 560px) {
+  .stats-toolbar { align-items: flex-start; }
+  .stats-controls { width: 100%; }
+  .stats-control { flex: 1 1 100px; }
+  .stats-control select { width: 100%; }
+  .stats-controls button { flex: 1 1 auto; align-self: end; }
+  .stats-panel { padding: 13px; }
+  .stats-metrics { grid-template-columns: 1fr 1fr; }
+}
+
+body.is-widget .app-shell { display: block; width: auto; }
+body.is-widget .side-panel { display: none; }
 
 /* ==================================================== widget: liquid glass
    The /widget surface (and ?compact=1) renders this liquid-glass popover
@@ -488,7 +619,17 @@ body.is-widget .shell { display: none; }
 </style>
 </head>
 <body>
+<div class="app-shell">
+<aside class="side-panel" aria-label="Dashboard sections">
+  <div class="wordmark"><span class="wordmark-mark" aria-hidden="true"><span></span><span></span><span></span></span>headroom</div>
+  <nav class="side-nav" role="tablist" aria-label="Dashboard views">
+    <a id="usage-nav" href="#usage" data-tab="usage" role="tab" aria-controls="usage-tab">Usage</a>
+    <a id="stats-nav" href="#stats" data-tab="stats" role="tab" aria-controls="stats-tab">Stats</a>
+  </nav>
+  <p class="side-note">Window percentage only.<br>No token counts stored.</p>
+</aside>
 <main class="shell">
+<div class="tab-view" id="usage-tab" role="tabpanel" aria-labelledby="usage-nav">
   <header class="toolbar">
     <div class="brand">
       <h1 class="title" id="title">headroom</h1>
@@ -547,7 +688,68 @@ body.is-widget .shell { display: none; }
   </footer>
   <p class="credit">tracked by <a href="https://github.com/domanski-ai/headroom">headroom</a> —
     usage read straight from your providers, no tokens spent</p>
+</div>
+
+<section class="tab-view" id="stats-tab" role="tabpanel" aria-labelledby="stats-nav" hidden>
+  <header class="stats-toolbar">
+    <div>
+      <h1 class="stats-title">Usage history</h1>
+      <p class="stats-intro">Window utilization over time. Percentages show each provider window consumed, never token volume.</p>
+    </div>
+    <div class="stats-controls">
+      <label class="stats-control"><span>Range</span>
+        <select id="history-range" aria-label="History range">
+          <option value="1">24h</option>
+          <option value="7" selected>7d</option>
+          <option value="30">30d</option>
+        </select>
+      </label>
+      <label class="stats-control"><span>Window</span>
+        <select id="history-window" aria-label="Usage window"></select>
+      </label>
+      <button class="refresh" id="history-refresh" type="button">Refresh</button>
+    </div>
+  </header>
+
+  <div class="stats-state" id="stats-state" aria-live="polite">
+    <strong>Loading history</strong>
+    <small>Reading saved window percentages.</small>
+    <span class="stats-skeleton" aria-hidden="true"><span></span><span></span><span></span></span>
+  </div>
+
+  <div class="stats-content" id="stats-content" hidden>
+    <section class="stats-panel panel" aria-labelledby="history-chart-title">
+      <header class="stats-panel-head">
+        <div>
+          <h2 id="history-chart-title">Window utilization</h2>
+          <p class="stats-panel-note">Lines show bucket means; peak markers preserve the highest sample in each bucket.</p>
+        </div>
+        <div class="chart-legend" id="history-legend" aria-label="Account legend"></div>
+      </header>
+      <div class="chart-wrap" id="history-chart"></div>
+    </section>
+
+    <section class="stats-panel panel" aria-labelledby="account-summary-title">
+      <header class="stats-panel-head">
+        <h2 id="account-summary-title">Account summary</h2>
+        <p class="stats-panel-note" id="summary-window-note">Selected window</p>
+      </header>
+      <div class="stats-accounts" id="stats-accounts"></div>
+    </section>
+
+    <section class="stats-panel panel" aria-labelledby="leaderboard-title">
+      <header class="stats-panel-head">
+        <div>
+          <h2 id="leaderboard-title">Workhorse leaderboard</h2>
+          <p class="stats-panel-note">Ranked by average 7d window utilization, then cap-hit episodes. This is window percentage, not tokens.</p>
+        </div>
+      </header>
+      <div class="leaderboard-wrap" id="leaderboard-wrap"></div>
+    </section>
+  </div>
+</section>
 </main>
+</div>
 
 <div class="hr" id="hr" data-theme="midnight">
   <div class="hr-wall" aria-hidden="true">
@@ -805,6 +1007,216 @@ async function load(manual){
   }finally{
     if(manual&&requestId===requestNumber){button.disabled=false;button.textContent="Refresh";}
   }
+}
+
+/* =========================================================== history */
+const HISTORY_URL="history.json";
+const SERIES_COLORS=["var(--accent)","var(--green)","var(--orange)","var(--red)","var(--ink-2)"];
+let historyData=null,historyRequest=0;
+
+function validateHistory(data){
+  if(!data||data.schema_version!==1||!Number.isFinite(data.generated)||
+     !Number.isFinite(data.days)||!Array.isArray(data.series)||
+     !Array.isArray(data.summary)||!Array.isArray(data.leaderboard))
+    throw new Error("history response invalid");
+  data.series.forEach(account=>{
+    if(!account||typeof account.name!=="string"||!account.windows||typeof account.windows!=="object")
+      throw new Error("history account invalid");
+    Object.values(account.windows).forEach(points=>{
+      if(!Array.isArray(points))throw new Error("history series invalid");
+      points.forEach(point=>{
+        if(!point||!Number.isFinite(point.ts)||!Number.isFinite(point.mean)||
+           !Number.isFinite(point.max)||point.mean<0||point.mean>100||
+           point.max<0||point.max>100)throw new Error("history point invalid");
+      });
+    });
+  });
+  return data;
+}
+function statsPct(value){
+  return Number.isFinite(value)?(Math.round(value*10)/10)+"%":"n/a";
+}
+function statsDate(epoch,withTime){
+  if(!Number.isFinite(epoch))return"time unknown";
+  const options=withTime?{hour:"numeric",minute:"2-digit"}:{month:"short",day:"numeric"};
+  try{return new Intl.DateTimeFormat(undefined,options).format(new Date(epoch*1e3));}
+  catch(e){return"time unknown";}
+}
+function showStatsState(title,detail,loading){
+  const state=document.getElementById("stats-state");
+  state.hidden=false;
+  state.innerHTML="<strong>"+esc(title)+"</strong><small>"+esc(detail)+"</small>"+
+    (loading?'<span class="stats-skeleton" aria-hidden="true"><span></span><span></span><span></span></span>':"");
+  document.getElementById("stats-content").hidden=true;
+}
+function historyWindows(data){
+  const keys=[];
+  data.series.forEach(account=>Object.keys(account.windows||{}).forEach(key=>{
+    if(!keys.includes(key))keys.push(key);
+  }));
+  return keys.sort((a,b)=>{
+    const order=key=>key==="5h"?0:key==="7d"?1:key.startsWith("scoped:")?2:3;
+    return order(a)-order(b)||a.localeCompare(b);
+  });
+}
+function populateHistoryWindows(data){
+  const select=document.getElementById("history-window"),previous=select.value;
+  const keys=historyWindows(data);
+  select.innerHTML=keys.map(key=>'<option value="'+esc(key)+'">'+esc(key)+"</option>").join("");
+  select.value=keys.includes(previous)?previous:(keys.includes("7d")?"7d":keys[0]||"");
+  return keys;
+}
+function chartPoint(point,start,end,width,height,left,top){
+  const x=left+(point.ts-start)/(end-start)*width;
+  const y=top+(100-point.mean)/100*height;
+  const peak=top+(100-point.max)/100*height;
+  return{x:x,y:y,peak:peak};
+}
+function renderHistoryChart(data,key){
+  const chart=document.getElementById("history-chart");
+  const legend=document.getElementById("history-legend");
+  const series=data.series.map(account=>({
+    name:account.name,provider:account.provider,
+    points:(account.windows||{})[key]||[]
+  })).filter(account=>account.points.length);
+  if(!series.length){
+    chart.innerHTML='<div class="stats-inline-empty">No samples for this window in the selected range.</div>';
+    legend.innerHTML="";
+    return;
+  }
+  const all=series.flatMap(account=>account.points);
+  let start=Math.min(...all.map(point=>point.ts));
+  let end=Math.max(...all.map(point=>point.ts));
+  if(start===end)end=start+1;
+  const width=960,height=320,left=50,right=14,top=14,bottom=36;
+  const plotWidth=width-left-right,plotHeight=height-top-bottom;
+  const grid=[0,25,50,75,100].map(value=>{
+    const y=top+(100-value)/100*plotHeight;
+    return '<line class="chart-grid" x1="'+left+'" y1="'+y+'" x2="'+(width-right)+'" y2="'+y+'"></line>'+
+      '<text class="chart-axis" x="'+(left-9)+'" y="'+(y+3)+'" text-anchor="end">'+value+'%</text>';
+  }).join("");
+  const dates=[start,start+(end-start)/2,end].map((epoch,index)=>{
+    const x=left+index*plotWidth/2;
+    return '<text class="chart-axis" x="'+x+'" y="'+(height-10)+'" text-anchor="'+
+      (index===0?"start":index===2?"end":"middle")+'">'+esc(statsDate(epoch,data.days<=1))+"</text>";
+  }).join("");
+  let drawing="";
+  series.forEach((account,index)=>{
+    const color=SERIES_COLORS[index%SERIES_COLORS.length];
+    const points=account.points.map(point=>chartPoint(
+      point,start,end,plotWidth,plotHeight,left,top));
+    const line=points.map((point,pointIndex)=>(pointIndex?"L":"M")+point.x.toFixed(2)+" "+point.y.toFixed(2)).join(" ");
+    const area=line+" L "+points[points.length-1].x.toFixed(2)+" "+(top+plotHeight)+
+      " L "+points[0].x.toFixed(2)+" "+(top+plotHeight)+" Z";
+    const peaks=points.map((point,pointIndex)=>{
+      if(account.points[pointIndex].max<=account.points[pointIndex].mean+.05)return"";
+      return '<path class="chart-peak" stroke="'+color+'" d="M '+point.x.toFixed(2)+" "+point.y.toFixed(2)+
+        " L "+point.x.toFixed(2)+" "+point.peak.toFixed(2)+'"></path><circle class="chart-peak-dot" fill="'+color+
+        '" cx="'+point.x.toFixed(2)+'" cy="'+point.peak.toFixed(2)+'" r="2"></circle>';
+    }).join("");
+    drawing+='<path fill="'+color+'" fill-opacity=".055" d="'+area+'"></path>'+peaks+
+      '<path class="chart-line" stroke="'+color+'" d="'+line+'"><title>'+esc(account.name)+" "+esc(key)+"</title></path>";
+  });
+  chart.innerHTML='<svg viewBox="0 0 '+width+" "+height+'" role="img" aria-label="'+esc(key)+
+    ' window percentage used over time">'+grid+dates+drawing+"</svg>";
+  legend.innerHTML=series.map((account,index)=>'<span style="--series:'+SERIES_COLORS[index%SERIES_COLORS.length]+
+    '"><i></i>'+esc(account.name)+"</span>").join("");
+}
+function renderAccountStats(data,key){
+  const target=document.getElementById("stats-accounts");
+  const accounts=data.summary.filter(account=>account&&typeof account.name==="string"&&
+    account.windows&&account.windows[key]);
+  document.getElementById("summary-window-note").textContent=key+" window percentage used";
+  if(!accounts.length){
+    target.innerHTML='<div class="stats-inline-empty">No account summaries for this window.</div>';
+    return;
+  }
+  target.innerHTML=accounts.map(account=>{
+    const metric=account.windows[key],peak=metric.peak||{};
+    return '<article class="stats-account"><header class="stats-account-head"><span class="stats-account-name">'+
+      esc(account.name)+'</span><span class="stats-account-provider">'+esc(account.provider||"")+"</span></header>"+
+      '<div class="stats-metrics"><div class="stats-metric"><span>Current</span><strong>'+statsPct(metric.current)+
+      '</strong><small>window used</small></div><div class="stats-metric"><span>Peak</span><strong>'+statsPct(peak.value)+
+      "</strong><small>"+esc(statsDate(peak.ts,false))+'</small></div><div class="stats-metric"><span>Average</span><strong>'+statsPct(metric.average)+
+      '</strong><small>'+esc(metric.sample_count)+' samples</small></div><div class="stats-metric"><span>Cap hits</span><strong>'+
+      esc(metric.cap_hit_episodes)+"</strong><small>episodes</small></div></div></article>";
+  }).join("");
+}
+function renderLeaderboard(data){
+  const target=document.getElementById("leaderboard-wrap");
+  if(!data.leaderboard.length){
+    target.innerHTML='<div class="stats-inline-empty">No 7d window samples are available for ranking.</div>';
+    return;
+  }
+  target.innerHTML='<table class="leaderboard"><thead><tr><th scope="col">Rank</th><th scope="col">Account</th>'+
+    '<th scope="col">Provider</th><th scope="col">Average 7d used</th><th scope="col">Cap hits</th><th scope="col">Samples</th>'+
+    '</tr></thead><tbody>'+data.leaderboard.map(account=>'<tr><td class="rank">'+esc(account.rank)+
+    '</td><td class="leader-name">'+esc(account.name)+'</td><td>'+esc(account.provider||"")+'</td><td>'+statsPct(account.average)+
+    '</td><td>'+esc(account.cap_hit_episodes)+'</td><td>'+esc(account.sample_count)+"</td></tr>").join("")+"</tbody></table>";
+}
+function renderStats(){
+  if(!historyData)return;
+  const keys=populateHistoryWindows(historyData);
+  if(!keys.length){
+    showStatsState("No usable samples yet","History exists, but no current window percentages are available.",false);
+    return;
+  }
+  const key=document.getElementById("history-window").value;
+  document.getElementById("stats-state").hidden=true;
+  document.getElementById("stats-content").hidden=false;
+  renderHistoryChart(historyData,key);
+  renderAccountStats(historyData,key);
+  renderLeaderboard(historyData);
+}
+function showHistoryFailure(error){
+  if(error&&error.code==="history_disabled")
+    showStatsState("History is turned off","Remove HEADROOM_HISTORY=0 and run a collection to begin saving window percentages.",false);
+  else if(error&&error.code==="no history yet")
+    showStatsState("No history yet","Run headroom collect, then return after the next saved reading.",false);
+  else
+    showStatsState("History is unavailable here","The history feed could not be reached. Static builds still show Usage; use headroom serve for Stats.",false);
+}
+async function loadHistory(manual){
+  const requestId=++historyRequest,button=document.getElementById("history-refresh");
+  if(manual){button.disabled=true;button.textContent="Refreshing…";}
+  showStatsState("Loading history","Reading saved window percentages.",true);
+  let timer=null;
+  try{
+    const days=document.getElementById("history-range").value;
+    const controller=new AbortController();
+    timer=setTimeout(()=>controller.abort(),12e3);
+    const response=await fetch(HISTORY_URL+"?days="+encodeURIComponent(days)+"&t="+Date.now(),
+      {cache:"no-store",signal:controller.signal});
+    let payload=null;
+    try{payload=await response.json();}catch(e){}
+    if(!response.ok){const error=new Error("history returned HTTP "+response.status);
+      error.code=payload&&payload.error;throw error;}
+    const data=validateHistory(payload);
+    if(requestId===historyRequest){historyData=data;renderStats();}
+  }catch(error){if(requestId===historyRequest)showHistoryFailure(error);}
+  finally{
+    if(timer!==null)clearTimeout(timer);
+    if(manual&&requestId===historyRequest){button.disabled=false;button.textContent="Refresh";}
+  }
+}
+function syncTabs(){
+  const active=location.hash==="#stats"?"stats":"usage";
+  document.getElementById("usage-tab").hidden=active!=="usage";
+  document.getElementById("stats-tab").hidden=active!=="stats";
+  document.querySelectorAll("[data-tab]").forEach(link=>{
+    const selected=link.getAttribute("data-tab")===active;
+    link.setAttribute("aria-selected",selected?"true":"false");
+    link.tabIndex=selected?0:-1;
+  });
+  if(active==="stats")loadHistory(false);
+}
+function initTabs(){
+  window.addEventListener("hashchange",syncTabs);
+  document.getElementById("history-range").addEventListener("change",()=>loadHistory(false));
+  document.getElementById("history-window").addEventListener("change",renderStats);
+  document.getElementById("history-refresh").addEventListener("click",()=>loadHistory(true));
+  syncTabs();
+  setInterval(()=>{if(location.hash==="#stats")loadHistory(false);},6e4);
 }
 
 /* =================================================== liquid-glass widget */
@@ -1145,6 +1557,7 @@ picker.addEventListener("change",()=>applyTheme(picker.value));
   applyTheme(params.get("theme")||stored||configured||"midnight");
   if(CONFIG&&CONFIG.title){set("title",CONFIG.title);document.title=CONFIG.title;}
   if(widgetMode){hrInit(params.get("size"));return;}
+  initTabs();
   document.getElementById("refresh").addEventListener("click",()=>load(true));
   load(false);
   setInterval(()=>load(false),6e4);

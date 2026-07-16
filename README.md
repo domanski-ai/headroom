@@ -128,6 +128,20 @@ headroom claude            # launch Claude Code on the best account
 headroom rotate            # limit hit? cool this login, switch to the next
 ```
 
+## Stats & history
+
+The dashboard's Stats tab charts saved provider-window utilization, summarizes
+current/peak/average percentages and cap-hit episodes, and ranks the 7-day
+workhorses. History contains window percentages only: never token counts,
+emails, or provider identity fields. It is sampled at most once per minute and
+retained for 30 days by default.
+
+Set `HEADROOM_HISTORY=0` to disable history entirely. Retention and sampling can
+be adjusted with `HEADROOM_HISTORY_RETENTION_DAYS` and
+`HEADROOM_HISTORY_MIN_INTERVAL`. The two-file static dashboard remains
+supported; on static hosting the Usage tab works normally and Stats explains
+that the live `/history.json` feed requires `headroom serve`.
+
 ## Widgets
 
 ![Menu bar widget and compact dashboard, rendered from live fleet data](marketing/hr-widgets.png)

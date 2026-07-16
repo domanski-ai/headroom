@@ -20,7 +20,7 @@ import webbrowser
 from dataclasses import dataclass
 
 from . import collect as collector
-from . import paths, registry, widget
+from . import history, paths, registry, widget
 
 TEMPLATE = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "dashboard", "template.html")
@@ -267,6 +267,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(b"forbidden: non-loopback Host")
             return
         route = urllib.parse.urlsplit(self.path).path
+        if route == "/history.json":
+            self._serve_history()
+            return
         if route in ("/usage.json", "/widget.json", "/widget.txt"):
             self._serve_feed(route)
             return
@@ -294,6 +297,40 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _serve_history(self):
+        query = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(self.path).query)
+        try:
+            days = int((query.get("days") or [7])[0])
+        except (TypeError, ValueError):
+            days = 7
+        days = min(history.retention_days(), max(1, days))
+        if self.demo:
+            snapshot = paths.load_json(
+                os.path.join(self.directory, "usage.json"))
+            rows = history.demo_rows(snapshot, days) \
+                if isinstance(snapshot, dict) else []
+        else:
+            if not history.enabled():
+                self._send_body(
+                    503, "application/json", b'{"error":"history_disabled"}')
+                return
+            rows = history.load_series(days)
+        if not rows:
+            self._send_body(
+                503, "application/json", b'{"error":"no history yet"}')
+            return
+        try:
+            value = history.response(
+                days, rows=rows, generated=int(time.time()))
+            body = json.dumps(value, allow_nan=False,
+                              separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError, OverflowError):
+            self._send_body(
+                503, "application/json", b'{"error":"invalid history"}')
+            return
+        self._send_body(200, "application/json", body)
 
     def _serve_feed(self, route):
         result = self._snapshot_result()
