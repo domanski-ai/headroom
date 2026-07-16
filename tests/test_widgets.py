@@ -1279,14 +1279,18 @@ class DashboardHttpTests(unittest.TestCase):
                         init.index("if(widgetMode)"))
         leaderboard = template.split("function renderLeaderboard(data){",
                                      1)[1].split("\n}", 1)[0]
+        # with telemetry on, the ranking lives in the Accounts column and the
+        # window-% leaderboard hides; without it, the fallback stays intact
         self.assertIn("if(tokenStats)", leaderboard)
-        self.assertIn("lifetime_grand_total", leaderboard)
-        self.assertIn("last7d_grand_total", leaderboard)
-        self.assertIn("Lifetime tokens", leaderboard)
-        self.assertIn("Last 7d tokens", leaderboard)
+        self.assertIn("panel.hidden=true;\n    return;", leaderboard)
         self.assertIn("Avg weekly used", leaderboard)
         self.assertIn("if(!data){panel.hidden=true;return;}", leaderboard)
         self.assertIn("Ranked by average Weekly-all utilization", leaderboard)
+        accounts = template.split("function renderTokenAccounts(){",
+                                  1)[1].split("\n}", 1)[0]
+        self.assertIn("lifetime_grand_total", accounts)
+        self.assertIn("last7d_grand_total", accounts)
+        self.assertIn("token-account-row", accounts)
 
     def test_widget_href_uses_actual_server_address_port(self):
         port = 49152
