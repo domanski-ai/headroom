@@ -187,7 +187,7 @@ class TokenParserTests(unittest.TestCase):
         parsed = tokens._parse_stream(
             io.BytesIO(codex_rows.encode()), "codex")
         self.assertEqual(parsed["days"]["2026-07-11"]["families"],
-                         {"other": 120})
+                         {"gpt": 120})
         self.assertEqual(parsed["days"]["2026-07-11"]["efforts"],
                          {"xhigh": 120})
 

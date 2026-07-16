@@ -29,7 +29,7 @@ MAX_PAYLOAD_DAYS = 400
 MAX_SESSION_SECONDS = 48 * 60 * 60
 COUNT_KEYS = ("input", "output", "cache_read", "cache_creation", "total",
               "grand_total")
-FAMILY_LABELS = ("fable", "opus", "sonnet", "haiku", "other")
+FAMILY_LABELS = ("fable", "opus", "sonnet", "haiku", "gpt", "other")
 EFFORT_LABELS = ("none", "minimal", "low", "medium", "high", "xhigh")
 DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
