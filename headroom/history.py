@@ -5,6 +5,8 @@ until the oldest row exceeds retention by a full day, while a configurable
 ``HEADROOM_HISTORY_MAX_BYTES`` cap (32 MiB by default, 1 MiB minimum) forces
 an earlier prune and trims an oversized retained set to 80%.
 """
+import errno
+import fcntl
 import json
 import math
 import os
@@ -21,6 +23,7 @@ DEFAULT_MAX_BYTES = 32 * 1024 * 1024
 MIN_MAX_BYTES = 1024 * 1024
 MAX_LINE_BYTES = 1024 * 1024
 MAX_CHART_POINTS = 200
+READ_DRAIN_BYTES = 64 * 1024
 
 
 def enabled():
@@ -59,6 +62,10 @@ def _finite_number(value, low=None, high=None):
     return value
 
 
+def _safe_label(value):
+    return isinstance(value, str) and "@" not in value and len(value) <= 40
+
+
 def _project_account(account):
     if not isinstance(account, dict):
         return None
@@ -67,7 +74,7 @@ def _project_account(account):
     if not isinstance(name, str) or not isinstance(provider, str):
         return None
     plan = account.get("plan")
-    plan = plan if isinstance(plan, str) else None
+    plan = plan if _safe_label(plan) else None
     source_windows = account.get("windows")
     if source_windows is None:
         source_windows = {}
@@ -75,7 +82,7 @@ def _project_account(account):
         return None
     windows = {}
     for key, window in source_windows.items():
-        if not isinstance(key, str) or not isinstance(window, dict):
+        if not _safe_label(key) or not isinstance(window, dict):
             continue
         used = _finite_number(window.get("used_percent"), 0, 100)
         reset = _finite_number(window.get("resets_at"))
@@ -126,6 +133,9 @@ def _normalize_row(value):
         normalized = _project_account(account)
         if normalized is None:
             return None
+        if not _safe_label(normalized["name"]) \
+                or not _safe_label(normalized["provider"]):
+            continue
         projected.append(normalized)
     return {"ts": ts, "accounts": projected}
 
@@ -141,26 +151,62 @@ def _parse_line(line):
         return None
 
 
+def _bounded_lines(handle):
+    """Yield bounded physical lines without reading beyond the load budget."""
+    budget = max_bytes() * 2
+    file_size = os.fstat(handle.fileno()).st_size
+    consumed = 0
+    while consumed < budget:
+        limit = min(MAX_LINE_BYTES + 1, budget - consumed)
+        line = handle.readline(limit)
+        if not line:
+            break
+        consumed += len(line)
+        if line.endswith(b"\n"):
+            yield line
+            continue
+        if len(line) < limit or handle.tell() >= file_size:
+            if len(line) <= MAX_LINE_BYTES:
+                yield line
+            continue
+        if limit < MAX_LINE_BYTES + 1:
+            break
+        del line
+        while consumed < budget:
+            chunk = handle.readline(min(READ_DRAIN_BYTES, budget - consumed))
+            if not chunk:
+                break
+            consumed += len(chunk)
+            ended = chunk.endswith(b"\n")
+            del chunk
+            if ended:
+                break
+    if handle.tell() < file_size:
+        raise OSError(errno.EFBIG, "history read budget exceeded", handle.name)
+
+
 def _read_rows(path):
     rows = []
     try:
         with open(path, "rb") as handle:
-            for line in handle:
+            for line in _bounded_lines(handle):
                 row = _parse_line(line)
                 if row is not None:
                     rows.append(row)
-    except OSError:
-        return []
+    except OSError as error:
+        if error.errno == errno.ENOENT:
+            return []
+        raise
     rows.sort(key=lambda row: row["ts"])
     return rows
 
 
-def _oldest_row(path):
+def _oldest_row(path, now):
     try:
         with open(path, "rb") as handle:
-            for line in handle:
+            for line in _bounded_lines(handle):
                 row = _parse_line(line)
-                if row is not None:
+                if row is not None and row["ts"] <= now + 300:
                     return row
     except OSError:
         pass
@@ -224,8 +270,12 @@ def _write_rows_atomic(rows):
 
 
 def _row_size(row):
-    return len(json.dumps(
-        row, allow_nan=False, separators=(",", ":")).encode("utf-8")) + 1
+    return len(_encode_row(row)) + 1
+
+
+def _encode_row(row):
+    return json.dumps(
+        row, allow_nan=False, separators=(",", ":")).encode("utf-8")
 
 
 def _rows_within_bytes(rows, limit):
@@ -241,15 +291,28 @@ def _rows_within_bytes(rows, limit):
 
 
 def _append_row(row):
+    payload = _encode_row(row)
+    if len(payload) > MAX_LINE_BYTES:
+        raise ValueError("history row exceeds maximum line size")
     _ensure_storage()
     descriptor = os.open(
-        paths.history_path(), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        paths.history_path(), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
     os.fchmod(descriptor, 0o600)
-    with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-        json.dump(row, handle, allow_nan=False, separators=(",", ":"))
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    with os.fdopen(descriptor, "a+b") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            handle.seek(0, os.SEEK_END)
+            end = handle.tell()
+            prefix = b""
+            if end:
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) != b"\n":
+                    prefix = b"\n"
+            handle.write(prefix + payload + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def append_snapshot(snapshot, now=None):
@@ -259,16 +322,23 @@ def append_snapshot(snapshot, now=None):
     now = int(time.time() if now is None else now)
     path = paths.history_path()
     cap = max_bytes()
-    oldest = _oldest_row(path)
+    oldest = _oldest_row(path, now)
     over_cap = _file_size(path) > cap
     prune_before = now - (retention_days() + 1) * 86400
     if over_cap or (oldest is not None and oldest["ts"] < prune_before):
         cutoff = now - retention_days() * 86400
-        rows = [old for old in _read_rows(path) if old["ts"] >= cutoff]
-        if over_cap and sum(_row_size(old) for old in rows) > cap:
-            rows = _rows_within_bytes(rows, int(cap * .8))
-        _write_rows_atomic(rows)
-        newest = rows[-1] if rows else None
+        try:
+            loaded = _read_rows(path)
+        except OSError:
+            loaded = None
+        if loaded is not None:
+            rows = [old for old in loaded if old["ts"] >= cutoff]
+            if over_cap and sum(_row_size(old) for old in rows) > cap:
+                rows = _rows_within_bytes(rows, int(cap * .8))
+            _write_rows_atomic(rows)
+            newest = rows[-1] if rows else None
+        else:
+            newest = _tail_row(path)
     else:
         newest = _tail_row(path)
     age = now - newest["ts"] if newest is not None else None
@@ -280,11 +350,15 @@ def append_snapshot(snapshot, now=None):
 
 
 def remove_account(name):
-    """Atomically remove one account from all history, never raising out."""
+    """Atomically remove one account, raising if the purge cannot complete."""
     try:
         path = paths.history_path()
-        if not os.path.exists(path):
-            return False
+        try:
+            os.stat(path)
+        except OSError as error:
+            if error.errno == errno.ENOENT:
+                return False
+            raise
         rows = []
         changed = False
         for row in _read_rows(path):
@@ -297,8 +371,9 @@ def remove_account(name):
                 changed = True
         _write_rows_atomic(rows)
         return changed
-    except Exception:
-        return False
+    except Exception as error:
+        raise RuntimeError(
+            f"history purge failed for account {name!r}: {error}") from error
 
 
 def load_series(days):
@@ -318,13 +393,14 @@ def _samples(rows):
     for row in sorted(rows, key=lambda value: value["ts"]):
         ts = row["ts"]
         for account in row["accounts"]:
-            if not account["ok"] or account["stale"]:
-                continue
             identity = (account["provider"], account["name"])
             target = accounts.setdefault(identity, {
                 "name": account["name"], "provider": account["provider"],
-                "plan": account["plan"], "windows": {},
+                "plan": account["plan"], "windows": {}, "latest_ts": ts,
             })
+            target["latest_ts"] = ts
+            if not account["ok"] or account["stale"]:
+                continue
             if account["plan"]:
                 target["plan"] = account["plan"]
             for key, window in account["windows"].items():
@@ -347,15 +423,21 @@ def _episode_count(samples):
     return episodes
 
 
-def summarize(days, rows=None):
+def summarize(days, rows=None, generated=None):
     rows = load_series(days) if rows is None else rows
+    generated = int(time.time() if generated is None else generated)
+    current_age_limit = 2 * min_interval() + 300
     result = []
     for account in _samples(rows).values():
         windows = {}
         for key, samples in account["windows"].items():
             peak_ts, peak_value = max(samples, key=lambda item: item[1])
+            age = generated - samples[-1][0]
+            current = samples[-1][1] \
+                if samples[-1][0] == account["latest_ts"] \
+                and 0 <= age <= current_age_limit else None
             windows[key] = {
-                "current": samples[-1][1],
+                "current": current,
                 "peak": {"value": peak_value, "ts": peak_ts},
                 "average": round(
                     sum(value for _, value in samples) / len(samples), 2),
@@ -404,10 +486,10 @@ def chart_series(days, rows=None):
     return sorted(result, key=lambda item: (item["name"], item["provider"]))
 
 
-def leaderboard(days, rows=None):
+def leaderboard(days, rows=None, generated=None):
     rows = load_series(days) if rows is None else rows
     ranked = []
-    for account in summarize(days, rows=rows):
+    for account in summarize(days, rows=rows, generated=generated):
         weekly = account["windows"].get("7d")
         if weekly is None:
             continue
@@ -433,8 +515,8 @@ def response(days, rows=None, generated=None):
     return {
         "schema_version": SCHEMA_VERSION, "generated": generated,
         "days": int(days), "series": chart_series(days, rows=rows),
-        "summary": summarize(days, rows=rows),
-        "leaderboard": leaderboard(days, rows=rows),
+        "summary": summarize(days, rows=rows, generated=generated),
+        "leaderboard": leaderboard(days, rows=rows, generated=generated),
     }
 
 

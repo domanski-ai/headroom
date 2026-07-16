@@ -69,7 +69,8 @@ raw identities, fingerprints, or credentials, even when dashboard email
 redaction is disabled.
 
 Writes are throttled to one sample per 60 seconds by default. On append,
-history older than 30 days is pruned with an atomic same-directory rewrite.
+history older than 30 days is pruned with an atomic same-directory rewrite;
+the amortized prune may retain up to one extra grace day before it runs.
 `HEADROOM_HISTORY_MIN_INTERVAL` and `HEADROOM_HISTORY_RETENTION_DAYS` change
 those defaults; `HEADROOM_HISTORY=0` disables both writes and the history feed.
 Any history failure is reduced to one warning and cannot fail collection.

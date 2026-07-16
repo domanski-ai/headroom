@@ -2308,6 +2308,25 @@ class RemoveCommand(unittest.TestCase):
             self.assertEqual(collect.cmd_remove(["a", "--yes"]), 2)
         self.assertEqual(len(registry.load()["accounts"]), 1)
 
+    def test_history_purge_failure_aborts_and_successful_rerun_purges(self):
+        self._write_state()
+        with mock.patch.object(history.os, "replace",
+                               side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(
+                    RuntimeError, "history purge failed.*disk full"):
+                collect.remove_slot("a")
+        self.assertEqual([entry["name"] for entry in registry.load()["accounts"]],
+                         ["a", "b"])
+        self.assertTrue(any(account["name"] == "a"
+                            for value in history.load_series(1)
+                            for account in value["accounts"]))
+
+        removed = collect.remove_slot("a")
+        self.assertEqual(removed["name"], "a")
+        self.assertFalse(any(account["name"] == "a"
+                             for value in history.load_series(1)
+                             for account in value["accounts"]))
+
 
 class DashboardRemovalOrdering(unittest.TestCase):
     def test_dashboard_cannot_republish_snapshot_after_remove(self):

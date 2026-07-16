@@ -163,6 +163,22 @@ class HistoryPersistenceTests(unittest.TestCase):
             self.assertEqual([json.loads(line)["ts"] for line in handle],
                              [NOW + 301, NOW])
 
+    def test_future_first_row_does_not_block_retention_prune(self):
+        paths.ensure_private(paths.history_dir())
+        with open(paths.history_path(), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(row(NOW + 301, 10)) + "\n")
+            handle.write(json.dumps(row(NOW - 2 * 86400 - 1, 20)) + "\n")
+        with mock.patch.dict(os.environ, {
+                "HEADROOM_HISTORY_MIN_INTERVAL": "0",
+                "HEADROOM_HISTORY_RETENTION_DAYS": "1"}), \
+                mock.patch.object(history.os, "replace",
+                                  wraps=os.replace) as replace:
+            self.assertTrue(history.append_snapshot(snapshot(30), now=NOW))
+        replace.assert_called_once()
+        with open(paths.history_path(), encoding="utf-8") as handle:
+            timestamps = [json.loads(line)["ts"] for line in handle]
+        self.assertNotIn(NOW - 2 * 86400 - 1, timestamps)
+
     def test_kill_switch_returns_before_filesystem_access(self):
         with mock.patch.dict(os.environ, {"HEADROOM_HISTORY": "0"}), \
                 mock.patch.object(history, "_read_rows",
@@ -188,18 +204,107 @@ class HistoryPersistenceTests(unittest.TestCase):
         self.assertEqual(len(loaded), 1)
         self.assertNotIn("email", loaded[0]["accounts"][0])
 
-    def test_binary_garbage_deep_json_and_long_lines_do_not_block_appends(self):
+    def test_bounded_giant_line_does_not_block_valid_rows_or_appends(self):
         paths.ensure_private(paths.history_dir())
         with open(paths.history_path(), "wb") as handle:
             handle.write(b"\xff\xfe not utf-8\n")
             handle.write(b"[" * 2000 + b"]" * 2000 + b"\n")
-            handle.write(b"x" * (history.MAX_LINE_BYTES + 1) + b"\n")
-        self.assertTrue(history.append_snapshot(snapshot(25), now=NOW))
+            handle.write(b"x" * (history.MAX_LINE_BYTES + 512 * 1024) + b"\n")
+            handle.write(json.dumps(row(NOW - 10, 15)).encode("utf-8") + b"\n")
+        sizes = []
+        raw = open(paths.history_path(), "rb")
+
+        class TrackingReader:
+            name = raw.name
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                raw.close()
+
+            def readline(self, size=-1):
+                sizes.append(size)
+                return raw.readline(size)
+
+            def fileno(self):
+                return raw.fileno()
+
+            def tell(self):
+                return raw.tell()
+
+        with mock.patch("builtins.open", return_value=TrackingReader()):
+            loaded = history._read_rows(paths.history_path())
+        self.assertEqual([value["ts"] for value in loaded], [NOW - 10])
+        self.assertTrue(sizes)
+        self.assertLessEqual(max(sizes), history.MAX_LINE_BYTES + 1)
+        with mock.patch.dict(os.environ, {
+                "HEADROOM_HISTORY_MIN_INTERVAL": "0"}):
+            self.assertTrue(history.append_snapshot(snapshot(25), now=NOW))
         with mock.patch.object(history.time, "time", return_value=NOW):
             loaded = history.load_series(1)
-        self.assertEqual(len(loaded), 1)
-        self.assertEqual(loaded[0]["accounts"][0]["windows"]["5h"][
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(loaded[-1]["accounts"][0]["windows"]["5h"][
             "used_percent"], 25.0)
+
+    def test_total_read_budget_is_enforced(self):
+        paths.ensure_private(paths.history_dir())
+        with open(paths.history_path(), "wb") as handle:
+            handle.write(b"x" * 129)
+        with mock.patch.object(history, "max_bytes", return_value=64), \
+                self.assertRaisesRegex(OSError, "read budget"):
+            history._read_rows(paths.history_path())
+
+    def test_unreadable_history_refuses_rewrite_but_allows_append(self):
+        paths.ensure_private(paths.history_dir())
+        with open(paths.history_path(), "wb") as handle:
+            handle.write(json.dumps(row(NOW - 10, 10)).encode("utf-8") + b"\n")
+        with mock.patch.object(history, "_file_size",
+                               return_value=history.max_bytes() + 1), \
+                mock.patch.object(history, "_read_rows",
+                                  side_effect=PermissionError("unreadable")), \
+                mock.patch.object(history, "_write_rows_atomic") as rewrite, \
+                mock.patch.object(history, "_tail_row", return_value=None), \
+                mock.patch.object(history, "_append_row") as append:
+            self.assertTrue(history.append_snapshot(snapshot(20), now=NOW))
+        rewrite.assert_not_called()
+        append.assert_called_once()
+
+        with mock.patch.object(history, "_read_rows",
+                               side_effect=PermissionError("unreadable")), \
+                mock.patch.object(history, "_write_rows_atomic") as rewrite:
+            with self.assertRaisesRegex(
+                    RuntimeError, "history purge failed.*unreadable"):
+                history.remove_account("alpha")
+        rewrite.assert_not_called()
+
+    def test_read_rows_treats_only_missing_as_empty(self):
+        self.assertEqual(history._read_rows(paths.history_path()), [])
+        with mock.patch("builtins.open",
+                        side_effect=PermissionError("unreadable")), \
+                self.assertRaisesRegex(PermissionError, "unreadable"):
+            history._read_rows(paths.history_path())
+
+    def test_oversized_encoded_row_is_not_appended(self):
+        value = snapshot()
+        value["accounts"] *= 6000
+        with self.assertRaisesRegex(ValueError, "maximum line size"):
+            history.append_snapshot(value, now=NOW)
+        self.assertFalse(os.path.exists(paths.history_path()))
+
+    def test_append_repairs_missing_trailing_newline(self):
+        paths.ensure_private(paths.history_dir())
+        first = json.dumps(row(NOW - 60, 10), separators=(",", ":"))
+        with open(paths.history_path(), "w", encoding="utf-8") as handle:
+            handle.write(first)
+        self.assertTrue(history.append_snapshot(snapshot(20), now=NOW))
+        with open(paths.history_path(), "rb") as handle:
+            raw = handle.read()
+        self.assertIn(b"}\n{", raw)
+        self.assertTrue(raw.endswith(b"\n"))
+        with mock.patch.object(history.time, "time", return_value=NOW):
+            loaded = history.load_series(1)
+        self.assertEqual([value["ts"] for value in loaded], [NOW - 60, NOW])
 
     def test_remove_account_rewrites_rows_and_drops_empty_rows(self):
         only_a = row(NOW - 3, 10, name="a")
@@ -218,11 +323,17 @@ class HistoryPersistenceTests(unittest.TestCase):
         self.assertTrue(all([account["name"] for account in value["accounts"]]
                             == ["b"] for value in loaded))
 
-    def test_remove_account_is_fail_safe(self):
+    def test_remove_account_raises_clear_error_and_keeps_original(self):
         history.append_snapshot(snapshot(), now=NOW)
+        with open(paths.history_path(), "rb") as handle:
+            before = handle.read()
         with mock.patch.object(history.os, "replace",
                                side_effect=OSError("disk full")):
-            self.assertFalse(history.remove_account("alpha"))
+            with self.assertRaisesRegex(
+                    RuntimeError, "history purge failed.*disk full"):
+                history.remove_account("alpha")
+        with open(paths.history_path(), "rb") as handle:
+            self.assertEqual(handle.read(), before)
 
     def test_throttle_carryover_accounts_are_not_projected(self):
         carried = snapshot(name="carried")["accounts"][0]
@@ -247,17 +358,41 @@ class HistoryPersistenceTests(unittest.TestCase):
         self.assertEqual(window, {"used_percent": None, "resets_at": None})
 
     def test_public_snapshot_with_emails_never_leaks_to_history(self):
-        self.assertTrue(history.append_snapshot(snapshot(), now=NOW))
+        value = snapshot()
+        value["accounts"][0]["plan"] = "owner@example.test"
+        value["accounts"][0]["windows"]["scoped:acct@example.test"] = {
+            "used_percent": 91, "resets_at": NOW + 7200}
+        self.assertTrue(history.append_snapshot(value, now=NOW))
         with open(paths.history_path(), encoding="utf-8") as handle:
             raw = handle.read()
+        self.assertNotIn("@", raw)
         self.assertNotIn("owner@example.test", raw)
         self.assertNotIn("window@example.test", raw)
         self.assertNotIn("identity", raw)
         account = json.loads(raw)["accounts"][0]
+        self.assertIsNone(account["plan"])
+        self.assertNotIn("scoped:acct@example.test", account["windows"])
         self.assertEqual(set(account), {
             "name", "provider", "plan", "ok", "stale", "windows"})
         self.assertEqual(set(account["windows"]["5h"]), {
             "used_percent", "resets_at"})
+
+    def test_legacy_name_and_provider_identities_are_screened_on_load(self):
+        paths.ensure_private(paths.history_dir())
+        unsafe_name = row(NOW - 3, 10)
+        unsafe_name["accounts"][0]["name"] = "owner@example.test"
+        unsafe_provider = row(NOW - 2, 20)
+        unsafe_provider["accounts"][0]["provider"] = "acct@example.test"
+        safe = row(NOW - 1, 30, name="safe")
+        with open(paths.history_path(), "w", encoding="utf-8") as handle:
+            for value in (unsafe_name, unsafe_provider, safe):
+                handle.write(json.dumps(value) + "\n")
+        with mock.patch.object(history.time, "time", return_value=NOW):
+            loaded = history.load_series(1)
+        rendered = json.dumps(history.response(1, rows=loaded, generated=NOW))
+        self.assertNotIn("@", rendered)
+        self.assertEqual([account["name"] for account in loaded[-1]["accounts"]],
+                         ["safe"])
 
 
 class HistoryAggregationTests(unittest.TestCase):
@@ -265,7 +400,8 @@ class HistoryAggregationTests(unittest.TestCase):
         values = [99.6, 99.7, 95, 89, 99.5, 90, 89, 99.4]
         rows = [row(NOW + index, value)
                 for index, value in enumerate(values)]
-        summary = history.summarize(7, rows=rows)[0]["windows"]["5h"]
+        summary = history.summarize(
+            7, rows=rows, generated=NOW + len(values) - 1)[0]["windows"]["5h"]
         self.assertEqual(summary["cap_hit_episodes"], 2)
         self.assertEqual(summary["current"], 99.4)
         self.assertEqual(summary["peak"], {"value": 99.7, "ts": NOW + 1})
@@ -279,6 +415,18 @@ class HistoryAggregationTests(unittest.TestCase):
         summary = history.summarize(7, rows=rows)[0]["windows"]["5h"]
         self.assertEqual(summary["average"], 10.0)
         self.assertEqual(summary["sample_count"], 1)
+
+    def test_current_is_null_for_held_or_old_latest_sample(self):
+        held_rows = [row(NOW, 10), row(NOW + 1, 80, stale=True)]
+        held = history.response(
+            7, rows=held_rows, generated=NOW + 1)["summary"][0]["windows"]["5h"]
+        self.assertIsNone(held["current"])
+        with mock.patch.dict(os.environ, {
+                "HEADROOM_HISTORY_MIN_INTERVAL": "60"}):
+            old = history.response(
+                7, rows=[row(NOW, 10)],
+                generated=NOW + 421)["summary"][0]["windows"]["5h"]
+        self.assertIsNone(old["current"])
 
     def test_downsampling_is_bounded_and_preserves_bucket_peaks(self):
         rows = [row(NOW + index, index % 101) for index in range(1001)]
@@ -350,6 +498,22 @@ class CollectHistoryHookTests(unittest.TestCase):
         self.assertIsNotNone(paths.load_json(paths.private_snapshot_path()))
         self.assertIsNotNone(paths.load_json(paths.public_snapshot_path()))
         self.assertEqual(errors.getvalue().count("history append failed"), 1)
+
+    def test_history_warning_write_failure_does_not_fail_collection(self):
+        class BrokenStderr:
+            def write(self, _value):
+                raise BrokenPipeError("closed")
+
+            def flush(self):
+                pass
+
+        patches = self._patch_collect()
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                mock.patch.object(history, "append_snapshot",
+                                  side_effect=OSError("disk full")), \
+                mock.patch.object(collect.sys, "stderr", BrokenStderr()):
+            result = collect.run_collect(quiet=True)
+        self.assertIs(result, self.private)
 
 
 if __name__ == "__main__":

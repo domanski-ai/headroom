@@ -320,7 +320,7 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
 .chart-line { fill: none; stroke-width: 2; vector-effect: non-scaling-stroke; }
 .chart-peak { fill: none; stroke-width: 1; opacity: .38;
               vector-effect: non-scaling-stroke; }
-.chart-peak-dot { stroke: var(--panel); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.chart-peak-dot { stroke: var(--bg); stroke-width: 1; vector-effect: non-scaling-stroke; }
 .chart-legend { display: flex; flex-wrap: wrap; gap: 4px 6px; }
 .chart-legend .legend-item { display: inline-flex; align-items: center; gap: 6px; padding: 4px 7px;
                              border: 0; border-radius: var(--radius); background: none;
@@ -739,7 +739,7 @@ body.is-widget .shell { display: none; }
       <header class="stats-panel-head">
         <div>
           <h2 id="history-chart-title">Window utilization</h2>
-          <p class="stats-panel-note">Lines show bucket means; peak markers preserve the highest sample in each bucket.</p>
+          <p class="stats-panel-note" id="history-chart-note">Lines show bucket means; peak markers preserve the highest sample in each bucket.</p>
         </div>
         <div class="chart-legend" id="history-legend" aria-label="Account legend"></div>
       </header>
@@ -1107,14 +1107,14 @@ function renderHistoryChart(data,key){
     legend.innerHTML="";
     return;
   }
-  const visibleNames={};
-  series.filter(account=>!hiddenSeries.has(account.key)).forEach(account=>{
-    visibleNames[account.name]=(visibleNames[account.name]||0)+1;
+  const allNames={};
+  data.series.forEach(account=>{
+    allNames[account.name]=(allNames[account.name]||0)+1;
   });
   legend.innerHTML=series.map((account,index)=>'<button type="button" class="legend-item" data-series="'+
     esc(account.key)+'" aria-pressed="'+(hiddenSeries.has(account.key)?"false":"true")+
     '" style="--series:'+SERIES_COLORS[index%SERIES_COLORS.length]+'"><i></i>'+esc(account.name+
-      (visibleNames[account.name]>1?" · "+account.provider:""))+"</button>").join("");
+      (allNames[account.name]>1?" · "+account.provider:""))+"</button>").join("");
   legend.querySelectorAll(".legend-item").forEach(item=>item.addEventListener("click",()=>{
     const identity=item.getAttribute("data-series");
     if(hiddenSeries.has(identity))hiddenSeries.delete(identity);else hiddenSeries.add(identity);
@@ -1253,8 +1253,9 @@ function showHistoryFailure(error){
 }
 async function loadHistory(manual){
   const requestId=++historyRequest,button=document.getElementById("history-refresh");
+  const replaceView=manual||document.getElementById("stats-content").hidden;
   if(manual){button.disabled=true;button.textContent="Refreshing…";}
-  showStatsState("Loading history","Reading saved window percentages.",true);
+  if(replaceView)showStatsState("Loading history","Reading saved window percentages.",true);
   let timer=null;
   try{
     const days=document.getElementById("history-range").value;
@@ -1267,8 +1268,11 @@ async function loadHistory(manual){
     if(!response.ok){const error=new Error("history returned HTTP "+response.status);
       error.code=payload&&payload.error;throw error;}
     const data=validateHistory(payload);
-    if(requestId===historyRequest){historyData=data;renderStats();}
-  }catch(error){if(requestId===historyRequest){historyData=null;showHistoryFailure(error);}}
+    if(requestId===historyRequest){historyData=data;renderStats();
+      document.getElementById("history-chart-note").textContent=
+        "Lines show bucket means; peak markers preserve the highest sample in each bucket."+
+        (data.days!==Number(days)?" · showing "+data.days+"d":"");}
+  }catch(error){if(requestId===historyRequest&&replaceView){historyData=null;showHistoryFailure(error);}}
   finally{
     if(timer!==null)clearTimeout(timer);
     if(manual){button.disabled=false;button.textContent="Refresh";}

@@ -134,7 +134,8 @@ The dashboard's Stats tab charts saved provider-window utilization, summarizes
 current/peak/average percentages and cap-hit episodes, and ranks the 7-day
 workhorses. History contains window percentages only: never token counts,
 emails, or provider identity fields. It is sampled at most once per minute and
-retained for 30 days by default.
+retained for 30 days by default, with up to one extra grace day before the
+amortized retention prune runs.
 
 Set `HEADROOM_HISTORY=0` to disable history entirely. Retention and sampling can
 be adjusted with `HEADROOM_HISTORY_RETENTION_DAYS` and

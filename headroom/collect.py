@@ -1332,7 +1332,11 @@ def run_collect(quiet=False):
         try:
             history.append_snapshot(public)
         except Exception as error:  # history must never break collection
-            print(f"headroom: history append failed: {error}", file=sys.stderr)
+            try:
+                print(f"headroom: history append failed: {error}",
+                      file=sys.stderr)
+            except OSError:
+                pass
         if not quiet:
             print_snapshot(snapshot)
         return snapshot
@@ -1391,13 +1395,13 @@ def remove_slot(name):
         # preserving the established config -> cooldown -> quarantine order.
         # The collection lock covers the full sequence, so a collector cannot
         # start from the old registry and later overwrite these pruned feeds.
+        history.remove_account(name)
         removed = registry.remove_account(name)
         if _prune_snapshot_slot(private, name):
             paths.write_json_atomic(paths.private_snapshot_path(), private)
         if _prune_snapshot_slot(public, name):
             paths.write_json_atomic(paths.public_snapshot_path(), public,
                                     mode=0o644)
-        history.remove_account(name)
         route.remove_slot_state(name)
         return removed
 

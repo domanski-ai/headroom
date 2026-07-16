@@ -4,6 +4,17 @@ Findings from an adversarial cross-model review (GPT-5.6, x-high effort,
 2026-07-11) that are deliberate tradeoffs or blocked on upstream, documented
 here so users can judge them for their own threat model.
 
+## Stats/history v1 known limits
+
+- Cap-hit episode counting does not split episodes across provider window
+  resets, so the count can be low when a reset occurs during an episode.
+- Retention pruning is amortized and can keep up to one extra grace day before
+  rewriting the history file.
+- `/history.json` rebuilds its aggregations for every request, which is
+  acceptable at the current history scale.
+- Dashboards with six or more series repeat legend colours.
+- Chart end-labels can overlap when there are more series than vertical space.
+
 ## Supervised-launch residuals (opt-in launch safety)
 
 The opt-in launch-safety features (`--headroom-launch-fallback` /

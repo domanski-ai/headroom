@@ -687,6 +687,21 @@ class HistoryHttpTests(unittest.TestCase):
         self.assertEqual(headers["content-type"], "application/json")
         self.assertTrue(json.loads(body)["series"])
 
+    def test_provider_labels_with_emails_never_reach_history_feed(self):
+        with self.live_server(with_history=False) as server:
+            account = usage_account()
+            account["plan"] = "owner@example.test"
+            account["windows"]["scoped:acct@example.test"] = {
+                "used_percent": 75, "resets_at": int(time.time()) + 3600}
+            history.append_snapshot(
+                usage_snapshot(account), now=int(time.time()))
+            with open(paths.history_path(), "rb") as handle:
+                raw = handle.read()
+            status, _, body = memory_get(*server, "/history.json")
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"@", raw)
+        self.assertNotIn(b"@", body)
+
     def test_unexpected_history_error_returns_json_503(self):
         with self.live_server() as server, \
                 mock.patch.object(history, "load_series",
