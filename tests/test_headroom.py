@@ -2147,13 +2147,21 @@ class CollectionLockOrdering(unittest.TestCase):
 
         snapshot = {"schema_version": 1, "run_id": "fixture", "generated": 1,
                     "generated_iso": "fixture", "accounts": []}
+        token_scanned = threading.Event()
+
+        def token_scan():
+            guarded_load()
+            token_scanned.set()
+
         with tempfile.TemporaryDirectory() as root, \
                 mock.patch.dict(os.environ, {"HEADROOM_DIR": root}), \
                 mock.patch.object(registry, "load", side_effect=guarded_load), \
                 mock.patch.object(collect, "collect", return_value=snapshot), \
                 mock.patch.object(registry, "dashboard_settings",
-                                  return_value={"redact_emails": True}):
+                                  return_value={"redact_emails": True}), \
+                mock.patch.object(tokens, "collect", side_effect=token_scan):
             collect.run_collect(quiet=True)
+            self.assertTrue(token_scanned.wait(2))
         # Initial collection and the locked ID/pin merge remain inside the
         # collection lock. The third load belongs to the token scanner and is
         # deliberately outside it (serialized by state/tokens/scan.lock).

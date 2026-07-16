@@ -777,6 +777,7 @@ body.is-widget .shell { display: none; }
 
   <div class="token-stats" id="token-stats" hidden>
     <p class="token-partial" id="token-partial" hidden>Partial data</p>
+    <p class="token-partial" id="token-stale" hidden>telemetry stale</p>
     <section class="token-summary" aria-label="Token summary">
       <article class="token-tile"><span>Lifetime tokens</span>
         <strong id="token-lifetime">–</strong><small>all token traffic</small></article>
@@ -869,8 +870,10 @@ const DATA_URL = "usage.json";
 const CACHE_KEY = "headroom-cache-" + ((CONFIG && CONFIG.redact) ? "r" : "f");
 const SNAPSHOT_MAX_AGE = CONFIG&&Number.isFinite(CONFIG.snapshot_max_age)?CONFIG.snapshot_max_age:900;
 const OBSERVATION_MAX_AGE = CONFIG&&Number.isFinite(CONFIG.observation_max_age)?CONFIG.observation_max_age:1800;
+const TOKEN_SCAN_INTERVAL = CONFIG&&Number.isFinite(CONFIG.token_scan_interval)?Math.max(0,CONFIG.token_scan_interval):900;
+const TOKEN_MAX_DAYS=400,TOKEN_SUPPRESS_AGE=7*86400;
 let requestNumber = 0;
-let tokenStats = null;
+let tokenStats = null,tokenTelemetryStale=false;
 
 /* ------------------------------------------------------------- helpers */
 function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
@@ -1020,6 +1023,15 @@ function withoutTokenStats(data){
   if(!data||typeof data!=="object")return data;
   const clean=Object.assign({},data);delete clean.token_stats;return clean;
 }
+function sanitizeLegacyCaches(){
+  ["headroom-cache-r","headroom-cache-f"].forEach(key=>{
+    try{
+      const raw=localStorage.getItem(key);if(raw==null)return;
+      const clean=withoutTokenStats(JSON.parse(raw));
+      localStorage.setItem(key,JSON.stringify(clean));
+    }catch(e){try{localStorage.removeItem(key);}catch(ignore){}}
+  });
+}
 function render(data,forceNoncurrent){
   const now=Date.now()/1e3,display=data._headroom_display;
   if(display.freshness.state==="held"||!Number.isFinite(data.generated)||data.generated>now) snapshotState="held";
@@ -1037,7 +1049,9 @@ function render(data,forceNoncurrent){
   const lowest=readings.length?readings.reduce((b,r)=>r.left<b.left?r:b):null;
   const claude=accounts.filter(a=>a.provider==="claude");
   const codex=accounts.filter(a=>a.provider==="codex");
-  tokenStats=data.token_stats;
+  const tokenState=tokenTelemetryState(data.token_stats,now);
+  tokenStats=tokenState.suppressed?null:data.token_stats;
+  tokenTelemetryStale=tokenState.stale;
   renderTokenStats();
   set("verified",current.length+"/"+accounts.length);
   set("average",avg==null?"n/a":avg+"%");
@@ -1133,12 +1147,29 @@ function tokenCounts(value){
   if(!tokenNumber(value.grand_total))value.grand_total=value.total+value.cache_read;
   return tokenNumber(value.grand_total);
 }
+function tokenTelemetryState(value,now){
+  if(!value||!Number.isFinite(value.generated))return{stale:false,suppressed:false};
+  const age=now-value.generated;
+  return{stale:age>4*TOKEN_SCAN_INTERVAL&&age<=TOKEN_SUPPRESS_AGE,
+    suppressed:age>TOKEN_SUPPRESS_AGE};
+}
 function validateTokenStats(value){
   if(value==null)return null;
   if(!value||typeof value!=="object"||!Number.isFinite(value.generated)||
      !value.days||typeof value.days!=="object"||Array.isArray(value.days)||
      !Array.isArray(value.accounts)||!value.summary||typeof value.summary!=="object")return null;
-  if(!Object.entries(value.days).every(([day,counts])=>/^\d{4}-\d{2}-\d{2}$/.test(day)&&tokenCounts(counts)))return null;
+  const generatedDate=new Date(value.generated*1e3);
+  if(!Number.isFinite(generatedDate.getTime()))return null;
+  const end=Date.UTC(generatedDate.getUTCFullYear(),generatedDate.getUTCMonth(),generatedDate.getUTCDate());
+  const start=end-(TOKEN_MAX_DAYS-1)*864e5,safeDays={};
+  for(const [day,counts] of Object.entries(value.days)){
+    const ts=tokenDayEpoch(day);
+    if(ts==null||utcDay(new Date(ts))!==day)return null;
+    if(ts<start||ts>end)continue;
+    if(!tokenCounts(counts))return null;
+    safeDays[day]=counts;
+  }
+  value.days=safeDays;
   const summary=value.summary,peak=summary.peak;
   if(!tokenNumber(summary.lifetime)||!tokenNumber(summary.current_streak)||
      !tokenNumber(summary.longest_streak)||!peak||!tokenNumber(peak.total)||
@@ -1201,9 +1232,11 @@ function tokenDenseSeries(days,endDay){
   })).filter(point=>point.ts!=null).sort((a,b)=>a.ts-b.ts);
   if(!entries.length)return[];
   const totals=new Map(entries.map(point=>[point.ts,point.total]));
-  const requestedEnd=tokenDayEpoch(endDay),end=Math.max(entries[entries.length-1].ts,requestedEnd==null?0:requestedEnd);
+  const requestedEnd=tokenDayEpoch(endDay),end=requestedEnd==null?entries[entries.length-1].ts:requestedEnd;
+  const start=Math.max(entries[0].ts,end-(TOKEN_MAX_DAYS-1)*TOKEN_DAY_MS);
+  if(start>end)return[];
   const dense=[];
-  for(let ts=entries[0].ts;ts<=end;ts+=TOKEN_DAY_MS)
+  for(let ts=start;ts<=end&&dense.length<TOKEN_MAX_DAYS;ts+=TOKEN_DAY_MS)
     dense.push({date:utcDay(new Date(ts)),ts:ts,total:totals.get(ts)||0});
   return dense;
 }
@@ -1235,7 +1268,8 @@ function tokenHeatmapMaximum(days,start,today){
 }
 function renderTokenHeatmap(){
   const target=document.getElementById("token-heatmap"),days=tokenStats.days||{};
-  const now=new Date(),today=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate()));
+  const generated=new Date(tokenStats.generated*1e3),today=new Date(Date.UTC(
+    generated.getUTCFullYear(),generated.getUTCMonth(),generated.getUTCDate()));
   const weekStart=new Date(today);weekStart.setUTCDate(today.getUTCDate()-today.getUTCDay());
   const start=new Date(weekStart);start.setUTCDate(weekStart.getUTCDate()-51*7);
   const maximum=tokenHeatmapMaximum(days,start,today);
@@ -1306,31 +1340,38 @@ function renderTokenActivity(){
     renderTokenHeatmap();
   }else if(tokenActivityMode==="weekly"){
     note.textContent="Grand-total tokens grouped into UTC Sunday-start 7-day buckets.";
-    renderTokenSeries(tokenWeeklySeries(tokenStats.days,utcDay(new Date())),"weekly");
+    renderTokenSeries(tokenWeeklySeries(tokenStats.days,utcDay(new Date(tokenStats.generated*1e3))),"weekly");
   }else{
     note.textContent="Running grand-total tokens across the available daily history.";
-    renderTokenSeries(tokenCumulativeSeries(tokenStats.days,utcDay(new Date())),"cumulative");
+    renderTokenSeries(tokenCumulativeSeries(tokenStats.days,utcDay(new Date(tokenStats.generated*1e3))),"cumulative");
   }
 }
 function renderTokenStats(){
   const target=document.getElementById("token-stats"),leaderboard=document.getElementById("leaderboard-panel"),
-    partial=document.getElementById("token-partial");
+    partial=document.getElementById("token-partial"),stale=document.getElementById("token-stale"),
+    enabled=CONFIG&&CONFIG.token_stats_enabled===true;
+  const sideNote=document.getElementById("side-note");
+  if(enabled)sideNote.textContent="Window % read live · token totals from your local session logs.";
+  else sideNote.innerHTML="Window percentage only.<br>No token counts stored.";
   if(!tokenStats){
     target.hidden=true;
     partial.hidden=true;
+    stale.hidden=true;
     document.getElementById("stats-title").textContent="Usage history";
     document.getElementById("stats-intro").textContent="Window utilization over time. Percentages show each provider window consumed, never token volume.";
-    document.getElementById("side-note").innerHTML="Window percentage only.<br>No token counts stored.";
     if(historyData)renderLeaderboard(historyData);else leaderboard.hidden=true;
     return;
   }
   target.hidden=false;
   partial.hidden=!tokenStats.partial;
-  partial.textContent=tokenStats.partial?"Partial data · "+tokenStats.failed_file_count+
-    (tokenStats.failed_file_count===1?" file could not be read.":" files could not be read."):"";
+  partial.textContent=tokenStats.partial?(tokenStats.failed_file_count?
+    "Partial data · "+tokenStats.failed_file_count+
+      (tokenStats.failed_file_count===1?" file could not be read.":" files could not be read."):
+    "Partial data · a scan bound or provider-root check was reached."):"";
+  stale.hidden=!tokenTelemetryStale;
+  stale.textContent=tokenTelemetryStale?"telemetry stale · last updated "+age(tokenStats.generated):"";
   document.getElementById("stats-title").textContent="Usage stats";
   document.getElementById("stats-intro").textContent="Local token activity and provider-window utilization in one view.";
-  document.getElementById("side-note").innerHTML="Local token aggregates.<br>No message content stored.";
   const summary=tokenStats.summary,longest=summary.longest_session||{};
   document.getElementById("token-lifetime").textContent=formatTokens(summary.grand_total);
   document.getElementById("token-peak").textContent=formatTokens(summary.peak.grand_total);
@@ -1990,6 +2031,7 @@ function applyTheme(name){
 }
 picker.addEventListener("change",()=>applyTheme(picker.value));
 (function init(){
+  sanitizeLegacyCaches();
   const configured=CONFIG&&CONFIG.theme;
   let stored=null;
   try{stored=localStorage.getItem("headroom-theme");}catch(e){}

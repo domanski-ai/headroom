@@ -32,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -1284,6 +1285,38 @@ def collection_lock(blocking=True):
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+def _run_token_scan(scan):
+    try:
+        scan()
+    except Exception as error:  # token telemetry must never break collection
+        try:
+            print(f"headroom: token stats scan failed: {error}",
+                  file=sys.stderr)
+        except Exception:
+            pass
+
+
+def _trigger_token_scan(synchronous):
+    """Run deterministic CLI scans inline; feed-path scans are daemon work."""
+    scan = tokens.collect
+    if synchronous:
+        _run_token_scan(scan)
+        return None
+    try:
+        worker = threading.Thread(
+            target=_run_token_scan, args=(scan,),
+            name="headroom-token-scan", daemon=True)
+        worker.start()
+        return worker
+    except Exception as error:  # thread startup is optional and fail-safe
+        try:
+            print(f"headroom: token stats scan failed: {error}",
+                  file=sys.stderr)
+        except Exception:
+            pass
+        return None
+
+
 def run_collect(quiet=False):
     """Full collect run: lock, read, write both snapshots. Returns snapshot."""
     with collection_lock(blocking=False) as locked:
@@ -1348,17 +1381,10 @@ def run_collect(quiet=False):
                       file=sys.stderr)
             except Exception:
                 pass
-    # Session-log scanning can take seconds on a cold pass. It has its own
-    # flock and exact registry view, so it runs only after the collection lock
-    # is released and cannot block snapshot publication or race slot purges.
-    try:
-        tokens.collect()
-    except Exception as error:  # token telemetry must never break collection
-        try:
-            print(f"headroom: token stats scan failed: {error}",
-                  file=sys.stderr)
-        except Exception:
-            pass
+    # Session-log scanning can take seconds on a cold pass. Quiet callers are
+    # feed/serve hooks, so launch a fire-and-forget daemon only after releasing
+    # the collection lock. The CLI's non-quiet `collect` remains synchronous.
+    _trigger_token_scan(synchronous=not quiet)
     if not quiet:
         print_snapshot(snapshot)
     return snapshot

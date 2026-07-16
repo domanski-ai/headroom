@@ -418,6 +418,16 @@ const windowDays={
 };
 const weekly=tokenWeeklySeries(windowDays,"2026-01-11");
 const cumulative=tokenCumulativeSeries(windowDays,"2026-01-05");
+const count={input:1,output:1,cache_read:0,cache_creation:0,total:2,grand_total:2};
+const generated=Date.parse("2026-01-10T12:00:00Z")/1e3;
+const clamped=validateTokenStats({generated:generated,days:{
+  "2024-12-06":Object.assign({},count),
+  "2024-12-07":Object.assign({},count),
+  "2026-01-10":Object.assign({},count),
+  "2026-01-11":Object.assign({},count)
+},accounts:[],summary:{lifetime:4,current_streak:1,longest_streak:1,
+  peak:{date:"2026-01-10",total:2}}});
+const independentCap=tokenDenseSeries({"2000-01-01":{grand_total:1}},"2026-01-10");
 const target={innerHTML:""};
 globalThis.document={getElementById:()=>target};
 renderTokenSeries(cumulative,"cumulative");
@@ -425,10 +435,15 @@ console.log(JSON.stringify({
   maximum:tokenHeatmapMaximum(days,new Date("2026-01-01T00:00:00Z"),new Date("2026-01-03T00:00:00Z")),
   weekly:weekly,
   cumulative:cumulative,
+  clampedDays:Object.keys(clamped.days),
+  denseLength:independentCap.length,
+  denseLast:independentCap[independentCap.length-1].date,
+  staleState:tokenTelemetryState({generated:generated},generated+3601),
+  suppressedState:tokenTelemetryState({generated:generated},generated+7*86400+1),
   path:target.innerHTML
 }));
 """
-        return ('"use strict";\nfunction esc(value){return String(value);}\n'
+        return ('"use strict";\nconst TOKEN_MAX_DAYS=400,TOKEN_SUPPRESS_AGE=7*86400,TOKEN_SCAN_INTERVAL=900;\nfunction esc(value){return String(value);}\n'
                 + functions + tail)
 
     @unittest.skipUnless(NODE, "node runtime required to execute token charts")
@@ -454,6 +469,42 @@ console.log(JSON.stringify({
         self.assertIn(" H", path_data)
         self.assertIn(" V", path_data)
         self.assertNotIn(" L", path_data)
+        self.assertEqual(value["clampedDays"],
+                         ["2024-12-07", "2026-01-10"])
+        self.assertEqual(value["denseLength"], 400)
+        self.assertEqual(value["denseLast"], "2026-01-10")
+        self.assertEqual(value["staleState"],
+                         {"stale": True, "suppressed": False})
+        self.assertEqual(value["suppressedState"],
+                         {"stale": False, "suppressed": True})
+
+
+class LegacyTokenCacheJS(unittest.TestCase):
+    @unittest.skipUnless(NODE, "node runtime required to execute cache sanitizer")
+    def test_both_legacy_cache_keys_are_sanitized_at_init(self):
+        with open(dashboard.TEMPLATE) as handle:
+            template = handle.read()
+        functions = "function withoutTokenStats" + template.split(
+            "function withoutTokenStats", 1)[1].split(
+                "function render(data,forceNoncurrent)", 1)[0]
+        script = r'''
+const values=new Map([
+  ["headroom-cache-r",JSON.stringify({generated:1,token_stats:{secret:1}})],
+  ["headroom-cache-f",JSON.stringify({generated:2,token_stats:{secret:2}})]
+]);
+globalThis.localStorage={getItem:key=>values.has(key)?values.get(key):null,
+  setItem:(key,value)=>values.set(key,value),removeItem:key=>values.delete(key)};
+sanitizeLegacyCaches();
+console.log(JSON.stringify(Object.fromEntries(Array.from(values,([key,value])=>[key,JSON.parse(value)]))));
+'''
+        proc = subprocess.run(
+            [NODE, "-"], input='"use strict";\n' + functions + script,
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        caches = json.loads(proc.stdout.strip())
+        self.assertEqual(set(caches), {"headroom-cache-r", "headroom-cache-f"})
+        self.assertTrue(all("token_stats" not in value
+                            for value in caches.values()))
 
 
 class WidgetRendererTests(unittest.TestCase):
@@ -1096,6 +1147,9 @@ class DashboardHttpTests(unittest.TestCase):
                          widget.SNAPSHOT_MAX_AGE)
         self.assertEqual(injected["observation_max_age"],
                          widget.OBSERVATION_MAX_AGE)
+        self.assertEqual(injected["token_scan_interval"],
+                         dashboard.tokens.scan_interval())
+        self.assertFalse(injected["token_stats_enabled"])
         self.assertEqual(payload["_headroom_display"]["accounts"][0][
             "windows"]["5h"]["tone"], "green")
         self.assertIn('id="stats-tab"', html)
@@ -1151,6 +1205,7 @@ class DashboardHttpTests(unittest.TestCase):
 
         self.assertIn('id="token-stats" hidden', template)
         self.assertIn('id="token-partial" hidden', template)
+        self.assertIn('id="token-stale" hidden', template)
         self.assertIn('id="token-heatmap"', template)
         self.assertIn('class="token-heat-cell"', template)
         self.assertIn('data-token-mode="daily"', template)
@@ -1176,6 +1231,19 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertIn('getElementById("token-insights")', token_render)
         self.assertIn("tokenStats.partial", token_render)
         self.assertIn("tokenStats.failed_file_count", token_render)
+        self.assertIn("telemetry stale", token_render)
+        self.assertIn(
+            "Window % read live · token totals from your local session logs.",
+            token_render)
+        self.assertIn(
+            'sideNote.innerHTML="Window percentage only.<br>No token counts stored."',
+            token_render)
+        render = template.split("function render(data,forceNoncurrent){",
+                                1)[1].split("\n}", 1)[0]
+        self.assertIn("tokenState.suppressed?null:data.token_stats", render)
+        init = template.split("(function init(){", 1)[1].split("})();", 1)[0]
+        self.assertLess(init.index("sanitizeLegacyCaches();"),
+                        init.index("if(widgetMode)"))
         leaderboard = template.split("function renderLeaderboard(data){",
                                      1)[1].split("\n}", 1)[0]
         self.assertIn("if(tokenStats)", leaderboard)

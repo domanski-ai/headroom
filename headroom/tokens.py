@@ -6,6 +6,12 @@ private incremental state necessarily records home-relative source paths,
 byte offsets, mtimes, file identity/fingerprints, per-file daily subtotals,
 and the bounded counter/dedupe metadata needed to resume an append-only log.
 
+Resource bounds are deliberately fixed: physical records are at most 1 MiB,
+only UTC days from 2020-01-01 through scan-time +2 days are accepted, one file
+may retain at most 512 distinct days, and the published daily store may retain
+at most 3000 account/day entries. Crossing a cardinality cap marks telemetry
+partial instead of growing another in-memory map entry.
+
 ``total`` preserves the original input + output + cache creation accounting;
 ``grand_total`` also includes cache reads and drives Codex-mirror headlines.
 Codex reports cached input as a subset of input, so it is split into uncached
@@ -26,7 +32,7 @@ import time
 from . import paths, registry
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_SCAN_INTERVAL = 900
 MAX_PAYLOAD_DAYS = 400
 MAX_SESSION_SECONDS = 48 * 60 * 60
@@ -34,6 +40,10 @@ MAX_LINE_BYTES = 1024 * 1024
 READ_DRAIN_BYTES = 64 * 1024
 DEDUPE_TAIL_RECORDS = 512
 FINGERPRINT_BYTES = 4096
+MIN_TOKEN_DAY = datetime.date(2020, 1, 1)
+MAX_FUTURE_DAYS = 2
+MAX_FILE_DAYS = 512
+MAX_GLOBAL_DAYS = 3000
 HANDOFF_MARKER_SCHEMA = "headroom_token_copy@1"
 COUNT_KEYS = ("input", "output", "cache_read", "cache_creation", "total",
               "grand_total")
@@ -135,10 +145,12 @@ def _usage_value(usage, key, default=0):
     return _count(usage.get(key))
 
 
-def _model_family(model):
+def _model_family(model, provider=None):
     if not isinstance(model, str) or not model.strip():
         return None
     lowered = model.lower()
+    if provider == "codex":
+        return "gpt"
     return next((label for label in FAMILY_LABELS[:-1]
                  if label in lowered), "other")
 
@@ -244,7 +256,7 @@ def _codex_context(value):
     kind = value.get("type") or payload.get("type")
     if kind != "turn_context":
         return None, None
-    return (_model_family(payload.get("model")),
+    return (_model_family(payload.get("model"), provider="codex"),
             _effort_label(payload.get("effort")
                           or payload.get("reasoning_effort")))
 
@@ -297,7 +309,7 @@ def _normalized_day(value):
     return result
 
 
-def _normalized_days(value):
+def _normalized_days(value, limit=None, partial=None):
     result = {}
     if not isinstance(value, dict):
         return result
@@ -307,6 +319,10 @@ def _normalized_days(value):
             try:
                 datetime.date.fromisoformat(day)
             except ValueError:
+                continue
+            if limit is not None and day not in result and len(result) >= limit:
+                if partial is not None:
+                    partial[0] = True
                 continue
             result[day] = normalized
     return result
@@ -322,7 +338,9 @@ def _add_mix(target, source):
         target[label] = target.get(label, 0) + count
 
 
-def _add_day(days, day, counts, family=None, effort=None):
+def _add_day(days, day, counts, family=None, effort=None, limit=None):
+    if day not in days and limit is not None and len(days) >= limit:
+        return False
     target = days.setdefault(day, _empty_day())
     _add_counts(target, counts)
     family = family if family in FAMILY_LABELS else "other"
@@ -331,6 +349,7 @@ def _add_day(days, day, counts, family=None, effort=None):
     if effort in EFFORT_LABELS:
         target["efforts"][effort] = (
             target["efforts"].get(effort, 0) + counts["grand_total"])
+    return True
 
 
 def _add_day_record(days, day, source):
@@ -390,20 +409,26 @@ def _dedupe_tail(value):
 
 
 def _bounded_record_lines(handle, end):
-    """Yield terminated, size-bounded physical records up to ``end``."""
+    """Yield every terminated physical record up to ``end``.
+
+    Oversized records are represented by ``None`` after bounded draining so
+    callers can checkpoint them without retaining their content. Only an
+    unterminated EOF fragment is deliberately left before the checkpoint.
+    """
     while handle.tell() < end:
         remaining = end - handle.tell()
         line = handle.readline(min(MAX_LINE_BYTES + 1, remaining))
         if not line:
             break
         if line.endswith(b"\n"):
-            if len(line.rstrip(b"\r\n")) <= MAX_LINE_BYTES:
-                yield handle.tell(), line
+            yield (handle.tell(), line
+                   if len(line.rstrip(b"\r\n")) <= MAX_LINE_BYTES else None)
             continue
         if handle.tell() >= end:
             break  # final fragment: never parse or checkpoint it
         # The line exceeded the cap. Drain it in bounded chunks, then allow
         # later well-formed records to make progress without retaining it.
+        record_end = None
         while handle.tell() < end:
             chunk = handle.readline(min(READ_DRAIN_BYTES, end - handle.tell()))
             if not chunk:
@@ -411,32 +436,46 @@ def _bounded_record_lines(handle, end):
             terminated = chunk.endswith(b"\n")
             del chunk
             if terminated:
+                record_end = handle.tell()
                 break
+        if record_end is not None:
+            yield record_end, None
 
 
-def _parse_stream(handle, provider, start=0, previous=None, end=None):
+def _parse_stream(handle, provider, start=0, previous=None, end=None, now=None):
     previous = previous or {}
     if end is None:
         position = handle.tell()
         handle.seek(0, os.SEEK_END)
         end = handle.tell()
         handle.seek(position)
-    days = _normalized_days(previous.get("days")) if start else {}
+    cap_reached = [False]
+    days = _normalized_days(
+        previous.get("days"), limit=MAX_FILE_DAYS,
+        partial=cap_reached) if start else {}
+    file_partial = previous.get("partial") is True or cap_reached[0]
     last_counter = (_normalized_counts(previous.get("last_counter"))
                     if start else None)
     first_event_ts = previous.get("first_event_ts") if start else None
     last_event_ts = previous.get("last_event_ts") if start else None
     current_family = previous.get("last_family") if start else None
+    if provider == "codex" and current_family not in FAMILY_LABELS:
+        current_family = "gpt"
     current_effort = previous.get("last_effort") if start else None
     seen = _dedupe_tail(previous.get("dedupe_tail")) if start else \
         collections.OrderedDict()
     valid_offset = start
+    scan_day = datetime.datetime.fromtimestamp(
+        time.time() if now is None else now, datetime.timezone.utc).date()
+    latest_day = scan_day + datetime.timedelta(days=MAX_FUTURE_DAYS)
     handle.seek(start)
     for record_end, line in _bounded_record_lines(handle, end):
+        valid_offset = record_end
+        if line is None:
+            continue
         record = _record(line)
         if record is None:
             continue
-        valid_offset = record_end
         if _handoff_prefix_end(record):
             # Everything through this boundary was already attributed to the
             # source slot. Retain counter/dedupe/model context only, so target
@@ -446,10 +485,28 @@ def _parse_stream(handle, provider, start=0, previous=None, end=None):
             last_event_ts = None
             continue
         event_ts = _timestamp(record.get("timestamp"))
-        if event_ts is not None:
-            if first_event_ts is None:
-                first_event_ts = event_ts
-            last_event_ts = event_ts
+        event_day = _day(event_ts)
+        parsed_day = _date(event_day)
+        event_allowed = (event_ts is not None and parsed_day is not None
+                         and MIN_TOKEN_DAY <= parsed_day <= latest_day)
+        if not event_allowed:
+            if provider == "claude":
+                parsed = parse_claude_record(record)
+                if parsed is not None and parsed[2] is not None:
+                    _delta, maximum = _message_delta(
+                        parsed[1], seen.get(parsed[2]))
+                    seen.pop(parsed[2], None)
+                    seen[parsed[2]] = maximum
+                    while len(seen) > DEDUPE_TAIL_RECORDS:
+                        seen.popitem(last=False)
+            else:
+                parsed = parse_codex_record(record)
+                if parsed is not None:
+                    last_counter = parsed[1]
+            continue
+        if first_event_ts is None:
+            first_event_ts = event_ts
+        last_event_ts = event_ts
         if provider == "claude":
             parsed = parse_claude_record(record)
             if parsed is None:
@@ -458,13 +515,17 @@ def _parse_stream(handle, provider, start=0, previous=None, end=None):
             if signature is not None:
                 delta, maximum = _message_delta(counts, seen.get(signature))
                 if delta["grand_total"] > 0:
-                    _add_day(days, day, delta, family=family)
+                    if not _add_day(days, day, delta, family=family,
+                                    limit=MAX_FILE_DAYS):
+                        file_partial = True
                 seen.pop(signature, None)
                 seen[signature] = maximum
                 while len(seen) > DEDUPE_TAIL_RECORDS:
                     seen.popitem(last=False)
             else:
-                _add_day(days, day, counts, family=family)
+                if not _add_day(days, day, counts, family=family,
+                                limit=MAX_FILE_DAYS):
+                    file_partial = True
         else:
             family, effort = _codex_context(record)
             if family is not None:
@@ -477,10 +538,14 @@ def _parse_stream(handle, provider, start=0, previous=None, end=None):
             day, counter = parsed
             delta = _counter_delta(counter, last_counter)
             if delta["grand_total"] > 0:
-                _add_day(days, day, delta, family=current_family,
-                         effort=current_effort)
+                if not _add_day(days, day, delta, family=current_family,
+                                effort=current_effort,
+                                limit=MAX_FILE_DAYS):
+                    file_partial = True
             last_counter = counter
     result = {"days": days, "offset": valid_offset}
+    if file_partial:
+        result["partial"] = True
     if first_event_ts is not None:
         result["first_event_ts"] = first_event_ts
         result["last_event_ts"] = last_event_ts
@@ -536,8 +601,38 @@ def _open_contained(home, relative_path):
         raise
 
 
-def _scan_file(home, relative_path, provider, previous=None):
+def _stat_contained(home, relative_path):
+    home = registry.expand(home)
+    real_home = os.path.realpath(home)
+    path = os.path.join(home, *_relative_parts(relative_path))
+    if not _inside_home(os.path.realpath(path), real_home):
+        raise OSError("token source escapes account home")
+    current = os.lstat(path)
+    if not stat.S_ISREG(current.st_mode):
+        raise OSError("token source is not a contained regular file")
+    return current
+
+
+def _checkpoint_hash(handle, offset):
+    start = max(0, offset - FINGERPRINT_BYTES)
+    handle.seek(start)
+    return hashlib.sha256(handle.read(offset - start)).hexdigest()
+
+
+def _scan_file(home, relative_path, provider, previous=None, now=None):
     previous = previous if isinstance(previous, dict) else {}
+    candidate = _stat_contained(home, relative_path)
+    previous_offset = previous.get("offset")
+    unchanged = (
+        not previous.get("last_error")
+        and previous.get("st_dev") == candidate.st_dev
+        and previous.get("st_ino") == candidate.st_ino
+        and isinstance(previous_offset, int)
+        and previous_offset == previous.get("size") == candidate.st_size
+        and previous.get("mtime_ns") == candidate.st_mtime_ns
+    )
+    if unchanged:
+        return dict(previous)
     descriptor = _open_contained(home, relative_path)
     with os.fdopen(descriptor, "rb") as handle:
         bound = os.fstat(handle.fileno())  # size/mtime snapshot before reading
@@ -548,21 +643,17 @@ def _scan_file(home, relative_path, provider, previous=None):
             and previous.get("st_ino") == bound.st_ino
             and previous.get("fingerprint") == fingerprint
         )
-        previous_offset = previous.get("offset")
-        unchanged = (
-            same_file
-            and not previous.get("last_error")
-            and isinstance(previous_offset, int)
-            and previous_offset == previous.get("size") == bound.st_size
-            and previous.get("mtime_ns") == bound.st_mtime_ns
-        )
-        if unchanged:
-            return dict(previous)
         append = (same_file and isinstance(previous_offset, int)
-                  and 0 <= previous_offset <= bound.st_size)
+                  and 0 <= previous_offset <= bound.st_size
+                  and isinstance(previous.get("checkpoint_hash"), str)
+                  and previous["checkpoint_hash"] ==
+                  _checkpoint_hash(handle, previous_offset))
         result = _parse_stream(
             handle, provider, start=previous_offset if append else 0,
-            previous=previous if append else None, end=bound.st_size)
+            previous=previous if append else None, end=bound.st_size,
+            now=now)
+        result["checkpoint_hash"] = _checkpoint_hash(
+            handle, result["offset"])
     result.update({
         "size": bound.st_size,
         "mtime_ns": bound.st_mtime_ns,
@@ -574,14 +665,33 @@ def _scan_file(home, relative_path, provider, previous=None):
     return result
 
 
-def _files(account):
+def _files(account, errors=None):
+    errors = [] if errors is None else errors
     home = registry.expand(account["home"])
     root_name = "projects" if account["provider"] == "claude" else "sessions"
     root = os.path.join(home, root_name)
+    root_stat = os.lstat(root)
+    real_home = os.path.realpath(home)
+    if stat.S_ISLNK(root_stat.st_mode):
+        raise OSError("symlinked token provider root")
+    if not stat.S_ISDIR(root_stat.st_mode) \
+            or not _inside_home(os.path.realpath(root), real_home):
+        raise OSError("token provider root escapes account home")
+
+    def walk_error(error):
+        errors.append(error)
+
     for directory, subdirectories, filenames in os.walk(
-            root, followlinks=False):
-        subdirectories[:] = [name for name in subdirectories
-                             if not os.path.islink(os.path.join(directory, name))]
+            root, followlinks=False, onerror=walk_error):
+        safe_subdirectories = []
+        for name in subdirectories:
+            try:
+                if not stat.S_ISLNK(os.lstat(
+                        os.path.join(directory, name)).st_mode):
+                    safe_subdirectories.append(name)
+            except OSError as error:
+                errors.append(error)
+        subdirectories[:] = safe_subdirectories
         for name in filenames:
             if account["provider"] == "claude":
                 matches = name.endswith(".jsonl")
@@ -591,7 +701,8 @@ def _files(account):
             try:
                 if not matches or not stat.S_ISREG(os.lstat(path).st_mode):
                     continue
-            except OSError:
+            except OSError as error:
+                errors.append(error)
                 continue
             yield os.path.relpath(path, home).replace(os.sep, "/")
 
@@ -624,10 +735,12 @@ def scan_lock(blocking=False):
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def _daily_from_files(files):
+def _daily_from_files(files, include_status=False):
     accounts = {}
+    cardinality = 0
+    partial = False
     if not isinstance(files, dict):
-        return accounts
+        return (accounts, partial) if include_status else accounts
     for slot_id, slot_files in files.items():
         if not isinstance(slot_id, str) or not isinstance(slot_files, dict):
             continue
@@ -635,46 +748,55 @@ def _daily_from_files(files):
             if not isinstance(entry, dict):
                 continue
             target = accounts.setdefault(slot_id, {})
-            for day, counts in _normalized_days(entry.get("days")).items():
+            capped = [False]
+            entry_days = _normalized_days(
+                entry.get("days"), limit=MAX_FILE_DAYS, partial=capped)
+            partial = partial or capped[0] or entry.get("partial") is True
+            for day, counts in entry_days.items():
+                if day not in target and cardinality >= MAX_GLOBAL_DAYS:
+                    partial = True
+                    entry["partial"] = True
+                    continue
+                if day not in target:
+                    cardinality += 1
                 _add_day_record(target, day, counts)
             first = _timestamp(entry.get("first_event_ts"))
             last = _timestamp(entry.get("last_event_ts"))
             day = _day(first)
             if day is not None and last is not None:
+                if day not in entry_days and len(entry_days) >= MAX_FILE_DAYS:
+                    partial = True
+                    entry["partial"] = True
+                    continue
+                if day not in target and cardinality >= MAX_GLOBAL_DAYS:
+                    partial = True
+                    entry["partial"] = True
+                    continue
+                if day not in target:
+                    cardinality += 1
                 duration = min(MAX_SESSION_SECONDS, max(0, int(last - first)))
                 aggregate = target.setdefault(day, _empty_day())
                 aggregate["session_count"] += 1
                 aggregate["longest_session_s"] = max(
                     aggregate["longest_session_s"], duration)
-    return accounts
+    return (accounts, partial) if include_status else accounts
 
 
 def collect(accounts=None, config=None, now=None, force=False):
-    """Incrementally scan one exact registry view; return False when gated."""
-    loaded_config = config is None
-    config = registry.load() if loaded_config else config
-    if not registry.token_stats_enabled(config):
-        return False
-    config_stamp = None
-    if loaded_config:
-        try:
-            metadata = os.stat(paths.config_path())
-            config_stamp = (metadata.st_dev, metadata.st_ino,
-                            metadata.st_size, metadata.st_mtime_ns)
-        except OSError:
-            return False
+    """Incrementally scan the authoritative registry; return False if gated.
+
+    ``accounts`` and ``config`` remain accepted for source compatibility but
+    are intentionally ignored: opt-out and enumeration must come from one
+    registry view loaded under the config lock after the scan lock is held.
+    """
     with scan_lock(blocking=False) as locked:
         if not locked:
             return False
-        if loaded_config:
-            try:
-                metadata = os.stat(paths.config_path())
-                if config_stamp != (metadata.st_dev, metadata.st_ino,
-                                    metadata.st_size, metadata.st_mtime_ns):
-                    return False
-            except OSError:
+        with registry.config_lock():
+            authoritative_config = registry.load()
+            if not registry.token_stats_enabled(authoritative_config):
                 return False
-        accounts = registry.accounts(config) if accounts is None else accounts
+            accounts = registry.accounts(authoritative_config)
         now = int(time.time() if now is None else now)
         old_state = paths.load_json(paths.token_scan_state_path()) or {}
         if not isinstance(old_state, dict) \
@@ -684,6 +806,26 @@ def collect(accounts=None, config=None, now=None, force=False):
         if not force and isinstance(last_scan, int) \
                 and 0 <= now - last_scan < scan_interval():
             return False
+        old_daily = paths.load_json(paths.token_daily_path())
+        if not isinstance(old_daily, dict) \
+                or old_daily.get("schema_version") != SCHEMA_VERSION:
+            old_daily = {
+                "schema_version": SCHEMA_VERSION,
+                "generated": 0,
+                "partial": True,
+                "failed_file_count": 0,
+                "accounts": {},
+            }
+        last_success = old_daily.get("last_success")
+        if not isinstance(last_success, int):
+            generated = old_daily.get("generated")
+            last_success = generated if isinstance(generated, int) \
+                and generated > 0 else None
+        attempted = dict(old_daily)
+        attempted["last_attempt"] = now
+        if last_success is not None:
+            attempted["last_success"] = last_success
+        paths.write_json_atomic(paths.token_daily_path(), attempted, mode=0o600)
         old_files = old_state.get("files")
         old_files = old_files if isinstance(old_files, dict) else {}
         live = [account for account in accounts
@@ -693,6 +835,7 @@ def collect(accounts=None, config=None, now=None, force=False):
                 and isinstance(account.get("home"), str)]
         files = {}
         failed_files = 0
+        failed_roots = 0
         for account in live:
             slot_id = account["id"]
             provider = account["provider"]
@@ -701,36 +844,62 @@ def collect(accounts=None, config=None, now=None, force=False):
                 if isinstance(previous_files, dict) else {}
             slot_files = {}
             seen = set()
-            for relative_path in _files(account):
-                if relative_path in seen:
-                    continue
-                seen.add(relative_path)
-                previous = previous_files.get(relative_path)
-                compatible = (isinstance(previous, dict)
-                              and previous.get("provider") == provider)
-                try:
-                    slot_files[relative_path] = _scan_file(
-                        account["home"], relative_path, provider,
-                        previous if compatible else None)
-                except Exception as error:  # one bad file never hides the rest
-                    failed_files += 1
-                    retained = dict(previous) if compatible else {
-                        "provider": provider, "days": {}, "offset": 0,
-                    }
-                    retained["last_error"] = type(error).__name__
-                    retained["last_error_at"] = now
-                    slot_files[relative_path] = retained
+            discovery_errors = []
+            try:
+                discovered = _files(account, errors=discovery_errors)
+                for relative_path in discovered:
+                    if relative_path in seen:
+                        continue
+                    seen.add(relative_path)
+                    previous = previous_files.get(relative_path)
+                    compatible = (isinstance(previous, dict)
+                                  and previous.get("provider") == provider)
+                    try:
+                        slot_files[relative_path] = _scan_file(
+                            account["home"], relative_path, provider,
+                            previous if compatible else None, now=now)
+                    except Exception as error:  # one bad file never hides rest
+                        failed_files += 1
+                        retained = dict(previous) if compatible else {
+                            "provider": provider, "days": {}, "offset": 0,
+                        }
+                        retained["last_error"] = type(error).__name__
+                        retained["last_error_at"] = now
+                        slot_files[relative_path] = retained
+            except OSError as error:
+                discovery_errors.append(error)
+            if discovery_errors:
+                failed_roots += 1
+                for relative_path, previous in previous_files.items():
+                    if relative_path not in seen and isinstance(previous, dict) \
+                            and previous.get("provider") == provider:
+                        slot_files[relative_path] = dict(previous)
             files[slot_id] = slot_files
+        daily_accounts, aggregate_partial = _daily_from_files(
+            files, include_status=True)
+        partial_files = sum(
+            1 for slot_files in files.values() if isinstance(slot_files, dict)
+            for entry in slot_files.values()
+            if isinstance(entry, dict) and entry.get("partial") is True)
+        partial = bool(failed_files or failed_roots or partial_files
+                       or aggregate_partial)
         daily = {
             "schema_version": SCHEMA_VERSION,
             "generated": now,
-            "partial": failed_files > 0,
+            "last_attempt": now,
+            "last_success": now,
+            "partial": partial,
             "failed_file_count": failed_files,
-            "accounts": _daily_from_files(files),
+            "failed_root_count": failed_roots,
+            "partial_file_count": partial_files,
+            "accounts": daily_accounts,
         }
         state = {
             "schema_version": SCHEMA_VERSION,
             "last_scan": now,
+            "last_attempt": now,
+            "last_success": now,
+            "failed_root_count": failed_roots,
             "files": files,
         }
         paths.write_json_atomic(paths.token_daily_path(), daily, mode=0o600)
@@ -745,7 +914,10 @@ def remove_account(slot_id):
     with scan_lock(blocking=True):
         state_path = paths.token_scan_state_path()
         state = paths.load_json(state_path)
-        if state is None and os.path.exists(state_path):
+        state_exists = os.path.exists(state_path)
+        state_authoritative = (not state_exists or (
+            isinstance(state, dict) and isinstance(state.get("files"), dict)))
+        if not state_authoritative:
             failures.append(f"unreadable {state_path}")
         state_files = state.get("files") if isinstance(state, dict) else None
         state_files = state_files if isinstance(state_files, dict) else {}
@@ -757,7 +929,13 @@ def remove_account(slot_id):
             if isinstance(slot_files, dict)
             for entry in slot_files.values()
             if isinstance(entry, dict) and entry.get("last_error")
-        )
+        ) if state_authoritative else None
+        partial_file_count = sum(
+            1 for slot_files in (state_files or {}).values()
+            if isinstance(slot_files, dict)
+            for entry in slot_files.values()
+            if isinstance(entry, dict) and entry.get("partial") is True
+        ) if state_authoritative else None
 
         daily_path = paths.token_daily_path()
         daily = paths.load_json(daily_path)
@@ -767,13 +945,19 @@ def remove_account(slot_id):
             if isinstance(daily, dict) else None
         if isinstance(daily_accounts, dict):
             changed = daily_accounts.pop(slot_id, None) is not None
-            partial_changed = (
-                daily.get("failed_file_count") != failed_file_count
-                or daily.get("partial") is not (failed_file_count > 0)
-            )
+            failed_root_count = _count(daily.get("failed_root_count", 0)) or 0
+            recalculated_partial = failed_file_count is not None and bool(
+                failed_file_count or failed_root_count or partial_file_count)
+            partial_changed = failed_file_count is not None and any((
+                daily.get("failed_file_count") != failed_file_count,
+                daily.get("partial_file_count") != partial_file_count,
+                daily.get("partial") is not recalculated_partial,
+            ))
             if changed or partial_changed:
-                daily["failed_file_count"] = failed_file_count
-                daily["partial"] = failed_file_count > 0
+                if failed_file_count is not None:
+                    daily["failed_file_count"] = failed_file_count
+                    daily["partial_file_count"] = partial_file_count
+                    daily["partial"] = recalculated_partial
                 paths.write_json_atomic(daily_path, daily, mode=0o600)
     if failures:
         raise RuntimeError("; ".join(failures))
@@ -901,10 +1085,14 @@ def summarize(store, accounts, now=None):
                        if most_used["tokens"] else
                        {"label": None, "share_pct": 0})
     failed_file_count = _count(store.get("failed_file_count", 0)) or 0
+    failed_root_count = _count(store.get("failed_root_count", 0)) or 0
+    partial_file_count = _count(store.get("partial_file_count", 0)) or 0
     return {
         "generated": generated,
-        "partial": store.get("partial") is True and failed_file_count > 0,
+        "partial": store.get("partial") is True,
         "failed_file_count": failed_file_count,
+        "failed_root_count": failed_root_count,
+        "partial_file_count": partial_file_count,
         "days": payload_days,
         "accounts": account_rows,
         "summary": {

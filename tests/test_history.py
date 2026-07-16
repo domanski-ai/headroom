@@ -541,6 +541,7 @@ class CollectHistoryHookTests(unittest.TestCase):
             mock.patch.object(registry, "dashboard_settings",
                               return_value={"redact_emails": False}),
             mock.patch.object(collect, "collect", return_value=self.private),
+            mock.patch.object(collect, "_trigger_token_scan"),
         )
 
     def test_hook_receives_exact_public_snapshot_after_publish(self):
@@ -550,6 +551,7 @@ class CollectHistoryHookTests(unittest.TestCase):
 
         patches = self._patch_collect()
         with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                patches[5], \
                 mock.patch.object(history, "append_snapshot",
                                   side_effect=verify) as append:
             collect.run_collect(quiet=True)
@@ -561,7 +563,8 @@ class CollectHistoryHookTests(unittest.TestCase):
         registry.save(config)
         private = json.loads(json.dumps(self.private))
         private["accounts"][0].pop("id")
-        with mock.patch.object(collect, "collect", return_value=private):
+        with mock.patch.object(collect, "collect", return_value=private), \
+                mock.patch.object(collect, "_trigger_token_scan"):
             collect.run_collect(quiet=True)
         stored = registry.load()["accounts"][0]
         rows = history._read_rows(paths.history_path())
@@ -575,6 +578,7 @@ class CollectHistoryHookTests(unittest.TestCase):
         errors = io.StringIO()
         patches = self._patch_collect()
         with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                patches[5], \
                 mock.patch.object(history, "append_snapshot",
                                   side_effect=OSError("disk full")), \
                 redirect_stderr(errors):
@@ -594,6 +598,7 @@ class CollectHistoryHookTests(unittest.TestCase):
 
         patches = self._patch_collect()
         with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                patches[5], \
                 mock.patch.object(history, "append_snapshot",
                                   side_effect=OSError("disk full")), \
                 mock.patch.object(collect.sys, "stderr", BrokenStderr()):
