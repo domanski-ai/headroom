@@ -646,7 +646,7 @@ body.is-widget .shell { display: none; }
   <p class="side-note">Window percentage only.<br>No token counts stored.</p>
 </aside>
 <main class="shell">
-<div class="tab-view" id="usage-tab" role="tabpanel" aria-labelledby="usage-nav">
+<div class="tab-view" id="usage-tab">
   <header class="toolbar">
     <div class="brand">
       <h1 class="title" id="title">headroom</h1>
@@ -707,7 +707,7 @@ body.is-widget .shell { display: none; }
     usage read straight from your providers, no tokens spent</p>
 </div>
 
-<section class="tab-view" id="stats-tab" role="tabpanel" aria-labelledby="stats-nav" hidden>
+<section class="tab-view" id="stats-tab" hidden>
   <header class="stats-toolbar">
     <div>
       <h1 class="stats-title">Usage history</h1>
@@ -1029,7 +1029,7 @@ async function load(manual){
 /* =========================================================== history */
 const HISTORY_URL="history.json";
 const SERIES_COLORS=["var(--accent)","var(--green)","var(--orange)","var(--red)","var(--ink-2)"];
-let historyData=null,historyRequest=0;
+let historyData=null,historyForegroundRequest=0,historyBackgroundRequest=0,historyForegroundLoads=0;
 
 function validateHistory(data){
   if(!data||data.schema_version!==1||!Number.isFinite(data.generated)||
@@ -1126,7 +1126,7 @@ function renderHistoryChart(data,key){
   if(focusedSeries){
     const replacement=Array.from(legend.querySelectorAll(".legend-item")).find(
       item=>item.getAttribute("data-series")===focusedSeries);
-    if(replacement)replacement.focus();
+    if(replacement)replacement.focus({preventScroll:true});
   }
   const visible=series.map(account=>({account:account,color:account.color}))
     .filter(entry=>!hiddenSeries.has(entry.account.key));
@@ -1259,8 +1259,14 @@ function showHistoryFailure(error){
     showStatsState("History is unavailable here","The history feed could not be reached. Static builds still show Usage; use headroom serve for Stats.",false);
 }
 async function loadHistory(manual,background=false){
-  const requestId=++historyRequest,button=document.getElementById("history-refresh");
+  if(background&&historyForegroundLoads)return;
+  const requestId=background?++historyBackgroundRequest:++historyForegroundRequest;
+  const foregroundAtStart=historyForegroundRequest,button=document.getElementById("history-refresh");
   const replaceView=!background;
+  if(!background)historyForegroundLoads++;
+  const isCurrent=()=>background
+    ? requestId===historyBackgroundRequest&&foregroundAtStart===historyForegroundRequest&&historyForegroundLoads===0
+    : requestId===historyForegroundRequest;
   if(manual){button.disabled=true;button.textContent="Refreshing…";}
   if(replaceView)showStatsState("Loading history","Reading saved window percentages.",true);
   let timer=null;
@@ -1275,13 +1281,14 @@ async function loadHistory(manual,background=false){
     if(!response.ok){const error=new Error("history returned HTTP "+response.status);
       error.code=payload&&payload.error;throw error;}
     const data=validateHistory(payload);
-    if(requestId===historyRequest){historyData=data;renderStats();
+    if(isCurrent()){historyData=data;renderStats();
       document.getElementById("history-chart-note").textContent=
         "Lines show bucket means; peak markers preserve the highest sample in each bucket."+
         (data.days!==Number(days)?" · showing "+data.days+"d":"");}
-  }catch(error){if(requestId===historyRequest&&replaceView){historyData=null;showHistoryFailure(error);}}
+  }catch(error){if(isCurrent()&&replaceView){historyData=null;showHistoryFailure(error);}}
   finally{
     if(timer!==null)clearTimeout(timer);
+    if(!background)historyForegroundLoads--;
     if(manual){button.disabled=false;button.textContent="Refresh";}
   }
 }

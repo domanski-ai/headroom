@@ -1391,6 +1391,7 @@ def remove_slot(name):
         # Refuse before mutating the registry if a protective ledger cannot be
         # read and therefore cannot be safely scrubbed.
         route.preflight_remove_slot_state()
+        history.mark_purge_pending(name)
         # remove_account reloads under the registry lock, revalidating that the
         # slot still exists before the first mutation.  The collection lock
         # covers the full sequence, so a collector cannot later republish it.
@@ -1400,15 +1401,31 @@ def remove_slot(name):
         if _prune_snapshot_slot(public, name):
             paths.write_json_atomic(paths.public_snapshot_path(), public,
                                     mode=0o644)
+        failures = []
         try:
             history.remove_account(name)
         except Exception as error:
+            failures.append((
+                f"history purge for {paths.history_path()}", error))
+        finally:
+            try:
+                route.remove_slot_state(name)
+            except Exception as error:
+                failures.append(("route cleanup", error))
+        if failures:
+            details = "; ".join(
+                f"{operation}: {error}" for operation, error in failures)
             raise RuntimeError(
-                f"the slot is removed; history purge failed for "
-                f"{paths.history_path()}: {error}; purge account {name!r} "
-                "rows from the named history file manually or re-add+remove "
-                "the slot") from error
-        route.remove_slot_state(name)
+                f"the slot is removed; cleanup failed for account {name!r}: "
+                f"{details}; purge remains pending in "
+                f"{paths.purge_pending_path()}") from failures[0][1]
+        try:
+            history.clear_purge_pending(name)
+        except Exception as error:
+            raise RuntimeError(
+                f"the slot is removed; purge tombstone clear failed for "
+                f"account {name!r}: {error}; purge remains pending in "
+                f"{paths.purge_pending_path()}") from error
         return removed
 
 

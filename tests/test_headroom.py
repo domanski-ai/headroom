@@ -2335,14 +2335,78 @@ class RemoveCommand(unittest.TestCase):
         message = str(raised.exception)
         self.assertIn("the slot is removed", message)
         self.assertIn(history_file, message)
-        self.assertIn("purge account 'a' rows", message)
-        self.assertIn("manually or re-add+remove", message)
+        self.assertIn("history purge", message)
+        self.assertIn(paths.purge_pending_path(), message)
+        self.assertEqual(paths.load_json(paths.purge_pending_path()), ["a"])
+        self.assertEqual(route.cooldowns(), {"b:*": 300})
+        self.assertEqual(route.quarantines(), {"b": {"reason": "other"}})
         self.assertEqual([entry["name"] for entry in registry.load()["accounts"]],
                          ["b"])
         for path in (paths.private_snapshot_path(),
                      paths.public_snapshot_path()):
             self.assertEqual([entry["name"] for entry in
                               paths.load_json(path)["accounts"]], ["b"])
+
+    def test_removal_aggregates_history_and_route_cleanup_errors(self):
+        self._write_state()
+        with mock.patch.object(history, "remove_account",
+                               side_effect=OSError("disk full")) as purge, \
+                mock.patch.object(route, "remove_slot_state",
+                                  side_effect=OSError("ledger locked")) as cleanup:
+            with self.assertRaises(RuntimeError) as raised:
+                collect.remove_slot("a")
+        purge.assert_called_once_with("a")
+        cleanup.assert_called_once_with("a")
+        message = str(raised.exception)
+        self.assertIn("history purge", message)
+        self.assertIn("disk full", message)
+        self.assertIn("route cleanup", message)
+        self.assertIn("ledger locked", message)
+        self.assertEqual(paths.load_json(paths.purge_pending_path()), ["a"])
+
+    def test_snapshot_crash_tombstone_hides_same_name_until_retry_succeeds(self):
+        self._write_state()
+        original_write = paths.write_json_atomic
+
+        def fail_private(path, value, mode=0o600):
+            if path == paths.private_snapshot_path():
+                raise OSError("snapshot crash")
+            return original_write(path, value, mode=mode)
+
+        with mock.patch.object(paths, "write_json_atomic",
+                               side_effect=fail_private), \
+                self.assertRaisesRegex(OSError, "snapshot crash"):
+            collect.remove_slot("a")
+        self.assertEqual([entry["name"] for entry in registry.load()["accounts"]],
+                         ["b"])
+        self.assertEqual(paths.load_json(paths.purge_pending_path()), ["a"])
+        self.assertFalse(any(account["name"] == "a"
+                             for value in history.load_series(1)
+                             for account in value["accounts"]))
+
+        config = registry.load()
+        config["accounts"].append({
+            "name": "a", "provider": "claude", "home": self.home_a})
+        registry.save(config)
+        reconnected = {"schema_version": 1, "accounts": [_claude_row("a")]}
+        now = int(time.time())
+        with mock.patch.dict(os.environ,
+                             {"HEADROOM_HISTORY_MIN_INTERVAL": "0"}), \
+                mock.patch.object(history, "remove_account",
+                                  side_effect=OSError("purge still blocked")):
+            self.assertTrue(history.append_snapshot(reconnected, now=now))
+        self.assertEqual(paths.load_json(paths.purge_pending_path()), ["a"])
+        self.assertFalse(any(account["name"] == "a"
+                             for value in history.load_series(1)
+                             for account in value["accounts"]))
+
+        with mock.patch.dict(os.environ,
+                             {"HEADROOM_HISTORY_MIN_INTERVAL": "0"}):
+            self.assertTrue(history.append_snapshot(reconnected, now=now))
+        self.assertEqual(paths.load_json(paths.purge_pending_path()), [])
+        self.assertTrue(any(account["name"] == "a"
+                            for value in history.load_series(1)
+                            for account in value["accounts"]))
 
     def test_concurrent_removal_revalidates_before_history_purge(self):
         self._write_state()
@@ -2352,9 +2416,13 @@ class RemoveCommand(unittest.TestCase):
                     registry.RegistryError, "no connected account named 'a'"):
             collect.remove_slot("a")
         purge.assert_not_called()
+        self.assertEqual(paths.load_json(paths.purge_pending_path()), ["a"])
         self.assertTrue(any(account["name"] == "a"
-                            for value in history.load_series(1)
+                            for value in history._read_rows(paths.history_path())
                             for account in value["accounts"]))
+        self.assertFalse(any(account["name"] == "a"
+                             for value in history.load_series(1)
+                             for account in value["accounts"]))
 
 
 class DashboardRemovalOrdering(unittest.TestCase):

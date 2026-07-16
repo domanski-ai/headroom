@@ -248,6 +248,37 @@ def _ensure_storage():
     return paths.ensure_private(paths.history_dir())
 
 
+def _pending_purges():
+    path = paths.purge_pending_path()
+    value = paths.load_json(path)
+    if value is None:
+        if os.path.exists(path):
+            raise RuntimeError(f"purge tombstone is unreadable: {path}")
+        return set()
+    if not isinstance(value, list) or any(
+            not isinstance(name, str) or not name for name in value):
+        raise RuntimeError(f"purge tombstone is invalid: {path}")
+    return set(value)
+
+
+def mark_purge_pending(name):
+    """Persist an account purge intent before destructive slot mutation."""
+    pending = _pending_purges()
+    if name not in pending:
+        pending.add(name)
+        _ensure_storage()
+        paths.write_json_atomic(paths.purge_pending_path(), sorted(pending))
+
+
+def clear_purge_pending(name):
+    """Clear a completed purge intent, retaining all other tombstones."""
+    pending = _pending_purges()
+    if name in pending:
+        pending.remove(name)
+        _ensure_storage()
+        paths.write_json_atomic(paths.purge_pending_path(), sorted(pending))
+
+
 def _write_rows_atomic(rows):
     directory = _ensure_storage()
     descriptor, temporary = tempfile.mkstemp(
@@ -317,6 +348,18 @@ def _append_row(row):
 
 def append_snapshot(snapshot, now=None):
     """Append one public snapshot, returning False when disabled/throttled."""
+    try:
+        pending = _pending_purges()
+    except Exception:
+        pending = None
+    if pending is not None:
+        for name in sorted(pending):
+            try:
+                remove_account(name)
+                clear_purge_pending(name)
+            except Exception:
+                continue
+            pending.discard(name)
     if not enabled():
         return False
     now = int(time.time() if now is None else now)
@@ -357,6 +400,11 @@ def append_snapshot(snapshot, now=None):
     if age is not None and 0 <= age < min_interval():
         return False
     row = project_snapshot(snapshot, ts=now)
+    if pending is None:
+        row["accounts"] = []
+    elif pending:
+        row["accounts"] = [account for account in row["accounts"]
+                           if account["name"] not in pending]
     _append_row(row)
     return True
 
@@ -396,8 +444,21 @@ def load_series(days):
         days = 1
     now = int(time.time())
     cutoff = now - days * 86400
-    return [row for row in _read_rows(paths.history_path())
+    rows = [row for row in _read_rows(paths.history_path())
             if cutoff <= row["ts"] <= now]
+    try:
+        pending = _pending_purges()
+    except Exception:
+        return []
+    if not pending:
+        return rows
+    filtered = []
+    for row in rows:
+        accounts = [account for account in row["accounts"]
+                    if account["name"] not in pending]
+        if accounts:
+            filtered.append({"ts": row["ts"], "accounts": accounts})
+    return filtered
 
 
 def _samples(rows):

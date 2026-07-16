@@ -972,6 +972,9 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertNotIn('role="tab"', nav)
         self.assertNotIn("aria-controls", nav)
         self.assertNotIn("aria-selected", template)
+        self.assertNotIn('role="tabpanel"', template)
+        self.assertNotIn('aria-labelledby="usage-nav"', template)
+        self.assertNotIn('aria-labelledby="stats-nav"', template)
         self.assertIn('aria-current="page"', nav)
         self.assertIn('.side-nav a[aria-current="page"]', template)
 
@@ -980,7 +983,8 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertIn("const active=document.activeElement;", chart)
         self.assertIn("legend.contains(active)", chart)
         self.assertIn('item.getAttribute("data-series")===focusedSeries', chart)
-        self.assertIn("if(replacement)replacement.focus();", chart)
+        self.assertIn("if(replacement)replacement.focus({preventScroll:true});",
+                      chart)
         self.assertLess(chart.index("color:SERIES_COLORS[index"),
                         chart.index(")).filter(account=>account.points.length)"))
         self.assertIn("color:account.color", chart)
@@ -991,7 +995,15 @@ class DashboardHttpTests(unittest.TestCase):
             1)[0]
         self.assertIn("manual,background=false", history_script)
         self.assertIn("const replaceView=!background;", history_script)
-        self.assertIn("requestId===historyRequest&&replaceView", history_script)
+        self.assertIn("if(background&&historyForegroundLoads)return;",
+                      history_script)
+        self.assertIn("++historyBackgroundRequest:++historyForegroundRequest",
+                      history_script)
+        self.assertIn("foregroundAtStart===historyForegroundRequest",
+                      history_script)
+        self.assertIn("isCurrent()&&replaceView", history_script)
+        self.assertIn("if(!background)historyForegroundLoads--;",
+                      history_script)
         self.assertIn('if(active==="stats")loadHistory(false);', history_script)
         self.assertIn('history-range").addEventListener("change",()=>loadHistory(false))',
                       history_script)
