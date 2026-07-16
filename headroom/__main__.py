@@ -329,6 +329,7 @@ def _dispatch(argv):
     if command == "collect":
         from . import collect
         collect.run_collect()
+        collect._trigger_token_scan(synchronous=True)
         return 0
     if command == "status":
         from . import route

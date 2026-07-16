@@ -41,6 +41,7 @@ DEFAULT_DASHBOARD = {
     "title": "AI Fleet",
     "redact_emails": True,
     "port": 8377,
+    "token_stats": False,
 }
 
 # Model-family -> provider. `pick`/`run` accept any model string; family()
@@ -179,6 +180,18 @@ def dashboard_settings(config=None):
     except (TypeError, ValueError):
         settings["port"] = 8377
     return settings
+
+
+def token_stats_enabled(config=None):
+    """True only for the explicit local-token telemetry opt-in."""
+    if os.environ.get("HEADROOM_TOKEN_STATS") == "1":
+        return True
+    try:
+        config = load() if config is None else config
+    except RegistryError:
+        return False
+    dashboard = (config or {}).get("dashboard")
+    return isinstance(dashboard, dict) and dashboard.get("token_stats") is True
 
 
 def ordered_for(fam, config=None):

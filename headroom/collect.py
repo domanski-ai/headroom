@@ -32,13 +32,14 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-from . import history, paths, registry
+from . import history, paths, registry, tokens
 
 IDENTITY_TIMEOUT = paths.env_int("HEADROOM_IDENTITY_TIMEOUT", 15)
 CODEX_STALE_AFTER = paths.env_int("HEADROOM_CODEX_STALE_AFTER", 1800)
@@ -1284,6 +1285,38 @@ def collection_lock(blocking=True):
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+def _run_token_scan(scan):
+    try:
+        scan()
+    except Exception as error:  # token telemetry must never break collection
+        try:
+            print(f"headroom: token stats scan failed: {error}",
+                  file=sys.stderr)
+        except Exception:
+            pass
+
+
+def _trigger_token_scan(synchronous):
+    """Run CLI-owned scans inline; dashboard-owned scans are daemon work."""
+    scan = tokens.collect
+    if synchronous:
+        _run_token_scan(scan)
+        return None
+    try:
+        worker = threading.Thread(
+            target=_run_token_scan, args=(scan,),
+            name="headroom-token-scan", daemon=True)
+        worker.start()
+        return worker
+    except Exception as error:  # thread startup is optional and fail-safe
+        try:
+            print(f"headroom: token stats scan failed: {error}",
+                  file=sys.stderr)
+        except Exception:
+            pass
+        return None
+
+
 def run_collect(quiet=False):
     """Full collect run: lock, read, write both snapshots. Returns snapshot."""
     with collection_lock(blocking=False) as locked:
@@ -1348,9 +1381,9 @@ def run_collect(quiet=False):
                       file=sys.stderr)
             except Exception:
                 pass
-        if not quiet:
-            print_snapshot(snapshot)
-        return snapshot
+    if not quiet:
+        print_snapshot(snapshot)
+    return snapshot
 
 
 def _warning_mentions_slot(warning, name):
@@ -1426,6 +1459,11 @@ def remove_slot(name):
             except Exception as error:
                 warnings.append((
                     f"history purge for {paths.history_path()}", error))
+            try:
+                tokens.remove_account(removed.get("id"))
+            except Exception as error:
+                warnings.append((
+                    f"token purge for {paths.tokens_dir()}", error))
         finally:
             try:
                 route.remove_slot_state(name)

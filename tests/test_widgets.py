@@ -398,6 +398,202 @@ class CodexLiftedFiveHourDashboardJS(unittest.TestCase):
         self.assertTrue(out["hr_bar_green"])
 
 
+class TokenChartMathJS(unittest.TestCase):
+    @staticmethod
+    def _harness():
+        with open(dashboard.TEMPLATE) as handle:
+            template = handle.read()
+        validator = "function validate" + template.split(
+            "function validate", 1)[1].split(
+                "function withoutTokenStats", 1)[0]
+        functions = "function tokenNumber" + template.split(
+            "function tokenNumber", 1)[1].split(
+                "function renderTokenStats", 1)[0]
+        tail = r"""
+const browserNow=Date.parse("2026-01-10T18:00:00Z");
+Date.now=()=>browserNow;
+const days={
+  "2026-01-01":{grand_total:10},
+  "2026-01-03":{grand_total:30},
+  "2027-01-01":{grand_total:999}
+};
+const windowDays={
+  "2026-01-01":{grand_total:10},
+  "2026-01-03":{grand_total:30}
+};
+const weekly=tokenWeeklySeries(windowDays,"2026-01-11");
+const cumulative=tokenCumulativeSeries(windowDays,"2026-01-05");
+const count={input:1,output:1,cache_read:0,cache_creation:0,total:2,grand_total:2};
+const generated=Date.parse("2026-01-10T12:00:00Z")/1e3;
+const statsPayload=(summary={},accounts=[])=>({generated:generated,
+  days:{"2026-01-10":Object.assign({},count)},accounts:accounts,
+  summary:Object.assign({lifetime:2,current_streak:1,longest_streak:1,
+    peak:{date:"2026-01-10",total:2}},summary)});
+const hostilePeakDate=validateTokenStats(statsPayload({
+  peak:{date:{toString:null},total:2}}));
+const hostileAccountDate=validateTokenStats(statsPayload({},[{id:"a",name:"A",
+  provider:"claude",lifetime:2,last7d:2,
+  peak:{date:{toString:null},total:2}}]));
+const hostileNested=validateTokenStats(statsPayload({
+  longest_session:{seconds:1,date:null,account:{toString:null}},
+  most_used_model:{label:{toString:null},share_pct:Infinity}}));
+const outOfRangeShare=validateTokenStats(statsPayload({
+  most_used_model:{label:"sonnet",share_pct:101}}));
+const validDecimalShare=validateTokenStats(statsPayload({
+  most_used_model:{label:"sonnet",share_pct:12.5}}));
+const unsafeSummary=validateTokenStats(statsPayload({
+  lifetime:Number.MAX_SAFE_INTEGER+1}));
+const unsafeCounts=statsPayload();
+unsafeCounts.days["2026-01-10"]={input:Number.MAX_SAFE_INTEGER,output:0,
+  cache_read:1,cache_creation:0,total:Number.MAX_SAFE_INTEGER};
+const unsafeDay=validateTokenStats(unsafeCounts);
+const overflowDays={"2026-01-01":{grand_total:Number.MAX_SAFE_INTEGER},
+  "2026-01-02":{grand_total:1}};
+const weeklyOverflow=tokenWeeklySeries(overflowDays,"2026-01-02");
+const cumulativeOverflow=tokenCumulativeSeries(overflowDays,"2026-01-02");
+const disabledStats={};
+Object.defineProperty(disabledStats,"generated",{get(){throw new Error("disabled telemetry inspected");}});
+const disabled=validate({generated:generated,accounts:[],token_stats_enabled:false,
+  token_stats:disabledStats,_headroom_display:{schema:"headroom_widget@1",
+    freshness:{state:"current"},accounts:[]}});
+const clamped=validateTokenStats({generated:generated,days:{
+  "2024-12-06":Object.assign({},count),
+  "2024-12-07":Object.assign({},count),
+  "2026-01-10":Object.assign({},count),
+  "2026-01-11":Object.assign({},count)
+},accounts:[],summary:{lifetime:4,current_streak:1,longest_streak:1,
+  peak:{date:"2026-01-10",total:2}}});
+const futureGenerated=Date.parse("2026-01-12T12:00:00Z")/1e3;
+const futureClamped=validateTokenStats({generated:futureGenerated,days:{
+  "2024-12-07":Object.assign({},count),
+  "2026-01-10":Object.assign({},count),
+  "2026-01-11":Object.assign({},count)
+},accounts:[],summary:{lifetime:4,current_streak:1,longest_streak:1,
+  peak:{date:"2026-01-10",total:2}}});
+const independentCap=tokenDenseSeries({"2000-01-01":{grand_total:1}},"2026-01-10");
+const target={innerHTML:""};
+globalThis.document={getElementById:()=>target};
+renderTokenSeries(cumulative,"cumulative");
+console.log(JSON.stringify({
+  maximum:tokenHeatmapMaximum(days,new Date("2026-01-01T00:00:00Z"),new Date("2026-01-03T00:00:00Z")),
+  weekly:weekly,
+  cumulative:cumulative,
+  clampedDays:Object.keys(clamped.days),
+  futureClampedDays:Object.keys(futureClamped.days),
+  futureEnd:utcDay(new Date(tokenWindowEnd(futureGenerated))),
+  denseLength:independentCap.length,
+  denseLast:independentCap[independentCap.length-1].date,
+  staleAge:TOKEN_STALE_AGE,suppressAge:TOKEN_SUPPRESS_AGE,
+  largeAges:tokenTelemetryThresholds(400000),
+  staleState:tokenTelemetryState({generated:generated},generated+3600),
+  suppressedState:tokenTelemetryState({generated:generated},generated+7*86400),
+  futureState:tokenTelemetryState({generated:futureGenerated},generated),
+  hostilePeakDate:hostilePeakDate===null,
+  hostileAccountCount:hostileAccountDate.accounts.length,
+  hostileNestedAccount:hostileNested.summary.longest_session.account,
+  hostileNestedLabel:hostileNested.summary.most_used_model.label,
+  hostileNestedShare:hostileNested.summary.most_used_model.share_pct,
+  outOfRangeShare:outOfRangeShare.summary.most_used_model.share_pct,
+  validDecimalShare:validDecimalShare.summary.most_used_model.share_pct,
+  unsafeSummary:unsafeSummary===null,unsafeDay:unsafeDay===null,
+  tokenNumbers:[tokenNumber(0),tokenNumber(Number.MAX_SAFE_INTEGER),
+    tokenNumber(Number.MAX_SAFE_INTEGER+1),tokenNumber(1.5),tokenNumber(-1)],
+  weeklyOverflow:weeklyOverflow,cumulativeOverflow:cumulativeOverflow,
+  disabledHasTokenStats:Object.prototype.hasOwnProperty.call(disabled,"token_stats"),
+  path:target.innerHTML
+}));
+"""
+        return ('"use strict";\nconst TOKEN_MAX_DAYS=400,TOKEN_SCAN_INTERVAL=60,'
+                'TOKEN_AGE_LIMITS=tokenTelemetryThresholds(TOKEN_SCAN_INTERVAL),'
+                'TOKEN_STALE_AGE=TOKEN_AGE_LIMITS.stale,'
+                'TOKEN_SUPPRESS_AGE=TOKEN_AGE_LIMITS.suppress;\n'
+                'function esc(value){return String(value);}\n'
+                + validator + functions + tail)
+
+    @unittest.skipUnless(NODE, "node runtime required to execute token charts")
+    def test_window_scale_dense_utc_buckets_and_step_cumulative(self):
+        proc = subprocess.run([NODE, "-"], input=self._harness(),
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        value = json.loads(proc.stdout.strip().splitlines()[-1])
+        # The out-of-window 999 value must not flatten the rendered heatmap.
+        self.assertEqual(value["maximum"], 30)
+        self.assertEqual([point["total"] for point in value["weekly"]],
+                         [40, 0, 0])
+        self.assertTrue(all(
+            right["ts"] - left["ts"] == 7 * 86400000
+            for left, right in zip(value["weekly"], value["weekly"][1:])))
+        self.assertEqual([point["total"] for point in value["cumulative"]],
+                         [10, 10, 40, 40, 40])
+        self.assertTrue(all(
+            right["ts"] - left["ts"] == 86400000
+            for left, right in zip(
+                value["cumulative"], value["cumulative"][1:])))
+        path_data = re.search(r' d="([^"]+)"', value["path"]).group(1)
+        self.assertIn(" H", path_data)
+        self.assertIn(" V", path_data)
+        self.assertNotIn(" L", path_data)
+        self.assertEqual(value["clampedDays"],
+                         ["2024-12-07", "2026-01-10"])
+        self.assertEqual(value["futureClampedDays"],
+                         ["2024-12-07", "2026-01-10"])
+        self.assertEqual(value["futureEnd"], "2026-01-10")
+        self.assertEqual(value["denseLength"], 400)
+        self.assertEqual(value["denseLast"], "2026-01-10")
+        self.assertEqual(value["staleAge"], 3600)
+        self.assertEqual(value["suppressAge"], 7 * 86400)
+        self.assertEqual(value["largeAges"], {
+            "stale": 4 * 400000, "suppress": 2 * 400000})
+        self.assertEqual(value["staleState"],
+                         {"stale": True, "suppressed": False})
+        self.assertEqual(value["suppressedState"],
+                         {"stale": False, "suppressed": True})
+        self.assertEqual(value["futureState"],
+                         {"stale": True, "suppressed": False})
+        self.assertTrue(value["hostilePeakDate"])
+        self.assertEqual(value["hostileAccountCount"], 0)
+        self.assertIsNone(value["hostileNestedAccount"])
+        self.assertIsNone(value["hostileNestedLabel"])
+        self.assertIsNone(value["hostileNestedShare"])
+        self.assertIsNone(value["outOfRangeShare"])
+        self.assertEqual(value["validDecimalShare"], 12.5)
+        self.assertTrue(value["unsafeSummary"])
+        self.assertTrue(value["unsafeDay"])
+        self.assertEqual(value["tokenNumbers"],
+                         [True, True, False, False, False])
+        self.assertEqual(value["weeklyOverflow"], [])
+        self.assertEqual(value["cumulativeOverflow"], [])
+        self.assertFalse(value["disabledHasTokenStats"])
+
+
+class LegacyTokenCacheJS(unittest.TestCase):
+    @unittest.skipUnless(NODE, "node runtime required to execute cache sanitizer")
+    def test_both_legacy_cache_keys_are_sanitized_at_init(self):
+        with open(dashboard.TEMPLATE) as handle:
+            template = handle.read()
+        functions = "function withoutTokenStats" + template.split(
+            "function withoutTokenStats", 1)[1].split(
+                "function render(data,forceNoncurrent)", 1)[0]
+        script = r'''
+const values=new Map([
+  ["headroom-cache-r",JSON.stringify({generated:1,token_stats:{secret:1}})],
+  ["headroom-cache-f",JSON.stringify({generated:2,token_stats:{secret:2}})]
+]);
+globalThis.localStorage={getItem:key=>values.has(key)?values.get(key):null,
+  setItem:(key,value)=>values.set(key,value),removeItem:key=>values.delete(key)};
+sanitizeLegacyCaches();
+console.log(JSON.stringify(Object.fromEntries(Array.from(values,([key,value])=>[key,JSON.parse(value)]))));
+'''
+        proc = subprocess.run(
+            [NODE, "-"], input='"use strict";\n' + functions + script,
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        caches = json.loads(proc.stdout.strip())
+        self.assertEqual(set(caches), {"headroom-cache-r", "headroom-cache-f"})
+        self.assertTrue(all("token_stats" not in value
+                            for value in caches.values()))
+
+
 class WidgetRendererTests(unittest.TestCase):
     def test_sanitizer_removes_newlines_and_controls(self):
         cleaned = widget.sanitize("a\r\nb\x00c\x1fd\x7fe\u200bf")
@@ -822,6 +1018,63 @@ class DashboardHttpTests(unittest.TestCase):
                             ("/usage.json", "/widget.json", "/widget.txt")]
         self.assertEqual(statuses, [200, 200, 200])
 
+    def test_live_usage_handler_embeds_opted_in_token_summary(self):
+        account = usage_account()
+        token_value = {
+            "generated": NOW,
+            "days": {"2033-05-18": {
+                "input": 10, "output": 5, "cache_read": 7,
+                "cache_creation": 3, "total": 18, "grand_total": 25,
+                "session_count": 1, "longest_session_s": 3600,
+                "families": {"sonnet": 25}, "efforts": {}}},
+            "accounts": [{
+                "id": account["id"], "name": account["name"],
+                "provider": account["provider"], "lifetime": 18,
+                "lifetime_grand_total": 25, "last7d": 18,
+                "last7d_grand_total": 25,
+                "peak": {"date": "2033-05-18", "total": 18,
+                         "grand_total": 25}}],
+            "summary": {
+                "lifetime": 18, "grand_total": 25,
+                "peak": {"date": "2033-05-18", "total": 18,
+                         "grand_total": 25},
+                "current_streak": 1, "longest_streak": 1,
+                "total_sessions": 1, "active_days": 1,
+                "longest_session": {"seconds": 3600,
+                                    "date": "2033-05-18",
+                                    "account": account["name"]},
+                "most_used_model": {"label": "sonnet",
+                                    "share_pct": 100.0},
+                "families": [{"label": "sonnet", "tokens": 25,
+                              "share_pct": 100.0}]},
+        }
+
+        class StaticGate:
+            def get(self, *_args):
+                return dashboard.RefreshResult(usage_snapshot(account))
+
+        class LiveHandler(dashboard.Handler):
+            demo = False
+            refresh_gate = StaticGate()
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(os.environ, {"HEADROOM_DIR": directory}), \
+                mock.patch.object(dashboard.tokens, "load_summary",
+                                  return_value=token_value):
+            registry.save({
+                "schema_version": 1,
+                "dashboard": {"token_stats": True},
+                "accounts": [{
+                    "id": account["id"], "name": account["name"],
+                    "provider": account["provider"], "home": "/tmp/alpha"}],
+            })
+            status, _, body = memory_get(
+                LiveHandler, directory, "/usage.json")
+        payload = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertIs(payload["token_stats_enabled"], True)
+        self.assertEqual(payload["token_stats"], token_value)
+
     def test_demo_history_is_synthesized_without_collecting(self):
         with mock.patch.object(dashboard.collector, "run_collect",
                                side_effect=AssertionError("demo collected")):
@@ -932,6 +1185,12 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertRegex(render_body,
                          r"sourceFailed=forceNoncurrent===true\|\|")
         self.assertRegex(fallback, r"render\(cached,true\)")
+        self.assertIn("JSON.stringify(withoutTokenStats(data))", fallback)
+        self.assertIn("cached=withoutTokenStats(validate(", fallback)
+        cache_strip = script.split("function withoutTokenStats(data){",
+                                   1)[1].split("\n}", 1)[0]
+        self.assertIn("delete clean.token_stats", cache_strip)
+        self.assertIn("delete clean.token_stats_enabled", cache_strip)
 
     def test_dom_tone_allowlist_covers_every_projected_tone(self):
         # every colour tone the Python projection can emit for a live window
@@ -977,6 +1236,13 @@ class DashboardHttpTests(unittest.TestCase):
                          widget.SNAPSHOT_MAX_AGE)
         self.assertEqual(injected["observation_max_age"],
                          widget.OBSERVATION_MAX_AGE)
+        self.assertEqual(injected["token_scan_interval"],
+                         dashboard.tokens.scan_interval())
+        self.assertNotIn("token_stats_enabled", injected)
+        self.assertIs(payload["token_stats_enabled"], False)
+        self.assertNotIn("CONFIG.token_stats_enabled", html)
+        self.assertIn(
+            "tokenStatsEnabled=data.token_stats_enabled===true", html)
         self.assertEqual(payload["_headroom_display"]["accounts"][0][
             "windows"]["5h"]["tone"], "green")
         self.assertIn('id="stats-tab"', html)
@@ -1029,6 +1295,87 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertIn('loadHistory(false,true);},6e4)', history_script)
         self.assertIn('link.setAttribute("aria-current","page")', history_script)
         self.assertIn('link.removeAttribute("aria-current")', history_script)
+
+        self.assertIn('id="token-stats" hidden', template)
+        self.assertIn('id="token-partial" hidden', template)
+        self.assertIn('id="token-stale" hidden', template)
+        self.assertIn('id="token-heatmap"', template)
+        self.assertIn('class="token-heat-cell"', template)
+        self.assertIn('data-token-mode="daily"', template)
+        self.assertIn('data-token-mode="weekly"', template)
+        self.assertIn('data-token-mode="cumulative"', template)
+        weekly = template.split("function tokenWeeklySeries(days,endDay){",
+                                1)[1].split("\n}", 1)[0]
+        self.assertIn("tokenDenseSeries(days,endDay)", weekly)
+        self.assertIn("buckets.set", weekly)
+        cumulative = template.split(
+            "function tokenCumulativeSeries(days,endDay){",
+                                    1)[1].split("\n}", 1)[0]
+        self.assertIn("running+=", cumulative)
+        self.assertIn("if(!tokenNumber(running))return[];", cumulative)
+        self.assertIn("tokenDenseSeries(days,endDay)", cumulative)
+        series = template.split("function renderTokenSeries(series,mode){",
+                                1)[1].split("\n}", 1)[0]
+        self.assertIn("const tickIndexes=[...new Set(", series)
+        activity = template.split("function renderTokenActivity(){",
+                                  1)[1].split("\n}", 1)[0]
+        self.assertIn(
+            'getElementById("token-heat-legend").hidden=tokenActivityMode!=="daily"',
+            activity)
+        token_render = template.split("function renderTokenStats(){",
+                                      1)[1].split("\n}", 1)[0]
+        self.assertIn("if(!tokenStats)", token_render)
+        self.assertIn("target.hidden=true", token_render)
+        self.assertIn("target.hidden=false", token_render)
+        self.assertIn("summary.grand_total", token_render)
+        self.assertIn("summary.peak.grand_total", token_render)
+        self.assertIn('getElementById("token-longest-session")', token_render)
+        self.assertIn('getElementById("token-insights")', token_render)
+        self.assertIn("tokenStats.partial", token_render)
+        self.assertIn("tokenStats.failed_file_count", token_render)
+        self.assertIn("telemetry stale", token_render)
+        self.assertIn(
+            "Window % read live · token totals from your local session logs.",
+            token_render)
+        self.assertIn(
+            'sideNote.innerHTML="Window percentage only.<br>No token counts stored."',
+            token_render)
+        self.assertIn(
+            'historyData&&!document.getElementById("stats-content").hidden',
+            token_render)
+        self.assertIn('insightRow(item.label+" tokens"', token_render)
+        render = template.split("function render(data,forceNoncurrent){",
+                                1)[1].split("\n}", 1)[0]
+        self.assertIn(
+            "tokenStatsEnabled&&!tokenState.suppressed?data.token_stats:null",
+            render)
+        validate = template.split("function validate(data){",
+                                  1)[1].split("\n}", 1)[0]
+        self.assertLess(validate.index("data.token_stats_enabled"),
+                        validate.index("validateTokenStats(data.token_stats)"))
+        self.assertIn("else delete data.token_stats", validate)
+        stats_state = template.split("function showStatsState(",
+                                     1)[1].split("\n}", 1)[0]
+        self.assertIn(
+            'document.getElementById("leaderboard-panel").hidden=true;',
+            stats_state)
+        init = template.split("(function init(){", 1)[1].split("})();", 1)[0]
+        self.assertLess(init.index("sanitizeLegacyCaches();"),
+                        init.index("if(widgetMode)"))
+        leaderboard = template.split("function renderLeaderboard(data){",
+                                     1)[1].split("\n}", 1)[0]
+        # with telemetry on, the ranking lives in the Accounts column and the
+        # window-% leaderboard hides; without it, the fallback stays intact
+        self.assertIn("if(tokenStats)", leaderboard)
+        self.assertIn("panel.hidden=true;\n    return;", leaderboard)
+        self.assertIn("Avg weekly used", leaderboard)
+        self.assertIn("if(!data){panel.hidden=true;return;}", leaderboard)
+        self.assertIn("Ranked by average Weekly-all utilization", leaderboard)
+        accounts = template.split("function renderTokenAccounts(){",
+                                  1)[1].split("\n}", 1)[0]
+        self.assertIn("lifetime_grand_total", accounts)
+        self.assertIn("last7d_grand_total", accounts)
+        self.assertIn("token-account-row", accounts)
 
     def test_widget_href_uses_actual_server_address_port(self):
         port = 49152

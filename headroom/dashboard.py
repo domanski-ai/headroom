@@ -20,7 +20,7 @@ import webbrowser
 from dataclasses import dataclass
 
 from . import collect as collector
-from . import history, paths, registry, widget
+from . import history, paths, registry, tokens, widget
 
 TEMPLATE = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "dashboard", "template.html")
@@ -29,11 +29,27 @@ FAILURE_BACKOFF_BASE = paths.env_int("HEADROOM_SERVE_FAILURE_BACKOFF_BASE", 5)
 FAILURE_BACKOFF_CAP = paths.env_int("HEADROOM_SERVE_FAILURE_BACKOFF_CAP", 300)
 
 
-def display_snapshot(snapshot, evaluated_at=None, force_noncurrent_reason=None):
+def display_snapshot(snapshot, evaluated_at=None, force_noncurrent_reason=None,
+                     config=None):
     """Attach the central display projection consumed by dashboard JavaScript."""
     value = dict(snapshot)
+    # The source snapshot is untrusted with respect to the current opt-in.
+    # Remove any stale/cached payload before consulting one exact config view.
+    value.pop("token_stats", None)
+    value.pop("token_stats_enabled", None)
     value["_headroom_display"] = widget.project_dashboard(
         snapshot, evaluated_at, force_noncurrent_reason)
+    try:
+        live_config = registry.load() if config is None else config
+        enabled = registry.token_stats_enabled(live_config)
+        value["token_stats_enabled"] = enabled
+        if enabled:
+            token_stats = tokens.load_summary(
+                registry.accounts(live_config), now=evaluated_at)
+            if token_stats is not None:
+                value["token_stats"] = token_stats
+    except Exception:
+        pass  # an optional private store can never break the usage payload
     return value
 
 
@@ -166,7 +182,8 @@ def build_demo(out_dir=None):
                                 for a in data["accounts"]]}
     build(demo_config, out_dir)
     with open(os.path.join(out_dir, "usage.json"), "w") as handle:
-        json.dump(display_snapshot(data), handle, allow_nan=False)
+        json.dump(display_snapshot(data, config=demo_config),
+                  handle, allow_nan=False)
     return out_dir
 
 
@@ -183,6 +200,7 @@ def build(config=None, out_dir=None, snapshot_file=None):
         "redact": bool(settings.get("redact_emails", True)),
         "snapshot_max_age": widget.SNAPSHOT_MAX_AGE,
         "observation_max_age": widget.OBSERVATION_MAX_AGE,
+        "token_scan_interval": tokens.scan_interval(),
         "accounts": [{"name": account["name"], "provider": account["provider"]}
                      for account in registry.accounts(config)],
     }
@@ -200,7 +218,8 @@ def build(config=None, out_dir=None, snapshot_file=None):
         with open(snapshot_file) as handle:
             snapshot = json.load(handle)
         with open(target, "w") as handle:
-            json.dump(display_snapshot(snapshot), handle, allow_nan=False)
+            json.dump(display_snapshot(snapshot, config=config),
+                      handle, allow_nan=False)
     print(f"dashboard built: {index}")
     return index
 
@@ -289,9 +308,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if self.demo:
             snapshot = paths.load_json(os.path.join(self.directory, "usage.json"))
             return RefreshResult(snapshot)
+        def collect_for_dashboard():
+            snapshot = collector.run_collect(quiet=True)
+            collector._trigger_token_scan(synchronous=False)
+            return snapshot
+
         return self.refresh_gate.get(
             lambda: paths.load_json(paths.public_snapshot_path()),
-            lambda: collector.run_collect(quiet=True))
+            collect_for_dashboard)
 
     def _send_body(self, status, content_type, body):
         self.send_response(status)
@@ -408,6 +432,7 @@ def serve(open_browser=False, port=None, demo=False):
         port = settings["port"] if port is None else port
         out_dir = paths.public_dir()
         build(config, out_dir)
+        collector._trigger_token_scan(synchronous=False)
     handler_cls = type("HeadroomHandler", (Handler,),
                        {"demo": demo, "refresh_gate": RefreshGate()})
     handler = lambda *args, **kwargs: handler_cls(*args, directory=out_dir, **kwargs)  # noqa: E731

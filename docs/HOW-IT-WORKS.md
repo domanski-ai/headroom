@@ -80,6 +80,59 @@ collection. The normal static build intentionally remains `index.html` plus
 `usage.json`, so its Usage tab keeps working while Stats shows an unavailable
 message when no live history endpoint exists.
 
+## Token stats (explicit opt-in)
+
+Token stats are a separate local collector, enabled only when
+`dashboard.token_stats` is exactly `true` in `config.json` or
+`HEADROOM_TOKEN_STATS=1` is present. The default path returns before transcript
+discovery or aggregate-state reads (the private scan lock may still be
+created). When enabled, the scan runs after the normal collection lock is
+released, uses its own `state/tokens/scan.lock`, and cannot fail the main
+collection.
+
+For every live registry slot, the collector streams only that provider's local
+CLI logs:
+
+- Claude Code: `<home>/projects/**/*.jsonl`, using timestamped assistant
+  `message.usage` counters. Progressive or repeated records with the same
+  request/message identity contribute their final component values once while
+  that identity remains in the bounded 512-record dedupe tail.
+- Codex: `<home>/sessions/**/rollout-*.jsonl`, using the authoritative
+  `total_token_usage` cumulative counter from `token_count` events. Counter
+  deltas are assigned to each event's UTC day, so repeated cumulative
+  emissions are not summed.
+
+The parser necessarily reads each JSONL record to reach its usage block, but
+message content is immediately discarded. Walks never follow directory
+symlinks, and every opened file is rechecked against the real account home.
+`state/tokens/daily.json` contains
+only slot IDs, UTC dates, and numeric `input`, `output`, `cache_read`,
+`cache_creation`, and `total` fields. The private `scan-state.json` additionally
+keys files by slot ID and home-relative path, and stores sizes, mtimes, device
+and inode identity, a first-4KB fingerprint, safe byte offsets, per-file
+numeric subtotals, bounded hashed dedupe metadata, and last-error status. It
+contains no absolute home paths, emails, or message text. Both files and the
+scan lock are mode `0600` under a mode `0700` directory.
+
+`total` is the headline token count: input + output + cache creation. Cache
+reads remain separate; `total + cache_read` is all tokens processed. Codex
+reports cached input as a subset of input, so headroom splits that amount out
+before aggregation. A first scan backfills all files. Later scans, throttled by
+`HEADROOM_TOKEN_SCAN_INTERVAL` (900 seconds by default), reuse unchanged
+per-file subtotals and read appended byte tails when possible. Only
+newline-terminated valid records advance a checkpoint; an incomplete EOF
+fragment is retried. Handoff target copies carry one content-free boundary
+record, so their copied prefix is attributed only to the source slot.
+
+At payload time, the store is projected through the current registry slot-ID
+allow-list. Removed slot generations are never served. Lifetime, per-account
+trailing-seven-day totals, peak days, and fleet streaks are derived then, and
+the daily fleet map is capped to the trailing 400 UTC days. The result is
+embedded in the existing usage payload; there is no token endpoint or extra
+network surface. Sessions whose logs live only on another machine are outside
+the collector's coverage. A scan with unreadable files keeps their previous
+subtotals and marks the embedded result as partial with a failed-file count.
+
 ## Cooldowns
 
 A limit-hit writes `"<account>:<scope>": <reset-epoch>` into
@@ -116,6 +169,9 @@ picked on unproven capacity.
 | `~/.headroom/state/usage-private.json` | 0600 | full snapshot incl. identity fingerprints |
 | `~/.headroom/state/public/usage.json` | 0644 | sanitized dashboard feed |
 | `~/.headroom/state/history/usage-history.jsonl` | 0600 | rolling window percentages; no emails or tokens |
+| `~/.headroom/state/tokens/daily.json` | 0600 | opt-in per-slot, per-UTC-day numeric token aggregates |
+| `~/.headroom/state/tokens/scan-state.json` | 0600 | opt-in private incremental paths, offsets, counters, and per-file numeric subtotals |
+| `~/.headroom/state/tokens/scan.lock` | 0600 | token-scan and slot-purge serialization |
 | `~/.headroom/state/cooldowns.json` | 0600 | active cooldowns |
 | `~/.headroom/state/provider-backoff.json` | 0600 | usage-endpoint 429 backoff |
 
@@ -127,4 +183,5 @@ Everything is overridable for testing or custom layouts: `HEADROOM_DIR`,
 `HEADROOM_IDENTITY_TIMEOUT`, `HEADROOM_SERVE_MAX_AGE`, `HEADROOM_HISTORY`,
 `HEADROOM_HISTORY_MIN_INTERVAL`, `HEADROOM_HISTORY_RETENTION_DAYS`,
 `HEADROOM_HISTORY_MAX_BYTES` (32 MiB default, 1 MiB floor),
+`HEADROOM_TOKEN_STATS`, `HEADROOM_TOKEN_SCAN_INTERVAL`,
 `HEADROOM_BIN_DIR`.

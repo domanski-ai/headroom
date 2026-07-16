@@ -25,6 +25,33 @@ here so users can judge them for their own threat model.
 - Dashboards with six or more series repeat legend colours.
 - Chart end-labels can overlap when there are more series than vertical space.
 
+## Token stats known limits (opt-in)
+
+- Coverage is machine-local. Sessions run on another computer, in a container,
+  or under an unregistered CLI home are absent until those session logs exist
+  inside a registered home on this machine. The figures therefore describe
+  locally visible activity, not provider billing or an account-wide audit.
+- Codex `token_count` events are assumed to expose a monotonically cumulative
+  `total_token_usage` counter within each rollout file. Headroom assigns
+  positive deltas to event days, ignores repeated totals, and treats a counter
+  decrease as a reset. A future Codex schema that changes those semantics will
+  require a parser update.
+- Claude duplicate suppression persists the most recent 512 hashed
+  request/message identities and their progressive maxima per file. A
+  duplicate repeated after it has fallen out of that bounded tail is accepted
+  and can count twice; the bound prevents transcript-sized scanner memory.
+- Handoffs created by this version carry a copied-prefix marker and are counted
+  exactly once across source and target slots. Historical target copies made
+  before that marker existed cannot be distinguished from native records and
+  may still double-count their copied prefix. Such copies are expected to be
+  rare and recent.
+- UTC timestamps define day boundaries and streaks. The current streak remains
+  current through the following UTC day so an unfinished day does not erase a
+  streak that was active yesterday.
+- If provider-managed logs are deleted, moved, or rewritten, the next scan may
+  reduce historical totals because the store is an aggregate of the logs that
+  remain locally available.
+
 ## Supervised-launch residuals (opt-in launch safety)
 
 The opt-in launch-safety features (`--headroom-launch-fallback` /
@@ -72,8 +99,9 @@ headroom disables automation for that child and leaves the child running.
 
 A live cross-account test showed that Claude can resume a transcript ending in
 an unresolved `tool_use`: Claude re-drives the dangling call and reaches a
-usable prompt. Automatic handoff therefore copies the capped transcript
-byte-for-byte and prints `the interrupted tool call may re-run on resume`.
+usable prompt. Automatic handoff therefore preserves every source record,
+adds only the headroom copy-boundary record, and prints
+`the interrupted tool call may re-run on resume`.
 If the interrupted tool had an external side effect, that side effect may run
 twice. All manual handoffs require `--force` for a dangling call: a 99–100%
 usage snapshot alone is not an authenticated cap event and does not relax this

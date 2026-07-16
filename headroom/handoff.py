@@ -21,7 +21,7 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from . import collect, paths, registry, route
+from . import collect, paths, registry, route, tokens
 
 SCHEMA = "headroom_handoff@2"
 MAX_SCAN_AGE = 48 * 3600
@@ -422,7 +422,7 @@ def _guard_complete_turn(events):
     if unresolved:
         raise HandoffError(
             "session stopped mid-tool-call (unresolved: %s); resume it once on "
-            "the source account, or use --force for a manual byte-for-byte fork"
+            "the source account, or use --force for a content-preserving fork"
             % ", ".join(unresolved))
 
 
@@ -908,20 +908,30 @@ def _copy_publish_pending(plan):
                     temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
                     0o600, dir_fd=directory_fd)
                 digest = hashlib.sha256()
+                last_byte = b""
                 while True:
                     chunk = os.read(source_fd, 1024 * 1024)
                     if not chunk:
                         break
                     digest.update(chunk)
+                    last_byte = chunk[-1:]
                     view = memoryview(chunk)
                     while view:
                         written = os.write(target_fd, view)
                         if written <= 0:
                             raise HandoffError("target transcript write was incomplete")
                         view = view[written:]
-                os.fsync(target_fd)
                 if digest.hexdigest() != plan.inspected["sha256"]:
                     raise HandoffError("source changed during copy — handoff aborted")
+                copy_boundary = ((b"" if last_byte == b"\n" else b"\n")
+                                 + tokens.handoff_marker_line())
+                view = memoryview(copy_boundary)
+                while view:
+                    written = os.write(target_fd, view)
+                    if written <= 0:
+                        raise HandoffError("target transcript write was incomplete")
+                    view = view[written:]
+                os.fsync(target_fd)
             finally:
                 os.close(source_fd)
                 if target_fd is not None:
@@ -975,13 +985,18 @@ def _stage_transcript(source, destination, expected_sha256):
         digest = hashlib.sha256()
         with open(source, "rb") as incoming, os.fdopen(descriptor, "wb") as outgoing:
             descriptor = None
+            last_byte = b""
             for chunk in iter(lambda: incoming.read(1024 * 1024), b""):
                 digest.update(chunk)
                 outgoing.write(chunk)
+                last_byte = chunk[-1:]
+            if digest.hexdigest() != expected_sha256:
+                raise HandoffError("source changed during copy — handoff aborted")
+            if last_byte != b"\n":
+                outgoing.write(b"\n")
+            outgoing.write(tokens.handoff_marker_line())
             outgoing.flush()
             os.fsync(outgoing.fileno())
-        if digest.hexdigest() != expected_sha256:
-            raise HandoffError("source changed during copy — handoff aborted")
         try:
             os.link(temporary, destination, follow_symlinks=False)
         except FileExistsError as error:
