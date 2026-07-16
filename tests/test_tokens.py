@@ -22,17 +22,33 @@ def slot_id(name):
 
 
 def counts(input_tokens, output, cache_read=0, cache_creation=0):
+    total = input_tokens + output + cache_creation
     return {
         "input": input_tokens,
         "output": output,
         "cache_read": cache_read,
         "cache_creation": cache_creation,
-        "total": input_tokens + output + cache_creation,
+        "total": total,
+        "grand_total": total + cache_read,
     }
 
 
+def day_counts(input_tokens, output, cache_read=0, cache_creation=0,
+               session_count=0, longest_session_s=0, families=None,
+               efforts=None):
+    result = counts(input_tokens, output, cache_read, cache_creation)
+    result.update({
+        "session_count": session_count,
+        "longest_session_s": longest_session_s,
+        "families": families or {},
+        "efforts": efforts or {},
+    })
+    return result
+
+
 def claude_line(timestamp, request_id, message_id, input_tokens=5,
-                output_tokens=3, cache_read=11, cache_creation=7):
+                output_tokens=3, cache_read=11, cache_creation=7,
+                model="claude-sonnet-4-5-20250929"):
     return json.dumps({
         "type": "assistant",
         "timestamp": timestamp,
@@ -41,6 +57,7 @@ def claude_line(timestamp, request_id, message_id, input_tokens=5,
         "message": {
             "id": message_id,
             "role": "assistant",
+            "model": model,
             "content": [{"type": "text", "text": "must not persist"}],
             "usage": {
                 "input_tokens": input_tokens,
@@ -73,6 +90,14 @@ def codex_line(timestamp, input_tokens, cached, output):
                 },
             },
         },
+    }) + "\n"
+
+
+def codex_context_line(timestamp, model="gpt-5.6-sol", effort="xhigh"):
+    return json.dumps({
+        "timestamp": timestamp,
+        "type": "turn_context",
+        "payload": {"model": model, "effort": effort},
     }) + "\n"
 
 
@@ -113,9 +138,11 @@ class TokenParserTests(unittest.TestCase):
             (first + duplicate + final_repeat + next_message).encode())
         parsed = tokens._parse_stream(stream, "claude")
         self.assertEqual(parsed["days"]["2026-07-11"],
-                         counts(5, 13, 11, 7))
+                         day_counts(5, 13, 11, 7,
+                                    families={"sonnet": 36}))
         self.assertEqual(parsed["days"]["2026-07-12"],
-                         counts(2, 4, 6, 8))
+                         day_counts(2, 4, 6, 8,
+                                    families={"sonnet": 20}))
         serialized = json.dumps(parsed)
         self.assertNotIn("must not persist", serialized)
         self.assertNotIn("req-1", serialized)
@@ -130,12 +157,61 @@ class TokenParserTests(unittest.TestCase):
         parsed = tokens._parse_stream(
             io.BytesIO("".join(rows).encode()), "codex")
         self.assertEqual(parsed["days"]["2026-07-10"],
-                         counts(40, 20, 60))
+                         day_counts(40, 20, 60))
         self.assertEqual(parsed["days"]["2026-07-11"],
-                         counts(40, 30, 40))
+                         day_counts(40, 30, 40))
         lifetime = sum(day["total"] for day in parsed["days"].values())
         self.assertEqual(lifetime, 130)
+        self.assertEqual(sum(day["grand_total"]
+                             for day in parsed["days"].values()), 230)
         self.assertEqual(parsed["last_counter"], counts(80, 50, 100))
+
+    def test_real_metadata_buckets_claude_families_and_codex_effort(self):
+        claude_rows = "".join([
+            claude_line("2026-07-11T00:00:00Z", "r1", "m1",
+                        model="claude-fable-5"),
+            claude_line("2026-07-11T00:01:00Z", "r2", "m2",
+                        model="claude-opus-4-1"),
+            claude_line("2026-07-11T00:02:00Z", "r3", "m3",
+                        model="claude-haiku-3-5"),
+            claude_line("2026-07-11T00:03:00Z", "r4", "m4",
+                        model="custom-preview"),
+        ])
+        parsed = tokens._parse_stream(
+            io.BytesIO(claude_rows.encode()), "claude")
+        self.assertEqual(parsed["days"]["2026-07-11"]["families"], {
+            "fable": 26, "opus": 26, "haiku": 26, "other": 26})
+
+        codex_rows = codex_context_line("2026-07-11T00:00:00Z") + \
+            codex_line("2026-07-11T00:00:01Z", 100, 60, 20)
+        parsed = tokens._parse_stream(
+            io.BytesIO(codex_rows.encode()), "codex")
+        self.assertEqual(parsed["days"]["2026-07-11"]["families"],
+                         {"other": 120})
+        self.assertEqual(parsed["days"]["2026-07-11"]["efforts"],
+                         {"xhigh": 120})
+
+    def test_session_duration_uses_file_endpoints_with_clamp_and_cap(self):
+        files = {}
+        cases = (
+            ("negative", "2026-07-10T01:00:00Z",
+             "2026-07-10T00:00:00Z", 0),
+            ("normal", "2026-07-11T00:00:00Z",
+             "2026-07-11T01:30:00Z", 5400),
+            ("capped", "2026-07-12T00:00:00Z",
+             "2026-07-15T00:00:00Z", 48 * 60 * 60),
+        )
+        for name, first, last, _expected in cases:
+            files[name] = {
+                "slot_id": "slot", "days": {},
+                "first_event_ts": tokens._timestamp(first),
+                "last_event_ts": tokens._timestamp(last),
+            }
+        daily = tokens._daily_from_files(files)["slot"]
+        for _name, first, _last, expected in cases:
+            day = first[:10]
+            self.assertEqual(daily[day]["session_count"], 1)
+            self.assertEqual(daily[day]["longest_session_s"], expected)
 
     def test_malformed_lines_and_usage_are_skipped(self):
         invalid = json.dumps({
@@ -215,8 +291,12 @@ class TokenStoreTests(unittest.TestCase):
         self.assertIn(0, starts)
         store = paths.load_json(paths.token_daily_path())
         daily = store["accounts"][self.account["id"]]
-        self.assertEqual(daily["2026-07-10"], counts(5, 3, 11, 7))
-        self.assertEqual(daily["2026-07-11"], counts(6, 4, 12, 8))
+        self.assertEqual(daily["2026-07-10"], day_counts(
+            5, 3, 11, 7, session_count=1, longest_session_s=86400,
+            families={"sonnet": 26}))
+        self.assertEqual(daily["2026-07-11"], day_counts(
+            6, 4, 12, 8, session_count=1,
+            families={"sonnet": 30}))
         self.assertEqual(stat.S_IMODE(os.stat(paths.tokens_dir()).st_mode),
                          0o700)
         self.assertEqual(stat.S_IMODE(os.stat(
@@ -243,7 +323,34 @@ class TokenStoreTests(unittest.TestCase):
             [self.account], config=self.config, now=NOW + 1, force=True)
         daily = paths.load_json(paths.token_daily_path())[
             "accounts"][self.account["id"]]
-        self.assertEqual(daily["2026-07-10"], counts(5, 10, 11, 7))
+        self.assertEqual(daily["2026-07-10"], day_counts(
+            5, 10, 11, 7, session_count=1, longest_session_s=1,
+            families={"sonnet": 33}))
+
+    def test_schema_bump_forces_full_rescan_before_throttle(self):
+        path = self.write("one.jsonl", claude_line(
+            "2026-07-10T00:00:00Z", "r1", "m1"))
+        stat_result = os.stat(path)
+        paths.write_json_atomic(paths.token_scan_state_path(), {
+            "schema_version": 1,
+            "last_scan": NOW,
+            "files": {path: {
+                "slot_id": self.account["id"], "provider": "claude",
+                "size": stat_result.st_size,
+                "mtime_ns": stat_result.st_mtime_ns,
+                "offset": stat_result.st_size,
+                "days": {},
+            }},
+        })
+        with mock.patch.object(tokens, "_scan_file",
+                               wraps=tokens._scan_file) as scan_file:
+            self.assertTrue(tokens.collect(
+                [self.account], config=self.config, now=NOW + 1))
+        scan_file.assert_called_once()
+        self.assertEqual(paths.load_json(
+            paths.token_scan_state_path())["schema_version"], 2)
+        self.assertEqual(paths.load_json(
+            paths.token_daily_path())["schema_version"], 2)
 
     def test_disabled_gate_does_not_scan_or_touch_token_state(self):
         disabled = dict(self.config)
@@ -302,15 +409,19 @@ class TokenSummaryTests(unittest.TestCase):
     def test_daily_peak_streak_lifetime_last7_and_slot_allow_list(self):
         live_days = {}
         for offset in (-20, -19, -18, -17, -16, -3, -2, -1, 0):
-            live_days[self.day(offset)] = counts(
+            live_days[self.day(offset)] = day_counts(
                 10 + offset + 20, 5, cache_read=2)
-        live_days[self.day(-2)] = counts(100, 20, cache_read=50)
+        live_days[self.day(-2)] = day_counts(
+            100, 20, cache_read=50, session_count=2,
+            longest_session_s=3700, families={"fable": 170},
+            efforts={"xhigh": 170})
         store = {
-            "schema_version": 1,
+            "schema_version": tokens.SCHEMA_VERSION,
             "generated": NOW - 10,
             "accounts": {
                 self.account["id"]: live_days,
-                slot_id("removed"): {self.day(0): counts(9999, 1)},
+                slot_id("removed"): {
+                    self.day(0): day_counts(9999, 1)},
             },
         }
         value = tokens.summarize(store, [self.account], now=NOW)
@@ -319,20 +430,64 @@ class TokenSummaryTests(unittest.TestCase):
         self.assertEqual(value["summary"]["current_streak"], 4)
         self.assertEqual(value["summary"]["longest_streak"], 5)
         self.assertEqual(value["summary"]["peak"], {
-            "date": self.day(-2), "total": 120})
+            "date": self.day(-2), "total": 120, "grand_total": 170})
         row = value["accounts"][0]
         self.assertEqual(row["peak"], value["summary"]["peak"])
         self.assertEqual(row["last7d"], sum(
             live_days[self.day(offset)]["total"]
             for offset in (-3, -2, -1, 0)))
         self.assertEqual(row["lifetime"], value["summary"]["lifetime"])
+        self.assertEqual(value["summary"]["grand_total"], sum(
+            counts["grand_total"] for counts in live_days.values()))
+        self.assertEqual(row["lifetime_grand_total"],
+                         value["summary"]["grand_total"])
+        self.assertEqual(row["last7d_grand_total"], sum(
+            live_days[self.day(offset)]["grand_total"]
+            for offset in (-3, -2, -1, 0)))
+        self.assertEqual(value["summary"]["total_sessions"], 2)
+        self.assertEqual(value["summary"]["longest_session"], {
+            "seconds": 3700, "date": self.day(-2), "account": "alpha"})
+        self.assertEqual(value["summary"]["active_days"], len(live_days))
+        self.assertEqual(value["summary"]["most_used_model"], {
+            "label": "fable", "share_pct": 100.0})
+        self.assertEqual(value["summary"]["families"][0], {
+            "label": "fable", "tokens": 170, "share_pct": 100.0})
+        self.assertEqual(value["summary"]["efforts"][-1], {
+            "label": "xhigh", "tokens": 170, "share_pct": 100.0})
+
+    def test_missing_new_derived_fields_are_zero_safe(self):
+        day = self.day(0)
+        value = tokens.summarize({
+            "schema_version": tokens.SCHEMA_VERSION,
+            "generated": NOW,
+            "accounts": {self.account["id"]: {day: counts(2, 3, 5)}},
+        }, [self.account], now=NOW)
+        self.assertEqual(value["summary"]["total_sessions"], 0)
+        self.assertEqual(value["summary"]["longest_session"], {
+            "seconds": 0, "date": None, "account": None})
+        self.assertEqual(value["summary"]["most_used_model"], {
+            "label": None, "share_pct": 0})
+
+    def test_session_only_day_does_not_become_token_peak(self):
+        day = self.day(0)
+        value = tokens.summarize({
+            "schema_version": tokens.SCHEMA_VERSION,
+            "generated": NOW,
+            "accounts": {self.account["id"]: {
+                day: day_counts(0, 0, session_count=1,
+                                longest_session_s=60)}},
+        }, [self.account], now=NOW)
+        self.assertEqual(value["summary"]["peak"], {
+            "date": None, "total": 0, "grand_total": 0})
+        self.assertEqual(value["summary"]["active_days"], 0)
+        self.assertEqual(value["summary"]["total_sessions"], 1)
 
     def test_display_payload_embeds_only_when_enabled_and_caps_400_days(self):
         days = {}
         for offset in range(-404, 1):
-            days[self.day(offset)] = counts(1, 1)
+            days[self.day(offset)] = day_counts(1, 1)
         paths.write_json_atomic(paths.token_daily_path(), {
-            "schema_version": 1, "generated": NOW,
+            "schema_version": tokens.SCHEMA_VERSION, "generated": NOW,
             "accounts": {self.account["id"]: days},
         })
         snapshot = usage_snapshot(self.account["id"])

@@ -308,8 +308,8 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
 .stats-content { display: grid; gap: 18px; margin-top: 16px; }
 .token-stats { display: grid; gap: 18px; margin-top: 16px; }
 .token-stats[hidden] { display: none; }
-.token-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
-                 gap: 10px; }
+.token-summary { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px; }
 .token-tile { min-width: 0; padding: 15px 16px; border: 1px solid var(--line);
               border-radius: var(--radius); background: var(--panel);
               box-shadow: var(--panel-shadow); }
@@ -364,6 +364,14 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
 .token-heat-legend i:nth-of-type(3) { opacity: .43; }
 .token-heat-legend i:nth-of-type(4) { opacity: .68; }
 .token-heat-legend i:nth-of-type(5) { opacity: 1; }
+.token-mode-toggle { display: flex; gap: 6px; }
+.token-mode-toggle button { border: 1px solid var(--line); border-radius: 7px;
+  background: var(--panel); color: var(--ink-3); padding: 5px 9px;
+  font: 600 9px var(--mono); cursor: pointer; }
+.token-mode-toggle button[aria-pressed="true"] { color: var(--ink);
+  border-color: var(--accent); }
+.token-insights { margin: 0; padding-left: 18px; color: var(--ink-2);
+  font: 500 11px/1.8 var(--mono); }
 .stats-meter { display: flex; gap: 3px; margin: 0 0 13px; }
 .stats-meter i { flex: 1 1 0; height: 7px; border-radius: var(--cell-radius);
                  background: var(--cell-bg); }
@@ -768,9 +776,11 @@ body.is-widget .shell { display: none; }
   <div class="token-stats" id="token-stats" hidden>
     <section class="token-summary" aria-label="Token summary">
       <article class="token-tile"><span>Lifetime tokens</span>
-        <strong id="token-lifetime">–</strong><small>cache reads excluded</small></article>
+        <strong id="token-lifetime">–</strong><small>all token traffic</small></article>
       <article class="token-tile"><span>Peak day</span>
         <strong id="token-peak">–</strong><small id="token-peak-date">–</small></article>
+      <article class="token-tile"><span>Longest session</span>
+        <strong id="token-longest-session">–</strong><small id="token-longest-session-note">–</small></article>
       <article class="token-tile"><span>Current streak</span>
         <strong id="token-current-streak">–</strong><small>consecutive UTC days</small></article>
       <article class="token-tile"><span>Longest streak</span>
@@ -780,12 +790,21 @@ body.is-widget .shell { display: none; }
       <header class="stats-panel-head">
         <div>
           <h2 id="token-activity-title">Token activity</h2>
-          <p class="stats-panel-note">Daily headline tokens in UTC · input + output + cache creation; cache reads excluded.</p>
+          <p class="stats-panel-note" id="token-activity-note">Daily grand-total tokens in UTC.</p>
+        </div>
+        <div class="token-mode-toggle" aria-label="Token activity mode">
+          <button type="button" data-token-mode="daily" aria-pressed="true">Daily</button>
+          <button type="button" data-token-mode="weekly" aria-pressed="false">Weekly</button>
+          <button type="button" data-token-mode="cumulative" aria-pressed="false">Cumulative</button>
         </div>
       </header>
       <div class="token-heatmap-wrap" id="token-heatmap"></div>
       <div class="token-heat-legend" aria-label="Token activity intensity">Less
         <i></i><i></i><i></i><i></i><i></i>More</div>
+    </section>
+    <section class="stats-panel panel" aria-labelledby="token-insights-title">
+      <header class="stats-panel-head"><h2 id="token-insights-title">Insights</h2></header>
+      <ul class="token-insights" id="token-insights"></ul>
     </section>
   </div>
 
@@ -1098,11 +1117,14 @@ async function load(manual){
 const HISTORY_URL="history.json";
 const SERIES_COLORS=["var(--accent)","var(--green)","var(--orange)","var(--red)","var(--ink-2)"];
 let historyData=null,historyForegroundRequest=0,historyBackgroundRequest=0,historyForegroundLoads=0;
+let tokenActivityMode="daily";
 
 function tokenNumber(value){return Number.isFinite(value)&&value>=0;}
 function tokenCounts(value){
-  return value&&typeof value==="object"&&!Array.isArray(value)&&
-    ["input","output","cache_read","cache_creation","total"].every(key=>tokenNumber(value[key]));
+  if(!value||typeof value!=="object"||Array.isArray(value)||
+     !["input","output","cache_read","cache_creation","total"].every(key=>tokenNumber(value[key])))return false;
+  if(!tokenNumber(value.grand_total))value.grand_total=value.total+value.cache_read;
+  return tokenNumber(value.grand_total);
 }
 function validateTokenStats(value){
   if(value==null)return null;
@@ -1114,10 +1136,25 @@ function validateTokenStats(value){
   if(!tokenNumber(summary.lifetime)||!tokenNumber(summary.current_streak)||
      !tokenNumber(summary.longest_streak)||!peak||!tokenNumber(peak.total)||
      !(peak.date==null||/^\d{4}-\d{2}-\d{2}$/.test(peak.date)))return null;
+  if(!tokenNumber(summary.grand_total))summary.grand_total=summary.lifetime;
+  if(!tokenNumber(peak.grand_total))peak.grand_total=peak.total;
+  if(!tokenNumber(summary.total_sessions))summary.total_sessions=0;
+  if(!tokenNumber(summary.active_days))summary.active_days=0;
+  if(!summary.longest_session||typeof summary.longest_session!=="object")
+    summary.longest_session={seconds:0,date:null,account:null};
+  if(!tokenNumber(summary.longest_session.seconds))summary.longest_session.seconds=0;
+  if(!summary.most_used_model||typeof summary.most_used_model!=="object")
+    summary.most_used_model={label:null,share_pct:0};
+  summary.families=Array.isArray(summary.families)?summary.families.filter(item=>item&&
+    typeof item.label==="string"&&tokenNumber(item.tokens)&&tokenNumber(item.share_pct)):[];
   value.accounts=value.accounts.filter(account=>account&&typeof account==="object"&&
     typeof account.id==="string"&&typeof account.name==="string"&&typeof account.provider==="string"&&
     tokenNumber(account.lifetime)&&tokenNumber(account.last7d)&&account.peak&&
     tokenNumber(account.peak.total)&&(account.peak.date==null||/^\d{4}-\d{2}-\d{2}$/.test(account.peak.date)));
+  value.accounts.forEach(account=>{
+    if(!tokenNumber(account.lifetime_grand_total))account.lifetime_grand_total=account.lifetime;
+    if(!tokenNumber(account.last7d_grand_total))account.last7d_grand_total=account.last7d;
+  });
   return value;
 }
 function formatTokens(value){
@@ -1139,12 +1176,36 @@ function tokenDate(day){
 }
 function utcDay(date){return date.toISOString().slice(0,10);}
 function streakLabel(value){return value+" "+(value===1?"day":"days");}
+function humanDuration(value){
+  if(!tokenNumber(value)||value<60)return value>0?"<1m":"0m";
+  const minutes=Math.floor(value/60),hours=Math.floor(minutes/60),rest=minutes%60;
+  return (hours?hours+"h ":"")+(rest||!hours?rest+"m":"");
+}
+function tokenWeeklySeries(days){
+  const buckets={};
+  Object.entries(days||{}).forEach(([day,counts])=>{
+    const date=new Date(day+"T00:00:00Z");
+    if(!Number.isFinite(date.getTime()))return;
+    date.setUTCDate(date.getUTCDate()-date.getUTCDay());
+    const key=utcDay(date);
+    buckets[key]=(buckets[key]||0)+(tokenNumber(counts.grand_total)?counts.grand_total:0);
+  });
+  return Object.keys(buckets).sort().map(date=>({date:date,total:buckets[date]}));
+}
+function tokenCumulativeSeries(days){
+  let running=0;
+  return Object.keys(days||{}).sort().map(date=>{
+    const counts=days[date]||{};
+    running+=tokenNumber(counts.grand_total)?counts.grand_total:0;
+    return{date:date,total:running};
+  });
+}
 function renderTokenHeatmap(){
   const target=document.getElementById("token-heatmap"),days=tokenStats.days||{};
   const now=new Date(),today=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate()));
   const weekStart=new Date(today);weekStart.setUTCDate(today.getUTCDate()-today.getUTCDay());
   const start=new Date(weekStart);start.setUTCDate(weekStart.getUTCDate()-51*7);
-  const values=Object.values(days).map(count=>count.total).filter(value=>value>0);
+  const values=Object.values(days).map(count=>count.grand_total).filter(value=>value>0);
   const maximum=values.length?Math.max(...values):0;
   const left=31,top=20,step=14,size=10,width=left+52*step,height=top+7*step+2;
   let labels='<text class="token-heat-label" x="0" y="'+(top+step+8)+'">Mon</text>'+
@@ -1159,7 +1220,7 @@ function renderTokenHeatmap(){
       if(date>today)continue;
       if(column===0&&row===0)labelDate=date;
       if(date.getUTCDate()===1)labelDate=date;
-      const key=utcDay(date),value=days[key]&&tokenNumber(days[key].total)?days[key].total:0;
+      const key=utcDay(date),value=days[key]&&tokenNumber(days[key].grand_total)?days[key].grand_total:0;
       const level=value>0&&maximum>0?Math.max(1,Math.min(4,Math.ceil(Math.sqrt(value/maximum)*4))):0;
       const x=left+column*step,y=top+row*step;
       cells+='<rect class="token-heat-cell" data-level="'+level+'" x="'+x+'" y="'+y+
@@ -1171,7 +1232,51 @@ function renderTokenHeatmap(){
         esc(new Intl.DateTimeFormat(undefined,{month:"short",timeZone:"UTC"}).format(labelDate))+"</text>";
     }
   }
-  target.innerHTML='<svg viewBox="0 0 '+width+" "+height+'" role="img" aria-label="Daily token activity for the trailing 52 weeks">'+labels+cells+"</svg>";
+  target.innerHTML='<svg viewBox="0 0 '+width+" "+height+'" role="img" aria-label="Daily grand-total token activity for the trailing 52 weeks">'+labels+cells+"</svg>";
+}
+function renderTokenSeries(series,mode){
+  const target=document.getElementById("token-heatmap");
+  if(!series.length){target.innerHTML='<div class="stats-inline-empty">No token activity yet.</div>';return;}
+  const width=900,height=230,left=42,right=18,top=14,bottom=32;
+  const plotWidth=width-left-right,plotHeight=height-top-bottom;
+  const maximum=Math.max(...series.map(point=>point.total),1);
+  const x=index=>left+(series.length===1?plotWidth/2:index*plotWidth/(series.length-1));
+  const y=value=>top+(1-value/maximum)*plotHeight;
+  const dates=[0,Math.floor((series.length-1)/2),series.length-1].map((index,labelIndex)=>
+    '<text class="chart-axis" x="'+x(index)+'" y="'+(height-9)+'" text-anchor="'+
+    (labelIndex===0?"start":labelIndex===2?"end":"middle")+'">'+esc(tokenDate(series[index].date))+"</text>").join("");
+  let drawing="";
+  if(mode==="weekly"){
+    const gap=series.length>1?plotWidth/series.length:plotWidth,bar=Math.max(2,gap*.68);
+    drawing=series.map((point,index)=>'<rect class="token-heat-cell" data-level="4" x="'+
+      (left+index*gap+(gap-bar)/2)+'" y="'+y(point.total)+'" width="'+bar+'" height="'+
+      Math.max(1,top+plotHeight-y(point.total))+'"><title>'+esc(point.date+": "+formatTokens(point.total)+" tokens")+
+      "</title></rect>").join("");
+  }else{
+    const line=series.map((point,index)=>(index?"L":"M")+x(index).toFixed(2)+" "+y(point.total).toFixed(2)).join(" ");
+    drawing='<path class="chart-line" stroke="var(--accent)" d="'+line+'"></path>'+
+      '<circle fill="var(--accent)" cx="'+x(series.length-1).toFixed(2)+'" cy="'+
+      y(series[series.length-1].total).toFixed(2)+'" r="2.8"><title>'+esc(formatTokens(series[series.length-1].total)+
+      " cumulative tokens")+"</title></circle>";
+  }
+  target.innerHTML='<svg viewBox="0 0 '+width+" "+height+'" role="img" aria-label="'+
+    esc(mode==="weekly"?"Weekly grand-total token activity":"Cumulative grand-total token activity")+'">'+
+    dates+drawing+"</svg>";
+}
+function renderTokenActivity(){
+  document.querySelectorAll("[data-token-mode]").forEach(button=>button.setAttribute(
+    "aria-pressed",button.getAttribute("data-token-mode")===tokenActivityMode?"true":"false"));
+  const note=document.getElementById("token-activity-note");
+  if(tokenActivityMode==="daily"){
+    note.textContent="Daily grand-total tokens in UTC.";
+    renderTokenHeatmap();
+  }else if(tokenActivityMode==="weekly"){
+    note.textContent="Grand-total tokens grouped into UTC Sunday-start 7-day buckets.";
+    renderTokenSeries(tokenWeeklySeries(tokenStats.days),"weekly");
+  }else{
+    note.textContent="Running grand-total tokens across the available daily history.";
+    renderTokenSeries(tokenCumulativeSeries(tokenStats.days),"cumulative");
+  }
 }
 function renderTokenStats(){
   const target=document.getElementById("token-stats"),leaderboard=document.getElementById("leaderboard-panel");
@@ -1187,12 +1292,24 @@ function renderTokenStats(){
   document.getElementById("stats-title").textContent="Usage stats";
   document.getElementById("stats-intro").textContent="Local token activity and provider-window utilization in one view.";
   document.getElementById("side-note").innerHTML="Local token aggregates.<br>No message content stored.";
-  document.getElementById("token-lifetime").textContent=formatTokens(tokenStats.summary.lifetime);
-  document.getElementById("token-peak").textContent=formatTokens(tokenStats.summary.peak.total);
+  const summary=tokenStats.summary,longest=summary.longest_session||{};
+  document.getElementById("token-lifetime").textContent=formatTokens(summary.grand_total);
+  document.getElementById("token-peak").textContent=formatTokens(summary.peak.grand_total);
   document.getElementById("token-peak-date").textContent=tokenDate(tokenStats.summary.peak.date);
-  document.getElementById("token-current-streak").textContent=streakLabel(tokenStats.summary.current_streak);
-  document.getElementById("token-longest-streak").textContent=streakLabel(tokenStats.summary.longest_streak);
-  renderTokenHeatmap();
+  document.getElementById("token-longest-session").textContent=humanDuration(longest.seconds);
+  document.getElementById("token-longest-session-note").textContent=longest.date?
+    (longest.account?longest.account+" · ":"")+tokenDate(longest.date):"No sessions";
+  document.getElementById("token-current-streak").textContent=streakLabel(summary.current_streak);
+  document.getElementById("token-longest-streak").textContent=streakLabel(summary.longest_streak);
+  const model=summary.most_used_model||{},families=summary.families||[];
+  document.getElementById("token-insights").innerHTML=
+    "<li>Total sessions: "+esc(summary.total_sessions)+"</li>"+
+    "<li>Active days: "+esc(summary.active_days)+"</li>"+
+    "<li>Most used model: "+esc(model.label||"n/a")+
+      (tokenNumber(model.share_pct)?" · "+esc(model.share_pct)+"%":"")+"</li>"+
+    "<li>Families: "+(families.length?families.map(item=>esc(item.label)+" "+
+      esc(formatTokens(item.tokens))+" ("+esc(item.share_pct)+"%)").join(" · "):"n/a")+"</li>";
+  renderTokenActivity();
   renderLeaderboard(historyData);
 }
 
@@ -1389,25 +1506,20 @@ function renderLeaderboard(data){
   const panel=document.getElementById("leaderboard-panel"),note=document.getElementById("leaderboard-note");
   if(tokenStats){
     panel.hidden=false;
-    note.textContent="Ranked by lifetime headline tokens. Weekly window average remains last for capacity context.";
-    const averages=new Map(((data&&data.leaderboard)||[]).map(account=>[account.id,account.average]));
-    const ranked=tokenStats.accounts.slice().sort((a,b)=>b.lifetime-a.lifetime||
-      b.last7d-a.last7d||a.name.localeCompare(b.name)||a.id.localeCompare(b.id));
+    note.textContent="Ranked by lifetime grand-total tokens, including cache reads.";
+    const ranked=tokenStats.accounts.slice().sort((a,b)=>
+      b.lifetime_grand_total-a.lifetime_grand_total||
+      b.last7d_grand_total-a.last7d_grand_total||a.name.localeCompare(b.name)||a.id.localeCompare(b.id));
     if(!ranked.length){
       target.innerHTML='<div class="stats-inline-empty">No live account slots are available for ranking.</div>';
       return;
     }
     target.innerHTML='<table class="leaderboard"><thead><tr><th scope="col">Rank</th><th scope="col">Account</th>'+
       '<th scope="col">Provider</th><th scope="col">Lifetime tokens</th><th scope="col">Last 7d tokens</th>'+
-      '<th scope="col">Peak day</th><th scope="col">Avg weekly used</th></tr></thead><tbody>'+ranked.map((account,index)=>{
-        const average=averages.get(account.id),peak=account.peak||{};
-        return '<tr><td class="rank">'+(index+1)+'</td><td class="leader-name">'+esc(account.name)+
-          '</td><td>'+esc(account.provider||"")+'</td><td>'+esc(formatTokens(account.lifetime))+
-          '</td><td>'+esc(formatTokens(account.last7d))+'</td><td>'+esc(tokenDate(peak.date))+" · "+
-          esc(formatTokens(peak.total))+'</td><td><span class="lb-bar" style="--w:'+
-          (Number.isFinite(average)?Math.min(100,Math.max(0,average)):0)+'%;--tone:'+usedTone(average)+
-          '" aria-hidden="true"><i></i></span>'+statsPct(average)+"</td></tr>";
-      }).join("")+"</tbody></table>";
+      '</tr></thead><tbody>'+ranked.map((account,index)=>
+        '<tr><td class="rank">'+(index+1)+'</td><td class="leader-name">'+esc(account.name)+
+        '</td><td>'+esc(account.provider||"")+'</td><td>'+esc(formatTokens(account.lifetime_grand_total))+
+        '</td><td>'+esc(formatTokens(account.last7d_grand_total))+"</td></tr>").join("")+"</tbody></table>";
     return;
   }
   if(!data){panel.hidden=true;return;}
@@ -1502,6 +1614,10 @@ function initTabs(){
   document.getElementById("history-range").addEventListener("change",()=>loadHistory(false));
   document.getElementById("history-window").addEventListener("change",renderStats);
   document.getElementById("history-refresh").addEventListener("click",()=>loadHistory(true));
+  document.querySelectorAll("[data-token-mode]").forEach(button=>button.addEventListener("click",()=>{
+    tokenActivityMode=button.getAttribute("data-token-mode");
+    if(tokenStats)renderTokenActivity();
+  }));
   syncTabs();
   setInterval(()=>{if(location.hash==="#stats")loadHistory(false,true);},6e4);
 }

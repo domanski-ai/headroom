@@ -6,10 +6,10 @@ private incremental state necessarily records source paths plus byte offsets,
 mtimes, per-file daily subtotals, and the minimum counter/dedupe metadata
 needed to resume an append-only log.
 
-``total`` is the dashboard headline: input + output + cache creation. Cache
-reads are retained separately and can be added to ``total`` to obtain all
-tokens processed. Codex reports cached input as a subset of input, so it is
-split into uncached ``input`` and ``cache_read`` before aggregation.
+``total`` preserves the original input + output + cache creation accounting;
+``grand_total`` also includes cache reads and drives Codex-mirror headlines.
+Codex reports cached input as a subset of input, so it is split into uncached
+``input`` and ``cache_read`` before aggregation.
 """
 import datetime
 import glob
@@ -23,10 +23,14 @@ import time
 from . import paths, registry
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_SCAN_INTERVAL = 900
 MAX_PAYLOAD_DAYS = 400
-COUNT_KEYS = ("input", "output", "cache_read", "cache_creation", "total")
+MAX_SESSION_SECONDS = 48 * 60 * 60
+COUNT_KEYS = ("input", "output", "cache_read", "cache_creation", "total",
+              "grand_total")
+FAMILY_LABELS = ("fable", "opus", "sonnet", "haiku", "other")
+EFFORT_LABELS = ("none", "minimal", "low", "medium", "high", "xhigh")
 DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -39,6 +43,17 @@ def _empty_counts():
     return {key: 0 for key in COUNT_KEYS}
 
 
+def _empty_day():
+    result = _empty_counts()
+    result.update({
+        "session_count": 0,
+        "longest_session_s": 0,
+        "families": {},
+        "efforts": {},
+    })
+    return result
+
+
 def _count(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -47,23 +62,33 @@ def _count(value):
     return int(value)
 
 
-def _day(value):
+def _timestamp(value):
     try:
         if isinstance(value, bool):
             return None
         if isinstance(value, (int, float)):
-            parsed = datetime.datetime.fromtimestamp(
-                value, datetime.timezone.utc)
+            return float(value) if math.isfinite(value) else None
         elif isinstance(value, str):
             parsed = datetime.datetime.fromisoformat(
                 value.replace("Z", "+00:00"))
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=datetime.timezone.utc)
             parsed = parsed.astimezone(datetime.timezone.utc)
+            return parsed.timestamp()
         else:
             return None
-        return parsed.date().isoformat()
     except (OverflowError, OSError, TypeError, ValueError):
+        return None
+
+
+def _day(value):
+    timestamp = _timestamp(value)
+    if timestamp is None:
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(
+            timestamp, datetime.timezone.utc).date().isoformat()
+    except (OverflowError, OSError, ValueError):
         return None
 
 
@@ -83,8 +108,23 @@ def _usage_value(usage, key, default=0):
     return _count(usage.get(key))
 
 
+def _model_family(model):
+    if not isinstance(model, str) or not model.strip():
+        return None
+    lowered = model.lower()
+    return next((label for label in FAMILY_LABELS[:-1]
+                 if label in lowered), "other")
+
+
+def _effort_label(effort):
+    if not isinstance(effort, str):
+        return None
+    lowered = effort.strip().lower()
+    return lowered if lowered in EFFORT_LABELS else None
+
+
 def parse_claude_record(line):
-    """Return ``(UTC day, counts, message-identity hash)`` for one record."""
+    """Return day, counts, identity hash, and model family for a record."""
     value = _record(line)
     if value is None:
         return None
@@ -107,6 +147,7 @@ def parse_claude_record(line):
         return None
     source["total"] = (source["input"] + source["output"]
                        + source["cache_creation"])
+    source["grand_total"] = source["total"] + source["cache_read"]
     day = _day(value.get("timestamp"))
     if day is None or source["total"] + source["cache_read"] <= 0:
         return None
@@ -117,7 +158,7 @@ def parse_claude_record(line):
     if any(isinstance(part, str) and part for part in identity):
         raw = json.dumps(identity, separators=(",", ":"))
         signature = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    return day, source, signature
+    return day, source, signature, _model_family(message.get("model"))
 
 
 def _codex_total_usage(value):
@@ -163,10 +204,22 @@ def parse_codex_record(line):
         "cache_creation": 0,
     }
     counter["total"] = counter["input"] + counter["output"]
+    counter["grand_total"] = counter["total"] + counter["cache_read"]
     day = _day(value.get("timestamp"))
     if day is None:
         return None
     return day, counter
+
+
+def _codex_context(value):
+    payload = value.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    kind = value.get("type") or payload.get("type")
+    if kind != "turn_context":
+        return None, None
+    return (_model_family(payload.get("model")),
+            _effort_label(payload.get("effort")
+                          or payload.get("reasoning_effort")))
 
 
 def _normalized_counts(value):
@@ -181,6 +234,32 @@ def _normalized_counts(value):
     if result["total"] != (result["input"] + result["output"]
                            + result["cache_creation"]):
         return None
+    if result["grand_total"] != result["total"] + result["cache_read"]:
+        return None
+    return result
+
+
+def _normalized_mix(value, labels):
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for label in labels:
+        count = _count(value.get(label, 0))
+        if count:
+            result[label] = count
+    return result
+
+
+def _normalized_day(value):
+    result = _normalized_counts(value)
+    if result is None:
+        return None
+    result.update({
+        "session_count": _count(value.get("session_count", 0)) or 0,
+        "longest_session_s": _count(value.get("longest_session_s", 0)) or 0,
+        "families": _normalized_mix(value.get("families"), FAMILY_LABELS),
+        "efforts": _normalized_mix(value.get("efforts"), EFFORT_LABELS),
+    })
     return result
 
 
@@ -189,7 +268,7 @@ def _normalized_days(value):
     if not isinstance(value, dict):
         return result
     for day, counts in value.items():
-        normalized = _normalized_counts(counts)
+        normalized = _normalized_day(counts)
         if isinstance(day, str) and DAY_RE.fullmatch(day) and normalized:
             try:
                 datetime.date.fromisoformat(day)
@@ -204,9 +283,30 @@ def _add_counts(target, source):
         target[key] += source[key]
 
 
-def _add_day(days, day, counts):
-    target = days.setdefault(day, _empty_counts())
+def _add_mix(target, source):
+    for label, count in source.items():
+        target[label] = target.get(label, 0) + count
+
+
+def _add_day(days, day, counts, family=None, effort=None):
+    target = days.setdefault(day, _empty_day())
     _add_counts(target, counts)
+    if family in FAMILY_LABELS:
+        target["families"][family] = (
+            target["families"].get(family, 0) + counts["grand_total"])
+    if effort in EFFORT_LABELS:
+        target["efforts"][effort] = (
+            target["efforts"].get(effort, 0) + counts["grand_total"])
+
+
+def _add_day_record(days, day, source):
+    target = days.setdefault(day, _empty_day())
+    _add_counts(target, source)
+    target["session_count"] += source["session_count"]
+    target["longest_session_s"] = max(
+        target["longest_session_s"], source["longest_session_s"])
+    _add_mix(target["families"], source["families"])
+    _add_mix(target["efforts"], source["efforts"])
 
 
 def _counter_delta(current, previous):
@@ -217,6 +317,7 @@ def _counter_delta(current, previous):
     delta = {key: current[key] - previous[key] for key in COUNT_KEYS}
     delta["total"] = (delta["input"] + delta["output"]
                       + delta["cache_creation"])
+    delta["grand_total"] = delta["total"] + delta["cache_read"]
     return delta
 
 
@@ -228,9 +329,11 @@ def _message_delta(current, previous):
     maximum = {key: max(current[key], previous[key]) for key in COUNT_KEYS}
     maximum["total"] = (maximum["input"] + maximum["output"]
                         + maximum["cache_creation"])
+    maximum["grand_total"] = maximum["total"] + maximum["cache_read"]
     delta = {key: maximum[key] - previous[key] for key in COUNT_KEYS}
     delta["total"] = (delta["input"] + delta["output"]
                       + delta["cache_creation"])
+    delta["grand_total"] = delta["total"] + delta["cache_read"]
     return delta, maximum
 
 
@@ -242,6 +345,10 @@ def _parse_stream(handle, provider, start=0, previous=None):
         previous.get("last_claude_counter")) if start else None)
     last_counter = (_normalized_counts(previous.get("last_counter"))
                     if start else None)
+    first_event_ts = previous.get("first_event_ts") if start else None
+    last_event_ts = previous.get("last_event_ts") if start else None
+    current_family = previous.get("last_family") if start else None
+    current_effort = previous.get("last_effort") if start else None
     seen = {}
     if last_claude and last_claude_counter is not None:
         seen[last_claude] = last_claude_counter
@@ -250,35 +357,56 @@ def _parse_stream(handle, provider, start=0, previous=None):
         line = handle.readline()
         if not line:
             break
+        record = _record(line)
+        if record is None:
+            continue
+        event_ts = _timestamp(record.get("timestamp"))
+        if event_ts is not None:
+            if first_event_ts is None:
+                first_event_ts = event_ts
+            last_event_ts = event_ts
         if provider == "claude":
-            parsed = parse_claude_record(line)
+            parsed = parse_claude_record(record)
             if parsed is None:
                 continue
-            day, counts, signature = parsed
+            day, counts, signature, family = parsed
             if signature is not None:
                 delta, maximum = _message_delta(counts, seen.get(signature))
-                if delta["total"] + delta["cache_read"] > 0:
-                    _add_day(days, day, delta)
+                if delta["grand_total"] > 0:
+                    _add_day(days, day, delta, family=family)
                 seen[signature] = maximum
                 last_claude = signature
                 last_claude_counter = maximum
             else:
-                _add_day(days, day, counts)
+                _add_day(days, day, counts, family=family)
         else:
-            parsed = parse_codex_record(line)
+            family, effort = _codex_context(record)
+            if family is not None:
+                current_family = family
+            if effort is not None:
+                current_effort = effort
+            parsed = parse_codex_record(record)
             if parsed is None:
                 continue
             day, counter = parsed
             delta = _counter_delta(counter, last_counter)
-            if delta["total"] + delta["cache_read"] > 0:
-                _add_day(days, day, delta)
+            if delta["grand_total"] > 0:
+                _add_day(days, day, delta, family=current_family,
+                         effort=current_effort)
             last_counter = counter
     result = {"days": days, "offset": handle.tell()}
+    if first_event_ts is not None:
+        result["first_event_ts"] = first_event_ts
+        result["last_event_ts"] = last_event_ts
     if provider == "claude" and last_claude:
         result["last_claude"] = last_claude
         result["last_claude_counter"] = last_claude_counter
     if provider == "codex" and last_counter is not None:
         result["last_counter"] = last_counter
+        if current_family is not None:
+            result["last_family"] = current_family
+        if current_effort is not None:
+            result["last_effort"] = current_effort
     return result
 
 
@@ -333,7 +461,16 @@ def _daily_from_files(files):
             continue
         target = accounts.setdefault(slot_id, {})
         for day, counts in _normalized_days(entry.get("days")).items():
-            _add_day(target, day, counts)
+            _add_day_record(target, day, counts)
+        first = _timestamp(entry.get("first_event_ts"))
+        last = _timestamp(entry.get("last_event_ts"))
+        day = _day(first)
+        if day is not None and last is not None:
+            duration = min(MAX_SESSION_SECONDS, max(0, int(last - first)))
+            aggregate = target.setdefault(day, _empty_day())
+            aggregate["session_count"] += 1
+            aggregate["longest_session_s"] = max(
+                aggregate["longest_session_s"], duration)
     return accounts
 
 
@@ -414,11 +551,24 @@ def _date(value):
 
 
 def _peak(days):
-    if not days:
-        return {"date": None, "total": 0}
-    day, counts = max(days.items(), key=lambda item: (
-        item[1]["total"], item[0]))
-    return {"date": day, "total": counts["total"]}
+    active = {day: counts for day, counts in days.items()
+              if counts["grand_total"] > 0}
+    if not active:
+        return {"date": None, "total": 0, "grand_total": 0}
+    day, counts = max(active.items(), key=lambda item: (
+        item[1]["grand_total"], item[0]))
+    return {"date": day, "total": counts["total"],
+            "grand_total": counts["grand_total"]}
+
+
+def _breakdown(totals, labels):
+    classified = sum(totals.values())
+    return [{
+        "label": label,
+        "tokens": totals.get(label, 0),
+        "share_pct": round(totals.get(label, 0) * 100 / classified, 1)
+        if classified else 0,
+    } for label in labels]
 
 
 def _streaks(active_days, today):
@@ -442,7 +592,8 @@ def _streaks(active_days, today):
 
 def summarize(store, accounts, now=None):
     """Project private daily aggregates through the live slot allow-list."""
-    if not isinstance(store, dict) or store.get("schema_version") != 1:
+    if not isinstance(store, dict) \
+            or store.get("schema_version") != SCHEMA_VERSION:
         return None
     raw_accounts = store.get("accounts")
     if not isinstance(raw_accounts, dict):
@@ -453,6 +604,9 @@ def summarize(store, accounts, now=None):
     generated = store.get("generated")
     generated = generated if isinstance(generated, int) else now
     fleet_days = {}
+    family_totals = {label: 0 for label in FAMILY_LABELS}
+    effort_totals = {label: 0 for label in EFFORT_LABELS}
+    longest_session = {"seconds": 0, "date": None, "account": None}
     account_rows = []
     for account in accounts:
         slot_id = account.get("id") if isinstance(account, dict) else None
@@ -462,33 +616,69 @@ def summarize(store, accounts, now=None):
         days = {day: counts for day, counts in days.items()
                 if _date(day) <= today}
         for day, counts in days.items():
-            _add_day(fleet_days, day, counts)
+            _add_day_record(fleet_days, day, counts)
+            _add_mix(family_totals, counts["families"])
+            _add_mix(effort_totals, counts["efforts"])
+            if counts["session_count"]:
+                candidate = (counts["longest_session_s"], day,
+                             account.get("name", ""))
+                current = (longest_session["seconds"],
+                           longest_session["date"] or "",
+                           longest_session["account"] or "")
+                if candidate > current:
+                    longest_session = {
+                        "seconds": counts["longest_session_s"],
+                        "date": day,
+                        "account": account.get("name", ""),
+                    }
         last7_cutoff = today - datetime.timedelta(days=6)
         account_rows.append({
             "id": slot_id,
             "name": account.get("name", ""),
             "provider": account.get("provider", ""),
             "lifetime": sum(counts["total"] for counts in days.values()),
+            "lifetime_grand_total": sum(
+                counts["grand_total"] for counts in days.values()),
             "last7d": sum(counts["total"] for day, counts in days.items()
                           if _date(day) >= last7_cutoff),
+            "last7d_grand_total": sum(
+                counts["grand_total"] for day, counts in days.items()
+                if _date(day) >= last7_cutoff),
             "peak": _peak(days),
         })
     lifetime = sum(counts["total"] for counts in fleet_days.values())
+    grand_total = sum(counts["grand_total"] for counts in fleet_days.values())
     active = [day for day, counts in fleet_days.items()
-              if counts["total"] + counts["cache_read"] > 0]
+              if counts["grand_total"] > 0]
     current, longest = _streaks(active, today)
     cutoff = today - datetime.timedelta(days=MAX_PAYLOAD_DAYS - 1)
     payload_days = {day: fleet_days[day] for day in sorted(fleet_days)
                     if cutoff <= _date(day) <= today}
+    families = _breakdown(family_totals, FAMILY_LABELS)
+    efforts = _breakdown(effort_totals, EFFORT_LABELS)
+    most_used = max(families, key=lambda item: (
+        item["tokens"], -FAMILY_LABELS.index(item["label"])))
+    most_used_model = ({"label": most_used["label"],
+                        "share_pct": most_used["share_pct"]}
+                       if most_used["tokens"] else
+                       {"label": None, "share_pct": 0})
     return {
         "generated": generated,
         "days": payload_days,
         "accounts": account_rows,
         "summary": {
             "lifetime": lifetime,
+            "grand_total": grand_total,
             "peak": _peak(fleet_days),
             "current_streak": current,
             "longest_streak": longest,
+            "total_sessions": sum(
+                counts["session_count"] for counts in fleet_days.values()),
+            "longest_session": longest_session,
+            "active_days": len(active),
+            "most_used_model": most_used_model,
+            "families": families,
+            "efforts": efforts,
         },
     }
 

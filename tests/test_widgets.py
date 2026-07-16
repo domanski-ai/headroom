@@ -828,16 +828,29 @@ class DashboardHttpTests(unittest.TestCase):
             "generated": NOW,
             "days": {"2033-05-18": {
                 "input": 10, "output": 5, "cache_read": 7,
-                "cache_creation": 3, "total": 18}},
+                "cache_creation": 3, "total": 18, "grand_total": 25,
+                "session_count": 1, "longest_session_s": 3600,
+                "families": {"sonnet": 25}, "efforts": {}}},
             "accounts": [{
                 "id": account["id"], "name": account["name"],
                 "provider": account["provider"], "lifetime": 18,
-                "last7d": 18,
-                "peak": {"date": "2033-05-18", "total": 18}}],
+                "lifetime_grand_total": 25, "last7d": 18,
+                "last7d_grand_total": 25,
+                "peak": {"date": "2033-05-18", "total": 18,
+                         "grand_total": 25}}],
             "summary": {
-                "lifetime": 18,
-                "peak": {"date": "2033-05-18", "total": 18},
-                "current_streak": 1, "longest_streak": 1},
+                "lifetime": 18, "grand_total": 25,
+                "peak": {"date": "2033-05-18", "total": 18,
+                         "grand_total": 25},
+                "current_streak": 1, "longest_streak": 1,
+                "total_sessions": 1, "active_days": 1,
+                "longest_session": {"seconds": 3600,
+                                    "date": "2033-05-18",
+                                    "account": account["name"]},
+                "most_used_model": {"label": "sonnet",
+                                    "share_pct": 100.0},
+                "families": [{"label": "sonnet", "tokens": 25,
+                              "share_pct": 100.0}]},
         }
 
         class StaticGate:
@@ -1076,14 +1089,32 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertIn('id="token-stats" hidden', template)
         self.assertIn('id="token-heatmap"', template)
         self.assertIn('class="token-heat-cell"', template)
+        self.assertIn('data-token-mode="daily"', template)
+        self.assertIn('data-token-mode="weekly"', template)
+        self.assertIn('data-token-mode="cumulative"', template)
+        weekly = template.split("function tokenWeeklySeries(days){",
+                                1)[1].split("\n}", 1)[0]
+        self.assertIn("date.setUTCDate(date.getUTCDate()-date.getUTCDay())",
+                      weekly)
+        self.assertIn("counts.grand_total", weekly)
+        cumulative = template.split("function tokenCumulativeSeries(days){",
+                                    1)[1].split("\n}", 1)[0]
+        self.assertIn("running+=", cumulative)
+        self.assertIn("counts.grand_total", cumulative)
         token_render = template.split("function renderTokenStats(){",
                                       1)[1].split("\n}", 1)[0]
         self.assertIn("if(!tokenStats)", token_render)
         self.assertIn("target.hidden=true", token_render)
         self.assertIn("target.hidden=false", token_render)
+        self.assertIn("summary.grand_total", token_render)
+        self.assertIn("summary.peak.grand_total", token_render)
+        self.assertIn('getElementById("token-longest-session")', token_render)
+        self.assertIn('getElementById("token-insights")', token_render)
         leaderboard = template.split("function renderLeaderboard(data){",
                                      1)[1].split("\n}", 1)[0]
         self.assertIn("if(tokenStats)", leaderboard)
+        self.assertIn("lifetime_grand_total", leaderboard)
+        self.assertIn("last7d_grand_total", leaderboard)
         self.assertIn("Lifetime tokens", leaderboard)
         self.assertIn("Last 7d tokens", leaderboard)
         self.assertIn("Avg weekly used", leaderboard)
