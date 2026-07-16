@@ -67,6 +67,18 @@ def history_path():
     return os.path.join(history_dir(), "usage-history.jsonl")
 
 
+def tokens_dir():
+    return os.path.join(state_dir(), "tokens")
+
+
+def token_scan_state_path():
+    return os.path.join(tokens_dir(), "scan-state.json")
+
+
+def token_daily_path():
+    return os.path.join(tokens_dir(), "daily.json")
+
+
 def private_snapshot_path():
     return os.path.join(state_dir(), "usage-private.json")
 

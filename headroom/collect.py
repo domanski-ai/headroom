@@ -38,7 +38,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-from . import history, paths, registry
+from . import history, paths, registry, tokens
 
 IDENTITY_TIMEOUT = paths.env_int("HEADROOM_IDENTITY_TIMEOUT", 15)
 CODEX_STALE_AFTER = paths.env_int("HEADROOM_CODEX_STALE_AFTER", 1800)
@@ -1345,6 +1345,15 @@ def run_collect(quiet=False):
         except Exception as error:  # history must never break collection
             try:
                 print(f"headroom: history append failed: {error}",
+                      file=sys.stderr)
+            except Exception:
+                pass
+        try:
+            if registry.token_stats_enabled(config):
+                tokens.collect(live_accounts, config=config)
+        except Exception as error:  # token telemetry must never break collection
+            try:
+                print(f"headroom: token stats scan failed: {error}",
                       file=sys.stderr)
             except Exception:
                 pass

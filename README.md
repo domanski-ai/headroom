@@ -143,6 +143,42 @@ be adjusted with `HEADROOM_HISTORY_RETENTION_DAYS` and
 supported; on static hosting the Usage tab works normally and Stats explains
 that the live `/history.json` feed requires `headroom serve`.
 
+### Token stats (opt-in)
+
+Token stats add local Codex-style insights to the same Stats tab: lifetime
+tokens, peak day, daily activity, streaks, and a leaderboard ranked by real
+token volume. This is **off by default** because enabling it reads local CLI
+session transcripts. It makes no network requests.
+
+Enable it in `~/.headroom/config.json`:
+
+```json
+{
+  "dashboard": {
+    "token_stats": true
+  }
+}
+```
+
+Or set `HEADROOM_TOKEN_STATS=1` for the headroom process. Disable it by removing
+that environment variable and removing the setting or changing it to `false`.
+The off state does not scan session logs or attach token data to the dashboard
+payload.
+
+When enabled, headroom streams Claude Code's `projects/**/*.jsonl` and Codex's
+`sessions/**/rollout-*.jsonl` under each registered account home. It stores
+daily numeric aggregates and private incremental byte-offset state under
+`state/tokens/`; it never stores message content, emails, or raw provider
+identities. The headline count is input + output + cache creation. Cache reads
+are kept as a separate number, so total tokens processed can still be derived
+without inflating the headline. Scans run at most every 15 minutes by default
+and only read new files or appended tails after the first backfill; override
+the interval with `HEADROOM_TOKEN_SCAN_INTERVAL` (seconds).
+
+Coverage is local to this machine and these registered homes. Sessions run on
+another machine do not appear until their logs exist here. Static dashboard
+exports can show the embedded token aggregates without adding an endpoint.
+
 ## Widgets
 
 ![Menu bar widget and compact dashboard, rendered from live fleet data](marketing/hr-widgets.png)

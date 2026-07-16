@@ -822,6 +822,49 @@ class DashboardHttpTests(unittest.TestCase):
                             ("/usage.json", "/widget.json", "/widget.txt")]
         self.assertEqual(statuses, [200, 200, 200])
 
+    def test_live_usage_handler_embeds_opted_in_token_summary(self):
+        account = usage_account()
+        token_value = {
+            "generated": NOW,
+            "days": {"2033-05-18": {
+                "input": 10, "output": 5, "cache_read": 7,
+                "cache_creation": 3, "total": 18}},
+            "accounts": [{
+                "id": account["id"], "name": account["name"],
+                "provider": account["provider"], "lifetime": 18,
+                "last7d": 18,
+                "peak": {"date": "2033-05-18", "total": 18}}],
+            "summary": {
+                "lifetime": 18,
+                "peak": {"date": "2033-05-18", "total": 18},
+                "current_streak": 1, "longest_streak": 1},
+        }
+
+        class StaticGate:
+            def get(self, *_args):
+                return dashboard.RefreshResult(usage_snapshot(account))
+
+        class LiveHandler(dashboard.Handler):
+            demo = False
+            refresh_gate = StaticGate()
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(os.environ, {"HEADROOM_DIR": directory}), \
+                mock.patch.object(dashboard.tokens, "load_summary",
+                                  return_value=token_value):
+            registry.save({
+                "schema_version": 1,
+                "dashboard": {"token_stats": True},
+                "accounts": [{
+                    "id": account["id"], "name": account["name"],
+                    "provider": account["provider"], "home": "/tmp/alpha"}],
+            })
+            status, _, body = memory_get(
+                LiveHandler, directory, "/usage.json")
+        payload = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["token_stats"], token_value)
+
     def test_demo_history_is_synthesized_without_collecting(self):
         with mock.patch.object(dashboard.collector, "run_collect",
                                side_effect=AssertionError("demo collected")):
@@ -1029,6 +1072,23 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertIn('loadHistory(false,true);},6e4)', history_script)
         self.assertIn('link.setAttribute("aria-current","page")', history_script)
         self.assertIn('link.removeAttribute("aria-current")', history_script)
+
+        self.assertIn('id="token-stats" hidden', template)
+        self.assertIn('id="token-heatmap"', template)
+        self.assertIn('class="token-heat-cell"', template)
+        token_render = template.split("function renderTokenStats(){",
+                                      1)[1].split("\n}", 1)[0]
+        self.assertIn("if(!tokenStats)", token_render)
+        self.assertIn("target.hidden=true", token_render)
+        self.assertIn("target.hidden=false", token_render)
+        leaderboard = template.split("function renderLeaderboard(data){",
+                                     1)[1].split("\n}", 1)[0]
+        self.assertIn("if(tokenStats)", leaderboard)
+        self.assertIn("Lifetime tokens", leaderboard)
+        self.assertIn("Last 7d tokens", leaderboard)
+        self.assertIn("Avg weekly used", leaderboard)
+        self.assertIn("if(!data){panel.hidden=true;return;}", leaderboard)
+        self.assertIn("Ranked by average Weekly-all utilization", leaderboard)
 
     def test_widget_href_uses_actual_server_address_port(self):
         port = 49152

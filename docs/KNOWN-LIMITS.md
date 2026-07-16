@@ -25,6 +25,28 @@ here so users can judge them for their own threat model.
 - Dashboards with six or more series repeat legend colours.
 - Chart end-labels can overlap when there are more series than vertical space.
 
+## Token stats known limits (opt-in)
+
+- Coverage is machine-local. Sessions run on another computer, in a container,
+  or under an unregistered CLI home are absent until those session logs exist
+  inside a registered home on this machine. The figures therefore describe
+  locally visible activity, not provider billing or an account-wide audit.
+- Codex `token_count` events are assumed to expose a monotonically cumulative
+  `total_token_usage` counter within each rollout file. Headroom assigns
+  positive deltas to event days, ignores repeated totals, and treats a counter
+  decrease as a reset. A future Codex schema that changes those semantics will
+  require a parser update.
+- Claude duplicate suppression uses the request/message usage identity. For an
+  appended tail, only the boundary identity and identities in the new tail are
+  available; a future CLI that repeats an old usage record much later in the
+  same file could count it twice.
+- UTC timestamps define day boundaries and streaks. The current streak remains
+  current through the following UTC day so an unfinished day does not erase a
+  streak that was active yesterday.
+- If provider-managed logs are deleted, moved, or rewritten, the next scan may
+  reduce historical totals because the store is an aggregate of the logs that
+  remain locally available.
+
 ## Supervised-launch residuals (opt-in launch safety)
 
 The opt-in launch-safety features (`--headroom-launch-fallback` /
