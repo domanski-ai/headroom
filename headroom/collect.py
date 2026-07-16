@@ -1297,7 +1297,7 @@ def _run_token_scan(scan):
 
 
 def _trigger_token_scan(synchronous):
-    """Run deterministic CLI scans inline; feed-path scans are daemon work."""
+    """Run CLI-owned scans inline; dashboard-owned scans are daemon work."""
     scan = tokens.collect
     if synchronous:
         _run_token_scan(scan)
@@ -1381,10 +1381,6 @@ def run_collect(quiet=False):
                       file=sys.stderr)
             except Exception:
                 pass
-    # Session-log scanning can take seconds on a cold pass. Quiet callers are
-    # feed/serve hooks, so launch a fire-and-forget daemon only after releasing
-    # the collection lock. The CLI's non-quiet `collect` remains synchronous.
-    _trigger_token_scan(synchronous=not quiet)
     if not quiet:
         print_snapshot(snapshot)
     return snapshot

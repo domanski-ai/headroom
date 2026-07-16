@@ -8,10 +8,11 @@ import stat
 import tempfile
 import threading
 import unittest
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from unittest import mock
 
 from headroom import collect as usage_collect
+from headroom import __main__ as cli
 from headroom import dashboard, paths, registry, tokens
 
 
@@ -126,6 +127,8 @@ class TokenParserTests(unittest.TestCase):
         self.assertIn("2020-01-01", tokens.__doc__)
         self.assertIn("512 distinct days", tokens.__doc__)
         self.assertIn("3000 account/day entries", tokens.__doc__)
+        self.assertIn("50,000 files", tokens.__doc__)
+        self.assertIn("24 MiB", tokens.__doc__)
 
     def test_claude_real_shape_dedupes_repeated_assistant_usage(self):
         first = claude_line(
@@ -237,6 +240,44 @@ class TokenParserTests(unittest.TestCase):
         parsed = tokens._parse_stream(
             io.BytesIO(("not-json\n" + invalid + valid).encode()), "claude")
         self.assertEqual(list(parsed["days"]), ["2026-07-10"])
+
+    def test_hostile_terminated_records_are_skipped_and_checkpointed(self):
+        huge = claude_line(
+            "2026-07-10T00:00:00Z", "huge", "huge",
+            input_tokens=int("9" * 400))
+        deep = (b'{"nested":' + b"[" * 2000 + b"0"
+                + b"]" * 2000 + b"}\n")
+        explosive = claude_line(
+            "2026-07-10T00:00:01Z", "overflow", "overflow")
+        generic = claude_line(
+            "2026-07-10T00:00:02Z", "generic", "generic")
+        valid = claude_line(
+            "2026-07-10T00:00:03Z", "valid", "valid")
+        payload = (huge.encode() + deep + explosive.encode()
+                   + generic.encode() + valid.encode())
+        original = tokens.parse_claude_record
+        original_loads = tokens.json.loads
+
+        def load(record):
+            if '"nested"' in record:
+                raise RecursionError("deep nesting fixture")
+            return original_loads(record)
+
+        def parse(record):
+            if record.get("requestId") == "overflow":
+                raise OverflowError("hostile fixture")
+            if record.get("requestId") == "generic":
+                raise RuntimeError("hostile fixture")
+            return original(record)
+
+        self.assertIsNone(tokens.parse_claude_record(huge))
+        with mock.patch.object(tokens.json, "loads", side_effect=load), \
+                mock.patch.object(tokens, "parse_claude_record",
+                                  side_effect=parse):
+            parsed = tokens._parse_stream(
+                io.BytesIO(payload), "claude", now=NOW)
+        self.assertEqual(parsed["offset"], len(payload))
+        self.assertEqual(parsed["days"]["2026-07-10"]["grand_total"], 26)
 
     def test_handoff_marker_skips_copied_prefix_but_keeps_delta_context(self):
         marker = tokens.handoff_marker_line().decode()
@@ -698,6 +739,43 @@ class TokenStoreTests(unittest.TestCase):
         self.assertEqual(set(recovered), {"projects/project/one.jsonl"})
         self.assertTrue(os.path.exists(first))
 
+    def test_rename_during_walk_error_drops_retained_inode_alias(self):
+        old_path = self.write("old.jsonl", claude_line(
+            "2026-07-10T00:00:00Z", "r1", "m1"))
+        tokens.collect(now=NOW, force=True)
+        new_path = os.path.join(self.project, "new.jsonl")
+        os.rename(old_path, new_path)
+        new_relative = "projects/project/new.jsonl"
+
+        def interrupted_walk(_account, errors=None):
+            yield new_relative
+            errors.append(OSError("walk interrupted"))
+
+        with mock.patch.object(tokens, "_files", side_effect=interrupted_walk):
+            tokens.collect(now=NOW + 1, force=True)
+        state = paths.load_json(paths.token_scan_state_path())
+        self.assertEqual(list(state["files"][self.account["id"]]),
+                         [new_relative])
+        daily = paths.load_json(paths.token_daily_path())
+        self.assertEqual(daily["accounts"][self.account["id"]][
+            "2026-07-10"]["grand_total"], 26)
+        self.assertTrue(daily["partial"])
+        self.assertEqual(daily["failed_root_slot_ids"], [self.account["id"]])
+
+    def test_aggregation_dedupes_file_identity_first_path_wins(self):
+        files = {self.account["id"]: {
+            "first": {"st_dev": 7, "st_ino": 9,
+                      "days": {"2026-07-10": day_counts(2, 3)}},
+            "second": {"st_dev": 7, "st_ino": 9,
+                       "days": {"2026-07-10": day_counts(90, 10)}},
+        }}
+        daily, partial = tokens._daily_from_files(files, include_status=True)
+        self.assertTrue(partial)
+        self.assertEqual(daily[self.account["id"]]["2026-07-10"],
+                         day_counts(2, 3, families={"other": 5}))
+        self.assertTrue(files[self.account["id"]]["second"][
+            "duplicate_identity"])
+
     def test_symlinked_provider_root_is_rejected_and_marked_partial(self):
         self.write("one.jsonl", claude_line(
             "2026-07-10T00:00:00Z", "r1", "m1"))
@@ -745,6 +823,77 @@ class TokenStoreTests(unittest.TestCase):
                             for slot_files in files.values()
                             for entry in slot_files.values()))
 
+    def test_state_budgets_compact_cold_files_then_mark_evictions_partial(self):
+        for index in range(3):
+            self.write(f"{index}.jsonl", claude_line(
+                "2026-07-10T00:00:00Z", f"r{index}", f"m{index}"))
+        with mock.patch.object(tokens, "MAX_TRACKED_FILES", 2), \
+                mock.patch.object(tokens, "MAX_SERIALIZED_STATE_BYTES",
+                                  10 * 1024 * 1024):
+            tokens.collect(now=NOW, force=True)
+        state = paths.load_json(paths.token_scan_state_path())
+        entries = state["files"][self.account["id"]]
+        self.assertEqual(len(entries), 2)
+        self.assertTrue(state["budget_partial"])
+        self.assertEqual(state["budget_dropped_files"], {
+            self.account["id"]: 1})
+        self.assertTrue(all("days" in entry for entry in entries.values()))
+        self.assertTrue(all("dedupe_tail" not in entry
+                            and "fingerprint" not in entry
+                            and "checkpoint_hash" not in entry
+                            for entry in entries.values()))
+        relative_path, compacted_entry = next(iter(entries.items()))
+        absolute_path = os.path.join(self.home, *relative_path.split("/"))
+        with open(absolute_path, "a", encoding="utf-8") as handle:
+            handle.write(claude_line(
+                "2026-07-10T00:00:01Z", "changed", "changed"))
+        starts = []
+        original_parse = tokens._parse_stream
+
+        def track_parse(handle, provider, start=0, previous=None, end=None,
+                        now=None):
+            starts.append(start)
+            return original_parse(
+                handle, provider, start=start, previous=previous, end=end,
+                now=now)
+
+        with mock.patch.object(tokens, "_parse_stream", side_effect=track_parse):
+            tokens._scan_file(
+                self.home, relative_path, "claude", compacted_entry,
+                now=NOW + 1)
+        self.assertEqual(starts, [0])
+        daily = paths.load_json(paths.token_daily_path())
+        self.assertTrue(daily["partial"])
+        self.assertEqual(daily["budget_dropped_file_count"], 1)
+
+        cold_entry = {
+            "provider": "claude", "mtime_ns": 0, "days": {
+                "2026-07-10": day_counts(1, 1)},
+            "dedupe_tail": [{"signature": "a" * 64,
+                             "maximum": counts(1, 1)} for _ in range(20)],
+            "fingerprint": "f" * 64, "checkpoint_hash": "c" * 64,
+        }
+        compacted_state = {
+            "schema_version": tokens.SCHEMA_VERSION,
+            "files": {self.account["id"]: {"cold": cold_entry}},
+        }
+        compacted_limit = tokens._serialized_state_size({
+            "schema_version": tokens.SCHEMA_VERSION,
+            "files": {self.account["id"]: {"cold": {
+                "provider": "claude", "mtime_ns": 0, "days": {
+                    "2026-07-10": day_counts(1, 1)}}}},
+            "compacted_file_count": 1,
+            "budget_dropped_files": {}, "budget_partial": False,
+        }) + 32
+        with mock.patch.object(tokens, "MAX_TRACKED_FILES", 10), \
+                mock.patch.object(tokens, "MAX_SERIALIZED_STATE_BYTES",
+                                  compacted_limit):
+            compacted, dropped = tokens._enforce_state_budgets(
+                compacted_state, NOW)
+        self.assertEqual((compacted, dropped), (1, 0))
+        self.assertLessEqual(tokens._serialized_state_size(compacted_state),
+                             compacted_limit)
+
     def test_scan_health_persists_attempt_and_success_separately(self):
         self.write("one.jsonl", claude_line(
             "2026-07-10T00:00:00Z", "r1", "m1"))
@@ -786,6 +935,36 @@ class TokenStoreTests(unittest.TestCase):
         self.assertEqual(daily["failed_file_count"], 7)
         self.assertEqual(daily["failed_root_count"], 2)
         self.assertEqual(daily["partial_file_count"], 3)
+
+    def test_removal_recomputes_failed_root_health_from_slot_ids(self):
+        target = self.account["id"]
+        survivor = slot_id("survivor")
+        paths.write_json_atomic(paths.token_scan_state_path(), {
+            "schema_version": tokens.SCHEMA_VERSION,
+            "failed_root_count": 2,
+            "failed_root_slot_ids": [target, survivor],
+            "files": {target: {}, survivor: {}},
+            "budget_dropped_files": {}, "budget_partial": False,
+        })
+        paths.write_json_atomic(paths.token_daily_path(), {
+            "schema_version": tokens.SCHEMA_VERSION,
+            "generated": NOW, "partial": True,
+            "failed_file_count": 0, "failed_root_count": 2,
+            "failed_root_slot_ids": [target, survivor],
+            "partial_file_count": 0, "accounts": {target: {}, survivor: {}},
+        })
+        tokens.remove_account(target)
+        state = paths.load_json(paths.token_scan_state_path())
+        daily = paths.load_json(paths.token_daily_path())
+        self.assertEqual(state["failed_root_slot_ids"], [survivor])
+        self.assertEqual(daily["failed_root_count"], 1)
+        self.assertTrue(daily["partial"])
+
+        tokens.remove_account(survivor)
+        daily = paths.load_json(paths.token_daily_path())
+        self.assertEqual(daily["failed_root_slot_ids"], [])
+        self.assertEqual(daily["failed_root_count"], 0)
+        self.assertFalse(daily["partial"])
 
     def test_scan_lock_serializes_scans(self):
         with tokens.scan_lock(blocking=True):
@@ -974,14 +1153,18 @@ class TokenSummaryTests(unittest.TestCase):
         snapshot = usage_snapshot(self.account["id"])
         enabled = dashboard.display_snapshot(
             snapshot, evaluated_at=NOW, config=self.config)
+        self.assertIs(enabled["token_stats_enabled"], True)
         self.assertIn("token_stats", enabled)
         self.assertEqual(len(enabled["token_stats"]["days"]), 400)
         self.assertEqual(min(enabled["token_stats"]["days"]), self.day(-399))
         disabled = dict(self.config)
         disabled["dashboard"] = {"token_stats": False}
-        poisoned = dict(snapshot, token_stats={"stale": True})
-        self.assertNotIn("token_stats", dashboard.display_snapshot(
-            poisoned, evaluated_at=NOW, config=disabled))
+        poisoned = dict(snapshot, token_stats={"stale": True},
+                        token_stats_enabled=True)
+        disabled_payload = dashboard.display_snapshot(
+            poisoned, evaluated_at=NOW, config=disabled)
+        self.assertNotIn("token_stats", disabled_payload)
+        self.assertIs(disabled_payload["token_stats_enabled"], False)
 
         with mock.patch.object(registry, "load",
                                return_value=self.config) as load, \
@@ -995,18 +1178,12 @@ class TokenSummaryTests(unittest.TestCase):
         value = dashboard.display_snapshot(
             usage_snapshot(self.account["id"]), evaluated_at=NOW,
             config=self.config)
+        self.assertIs(value["token_stats_enabled"], True)
         self.assertNotIn("token_stats", value)
 
-    def test_run_collect_token_failure_is_nonfatal_and_always_triggers_gate(self):
+    def test_run_collect_is_scan_free_for_quiet_and_verbose_callers(self):
         snapshot = usage_snapshot(self.account["id"])
         snapshot.update({"run_id": "fixture", "generated_iso": "fixture"})
-        failed = threading.Event()
-
-        def fail_scan():
-            failed.set()
-            raise RuntimeError("broken")
-
-        errors = io.StringIO()
         with mock.patch.object(usage_collect, "collect",
                                return_value=snapshot), \
                 mock.patch.object(registry, "apply_pins",
@@ -1015,39 +1192,20 @@ class TokenSummaryTests(unittest.TestCase):
                                   return_value={"redact_emails": True}), \
                 mock.patch.object(usage_collect.history, "append_snapshot"), \
                 mock.patch.object(tokens, "collect",
-                                  side_effect=fail_scan), \
-                redirect_stderr(errors):
+                                  side_effect=AssertionError("token scan")):
             self.assertIs(usage_collect.run_collect(quiet=True), snapshot)
-            self.assertTrue(failed.wait(2))
-        self.assertIn("token stats scan failed", errors.getvalue())
-        disabled = dict(self.config)
-        disabled["dashboard"] = {"token_stats": False}
-        registry.save(disabled)
-        scanned = threading.Event()
-        with mock.patch.object(usage_collect, "collect",
-                               return_value=snapshot), \
-                mock.patch.object(registry, "apply_pins",
-                                  return_value=[self.account]), \
-                mock.patch.object(registry, "dashboard_settings",
-                                  return_value={"redact_emails": True}), \
-                mock.patch.object(usage_collect.history, "append_snapshot"), \
-                mock.patch.object(tokens, "collect",
-                                  side_effect=lambda: scanned.set()) as scan:
-            usage_collect.run_collect(quiet=True)
-            self.assertTrue(scanned.wait(2))
-        scan.assert_called_once_with()
+            with redirect_stdout(io.StringIO()):
+                self.assertIs(usage_collect.run_collect(quiet=False), snapshot)
 
-    def test_run_collect_scans_only_after_collection_lock_is_released(self):
+    def test_cli_collect_scans_synchronously_after_collection_lock_release(self):
         snapshot = usage_snapshot(self.account["id"])
         snapshot.update({"run_id": "fixture", "generated_iso": "fixture"})
-
         observed = []
-        scanned = threading.Event()
+        caller_thread = threading.get_ident()
 
         def assert_unlocked():
             with usage_collect.collection_lock(blocking=False) as locked:
-                observed.append(locked)
-            scanned.set()
+                observed.append((locked, threading.get_ident()))
             return False
 
         with mock.patch.object(usage_collect, "collect",
@@ -1059,14 +1217,12 @@ class TokenSummaryTests(unittest.TestCase):
                 mock.patch.object(usage_collect.history, "append_snapshot"), \
                 mock.patch.object(tokens, "collect",
                                   side_effect=assert_unlocked) as scan:
-            self.assertIs(usage_collect.run_collect(quiet=True), snapshot)
-            self.assertTrue(scanned.wait(2))
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(cli._dispatch(["collect"]), 0)
         scan.assert_called_once_with()
-        self.assertEqual(observed, [True])
+        self.assertEqual(observed, [(True, caller_thread)])
 
-    def test_quiet_scans_are_daemon_nonblocking_and_single_flight(self):
-        snapshot = usage_snapshot(self.account["id"])
-        snapshot.update({"run_id": "fixture", "generated_iso": "fixture"})
+    def test_dashboard_owns_daemon_scans_and_they_remain_single_flight(self):
         entered = threading.Event()
         release = threading.Event()
         discovery_calls = []
@@ -1085,25 +1241,35 @@ class TokenSummaryTests(unittest.TestCase):
             workers.append(worker)
             return worker
 
-        with mock.patch.object(usage_collect, "collect",
-                               return_value=snapshot), \
-                mock.patch.object(registry, "apply_pins",
-                                  return_value=[self.account]), \
-                mock.patch.object(registry, "dashboard_settings",
-                                  return_value={"redact_emails": True}), \
-                mock.patch.object(usage_collect.history, "append_snapshot"), \
-                mock.patch.object(tokens, "_files", side_effect=slow_files), \
+        with mock.patch.object(tokens, "_files", side_effect=slow_files), \
                 mock.patch.object(usage_collect.threading, "Thread",
                                   side_effect=make_thread):
-            self.assertIs(usage_collect.run_collect(quiet=True), snapshot)
+            first = usage_collect._trigger_token_scan(synchronous=False)
             self.assertTrue(entered.wait(2))
-            self.assertIs(usage_collect.run_collect(quiet=True), snapshot)
+            second = usage_collect._trigger_token_scan(synchronous=False)
             self.assertTrue(all(worker.daemon for worker in workers))
-            self.assertTrue(workers[0].is_alive())
+            self.assertTrue(first.is_alive())
             release.set()
-            for worker in workers:
+            for worker in (first, second):
                 worker.join(2)
         self.assertEqual(discovery_calls, [self.account["id"]])
+
+        snapshot = usage_snapshot(self.account["id"])
+
+        class CallingGate:
+            def get(self, _load, collect_snapshot):
+                collect_snapshot()
+                return dashboard.RefreshResult(snapshot)
+
+        handler = object.__new__(dashboard.Handler)
+        handler.demo = False
+        handler.refresh_gate = CallingGate()
+        with mock.patch.object(usage_collect, "run_collect",
+                               return_value=snapshot) as collect_snapshot, \
+                mock.patch.object(usage_collect, "_trigger_token_scan") as trigger:
+            self.assertEqual(handler._snapshot_result().snapshot, snapshot)
+        collect_snapshot.assert_called_once_with(quiet=True)
+        trigger.assert_called_once_with(synchronous=False)
 
 
 if __name__ == "__main__":

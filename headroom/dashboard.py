@@ -36,11 +36,14 @@ def display_snapshot(snapshot, evaluated_at=None, force_noncurrent_reason=None,
     # The source snapshot is untrusted with respect to the current opt-in.
     # Remove any stale/cached payload before consulting one exact config view.
     value.pop("token_stats", None)
+    value.pop("token_stats_enabled", None)
     value["_headroom_display"] = widget.project_dashboard(
         snapshot, evaluated_at, force_noncurrent_reason)
     try:
         live_config = registry.load() if config is None else config
-        if registry.token_stats_enabled(live_config):
+        enabled = registry.token_stats_enabled(live_config)
+        value["token_stats_enabled"] = enabled
+        if enabled:
             token_stats = tokens.load_summary(
                 registry.accounts(live_config), now=evaluated_at)
             if token_stats is not None:
@@ -198,7 +201,6 @@ def build(config=None, out_dir=None, snapshot_file=None):
         "snapshot_max_age": widget.SNAPSHOT_MAX_AGE,
         "observation_max_age": widget.OBSERVATION_MAX_AGE,
         "token_scan_interval": tokens.scan_interval(),
-        "token_stats_enabled": registry.token_stats_enabled(config),
         "accounts": [{"name": account["name"], "provider": account["provider"]}
                      for account in registry.accounts(config)],
     }
@@ -306,9 +308,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if self.demo:
             snapshot = paths.load_json(os.path.join(self.directory, "usage.json"))
             return RefreshResult(snapshot)
+        def collect_for_dashboard():
+            snapshot = collector.run_collect(quiet=True)
+            collector._trigger_token_scan(synchronous=False)
+            return snapshot
+
         return self.refresh_gate.get(
             lambda: paths.load_json(paths.public_snapshot_path()),
-            lambda: collector.run_collect(quiet=True))
+            collect_for_dashboard)
 
     def _send_body(self, status, content_type, body):
         self.send_response(status)
@@ -425,6 +432,7 @@ def serve(open_browser=False, port=None, demo=False):
         port = settings["port"] if port is None else port
         out_dir = paths.public_dir()
         build(config, out_dir)
+        collector._trigger_token_scan(synchronous=False)
     handler_cls = type("HeadroomHandler", (Handler,),
                        {"demo": demo, "refresh_gate": RefreshGate()})
     handler = lambda *args, **kwargs: handler_cls(*args, directory=out_dir, **kwargs)  # noqa: E731

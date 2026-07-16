@@ -2130,7 +2130,7 @@ class LaunchMarker(unittest.TestCase):
 
 
 class CollectionLockOrdering(unittest.TestCase):
-    def test_collector_locks_before_loading_registry(self):
+    def test_collector_locks_before_loading_registry_and_never_scans_tokens(self):
         config = {"schema_version": 1, "accounts": [_account("a")]}
         observed = []
 
@@ -2147,25 +2147,18 @@ class CollectionLockOrdering(unittest.TestCase):
 
         snapshot = {"schema_version": 1, "run_id": "fixture", "generated": 1,
                     "generated_iso": "fixture", "accounts": []}
-        token_scanned = threading.Event()
-
-        def token_scan():
-            guarded_load()
-            token_scanned.set()
-
         with tempfile.TemporaryDirectory() as root, \
                 mock.patch.dict(os.environ, {"HEADROOM_DIR": root}), \
                 mock.patch.object(registry, "load", side_effect=guarded_load), \
                 mock.patch.object(collect, "collect", return_value=snapshot), \
                 mock.patch.object(registry, "dashboard_settings",
                                   return_value={"redact_emails": True}), \
-                mock.patch.object(tokens, "collect", side_effect=token_scan):
+                mock.patch.object(tokens, "collect",
+                                  side_effect=AssertionError("token scan")):
             collect.run_collect(quiet=True)
-            self.assertTrue(token_scanned.wait(2))
         # Initial collection and the locked ID/pin merge remain inside the
-        # collection lock. The third load belongs to the token scanner and is
-        # deliberately outside it (serialized by state/tokens/scan.lock).
-        self.assertEqual(observed, [True, True, False])
+        # collection lock. Quiet route/handoff callers do no token work.
+        self.assertEqual(observed, [True, True])
 
 
 class AuthRefreshCommand(unittest.TestCase):

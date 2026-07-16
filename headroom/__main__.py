@@ -329,6 +329,7 @@ def _dispatch(argv):
     if command == "collect":
         from . import collect
         collect.run_collect()
+        collect._trigger_token_scan(synchronous=True)
         return 0
     if command == "status":
         from . import route
@@ -449,6 +450,7 @@ def _dispatch(argv):
                             private, settings.get("redact_emails", True)),
                         mode=0o644)
                 dashboard.build(snapshot_file=paths.public_snapshot_path())
+            collect._trigger_token_scan(synchronous=False)
         return 0
     if command == "serve":
         from . import dashboard

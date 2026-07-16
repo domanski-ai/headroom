@@ -7,10 +7,12 @@ byte offsets, mtimes, file identity/fingerprints, per-file daily subtotals,
 and the bounded counter/dedupe metadata needed to resume an append-only log.
 
 Resource bounds are deliberately fixed: physical records are at most 1 MiB,
-only UTC days from 2020-01-01 through scan-time +2 days are accepted, one file
-may retain at most 512 distinct days, and the published daily store may retain
-at most 3000 account/day entries. Crossing a cardinality cap marks telemetry
-partial instead of growing another in-memory map entry.
+individual token counts are at most 10**12, only UTC days from 2020-01-01
+through scan-time +2 days are accepted. One file retains at most 512 distinct days;
+the daily store retains at most 3000 account/day entries. Scan state
+tracks at most 50,000 files and 24 MiB of serialized data; cold files unchanged
+for 30 days are compacted before files are dropped. Crossing a cardinality or
+state cap marks telemetry partial.
 
 ``total`` preserves the original input + output + cache creation accounting;
 ``grand_total`` also includes cache reads and drives Codex-mirror headlines.
@@ -38,12 +40,16 @@ MAX_PAYLOAD_DAYS = 400
 MAX_SESSION_SECONDS = 48 * 60 * 60
 MAX_LINE_BYTES = 1024 * 1024
 READ_DRAIN_BYTES = 64 * 1024
+MAX_TOKEN_COUNT = 10 ** 12
 DEDUPE_TAIL_RECORDS = 512
 FINGERPRINT_BYTES = 4096
 MIN_TOKEN_DAY = datetime.date(2020, 1, 1)
 MAX_FUTURE_DAYS = 2
 MAX_FILE_DAYS = 512
 MAX_GLOBAL_DAYS = 3000
+MAX_TRACKED_FILES = 50_000
+MAX_SERIALIZED_STATE_BYTES = 24 * 1024 * 1024
+COMPACT_AFTER_SECONDS = 30 * 86400
 HANDOFF_MARKER_SCHEMA = "headroom_token_copy@1"
 COUNT_KEYS = ("input", "output", "cache_read", "cache_creation", "total",
               "grand_total")
@@ -75,7 +81,10 @@ def _empty_day():
 def _count(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if not math.isfinite(value) or value < 0 or int(value) != value:
+    if isinstance(value, int):
+        return value if 0 <= value <= MAX_TOKEN_COUNT else None
+    if not math.isfinite(value) or value < 0 or value > MAX_TOKEN_COUNT \
+            or int(value) != value:
         return None
     return int(value)
 
@@ -116,7 +125,9 @@ def _record(line):
             line = line.decode("utf-8", errors="replace")
         value = json.loads(line) if isinstance(line, str) else line
         return value if isinstance(value, dict) else None
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except RecursionError:
+        return None
+    except Exception:
         return None
 
 
@@ -468,14 +479,13 @@ def _parse_stream(handle, provider, start=0, previous=None, end=None, now=None):
     scan_day = datetime.datetime.fromtimestamp(
         time.time() if now is None else now, datetime.timezone.utc).date()
     latest_day = scan_day + datetime.timedelta(days=MAX_FUTURE_DAYS)
-    handle.seek(start)
-    for record_end, line in _bounded_record_lines(handle, end):
-        valid_offset = record_end
-        if line is None:
-            continue
+
+    def consume(line):
+        nonlocal days, file_partial, last_counter, first_event_ts
+        nonlocal last_event_ts, current_family, current_effort
         record = _record(line)
         if record is None:
-            continue
+            return
         if _handoff_prefix_end(record):
             # Everything through this boundary was already attributed to the
             # source slot. Retain counter/dedupe/model context only, so target
@@ -483,7 +493,7 @@ def _parse_stream(handle, provider, start=0, previous=None, end=None, now=None):
             days = {}
             first_event_ts = None
             last_event_ts = None
-            continue
+            return
         event_ts = _timestamp(record.get("timestamp"))
         event_day = _day(event_ts)
         parsed_day = _date(event_day)
@@ -503,14 +513,14 @@ def _parse_stream(handle, provider, start=0, previous=None, end=None, now=None):
                 parsed = parse_codex_record(record)
                 if parsed is not None:
                     last_counter = parsed[1]
-            continue
+            return
         if first_event_ts is None:
             first_event_ts = event_ts
         last_event_ts = event_ts
         if provider == "claude":
             parsed = parse_claude_record(record)
             if parsed is None:
-                continue
+                return
             day, counts, signature, family = parsed
             if signature is not None:
                 delta, maximum = _message_delta(counts, seen.get(signature))
@@ -534,7 +544,7 @@ def _parse_stream(handle, provider, start=0, previous=None, end=None, now=None):
                 current_effort = effort
             parsed = parse_codex_record(record)
             if parsed is None:
-                continue
+                return
             day, counter = parsed
             delta = _counter_delta(counter, last_counter)
             if delta["grand_total"] > 0:
@@ -543,6 +553,20 @@ def _parse_stream(handle, provider, start=0, previous=None, end=None, now=None):
                                 limit=MAX_FILE_DAYS):
                     file_partial = True
             last_counter = counter
+
+    handle.seek(start)
+    for record_end, line in _bounded_record_lines(handle, end):
+        valid_offset = record_end
+        if line is None:
+            continue
+        try:
+            consume(line)
+        except RecursionError:
+            continue
+        except OverflowError:
+            continue
+        except Exception:
+            continue
     result = {"days": days, "offset": valid_offset}
     if file_partial:
         result["partial"] = True
@@ -735,10 +759,109 @@ def scan_lock(blocking=False):
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+def _file_identity(entry):
+    if not isinstance(entry, dict):
+        return None
+    device, inode = entry.get("st_dev"), entry.get("st_ino")
+    if any(isinstance(value, bool) or not isinstance(value, int)
+           for value in (device, inode)):
+        return None
+    return device, inode
+
+
+def _serialized_state_size(state):
+    return len(json.dumps(
+        state, allow_nan=False, indent=2).encode("utf-8")) + 1
+
+
+def _state_entries(files):
+    entries = []
+    for slot_id, slot_files in files.items():
+        if not isinstance(slot_id, str) or not isinstance(slot_files, dict):
+            continue
+        for relative_path, entry in slot_files.items():
+            if isinstance(relative_path, str) and isinstance(entry, dict):
+                mtime = entry.get("mtime_ns")
+                coldness = mtime if isinstance(mtime, int) else -1
+                entries.append((coldness, slot_id, relative_path, entry))
+    return sorted(entries, key=lambda item: item[:3])
+
+
+def _enforce_state_budgets(state, now):
+    """Compact, then evict, cold files until both global budgets hold."""
+    files = state["files"]
+    entries = _state_entries(files)
+    state["compacted_file_count"] = 0
+    state["budget_dropped_files"] = {}
+    state["budget_partial"] = False
+    size = _serialized_state_size(state)
+    if len(entries) <= MAX_TRACKED_FILES \
+            and size <= MAX_SERIALIZED_STATE_BYTES:
+        return 0, 0
+
+    cutoff_ns = (now - COMPACT_AFTER_SECONDS) * 1_000_000_000
+    compacted = 0
+    for mtime, _slot_id, _relative_path, entry in entries:
+        if mtime < 0:
+            continue
+        if mtime > cutoff_ns:
+            break
+        changed = False
+        for key in ("dedupe_tail", "fingerprint", "checkpoint_hash"):
+            if key in entry:
+                del entry[key]
+                changed = True
+        if changed:
+            compacted += 1
+    state["compacted_file_count"] = compacted
+    size = _serialized_state_size(state)
+    if len(entries) <= MAX_TRACKED_FILES \
+            and size <= MAX_SERIALIZED_STATE_BYTES:
+        return compacted, 0
+
+    dropped = collections.Counter()
+    remaining = len(entries)
+    next_index = 0
+    while next_index < len(entries) and (
+            remaining > MAX_TRACKED_FILES
+            or size > MAX_SERIALIZED_STATE_BYTES):
+        _mtime, slot_id, relative_path, entry = entries[next_index]
+        next_index += 1
+        slot_files = files.get(slot_id)
+        if not isinstance(slot_files, dict) \
+                or slot_files.get(relative_path) is not entry:
+            continue
+        member_size = (_serialized_state_size(relative_path)
+                       + _serialized_state_size(entry) + 2)
+        del slot_files[relative_path]
+        dropped[slot_id] += 1
+        remaining -= 1
+        size = max(0, size - member_size)
+
+    state["budget_dropped_files"] = dict(dropped)
+    state["budget_partial"] = bool(dropped)
+    size = _serialized_state_size(state)
+    while next_index < len(entries) and size > MAX_SERIALIZED_STATE_BYTES:
+        _mtime, slot_id, relative_path, entry = entries[next_index]
+        next_index += 1
+        slot_files = files.get(slot_id)
+        if not isinstance(slot_files, dict) \
+                or slot_files.get(relative_path) is not entry:
+            continue
+        del slot_files[relative_path]
+        dropped[slot_id] += 1
+        remaining -= 1
+        state["budget_dropped_files"] = dict(dropped)
+        state["budget_partial"] = True
+        size = _serialized_state_size(state)
+    return compacted, sum(dropped.values())
+
+
 def _daily_from_files(files, include_status=False):
     accounts = {}
     cardinality = 0
     partial = False
+    seen_identities = set()
     if not isinstance(files, dict):
         return (accounts, partial) if include_status else accounts
     for slot_id, slot_files in files.items():
@@ -747,6 +870,14 @@ def _daily_from_files(files, include_status=False):
         for entry in slot_files.values():
             if not isinstance(entry, dict):
                 continue
+            entry.pop("duplicate_identity", None)
+            identity = _file_identity(entry)
+            if identity is not None and identity in seen_identities:
+                entry["duplicate_identity"] = True
+                partial = True
+                continue
+            if identity is not None:
+                seen_identities.add(identity)
             target = accounts.setdefault(slot_id, {})
             capped = [False]
             entry_days = _normalized_days(
@@ -835,7 +966,7 @@ def collect(accounts=None, config=None, now=None, force=False):
                 and isinstance(account.get("home"), str)]
         files = {}
         failed_files = 0
-        failed_roots = 0
+        failed_root_slot_ids = []
         for account in live:
             slot_id = account["id"]
             provider = account["provider"]
@@ -844,6 +975,7 @@ def collect(accounts=None, config=None, now=None, force=False):
                 if isinstance(previous_files, dict) else {}
             slot_files = {}
             seen = set()
+            successful_identities = set()
             discovery_errors = []
             try:
                 discovered = _files(account, errors=discovery_errors)
@@ -855,9 +987,13 @@ def collect(accounts=None, config=None, now=None, force=False):
                     compatible = (isinstance(previous, dict)
                                   and previous.get("provider") == provider)
                     try:
-                        slot_files[relative_path] = _scan_file(
+                        scanned = _scan_file(
                             account["home"], relative_path, provider,
                             previous if compatible else None, now=now)
+                        slot_files[relative_path] = scanned
+                        identity = _file_identity(scanned)
+                        if identity is not None:
+                            successful_identities.add(identity)
                     except Exception as error:  # one bad file never hides rest
                         failed_files += 1
                         retained = dict(previous) if compatible else {
@@ -869,19 +1005,40 @@ def collect(accounts=None, config=None, now=None, force=False):
             except OSError as error:
                 discovery_errors.append(error)
             if discovery_errors:
-                failed_roots += 1
+                failed_root_slot_ids.append(slot_id)
                 for relative_path, previous in previous_files.items():
                     if relative_path not in seen and isinstance(previous, dict) \
                             and previous.get("provider") == provider:
+                        if _file_identity(previous) in successful_identities:
+                            continue
                         slot_files[relative_path] = dict(previous)
             files[slot_id] = slot_files
+        state = {
+            "schema_version": SCHEMA_VERSION,
+            "last_scan": now,
+            "last_attempt": now,
+            "last_success": now,
+            "failed_root_count": len(failed_root_slot_ids),
+            "failed_root_slot_ids": failed_root_slot_ids,
+            "files": files,
+        }
+        # Materialize aggregation-only markers before measuring serialized
+        # state; the second pass below recomputes totals after any evictions.
+        _daily_from_files(files)
+        compacted_files, budget_dropped_files = _enforce_state_budgets(
+            state, now)
         daily_accounts, aggregate_partial = _daily_from_files(
             files, include_status=True)
         partial_files = sum(
             1 for slot_files in files.values() if isinstance(slot_files, dict)
             for entry in slot_files.values()
             if isinstance(entry, dict) and entry.get("partial") is True)
-        partial = bool(failed_files or failed_roots or partial_files
+        duplicate_files = sum(
+            1 for slot_files in files.values() if isinstance(slot_files, dict)
+            for entry in slot_files.values()
+            if isinstance(entry, dict) and entry.get("duplicate_identity") is True)
+        partial = bool(failed_files or failed_root_slot_ids or partial_files
+                       or duplicate_files or budget_dropped_files
                        or aggregate_partial)
         daily = {
             "schema_version": SCHEMA_VERSION,
@@ -890,17 +1047,13 @@ def collect(accounts=None, config=None, now=None, force=False):
             "last_success": now,
             "partial": partial,
             "failed_file_count": failed_files,
-            "failed_root_count": failed_roots,
+            "failed_root_count": len(failed_root_slot_ids),
+            "failed_root_slot_ids": failed_root_slot_ids,
             "partial_file_count": partial_files,
+            "duplicate_file_count": duplicate_files,
+            "compacted_file_count": compacted_files,
+            "budget_dropped_file_count": budget_dropped_files,
             "accounts": daily_accounts,
-        }
-        state = {
-            "schema_version": SCHEMA_VERSION,
-            "last_scan": now,
-            "last_attempt": now,
-            "last_success": now,
-            "failed_root_count": failed_roots,
-            "files": files,
         }
         paths.write_json_atomic(paths.token_daily_path(), daily, mode=0o600)
         paths.write_json_atomic(
@@ -921,8 +1074,43 @@ def remove_account(slot_id):
             failures.append(f"unreadable {state_path}")
         state_files = state.get("files") if isinstance(state, dict) else None
         state_files = state_files if isinstance(state_files, dict) else {}
+        state_changed = False
         if slot_id in state_files:
             del state_files[slot_id]
+            state_changed = True
+        failed_root_slots = state.get("failed_root_slot_ids") \
+            if isinstance(state, dict) else None
+        if isinstance(failed_root_slots, list):
+            remaining_failed_roots = sorted({
+                value for value in failed_root_slots
+                if isinstance(value, str) and value != slot_id
+            })
+            if remaining_failed_roots != failed_root_slots:
+                state["failed_root_slot_ids"] = remaining_failed_roots
+                state_changed = True
+            if state.get("failed_root_count") != len(remaining_failed_roots):
+                state["failed_root_count"] = len(remaining_failed_roots)
+                state_changed = True
+            failed_root_count = len(remaining_failed_roots)
+        else:
+            failed_root_count = None
+        budget_dropped = state.get("budget_dropped_files") \
+            if isinstance(state, dict) else None
+        if isinstance(budget_dropped, dict):
+            if slot_id in budget_dropped:
+                del budget_dropped[slot_id]
+                state_changed = True
+            budget_dropped_file_count = sum(
+                value for value in budget_dropped.values()
+                if isinstance(value, int) and not isinstance(value, bool)
+                and value > 0)
+            budget_partial = bool(budget_dropped_file_count)
+            if state.get("budget_partial") is not budget_partial:
+                state["budget_partial"] = budget_partial
+                state_changed = True
+        else:
+            budget_dropped_file_count = None
+        if state_changed:
             paths.write_json_atomic(state_path, state, mode=0o600)
         failed_file_count = sum(
             1 for slot_files in (state_files or {}).values()
@@ -936,6 +1124,13 @@ def remove_account(slot_id):
             for entry in slot_files.values()
             if isinstance(entry, dict) and entry.get("partial") is True
         ) if state_authoritative else None
+        duplicate_file_count = sum(
+            1 for slot_files in (state_files or {}).values()
+            if isinstance(slot_files, dict)
+            for entry in slot_files.values()
+            if isinstance(entry, dict)
+            and entry.get("duplicate_identity") is True
+        ) if state_authoritative else None
 
         daily_path = paths.token_daily_path()
         daily = paths.load_json(daily_path)
@@ -945,18 +1140,37 @@ def remove_account(slot_id):
             if isinstance(daily, dict) else None
         if isinstance(daily_accounts, dict):
             changed = daily_accounts.pop(slot_id, None) is not None
-            failed_root_count = _count(daily.get("failed_root_count", 0)) or 0
+            if failed_root_count is None:
+                failed_root_count = _count(
+                    daily.get("failed_root_count", 0)) or 0
+            if budget_dropped_file_count is None:
+                budget_dropped_file_count = _count(
+                    daily.get("budget_dropped_file_count", 0)) or 0
             recalculated_partial = failed_file_count is not None and bool(
-                failed_file_count or failed_root_count or partial_file_count)
+                failed_file_count or failed_root_count or partial_file_count
+                or duplicate_file_count or budget_dropped_file_count)
             partial_changed = failed_file_count is not None and any((
                 daily.get("failed_file_count") != failed_file_count,
+                daily.get("failed_root_count") != failed_root_count,
+                isinstance(failed_root_slots, list)
+                and daily.get("failed_root_slot_ids")
+                != remaining_failed_roots,
                 daily.get("partial_file_count") != partial_file_count,
+                daily.get("duplicate_file_count", 0) != duplicate_file_count,
+                daily.get("budget_dropped_file_count", 0)
+                != budget_dropped_file_count,
                 daily.get("partial") is not recalculated_partial,
             ))
             if changed or partial_changed:
                 if failed_file_count is not None:
                     daily["failed_file_count"] = failed_file_count
+                    daily["failed_root_count"] = failed_root_count
+                    if isinstance(failed_root_slots, list):
+                        daily["failed_root_slot_ids"] = remaining_failed_roots
                     daily["partial_file_count"] = partial_file_count
+                    daily["duplicate_file_count"] = duplicate_file_count
+                    daily["budget_dropped_file_count"] = \
+                        budget_dropped_file_count
                     daily["partial"] = recalculated_partial
                 paths.write_json_atomic(daily_path, daily, mode=0o600)
     if failures:
@@ -1073,9 +1287,11 @@ def summarize(store, accounts, now=None):
     active = [day for day, counts in fleet_days.items()
               if counts["grand_total"] > 0]
     current, longest = _streaks(active, today)
-    cutoff = today - datetime.timedelta(days=MAX_PAYLOAD_DAYS - 1)
+    generated_day = _date(_day(generated)) or today
+    payload_end = min(generated_day, today)
+    cutoff = payload_end - datetime.timedelta(days=MAX_PAYLOAD_DAYS - 1)
     payload_days = {day: fleet_days[day] for day in sorted(fleet_days)
-                    if cutoff <= _date(day) <= today}
+                    if cutoff <= _date(day) <= payload_end}
     families = _breakdown(family_totals, FAMILY_LABELS)
     efforts = _breakdown(effort_totals, EFFORT_LABELS)
     most_used = max(families, key=lambda item: (
@@ -1087,12 +1303,19 @@ def summarize(store, accounts, now=None):
     failed_file_count = _count(store.get("failed_file_count", 0)) or 0
     failed_root_count = _count(store.get("failed_root_count", 0)) or 0
     partial_file_count = _count(store.get("partial_file_count", 0)) or 0
+    duplicate_file_count = _count(store.get("duplicate_file_count", 0)) or 0
+    compacted_file_count = _count(store.get("compacted_file_count", 0)) or 0
+    budget_dropped_file_count = _count(
+        store.get("budget_dropped_file_count", 0)) or 0
     return {
         "generated": generated,
         "partial": store.get("partial") is True,
         "failed_file_count": failed_file_count,
         "failed_root_count": failed_root_count,
         "partial_file_count": partial_file_count,
+        "duplicate_file_count": duplicate_file_count,
+        "compacted_file_count": compacted_file_count,
+        "budget_dropped_file_count": budget_dropped_file_count,
         "days": payload_days,
         "accounts": account_rows,
         "summary": {

@@ -407,6 +407,8 @@ class TokenChartMathJS(unittest.TestCase):
             "function tokenNumber", 1)[1].split(
                 "function renderTokenStats", 1)[0]
         tail = r"""
+const browserNow=Date.parse("2026-01-10T18:00:00Z");
+Date.now=()=>browserNow;
 const days={
   "2026-01-01":{grand_total:10},
   "2026-01-03":{grand_total:30},
@@ -427,6 +429,13 @@ const clamped=validateTokenStats({generated:generated,days:{
   "2026-01-11":Object.assign({},count)
 },accounts:[],summary:{lifetime:4,current_streak:1,longest_streak:1,
   peak:{date:"2026-01-10",total:2}}});
+const futureGenerated=Date.parse("2026-01-12T12:00:00Z")/1e3;
+const futureClamped=validateTokenStats({generated:futureGenerated,days:{
+  "2024-12-07":Object.assign({},count),
+  "2026-01-10":Object.assign({},count),
+  "2026-01-11":Object.assign({},count)
+},accounts:[],summary:{lifetime:4,current_streak:1,longest_streak:1,
+  peak:{date:"2026-01-10",total:2}}});
 const independentCap=tokenDenseSeries({"2000-01-01":{grand_total:1}},"2026-01-10");
 const target={innerHTML:""};
 globalThis.document={getElementById:()=>target};
@@ -436,14 +445,23 @@ console.log(JSON.stringify({
   weekly:weekly,
   cumulative:cumulative,
   clampedDays:Object.keys(clamped.days),
+  futureClampedDays:Object.keys(futureClamped.days),
+  futureEnd:utcDay(new Date(tokenWindowEnd(futureGenerated))),
   denseLength:independentCap.length,
   denseLast:independentCap[independentCap.length-1].date,
-  staleState:tokenTelemetryState({generated:generated},generated+3601),
-  suppressedState:tokenTelemetryState({generated:generated},generated+7*86400+1),
+  staleAge:TOKEN_STALE_AGE,suppressAge:TOKEN_SUPPRESS_AGE,
+  largeAges:tokenTelemetryThresholds(400000),
+  staleState:tokenTelemetryState({generated:generated},generated+3600),
+  suppressedState:tokenTelemetryState({generated:generated},generated+7*86400),
+  futureState:tokenTelemetryState({generated:futureGenerated},generated),
   path:target.innerHTML
 }));
 """
-        return ('"use strict";\nconst TOKEN_MAX_DAYS=400,TOKEN_SUPPRESS_AGE=7*86400,TOKEN_SCAN_INTERVAL=900;\nfunction esc(value){return String(value);}\n'
+        return ('"use strict";\nconst TOKEN_MAX_DAYS=400,TOKEN_SCAN_INTERVAL=60,'
+                'TOKEN_AGE_LIMITS=tokenTelemetryThresholds(TOKEN_SCAN_INTERVAL),'
+                'TOKEN_STALE_AGE=TOKEN_AGE_LIMITS.stale,'
+                'TOKEN_SUPPRESS_AGE=TOKEN_AGE_LIMITS.suppress;\n'
+                'function esc(value){return String(value);}\n'
                 + functions + tail)
 
     @unittest.skipUnless(NODE, "node runtime required to execute token charts")
@@ -471,12 +489,21 @@ console.log(JSON.stringify({
         self.assertNotIn(" L", path_data)
         self.assertEqual(value["clampedDays"],
                          ["2024-12-07", "2026-01-10"])
+        self.assertEqual(value["futureClampedDays"],
+                         ["2024-12-07", "2026-01-10"])
+        self.assertEqual(value["futureEnd"], "2026-01-10")
         self.assertEqual(value["denseLength"], 400)
         self.assertEqual(value["denseLast"], "2026-01-10")
+        self.assertEqual(value["staleAge"], 3600)
+        self.assertEqual(value["suppressAge"], 7 * 86400)
+        self.assertEqual(value["largeAges"], {
+            "stale": 4 * 400000, "suppress": 2 * 400000})
         self.assertEqual(value["staleState"],
                          {"stale": True, "suppressed": False})
         self.assertEqual(value["suppressedState"],
                          {"stale": False, "suppressed": True})
+        self.assertEqual(value["futureState"],
+                         {"stale": True, "suppressed": False})
 
 
 class LegacyTokenCacheJS(unittest.TestCase):
@@ -985,6 +1012,7 @@ class DashboardHttpTests(unittest.TestCase):
                 LiveHandler, directory, "/usage.json")
         payload = json.loads(body)
         self.assertEqual(status, 200)
+        self.assertIs(payload["token_stats_enabled"], True)
         self.assertEqual(payload["token_stats"], token_value)
 
     def test_demo_history_is_synthesized_without_collecting(self):
@@ -1102,6 +1130,7 @@ class DashboardHttpTests(unittest.TestCase):
         cache_strip = script.split("function withoutTokenStats(data){",
                                    1)[1].split("\n}", 1)[0]
         self.assertIn("delete clean.token_stats", cache_strip)
+        self.assertIn("delete clean.token_stats_enabled", cache_strip)
 
     def test_dom_tone_allowlist_covers_every_projected_tone(self):
         # every colour tone the Python projection can emit for a live window
@@ -1149,7 +1178,11 @@ class DashboardHttpTests(unittest.TestCase):
                          widget.OBSERVATION_MAX_AGE)
         self.assertEqual(injected["token_scan_interval"],
                          dashboard.tokens.scan_interval())
-        self.assertFalse(injected["token_stats_enabled"])
+        self.assertNotIn("token_stats_enabled", injected)
+        self.assertIs(payload["token_stats_enabled"], False)
+        self.assertNotIn("CONFIG.token_stats_enabled", html)
+        self.assertIn(
+            "tokenStatsEnabled=data.token_stats_enabled===true", html)
         self.assertEqual(payload["_headroom_display"]["accounts"][0][
             "windows"]["5h"]["tone"], "green")
         self.assertIn('id="stats-tab"', html)

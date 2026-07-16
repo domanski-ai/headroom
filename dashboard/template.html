@@ -871,9 +871,10 @@ const CACHE_KEY = "headroom-cache-" + ((CONFIG && CONFIG.redact) ? "r" : "f");
 const SNAPSHOT_MAX_AGE = CONFIG&&Number.isFinite(CONFIG.snapshot_max_age)?CONFIG.snapshot_max_age:900;
 const OBSERVATION_MAX_AGE = CONFIG&&Number.isFinite(CONFIG.observation_max_age)?CONFIG.observation_max_age:1800;
 const TOKEN_SCAN_INTERVAL = CONFIG&&Number.isFinite(CONFIG.token_scan_interval)?Math.max(0,CONFIG.token_scan_interval):900;
-const TOKEN_MAX_DAYS=400,TOKEN_SUPPRESS_AGE=7*86400;
+const TOKEN_MAX_DAYS=400,TOKEN_AGE_LIMITS=tokenTelemetryThresholds(TOKEN_SCAN_INTERVAL),
+  TOKEN_STALE_AGE=TOKEN_AGE_LIMITS.stale,TOKEN_SUPPRESS_AGE=TOKEN_AGE_LIMITS.suppress;
 let requestNumber = 0;
-let tokenStats = null,tokenTelemetryStale=false;
+let tokenStats = null,tokenTelemetryStale=false,tokenStatsEnabled=false;
 
 /* ------------------------------------------------------------- helpers */
 function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
@@ -1017,11 +1018,12 @@ function validate(data){
       if(w&&w.used_percent!=null&&(!Number.isFinite(w.used_percent)||w.used_percent<0||w.used_percent>100))
         throw new Error("invalid usage percentage");});});
   data.token_stats=validateTokenStats(data.token_stats);
+  data.token_stats_enabled=data.token_stats_enabled===true;
   return data;
 }
 function withoutTokenStats(data){
   if(!data||typeof data!=="object")return data;
-  const clean=Object.assign({},data);delete clean.token_stats;return clean;
+  const clean=Object.assign({},data);delete clean.token_stats;delete clean.token_stats_enabled;return clean;
 }
 function sanitizeLegacyCaches(){
   ["headroom-cache-r","headroom-cache-f"].forEach(key=>{
@@ -1049,6 +1051,7 @@ function render(data,forceNoncurrent){
   const lowest=readings.length?readings.reduce((b,r)=>r.left<b.left?r:b):null;
   const claude=accounts.filter(a=>a.provider==="claude");
   const codex=accounts.filter(a=>a.provider==="codex");
+  tokenStatsEnabled=data.token_stats_enabled===true;
   const tokenState=tokenTelemetryState(data.token_stats,now);
   tokenStats=tokenState.suppressed?null:data.token_stats;
   tokenTelemetryStale=tokenState.stale;
@@ -1084,6 +1087,7 @@ function render(data,forceNoncurrent){
 }
 function renderError(message){
   tokenStats=null;
+  tokenStatsEnabled=false;
   renderTokenStats();
   document.getElementById("providers").innerHTML=
     '<div class="empty">Usage feed unavailable<small>'+esc(message)+
@@ -1147,11 +1151,21 @@ function tokenCounts(value){
   if(!tokenNumber(value.grand_total))value.grand_total=value.total+value.cache_read;
   return tokenNumber(value.grand_total);
 }
+function tokenTelemetryThresholds(interval){
+  return{stale:Math.max(4*interval,3600),suppress:Math.max(7*86400,2*interval)};
+}
 function tokenTelemetryState(value,now){
   if(!value||!Number.isFinite(value.generated))return{stale:false,suppressed:false};
   const age=now-value.generated;
-  return{stale:age>4*TOKEN_SCAN_INTERVAL&&age<=TOKEN_SUPPRESS_AGE,
-    suppressed:age>TOKEN_SUPPRESS_AGE};
+  if(age<0)return{stale:true,suppressed:false};
+  if(age>=TOKEN_SUPPRESS_AGE)return{stale:false,suppressed:true};
+  return{stale:age>=TOKEN_STALE_AGE,suppressed:false};
+}
+function tokenWindowEnd(generated){
+  const value=new Date(generated*1e3),browser=new Date(Date.now());
+  const generatedDay=Date.UTC(value.getUTCFullYear(),value.getUTCMonth(),value.getUTCDate());
+  const browserDay=Date.UTC(browser.getUTCFullYear(),browser.getUTCMonth(),browser.getUTCDate());
+  return Math.min(generatedDay,browserDay);
 }
 function validateTokenStats(value){
   if(value==null)return null;
@@ -1160,7 +1174,7 @@ function validateTokenStats(value){
      !Array.isArray(value.accounts)||!value.summary||typeof value.summary!=="object")return null;
   const generatedDate=new Date(value.generated*1e3);
   if(!Number.isFinite(generatedDate.getTime()))return null;
-  const end=Date.UTC(generatedDate.getUTCFullYear(),generatedDate.getUTCMonth(),generatedDate.getUTCDate());
+  const end=tokenWindowEnd(value.generated);
   const start=end-(TOKEN_MAX_DAYS-1)*864e5,safeDays={};
   for(const [day,counts] of Object.entries(value.days)){
     const ts=tokenDayEpoch(day);
@@ -1268,8 +1282,7 @@ function tokenHeatmapMaximum(days,start,today){
 }
 function renderTokenHeatmap(){
   const target=document.getElementById("token-heatmap"),days=tokenStats.days||{};
-  const generated=new Date(tokenStats.generated*1e3),today=new Date(Date.UTC(
-    generated.getUTCFullYear(),generated.getUTCMonth(),generated.getUTCDate()));
+  const today=new Date(tokenWindowEnd(tokenStats.generated));
   const weekStart=new Date(today);weekStart.setUTCDate(today.getUTCDate()-today.getUTCDay());
   const start=new Date(weekStart);start.setUTCDate(weekStart.getUTCDate()-51*7);
   const maximum=tokenHeatmapMaximum(days,start,today);
@@ -1340,16 +1353,16 @@ function renderTokenActivity(){
     renderTokenHeatmap();
   }else if(tokenActivityMode==="weekly"){
     note.textContent="Grand-total tokens grouped into UTC Sunday-start 7-day buckets.";
-    renderTokenSeries(tokenWeeklySeries(tokenStats.days,utcDay(new Date(tokenStats.generated*1e3))),"weekly");
+    renderTokenSeries(tokenWeeklySeries(tokenStats.days,utcDay(new Date(tokenWindowEnd(tokenStats.generated)))),"weekly");
   }else{
     note.textContent="Running grand-total tokens across the available daily history.";
-    renderTokenSeries(tokenCumulativeSeries(tokenStats.days,utcDay(new Date(tokenStats.generated*1e3))),"cumulative");
+    renderTokenSeries(tokenCumulativeSeries(tokenStats.days,utcDay(new Date(tokenWindowEnd(tokenStats.generated)))),"cumulative");
   }
 }
 function renderTokenStats(){
   const target=document.getElementById("token-stats"),leaderboard=document.getElementById("leaderboard-panel"),
     partial=document.getElementById("token-partial"),stale=document.getElementById("token-stale"),
-    enabled=CONFIG&&CONFIG.token_stats_enabled===true;
+    enabled=tokenStatsEnabled;
   const sideNote=document.getElementById("side-note");
   if(enabled)sideNote.textContent="Window % read live · token totals from your local session logs.";
   else sideNote.innerHTML="Window percentage only.<br>No token counts stored.";
