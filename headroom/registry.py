@@ -13,7 +13,7 @@ Config shape (schema_version 1)::
       "dashboard": {"theme": "midnight", "title": "AI Fleet",
                      "redact_emails": false, "port": 8377},
       "accounts": [
-        {"name": "personal", "provider": "claude",
+        {"id": "3f62ad91b7c4", "name": "personal", "provider": "claude",
          "home": "~/.claude",  # or ~/.headroom/homes/personal
          "expected_email": "me@example.com",  # optional but recommended
          "reserved": false}    # optional: true = tracked but never routed to
@@ -29,11 +29,13 @@ import contextlib
 import fcntl
 import os
 import re
+import uuid
 
 from . import paths
 
 PROVIDERS = ("claude", "codex")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+ID_RE = re.compile(r"^[0-9a-f]{12}$")
 DEFAULT_DASHBOARD = {
     "theme": "midnight",
     "title": "AI Fleet",
@@ -87,7 +89,7 @@ def validate(config):
     accounts = config.get("accounts")
     if not isinstance(accounts, list) or not accounts:
         raise RegistryError("config.json has no accounts; run `headroom setup`")
-    names, homes = set(), set()
+    names, homes, ids = set(), set(), set()
     for account in accounts:
         if not isinstance(account, dict):
             raise RegistryError("account entries must be objects")
@@ -104,8 +106,16 @@ def validate(config):
             raise RegistryError(f"account {name}: provider must be one of {PROVIDERS}")
         if not isinstance(home, str) or not home:
             raise RegistryError(f"account {name}: home missing")
-        # optional fields: validate types when present, never require them —
-        # existing configs without these fields must keep loading unchanged
+        slot_id = account.get("id")
+        if slot_id is not None:
+            if not isinstance(slot_id, str) or not ID_RE.fullmatch(slot_id):
+                raise RegistryError(
+                    f"account {name}: id must be 12 lowercase hex characters")
+            if slot_id in ids:
+                raise RegistryError(f"account {name}: duplicate id {slot_id!r}")
+            ids.add(slot_id)
+        # Optional fields, including generation IDs, remain load-compatible so
+        # a collector can backfill legacy configs under the normal config lock.
         if "shared_desktop" in account \
                 and not isinstance(account["shared_desktop"], bool):
             raise RegistryError(
@@ -147,6 +157,15 @@ def accounts(config=None):
         row["home"] = expand(row["home"])
         result.append(row)
     return result
+
+
+def new_slot_id(config):
+    """Return a generation ID not already present in this registry view."""
+    existing = {account.get("id") for account in config.get("accounts", [])}
+    while True:
+        candidate = uuid.uuid4().hex[:12]
+        if candidate not in existing:
+            return candidate
 
 
 def dashboard_settings(config=None):
@@ -259,19 +278,18 @@ def remove_account(name):
 
 
 def apply_pins(pins):
-    """Record usage-org pins WITHOUT clobbering a concurrent account add:
-    take the config lock, reload the latest config, merge pins by slot name,
-    save. A collector that loaded a stale config can no longer delete an
-    account that `connect` added in the meantime."""
+    """Merge pins and backfill slot IDs against the latest locked registry."""
     pins = {name: value for name, value in (pins or {}).items() if value}
-    if not pins:
-        return
     with config_lock():
         config = load()
         changed = False
         for entry in config["accounts"]:
+            if not entry.get("id"):
+                entry["id"] = new_slot_id(config)
+                changed = True
             if entry["name"] in pins and not entry.get("pinned_usage_org"):
                 entry["pinned_usage_org"] = pins[entry["name"]]
                 changed = True
         if changed:
             save(config)
+        return accounts(config)

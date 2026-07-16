@@ -67,10 +67,6 @@ def history_path():
     return os.path.join(history_dir(), "usage-history.jsonl")
 
 
-def purge_pending_path():
-    return os.path.join(history_dir(), "purge-pending.json")
-
-
 def private_snapshot_path():
     return os.path.join(state_dir(), "usage-private.json")
 

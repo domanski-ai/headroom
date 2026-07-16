@@ -4,14 +4,17 @@ Ordinary writes are O(1) appends. Retention rewrites are amortized by waiting
 until the oldest row exceeds retention by a full day, while a configurable
 ``HEADROOM_HISTORY_MAX_BYTES`` cap (32 MiB by default, 1 MiB minimum) forces
 an earlier prune and trims an oversized retained set to 80%. The history kill
-switch stops background history access; an explicit slot removal still purges
-history directly as an operator-requested action.
+switch stops background history access; explicit slot removal still attempts a
+best-effort direct purge. Slot-generation IDs make registry membership
+authoritative: removed rows may remain on disk, but are never served or merged
+with a later slot that reuses the same display name.
 """
 import errno
 import fcntl
 import json
 import math
 import os
+import re
 import tempfile
 import time
 
@@ -26,6 +29,7 @@ MIN_MAX_BYTES = 1024 * 1024
 MAX_LINE_BYTES = 1024 * 1024
 MAX_CHART_POINTS = 200
 READ_DRAIN_BYTES = 64 * 1024
+ID_RE = re.compile(r"^[0-9a-f]{12}$")
 
 
 def enabled():
@@ -75,6 +79,9 @@ def _project_account(account):
     provider = account.get("provider")
     if not isinstance(name, str) or not isinstance(provider, str):
         return None
+    slot_id = account.get("id")
+    slot_id = slot_id if isinstance(slot_id, str) \
+        and ID_RE.fullmatch(slot_id) else None
     plan = account.get("plan")
     plan = plan if _safe_label(plan) else None
     source_windows = account.get("windows")
@@ -93,6 +100,7 @@ def _project_account(account):
             "resets_at": int(reset) if reset is not None else None,
         }
     return {
+        "id": slot_id,
         "name": name,
         "provider": provider,
         "plan": plan,
@@ -116,7 +124,7 @@ def project_snapshot(snapshot, ts=None):
         if isinstance(account, dict) and account.get("throttle_carryover"):
             continue
         projected = _project_account(account)
-        if projected is not None:
+        if projected is not None and projected["id"] is not None:
             accounts.append(projected)
     return {"ts": int(ts), "accounts": accounts}
 
@@ -250,37 +258,6 @@ def _ensure_storage():
     return paths.ensure_private(paths.history_dir())
 
 
-def _pending_purges():
-    path = paths.purge_pending_path()
-    value = paths.load_json(path)
-    if value is None:
-        if os.path.exists(path):
-            raise RuntimeError(f"purge tombstone is unreadable: {path}")
-        return set()
-    if not isinstance(value, list) or any(
-            not isinstance(name, str) or not name for name in value):
-        raise RuntimeError(f"purge tombstone is invalid: {path}")
-    return set(value)
-
-
-def mark_purge_pending(name):
-    """Persist an account purge intent before destructive slot mutation."""
-    pending = _pending_purges()
-    if name not in pending:
-        pending.add(name)
-        _ensure_storage()
-        paths.write_json_atomic(paths.purge_pending_path(), sorted(pending))
-
-
-def clear_purge_pending(name):
-    """Clear a completed purge intent, retaining all other tombstones."""
-    pending = _pending_purges()
-    if name in pending:
-        pending.remove(name)
-        _ensure_storage()
-        paths.write_json_atomic(paths.purge_pending_path(), sorted(pending))
-
-
 def _write_rows_atomic(rows):
     directory = _ensure_storage()
     descriptor, temporary = tempfile.mkstemp(
@@ -323,6 +300,18 @@ def _rows_within_bytes(rows, limit):
     return list(reversed(kept))
 
 
+def _filter_live_rows(rows, live_ids):
+    """Project rows to live slot generations; names are display labels only."""
+    live_ids = set(live_ids)
+    filtered = []
+    for row in rows:
+        accounts = [account for account in row["accounts"]
+                    if account.get("id") in live_ids]
+        if accounts:
+            filtered.append({"ts": row["ts"], "accounts": accounts})
+    return filtered
+
+
 def _append_row(row):
     payload = _encode_row(row)
     if len(payload) > MAX_LINE_BYTES:
@@ -348,24 +337,11 @@ def _append_row(row):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def append_snapshot(snapshot, now=None, registered_names=None):
+def append_snapshot(snapshot, now=None, live_ids=None):
     """Append one public snapshot, returning False when disabled/throttled."""
     if not enabled():
         return False
-    try:
-        pending = _pending_purges()
-    except Exception:
-        pending = None
-    if pending is not None and registered_names is not None:
-        registered_names = set(registered_names)
-        for name in sorted(pending):
-            try:
-                if name not in registered_names:
-                    remove_account(name)
-                clear_purge_pending(name)
-            except Exception:
-                continue
-            pending.discard(name)
+    live_ids = None if live_ids is None else set(live_ids)
     now = int(time.time() if now is None else now)
     path = paths.history_path()
     cap = max_bytes()
@@ -385,6 +361,10 @@ def append_snapshot(snapshot, now=None, registered_names=None):
         if loaded is not None:
             rows = [old for old in loaded
                     if cutoff <= old["ts"] <= now + 300]
+            if live_ids is not None:
+                # Physical cleanup is deliberately lazy. Correctness comes from
+                # read-time allow-listing, so a failed prune cannot revive a slot.
+                rows = _filter_live_rows(rows, live_ids)
             if over_cap and sum(_row_size(old) for old in rows) > cap:
                 rows = _rows_within_bytes(rows, int(cap * .8))
             try:
@@ -404,17 +384,15 @@ def append_snapshot(snapshot, now=None, registered_names=None):
     if age is not None and 0 <= age < min_interval():
         return False
     row = project_snapshot(snapshot, ts=now)
-    if pending is None:
-        row["accounts"] = []
-    elif pending:
-        row["accounts"] = [account for account in row["accounts"]
-                           if account["name"] not in pending]
+    if live_ids is not None:
+        filtered = _filter_live_rows([row], live_ids)
+        row = filtered[0] if filtered else {"ts": now, "accounts": []}
     _append_row(row)
     return True
 
 
-def remove_account(name):
-    """Atomically remove one account, raising if the purge cannot complete."""
+def remove_account(slot_id, legacy_name=None):
+    """Best-effort hygiene purge for one ID and same-name legacy rows."""
     try:
         path = paths.history_path()
         try:
@@ -427,7 +405,10 @@ def remove_account(name):
         changed = False
         for row in _read_rows(path):
             accounts = [account for account in row["accounts"]
-                        if account["name"] != name]
+                        if not ((slot_id is not None
+                                 and account.get("id") == slot_id)
+                                or (account.get("id") is None
+                                    and account["name"] == legacy_name))]
             changed = changed or len(accounts) != len(row["accounts"])
             if accounts:
                 rows.append({"ts": row["ts"], "accounts": accounts})
@@ -437,18 +418,13 @@ def remove_account(name):
         return changed
     except Exception as error:
         raise RuntimeError(
-            f"history purge failed for account {name!r}: {error}") from error
+            f"history purge failed for slot {slot_id!r}: {error}") from error
 
 
-def load_series(days):
-    """Load sanitized rows from the requested trailing-day range."""
-    try:
-        pending = _pending_purges()
-    except Exception:
+def load_series(days, live_ids):
+    """Load trailing rows projected to the caller's live registry IDs."""
+    if not enabled():
         return []
-    # Removal rewrites history before clearing its tombstone, so a reader that
-    # sees the cleared state must read purged rows. A reader that checked
-    # tombstones before removal began may see old rows and linearizes before it.
     try:
         days = max(1, int(days))
     except (TypeError, ValueError):
@@ -457,15 +433,7 @@ def load_series(days):
     cutoff = now - days * 86400
     rows = [row for row in _read_rows(paths.history_path())
             if cutoff <= row["ts"] <= now]
-    if not pending:
-        return rows
-    filtered = []
-    for row in rows:
-        accounts = [account for account in row["accounts"]
-                    if account["name"] not in pending]
-        if accounts:
-            filtered.append({"ts": row["ts"], "accounts": accounts})
-    return filtered
+    return _filter_live_rows(rows, live_ids)
 
 
 def _samples(rows):
@@ -473,11 +441,16 @@ def _samples(rows):
     for row in sorted(rows, key=lambda value: value["ts"]):
         ts = row["ts"]
         for account in row["accounts"]:
-            identity = (account["provider"], account["name"])
+            identity = account.get("id")
+            if identity is None:
+                continue
             target = accounts.setdefault(identity, {
-                "name": account["name"], "provider": account["provider"],
+                "id": identity, "name": account["name"],
+                "provider": account["provider"],
                 "plan": account["plan"], "windows": {}, "latest_ts": ts,
             })
+            target["name"] = account["name"]
+            target["provider"] = account["provider"]
             target["latest_ts"] = ts
             if not account["ok"] or account["stale"]:
                 continue
@@ -503,8 +476,8 @@ def _episode_count(samples):
     return episodes
 
 
-def summarize(days, rows=None, generated=None):
-    rows = load_series(days) if rows is None else rows
+def summarize(days, rows=None, generated=None, live_ids=None):
+    rows = load_series(days, live_ids or set()) if rows is None else rows
     generated = int(time.time() if generated is None else generated)
     current_age_limit = 2 * min_interval() + 300
     result = []
@@ -527,10 +500,12 @@ def summarize(days, rows=None, generated=None):
                 "last_ts": samples[-1][0],
             }
         result.append({
-            "name": account["name"], "provider": account["provider"],
+            "id": account["id"], "name": account["name"],
+            "provider": account["provider"],
             "plan": account["plan"], "windows": windows,
         })
-    return sorted(result, key=lambda item: (item["name"], item["provider"]))
+    return sorted(result, key=lambda item: (
+        item["name"], item["provider"], item["id"]))
 
 
 def _bucket(samples):
@@ -553,28 +528,31 @@ def _bucket(samples):
     return points
 
 
-def chart_series(days, rows=None):
-    rows = load_series(days) if rows is None else rows
+def chart_series(days, rows=None, live_ids=None):
+    rows = load_series(days, live_ids or set()) if rows is None else rows
     result = []
     for account in _samples(rows).values():
         result.append({
-            "name": account["name"], "provider": account["provider"],
+            "id": account["id"], "name": account["name"],
+            "provider": account["provider"],
             "plan": account["plan"],
             "windows": {key: _bucket(samples)
                         for key, samples in account["windows"].items()},
         })
-    return sorted(result, key=lambda item: (item["name"], item["provider"]))
+    return sorted(result, key=lambda item: (
+        item["name"], item["provider"], item["id"]))
 
 
-def leaderboard(days, rows=None, generated=None):
-    rows = load_series(days) if rows is None else rows
+def leaderboard(days, rows=None, generated=None, live_ids=None):
+    rows = load_series(days, live_ids or set()) if rows is None else rows
     ranked = []
     for account in summarize(days, rows=rows, generated=generated):
         weekly = account["windows"].get("7d")
         if weekly is None:
             continue
         ranked.append({
-            "name": account["name"], "provider": account["provider"],
+            "id": account["id"], "name": account["name"],
+            "provider": account["provider"],
             "plan": account["plan"], "window": "7d",
             "average": weekly["average"],
             "cap_hit_episodes": weekly["cap_hit_episodes"],
@@ -583,14 +561,15 @@ def leaderboard(days, rows=None, generated=None):
         })
     ranked.sort(key=lambda item: (
         -item["average"], -item["cap_hit_episodes"],
-        item["name"], item["provider"]))
+        item["name"], item["provider"], item["id"]))
     for index, account in enumerate(ranked, 1):
         account["rank"] = index
     return ranked
 
 
-def response(days, rows=None, generated=None):
-    rows = load_series(days) if rows is None else rows
+def response(days, live_ids, rows=None, generated=None):
+    rows = load_series(days, live_ids) if rows is None \
+        else _filter_live_rows(rows, live_ids)
     generated = int(time.time() if generated is None else generated)
     return {
         "schema_version": SCHEMA_VERSION, "generated": generated,
@@ -633,7 +612,8 @@ def demo_rows(snapshot, days, now=None):
                     "resets_at": window["resets_at"],
                 }
             accounts.append({
-                "name": account["name"], "provider": account["provider"],
+                "id": account["id"], "name": account["name"],
+                "provider": account["provider"],
                 "plan": account["plan"], "ok": True, "stale": False,
                 "windows": windows,
             })

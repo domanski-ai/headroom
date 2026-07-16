@@ -1,4 +1,5 @@
 """Rolling percentage-history persistence and aggregation tests."""
+import hashlib
 import io
 import json
 import os
@@ -15,11 +16,21 @@ from headroom import collect, history, paths, registry
 NOW = 2_000_000_000
 
 
-def snapshot(used=42.0, name="alpha", email="owner@example.test"):
+def slot_id(name):
+    return hashlib.sha256(name.encode()).hexdigest()[:12]
+
+
+def live_ids(*names):
+    return {slot_id(name) for name in names}
+
+
+def snapshot(used=42.0, name="alpha", email="owner@example.test",
+             account_id=None):
     return {
         "schema_version": 1,
         "generated": NOW,
         "accounts": [{
+            "id": account_id or slot_id(name),
             "name": name,
             "email": email,
             "provider": "claude",
@@ -37,8 +48,8 @@ def snapshot(used=42.0, name="alpha", email="owner@example.test"):
     }
 
 
-def row(ts, used, name="alpha", ok=True, stale=False):
-    value = snapshot(used=used, name=name)
+def row(ts, used, name="alpha", ok=True, stale=False, account_id=None):
+    value = snapshot(used=used, name=name, account_id=account_id)
     projected = history.project_snapshot(value, ts=ts)
     projected["accounts"][0]["ok"] = ok
     projected["accounts"][0]["stale"] = stale
@@ -82,7 +93,7 @@ class HistoryPersistenceTests(unittest.TestCase):
             history.append_snapshot(snapshot(20), now=NOW)
         replace.assert_called_once()
         with mock.patch.object(history.time, "time", return_value=NOW):
-            rows = history.load_series(30)
+            rows = history.load_series(30, live_ids("alpha"))
         self.assertEqual([value["ts"] for value in rows], [NOW])
         self.assertEqual(rows[0]["accounts"][0]["windows"]["5h"][
             "used_percent"], 20.0)
@@ -181,27 +192,12 @@ class HistoryPersistenceTests(unittest.TestCase):
 
     def test_kill_switch_returns_before_filesystem_access(self):
         with mock.patch.dict(os.environ, {"HEADROOM_HISTORY": "0"}), \
-                mock.patch.object(history, "_pending_purges") as pending, \
+                mock.patch.object(history, "_oldest_row") as oldest, \
                 mock.patch.object(history, "_read_rows",
                                   side_effect=AssertionError("filesystem read")):
             self.assertFalse(history.append_snapshot(snapshot(), now=NOW))
-        pending.assert_not_called()
+        oldest.assert_not_called()
         self.assertFalse(os.path.exists(paths.history_dir()))
-
-    def test_kill_switch_leaves_pending_purge_for_later(self):
-        history.append_snapshot(snapshot(), now=NOW)
-        history.mark_purge_pending("alpha")
-        with open(paths.history_path(), "rb") as handle:
-            before = handle.read()
-        with mock.patch.dict(os.environ, {"HEADROOM_HISTORY": "0"}), \
-                mock.patch.object(history, "_pending_purges") as pending, \
-                mock.patch.object(history, "remove_account") as purge:
-            self.assertFalse(history.append_snapshot(snapshot(), now=NOW + 60))
-        pending.assert_not_called()
-        purge.assert_not_called()
-        self.assertEqual(paths.load_json(paths.purge_pending_path()), ["alpha"])
-        with open(paths.history_path(), "rb") as handle:
-            self.assertEqual(handle.read(), before)
 
     def test_malformed_lines_are_ignored_and_loaded_rows_are_sanitized(self):
         paths.ensure_private(paths.history_dir())
@@ -217,7 +213,7 @@ class HistoryPersistenceTests(unittest.TestCase):
             }) + "\n")
             handle.write(json.dumps(valid) + "\n")
         with mock.patch.object(history.time, "time", return_value=NOW):
-            loaded = history.load_series(1)
+            loaded = history.load_series(1, live_ids("alpha"))
         self.assertEqual(len(loaded), 1)
         self.assertNotIn("email", loaded[0]["accounts"][0])
 
@@ -259,7 +255,7 @@ class HistoryPersistenceTests(unittest.TestCase):
                 "HEADROOM_HISTORY_MIN_INTERVAL": "0"}):
             self.assertTrue(history.append_snapshot(snapshot(25), now=NOW))
         with mock.patch.object(history.time, "time", return_value=NOW):
-            loaded = history.load_series(1)
+            loaded = history.load_series(1, live_ids("alpha"))
         self.assertEqual(len(loaded), 2)
         self.assertEqual(loaded[-1]["accounts"][0]["windows"]["5h"][
             "used_percent"], 25.0)
@@ -297,7 +293,7 @@ class HistoryPersistenceTests(unittest.TestCase):
                 mock.patch.object(history, "_write_rows_atomic") as rewrite:
             with self.assertRaisesRegex(
                     RuntimeError, "history purge failed.*unreadable"):
-                history.remove_account("alpha")
+                history.remove_account(slot_id("alpha"), "alpha")
         rewrite.assert_not_called()
 
     def test_read_rows_treats_only_missing_as_empty(self):
@@ -325,7 +321,7 @@ class HistoryPersistenceTests(unittest.TestCase):
         self.assertIn(b"}\n{", raw)
         self.assertTrue(raw.endswith(b"\n"))
         with mock.patch.object(history.time, "time", return_value=NOW):
-            loaded = history.load_series(1)
+            loaded = history.load_series(1, live_ids("alpha"))
         self.assertEqual([value["ts"] for value in loaded], [NOW - 60, NOW])
 
     def test_remove_account_rewrites_rows_and_drops_empty_rows(self):
@@ -333,61 +329,64 @@ class HistoryPersistenceTests(unittest.TestCase):
         only_b = row(NOW - 2, 20, name="b")
         both = row(NOW - 1, 30, name="a")
         both["accounts"].extend(only_b["accounts"])
-        history._write_rows_atomic([only_a, only_b, both])
+        legacy_a = row(NOW, 40, name="a")
+        legacy_a["accounts"][0].pop("id")
+        history._write_rows_atomic([only_a, only_b, both, legacy_a])
         with mock.patch.object(history.os, "replace",
                                wraps=os.replace) as replace:
-            self.assertTrue(history.remove_account("a"))
+            self.assertTrue(history.remove_account(slot_id("a"), "a"))
         replace.assert_called_once()
         with mock.patch.object(history.time, "time", return_value=NOW):
-            loaded = history.load_series(1)
+            loaded = history.load_series(1, live_ids("b"))
         self.assertEqual([value["ts"] for value in loaded],
                          [NOW - 2, NOW - 1])
         self.assertTrue(all([account["name"] for account in value["accounts"]]
                             == ["b"] for value in loaded))
 
-    def test_registered_tombstone_is_dropped_without_purging_history(self):
-        history.append_snapshot(snapshot(name="alpha"), now=NOW)
-        history.mark_purge_pending("alpha")
-        with mock.patch.dict(os.environ, {
-                "HEADROOM_HISTORY_MIN_INTERVAL": "0"}), \
-                mock.patch.object(history, "remove_account") as purge:
-            self.assertTrue(history.append_snapshot(
-                snapshot(20, name="alpha"), now=NOW + 1,
-                registered_names={"alpha"}))
-        purge.assert_not_called()
-        self.assertEqual(paths.load_json(paths.purge_pending_path()), [])
-        rows = history._read_rows(paths.history_path())
-        self.assertEqual([value["ts"] for value in rows], [NOW, NOW + 1])
-        self.assertTrue(all(account["name"] == "alpha" for value in rows
-                            for account in value["accounts"]))
+    def test_same_name_reconnect_never_serves_or_merges_dead_generation(self):
+        old_id = "111111111111"
+        new_id = "222222222222"
+        rows = [row(NOW - 3, 90, account_id=old_id),
+                row(NOW - 2, 20, account_id=new_id),
+                row(NOW - 1, 30, account_id=new_id)]
+        history._write_rows_atomic(rows)
+        with mock.patch.object(history.time, "time", return_value=NOW):
+            loaded = history.load_series(1, {new_id})
+        payload = history.response(
+            1, {new_id}, rows=history._read_rows(paths.history_path()),
+            generated=NOW)
+        self.assertEqual([value["ts"] for value in loaded], [NOW - 2, NOW - 1])
+        for key in ("series", "summary", "leaderboard"):
+            self.assertEqual([entry["id"] for entry in payload[key]], [new_id])
+        self.assertEqual(payload["summary"][0]["windows"]["5h"][
+            "sample_count"], 2)
+        self.assertEqual(payload["summary"][0]["windows"]["5h"]["peak"],
+                         {"value": 30.0, "ts": NOW - 1})
 
-    def test_unregistered_tombstone_is_purged_and_cleared(self):
-        history.append_snapshot(snapshot(name="alpha"), now=NOW)
-        history.mark_purge_pending("alpha")
+    def test_amortized_prune_drops_dead_generation_rows(self):
+        live_id = slot_id("alpha")
+        dead_id = "dddddddddddd"
+        rows = [row(NOW - 31 * 86400 - 1, 5, account_id=live_id),
+                row(NOW - 120, 90, account_id=dead_id),
+                row(NOW - 60, 20, account_id=live_id)]
+        history._write_rows_atomic(rows)
         with mock.patch.dict(os.environ, {
                 "HEADROOM_HISTORY_MIN_INTERVAL": "0"}):
             self.assertTrue(history.append_snapshot(
-                snapshot(20, name="bravo"), now=NOW + 1,
-                registered_names={"bravo"}))
-        self.assertEqual(paths.load_json(paths.purge_pending_path()), [])
-        rows = history._read_rows(paths.history_path())
-        self.assertEqual([account["name"] for value in rows
-                          for account in value["accounts"]], ["bravo"])
+                snapshot(30, account_id=live_id), now=NOW,
+                live_ids={live_id}))
+        physical = history._read_rows(paths.history_path())
+        self.assertEqual({account["id"] for value in physical
+                          for account in value["accounts"]}, {live_id})
+        self.assertEqual([value["ts"] for value in physical], [NOW - 60, NOW])
 
-    def test_load_series_filters_tombstone_read_before_rows(self):
-        history._write_rows_atomic([row(NOW - 1, 20, name="alpha")])
-        history.mark_purge_pending("alpha")
-        read_rows = history._read_rows
-
-        def clear_then_read(path):
-            history.clear_purge_pending("alpha")
-            return read_rows(path)
-
-        with mock.patch.object(history, "_read_rows",
-                               side_effect=clear_then_read), \
-                mock.patch.object(history.time, "time", return_value=NOW):
-            self.assertEqual(history.load_series(1), [])
-        self.assertEqual(paths.load_json(paths.purge_pending_path()), [])
+    def test_rows_without_ids_are_dead(self):
+        legacy = row(NOW - 1, 20)
+        legacy["accounts"][0].pop("id")
+        history._write_rows_atomic([legacy])
+        with mock.patch.object(history.time, "time", return_value=NOW):
+            self.assertEqual(
+                history.load_series(1, live_ids("alpha")), [])
 
     def test_remove_account_raises_clear_error_and_keeps_original(self):
         history.append_snapshot(snapshot(), now=NOW)
@@ -397,7 +396,7 @@ class HistoryPersistenceTests(unittest.TestCase):
                                side_effect=OSError("disk full")):
             with self.assertRaisesRegex(
                     RuntimeError, "history purge failed.*disk full"):
-                history.remove_account("alpha")
+                history.remove_account(slot_id("alpha"), "alpha")
         with open(paths.history_path(), "rb") as handle:
             self.assertEqual(handle.read(), before)
 
@@ -419,7 +418,7 @@ class HistoryPersistenceTests(unittest.TestCase):
         with open(paths.history_path(), "w", encoding="utf-8") as handle:
             handle.write(json.dumps(value) + "\n")
         with mock.patch.object(history.time, "time", return_value=NOW):
-            loaded = history.load_series(1)
+            loaded = history.load_series(1, live_ids("alpha"))
         window = loaded[0]["accounts"][0]["windows"]["5h"]
         self.assertEqual(window, {"used_percent": None, "resets_at": None})
 
@@ -439,7 +438,7 @@ class HistoryPersistenceTests(unittest.TestCase):
         self.assertIsNone(account["plan"])
         self.assertNotIn("scoped:acct@example.test", account["windows"])
         self.assertEqual(set(account), {
-            "name", "provider", "plan", "ok", "stale", "windows"})
+            "id", "name", "provider", "plan", "ok", "stale", "windows"})
         self.assertEqual(set(account["windows"]["5h"]), {
             "used_percent", "resets_at"})
 
@@ -454,8 +453,10 @@ class HistoryPersistenceTests(unittest.TestCase):
             for value in (unsafe_name, unsafe_provider, safe):
                 handle.write(json.dumps(value) + "\n")
         with mock.patch.object(history.time, "time", return_value=NOW):
-            loaded = history.load_series(1)
-        rendered = json.dumps(history.response(1, rows=loaded, generated=NOW))
+            loaded = history.load_series(
+                1, live_ids("alpha", "safe"))
+        rendered = json.dumps(history.response(
+            1, live_ids("alpha", "safe"), rows=loaded, generated=NOW))
         self.assertNotIn("@", rendered)
         self.assertEqual([account["name"] for account in loaded[-1]["accounts"]],
                          ["safe"])
@@ -485,12 +486,13 @@ class HistoryAggregationTests(unittest.TestCase):
     def test_current_is_null_for_held_or_old_latest_sample(self):
         held_rows = [row(NOW, 10), row(NOW + 1, 80, stale=True)]
         held = history.response(
-            7, rows=held_rows, generated=NOW + 1)["summary"][0]["windows"]["5h"]
+            7, live_ids("alpha"), rows=held_rows,
+            generated=NOW + 1)["summary"][0]["windows"]["5h"]
         self.assertIsNone(held["current"])
         with mock.patch.dict(os.environ, {
                 "HEADROOM_HISTORY_MIN_INTERVAL": "60"}):
             old = history.response(
-                7, rows=[row(NOW, 10)],
+                7, live_ids("alpha"), rows=[row(NOW, 10)],
                 generated=NOW + 421)["summary"][0]["windows"]["5h"]
         self.assertIsNone(old["current"])
 
@@ -535,16 +537,16 @@ class CollectHistoryHookTests(unittest.TestCase):
         return (
             mock.patch.object(registry, "load", return_value=self.config),
             mock.patch.object(registry, "accounts", return_value=[]),
-            mock.patch.object(registry, "apply_pins"),
+            mock.patch.object(registry, "apply_pins", return_value=[]),
             mock.patch.object(registry, "dashboard_settings",
                               return_value={"redact_emails": False}),
             mock.patch.object(collect, "collect", return_value=self.private),
         )
 
     def test_hook_receives_exact_public_snapshot_after_publish(self):
-        def verify(public, registered_names=None):
+        def verify(public, live_ids=None):
             self.assertEqual(paths.load_json(paths.public_snapshot_path()), public)
-            self.assertEqual(registered_names, set())
+            self.assertEqual(live_ids, set())
 
         patches = self._patch_collect()
         with patches[0], patches[1], patches[2], patches[3], patches[4], \
@@ -552,6 +554,22 @@ class CollectHistoryHookTests(unittest.TestCase):
                                   side_effect=verify) as append:
             collect.run_collect(quiet=True)
         append.assert_called_once()
+
+    def test_collect_backfills_legacy_registry_id_and_writes_it_to_history(self):
+        config = {"schema_version": 1, "accounts": [{
+            "name": "alpha", "provider": "claude", "home": "/tmp/alpha"}]}
+        registry.save(config)
+        private = json.loads(json.dumps(self.private))
+        private["accounts"][0].pop("id")
+        with mock.patch.object(collect, "collect", return_value=private):
+            collect.run_collect(quiet=True)
+        stored = registry.load()["accounts"][0]
+        rows = history._read_rows(paths.history_path())
+        self.assertRegex(stored["id"], r"^[0-9a-f]{12}$")
+        self.assertEqual(registry.accounts()[0]["id"], stored["id"])
+        self.assertEqual(rows[0]["accounts"][0]["id"], stored["id"])
+        self.assertEqual(paths.load_json(paths.public_snapshot_path())[
+            "accounts"][0]["id"], stored["id"])
 
     def test_history_failure_warns_once_and_collect_still_succeeds(self):
         errors = io.StringIO()

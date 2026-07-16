@@ -145,7 +145,8 @@ def build_demo(out_dir=None):
     now = int(time.time())
     data["generated"] = now - 30
     resets = {"5h": now + 2 * 3600 + 11 * 60, "7d": now + 3 * 86400}
-    for account in data.get("accounts", []):
+    for index, account in enumerate(data.get("accounts", []), 1):
+        account["id"] = f"{index:012x}"
         account["captured_at"] = now - 30
         for key, window in (account.get("windows") or {}).items():
             window["resets_at"] = resets["5h"] if key == "5h" else resets["7d"]
@@ -159,7 +160,8 @@ def build_demo(out_dir=None):
     os.makedirs(out_dir, exist_ok=True)
     demo_config = {"schema_version": 1,
                    "dashboard": {"theme": "midnight", "title": "headroom (demo)"},
-                   "accounts": [{"name": a["name"], "provider": a["provider"],
+                   "accounts": [{"id": a["id"], "name": a["name"],
+                                 "provider": a["provider"],
                                  "home": "/tmp/demo/" + a["name"]}
                                 for a in data["accounts"]]}
     build(demo_config, out_dir)
@@ -314,16 +316,22 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if self.demo:
                 snapshot = paths.load_json(
                     os.path.join(self.directory, "usage.json"))
+                live_ids = {account.get("id")
+                            for account in (snapshot or {}).get("accounts", [])
+                            if account.get("id")}
                 rows = history.demo_rows(snapshot, days) \
                     if isinstance(snapshot, dict) else []
             else:
-                rows = history.load_series(days)
+                config = registry.load()
+                live_ids = {account["id"] for account in registry.accounts(config)
+                            if account.get("id")}
+                rows = history.load_series(days, live_ids)
             if not rows:
                 self._send_body(
                     503, "application/json", b'{"error":"no history yet"}')
                 return
             value = history.response(
-                days, rows=rows, generated=int(time.time()))
+                days, live_ids, rows=rows, generated=int(time.time()))
             body = json.dumps(value, allow_nan=False,
                               separators=(",", ":")).encode("utf-8")
         except Exception:

@@ -49,7 +49,8 @@ OBSERVATION_MAX_AGE = paths.env_int("HEADROOM_OBSERVATION_MAX_AGE", 1800)
 SCHEMA_VERSION = 1
 
 PUBLIC_FIELDS = {
-    "name", "email", "provider", "plan", "ok", "note", "error_code", "retry_at",
+    "id", "name", "email", "provider", "plan", "ok", "note", "error_code",
+    "retry_at",
     "captured_at", "source", "stale", "windows", "identity_verified",
     "identity_method", "trust_state", "routable", "subscription",
     "throttle_carryover",
@@ -1047,7 +1048,8 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
         "accounts": [],
     }
     for account in accounts:
-        result = {"name": account["name"], "provider": account["provider"]}
+        result = {"id": account.get("id"), "name": account["name"],
+                  "provider": account["provider"]}
         try:
             if account["provider"] == "claude":
                 identity = claude_identity(account["home"])
@@ -1306,9 +1308,15 @@ def run_collect(quiet=False):
                            previous=previous)
         pins = {a["name"]: a.pop("pin_usage_org")
                 for a in snapshot["accounts"] if a.get("pin_usage_org")}
-        # merge pins under the config lock against the LATEST config, so a
-        # concurrent `connect` account-add is never overwritten by our stale copy
-        registry.apply_pins(pins)
+        # Merge pins and backfill IDs under the config lock against the LATEST
+        # registry, so concurrent account additions are preserved. The returned
+        # view is also the authority for this collection's live history IDs.
+        live_accounts = registry.apply_pins(pins)
+        live_by_name = {account["name"]: account["id"]
+                        for account in live_accounts}
+        for account in snapshot["accounts"]:
+            if account["name"] in live_by_name:
+                account["id"] = live_by_name[account["name"]]
         # carryover rows count as throttled for the backoff ledger: only a
         # run with NO throttle evidence at all may clear the provider backoff
         if any(a.get("provider") == "claude" and a.get("ok")
@@ -1332,8 +1340,7 @@ def run_collect(quiet=False):
         try:
             history.append_snapshot(
                 public,
-                registered_names={account["name"]
-                                  for account in registry.accounts(config)},
+                live_ids={account["id"] for account in live_accounts},
             )
         except Exception as error:  # history must never break collection
             try:
@@ -1395,23 +1402,12 @@ def remove_slot(name):
         # Refuse before mutating the registry if a protective ledger cannot be
         # read and therefore cannot be safely scrubbed.
         route.preflight_remove_slot_state()
-        history.mark_purge_pending(name)
         # remove_account reloads under the registry lock, revalidating that the
         # slot still exists before the first mutation.  The collection lock
         # covers the full sequence, so a collector cannot later republish it.
-        try:
-            removed = registry.remove_account(name)
-        except Exception as error:
-            try:
-                history.clear_purge_pending(name)
-            except Exception as rollback_error:
-                raise RuntimeError(
-                    f"registry mutation failed for account {name!r}: {error}; "
-                    f"purge tombstone rollback failed: {rollback_error}"
-                ) from error
-            raise
+        removed = registry.remove_account(name)
         failures = []
-        tombstone_cleared = False
+        warnings = []
         try:
             try:
                 if _prune_snapshot_slot(private, name):
@@ -1426,16 +1422,10 @@ def remove_slot(name):
             except Exception as error:
                 failures.append(("public snapshot cleanup", error))
             try:
-                history.remove_account(name)
+                history.remove_account(removed.get("id"), name)
             except Exception as error:
-                failures.append((
+                warnings.append((
                     f"history purge for {paths.history_path()}", error))
-            else:
-                try:
-                    history.clear_purge_pending(name)
-                    tombstone_cleared = True
-                except Exception as error:
-                    failures.append(("purge tombstone clear", error))
         finally:
             try:
                 route.remove_slot_state(name)
@@ -1443,12 +1433,19 @@ def remove_slot(name):
                 failures.append(("route cleanup", error))
         if failures:
             details = "; ".join(
-                f"{operation}: {error}" for operation, error in failures)
+                f"{operation}: {error}"
+                for operation, error in failures + warnings)
             raise RuntimeError(
                 f"the slot is removed; cleanup failed for account {name!r}: "
-                f"{details}" + ("; purge remains pending in "
-                f"{paths.purge_pending_path()}" if not tombstone_cleared else "")
-            ) from failures[0][1]
+                f"{details}") from failures[0][1]
+        if warnings:
+            details = "; ".join(
+                f"{operation}: {error}" for operation, error in warnings)
+            try:
+                print(f"headroom: warning: the slot is removed; {details}",
+                      file=sys.stderr)
+            except Exception:
+                pass
         return removed
 
 

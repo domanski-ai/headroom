@@ -1,4 +1,5 @@
 """Widget contract, refresh gate, integrations, and release artifact tests."""
+import hashlib
 import io
 import json
 import math
@@ -14,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stdout
 from unittest import mock
 
-from headroom import __main__, dashboard, history, paths, widget
+from headroom import __main__, dashboard, history, paths, registry, widget
 
 
 NOW = 2_000_000_000
@@ -27,8 +28,13 @@ WINDOWS_SCRIPT = os.path.join(ROOT, "experimental", "windows",
 WINDOWS_ICONS = os.path.join(ROOT, "experimental", "windows", "icons")
 
 
+def slot_id(name):
+    return hashlib.sha256(name.encode()).hexdigest()[:12]
+
+
 def usage_account(name="alpha", used5=20.0, used7=40.0, **overrides):
     account = {
+        "id": slot_id(name),
         "name": name,
         "provider": "claude",
         "ok": True,
@@ -632,9 +638,13 @@ class HistoryHttpTests(unittest.TestCase):
                     "HEADROOM_HISTORY_MIN_INTERVAL": "0",
                     "HEADROOM_HISTORY_RETENTION_DAYS": "30",
                 }):
+            account = usage_account()
+            registry.save({"schema_version": 1, "accounts": [{
+                "id": account["id"], "name": account["name"],
+                "provider": account["provider"], "home": "/tmp/alpha"}]})
             if with_history:
                 history.append_snapshot(
-                    usage_snapshot(usage_account()), now=int(time.time()))
+                    usage_snapshot(account), now=int(time.time()))
 
             class NoRefreshGate:
                 def get(self, *_args):
@@ -714,7 +724,10 @@ class HistoryHttpTests(unittest.TestCase):
 
     def test_disabled_wins_even_when_history_exists(self):
         with self.live_server() as server, \
-                mock.patch.dict(os.environ, {"HEADROOM_HISTORY": "0"}):
+                mock.patch.dict(os.environ, {"HEADROOM_HISTORY": "0"}), \
+                mock.patch.object(
+                    history, "_read_rows",
+                    side_effect=AssertionError("history filesystem touched")):
             status, _, body = memory_get(*server, "/history.json")
         self.assertEqual(status, 503)
         self.assertEqual(json.loads(body), {"error": "history_disabled"})
@@ -722,8 +735,13 @@ class HistoryHttpTests(unittest.TestCase):
     def test_history_route_never_collects_or_uses_refresh_gate(self):
         with self.live_server() as server, \
                 mock.patch.object(dashboard.collector, "run_collect",
-                                  side_effect=AssertionError("collected")):
+                                  side_effect=AssertionError("collected")), \
+                mock.patch.object(registry, "apply_pins",
+                                  side_effect=AssertionError("registry mutated")), \
+                mock.patch.object(registry, "load",
+                                  wraps=registry.load) as load:
             status, _, body = memory_get(*server, "/history.json?days=7")
+        load.assert_called_once_with()
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["schema_version"], 1)
 
@@ -981,6 +999,7 @@ class DashboardHttpTests(unittest.TestCase):
         chart = template.split("function renderHistoryChart(data,key){",
                                1)[1].split("\n}", 1)[0]
         self.assertIn("const active=document.activeElement;", chart)
+        self.assertIn("key:account.id", chart)
         self.assertIn("legend.contains(active)", chart)
         self.assertIn('item.getAttribute("data-series")===focusedSeries', chart)
         self.assertIn("if(replacement)replacement.focus({preventScroll:true});",

@@ -1037,7 +1037,8 @@ function validateHistory(data){
      !Array.isArray(data.summary)||!Array.isArray(data.leaderboard))
     throw new Error("history response invalid");
   data.series.forEach(account=>{
-    if(!account||typeof account.name!=="string"||!account.windows||typeof account.windows!=="object")
+    if(!account||typeof account.id!=="string"||typeof account.name!=="string"||
+       !account.windows||typeof account.windows!=="object")
       throw new Error("history account invalid");
     Object.values(account.windows).forEach(points=>{
       if(!Array.isArray(points))throw new Error("history series invalid");
@@ -1049,9 +1050,9 @@ function validateHistory(data){
     });
   });
   data.summary=data.summary.filter(entry=>entry&&typeof entry==="object"&&!Array.isArray(entry)&&
-    typeof entry.name==="string");
+    typeof entry.id==="string"&&typeof entry.name==="string");
   data.leaderboard=data.leaderboard.filter(entry=>entry&&typeof entry==="object"&&!Array.isArray(entry)&&
-    typeof entry.name==="string");
+    typeof entry.id==="string"&&typeof entry.name==="string");
   return data;
 }
 function statsPct(value){
@@ -1100,8 +1101,8 @@ function renderHistoryChart(data,key){
   const active=document.activeElement;
   const focusedSeries=active&&legend.contains(active)?active.getAttribute("data-series"):null;
   const series=data.series.map((account,index)=>({
-    name:account.name,provider:account.provider,
-    key:account.provider+"/"+account.name,
+    id:account.id,name:account.name,provider:account.provider,
+    key:account.id,
     color:SERIES_COLORS[index%SERIES_COLORS.length],
     points:(account.windows||{})[key]||[]
   })).filter(account=>account.points.length);

@@ -162,6 +162,7 @@ def add_account(config, name, provider, home, expected_email=None):
     def _append(cfg):
         nonlocal added
         if not any(a.get("name") == name for a in cfg.get("accounts", [])):
+            entry["id"] = registry.new_slot_id(cfg)
             cfg.setdefault("accounts", []).append(dict(entry))
             added = True
 
@@ -171,6 +172,7 @@ def add_account(config, name, provider, home, expected_email=None):
         registry.mutate(_append)
     except registry.RegistryError:
         # config doesn't exist yet (wizard building a fresh one) — create it
+        entry["id"] = registry.new_slot_id(config)
         config.setdefault("accounts", []).append(entry)
         registry.save(config)
         added = True
