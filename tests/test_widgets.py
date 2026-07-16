@@ -403,6 +403,9 @@ class TokenChartMathJS(unittest.TestCase):
     def _harness():
         with open(dashboard.TEMPLATE) as handle:
             template = handle.read()
+        validator = "function validate" + template.split(
+            "function validate", 1)[1].split(
+                "function withoutTokenStats", 1)[0]
         functions = "function tokenNumber" + template.split(
             "function tokenNumber", 1)[1].split(
                 "function renderTokenStats", 1)[0]
@@ -422,6 +425,37 @@ const weekly=tokenWeeklySeries(windowDays,"2026-01-11");
 const cumulative=tokenCumulativeSeries(windowDays,"2026-01-05");
 const count={input:1,output:1,cache_read:0,cache_creation:0,total:2,grand_total:2};
 const generated=Date.parse("2026-01-10T12:00:00Z")/1e3;
+const statsPayload=(summary={},accounts=[])=>({generated:generated,
+  days:{"2026-01-10":Object.assign({},count)},accounts:accounts,
+  summary:Object.assign({lifetime:2,current_streak:1,longest_streak:1,
+    peak:{date:"2026-01-10",total:2}},summary)});
+const hostilePeakDate=validateTokenStats(statsPayload({
+  peak:{date:{toString:null},total:2}}));
+const hostileAccountDate=validateTokenStats(statsPayload({},[{id:"a",name:"A",
+  provider:"claude",lifetime:2,last7d:2,
+  peak:{date:{toString:null},total:2}}]));
+const hostileNested=validateTokenStats(statsPayload({
+  longest_session:{seconds:1,date:null,account:{toString:null}},
+  most_used_model:{label:{toString:null},share_pct:Infinity}}));
+const outOfRangeShare=validateTokenStats(statsPayload({
+  most_used_model:{label:"sonnet",share_pct:101}}));
+const validDecimalShare=validateTokenStats(statsPayload({
+  most_used_model:{label:"sonnet",share_pct:12.5}}));
+const unsafeSummary=validateTokenStats(statsPayload({
+  lifetime:Number.MAX_SAFE_INTEGER+1}));
+const unsafeCounts=statsPayload();
+unsafeCounts.days["2026-01-10"]={input:Number.MAX_SAFE_INTEGER,output:0,
+  cache_read:1,cache_creation:0,total:Number.MAX_SAFE_INTEGER};
+const unsafeDay=validateTokenStats(unsafeCounts);
+const overflowDays={"2026-01-01":{grand_total:Number.MAX_SAFE_INTEGER},
+  "2026-01-02":{grand_total:1}};
+const weeklyOverflow=tokenWeeklySeries(overflowDays,"2026-01-02");
+const cumulativeOverflow=tokenCumulativeSeries(overflowDays,"2026-01-02");
+const disabledStats={};
+Object.defineProperty(disabledStats,"generated",{get(){throw new Error("disabled telemetry inspected");}});
+const disabled=validate({generated:generated,accounts:[],token_stats_enabled:false,
+  token_stats:disabledStats,_headroom_display:{schema:"headroom_widget@1",
+    freshness:{state:"current"},accounts:[]}});
 const clamped=validateTokenStats({generated:generated,days:{
   "2024-12-06":Object.assign({},count),
   "2024-12-07":Object.assign({},count),
@@ -454,6 +488,18 @@ console.log(JSON.stringify({
   staleState:tokenTelemetryState({generated:generated},generated+3600),
   suppressedState:tokenTelemetryState({generated:generated},generated+7*86400),
   futureState:tokenTelemetryState({generated:futureGenerated},generated),
+  hostilePeakDate:hostilePeakDate===null,
+  hostileAccountCount:hostileAccountDate.accounts.length,
+  hostileNestedAccount:hostileNested.summary.longest_session.account,
+  hostileNestedLabel:hostileNested.summary.most_used_model.label,
+  hostileNestedShare:hostileNested.summary.most_used_model.share_pct,
+  outOfRangeShare:outOfRangeShare.summary.most_used_model.share_pct,
+  validDecimalShare:validDecimalShare.summary.most_used_model.share_pct,
+  unsafeSummary:unsafeSummary===null,unsafeDay:unsafeDay===null,
+  tokenNumbers:[tokenNumber(0),tokenNumber(Number.MAX_SAFE_INTEGER),
+    tokenNumber(Number.MAX_SAFE_INTEGER+1),tokenNumber(1.5),tokenNumber(-1)],
+  weeklyOverflow:weeklyOverflow,cumulativeOverflow:cumulativeOverflow,
+  disabledHasTokenStats:Object.prototype.hasOwnProperty.call(disabled,"token_stats"),
   path:target.innerHTML
 }));
 """
@@ -462,7 +508,7 @@ console.log(JSON.stringify({
                 'TOKEN_STALE_AGE=TOKEN_AGE_LIMITS.stale,'
                 'TOKEN_SUPPRESS_AGE=TOKEN_AGE_LIMITS.suppress;\n'
                 'function esc(value){return String(value);}\n'
-                + functions + tail)
+                + validator + functions + tail)
 
     @unittest.skipUnless(NODE, "node runtime required to execute token charts")
     def test_window_scale_dense_utc_buckets_and_step_cumulative(self):
@@ -504,6 +550,20 @@ console.log(JSON.stringify({
                          {"stale": False, "suppressed": True})
         self.assertEqual(value["futureState"],
                          {"stale": True, "suppressed": False})
+        self.assertTrue(value["hostilePeakDate"])
+        self.assertEqual(value["hostileAccountCount"], 0)
+        self.assertIsNone(value["hostileNestedAccount"])
+        self.assertIsNone(value["hostileNestedLabel"])
+        self.assertIsNone(value["hostileNestedShare"])
+        self.assertIsNone(value["outOfRangeShare"])
+        self.assertEqual(value["validDecimalShare"], 12.5)
+        self.assertTrue(value["unsafeSummary"])
+        self.assertTrue(value["unsafeDay"])
+        self.assertEqual(value["tokenNumbers"],
+                         [True, True, False, False, False])
+        self.assertEqual(value["weeklyOverflow"], [])
+        self.assertEqual(value["cumulativeOverflow"], [])
+        self.assertFalse(value["disabledHasTokenStats"])
 
 
 class LegacyTokenCacheJS(unittest.TestCase):
@@ -1252,7 +1312,16 @@ class DashboardHttpTests(unittest.TestCase):
             "function tokenCumulativeSeries(days,endDay){",
                                     1)[1].split("\n}", 1)[0]
         self.assertIn("running+=", cumulative)
+        self.assertIn("if(!tokenNumber(running))return[];", cumulative)
         self.assertIn("tokenDenseSeries(days,endDay)", cumulative)
+        series = template.split("function renderTokenSeries(series,mode){",
+                                1)[1].split("\n}", 1)[0]
+        self.assertIn("const tickIndexes=[...new Set(", series)
+        activity = template.split("function renderTokenActivity(){",
+                                  1)[1].split("\n}", 1)[0]
+        self.assertIn(
+            'getElementById("token-heat-legend").hidden=tokenActivityMode!=="daily"',
+            activity)
         token_render = template.split("function renderTokenStats(){",
                                       1)[1].split("\n}", 1)[0]
         self.assertIn("if(!tokenStats)", token_render)
@@ -1271,9 +1340,25 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertIn(
             'sideNote.innerHTML="Window percentage only.<br>No token counts stored."',
             token_render)
+        self.assertIn(
+            'historyData&&!document.getElementById("stats-content").hidden',
+            token_render)
+        self.assertIn('insightRow(item.label+" tokens"', token_render)
         render = template.split("function render(data,forceNoncurrent){",
                                 1)[1].split("\n}", 1)[0]
-        self.assertIn("tokenState.suppressed?null:data.token_stats", render)
+        self.assertIn(
+            "tokenStatsEnabled&&!tokenState.suppressed?data.token_stats:null",
+            render)
+        validate = template.split("function validate(data){",
+                                  1)[1].split("\n}", 1)[0]
+        self.assertLess(validate.index("data.token_stats_enabled"),
+                        validate.index("validateTokenStats(data.token_stats)"))
+        self.assertIn("else delete data.token_stats", validate)
+        stats_state = template.split("function showStatsState(",
+                                     1)[1].split("\n}", 1)[0]
+        self.assertIn(
+            'document.getElementById("leaderboard-panel").hidden=true;',
+            stats_state)
         init = template.split("(function init(){", 1)[1].split("})();", 1)[0]
         self.assertLess(init.index("sanitizeLegacyCaches();"),
                         init.index("if(widgetMode)"))
