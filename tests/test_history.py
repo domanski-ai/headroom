@@ -78,7 +78,7 @@ class HistoryPersistenceTests(unittest.TestCase):
                 "HEADROOM_HISTORY_RETENTION_DAYS": "1"}), \
                 mock.patch.object(history.os, "replace",
                                   wraps=os.replace) as replace:
-            history.append_snapshot(snapshot(10), now=NOW - 2 * 86400)
+            history.append_snapshot(snapshot(10), now=NOW - 2 * 86400 - 1)
             history.append_snapshot(snapshot(20), now=NOW)
         replace.assert_called_once()
         with mock.patch.object(history.time, "time", return_value=NOW):
@@ -91,7 +91,7 @@ class HistoryPersistenceTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {
                 "HEADROOM_HISTORY_MIN_INTERVAL": "0",
                 "HEADROOM_HISTORY_RETENTION_DAYS": "1"}):
-            history.append_snapshot(snapshot(10), now=NOW - 2 * 86400)
+            history.append_snapshot(snapshot(10), now=NOW - 2 * 86400 - 1)
             with open(paths.history_path(), "rb") as handle:
                 before = handle.read()
             with mock.patch.object(history.os, "replace",
@@ -103,6 +103,65 @@ class HistoryPersistenceTests(unittest.TestCase):
         leftovers = [name for name in os.listdir(paths.history_dir())
                      if name.endswith(".tmp")]
         self.assertEqual(leftovers, [])
+
+    def test_retention_prune_is_amortized_by_one_day_grace(self):
+        with mock.patch.dict(os.environ, {
+                "HEADROOM_HISTORY_MIN_INTERVAL": "0",
+                "HEADROOM_HISTORY_RETENTION_DAYS": "1"}):
+            history.append_snapshot(snapshot(10), now=NOW - 86400 - 10)
+            with mock.patch.object(history.os, "replace",
+                                   wraps=os.replace) as replace:
+                history.append_snapshot(snapshot(20), now=NOW)
+                history.append_snapshot(snapshot(30), now=NOW + 1)
+                history.append_snapshot(snapshot(40), now=NOW + 2)
+        replace.assert_not_called()
+        with open(paths.history_path(), "rb") as handle:
+            self.assertEqual(len(handle.readlines()), 4)
+
+    def test_byte_cap_prunes_retention_then_oldest_rows_to_eighty_percent(self):
+        paths.ensure_private(paths.history_dir())
+        cap = history.MIN_MAX_BYTES
+        line = (json.dumps(row(NOW - 10, 10), separators=(",", ":")) +
+                "\n").encode("utf-8")
+        with open(paths.history_path(), "wb") as handle:
+            handle.write(line * (cap // len(line) + 100))
+        self.assertGreater(os.path.getsize(paths.history_path()), cap)
+        with mock.patch.dict(os.environ, {
+                "HEADROOM_HISTORY_MAX_BYTES": "1",
+                "HEADROOM_HISTORY_MIN_INTERVAL": "0"}), \
+                mock.patch.object(history.os, "replace",
+                                  wraps=os.replace) as replace:
+            self.assertTrue(history.append_snapshot(snapshot(20), now=NOW))
+        replace.assert_called_once()
+        appended_size = history._row_size(
+            history.project_snapshot(snapshot(20), ts=NOW))
+        self.assertLessEqual(os.path.getsize(paths.history_path()),
+                             int(cap * .8) + appended_size)
+
+    def test_pruning_happens_before_throttle(self):
+        with mock.patch.dict(os.environ, {
+                "HEADROOM_HISTORY_MIN_INTERVAL": "0",
+                "HEADROOM_HISTORY_RETENTION_DAYS": "1"}):
+            history.append_snapshot(snapshot(10), now=NOW - 2 * 86400 - 1)
+            history.append_snapshot(snapshot(20), now=NOW - 10)
+        with mock.patch.dict(os.environ, {
+                "HEADROOM_HISTORY_MIN_INTERVAL": "60",
+                "HEADROOM_HISTORY_RETENTION_DAYS": "1"}), \
+                mock.patch.object(history.os, "replace",
+                                  wraps=os.replace) as replace:
+            self.assertFalse(history.append_snapshot(snapshot(30), now=NOW))
+        replace.assert_called_once()
+        with open(paths.history_path(), encoding="utf-8") as handle:
+            self.assertEqual([json.loads(line)["ts"] for line in handle],
+                             [NOW - 10])
+
+    def test_future_tail_does_not_throttle_new_append(self):
+        self.assertTrue(history.append_snapshot(snapshot(10), now=NOW + 301))
+        self.assertTrue(history.append_snapshot(snapshot(20), now=NOW))
+        self.assertFalse(history.append_snapshot(snapshot(30), now=NOW + 30))
+        with open(paths.history_path(), encoding="utf-8") as handle:
+            self.assertEqual([json.loads(line)["ts"] for line in handle],
+                             [NOW + 301, NOW])
 
     def test_kill_switch_returns_before_filesystem_access(self):
         with mock.patch.dict(os.environ, {"HEADROOM_HISTORY": "0"}), \
@@ -128,6 +187,52 @@ class HistoryPersistenceTests(unittest.TestCase):
             loaded = history.load_series(1)
         self.assertEqual(len(loaded), 1)
         self.assertNotIn("email", loaded[0]["accounts"][0])
+
+    def test_binary_garbage_deep_json_and_long_lines_do_not_block_appends(self):
+        paths.ensure_private(paths.history_dir())
+        with open(paths.history_path(), "wb") as handle:
+            handle.write(b"\xff\xfe not utf-8\n")
+            handle.write(b"[" * 2000 + b"]" * 2000 + b"\n")
+            handle.write(b"x" * (history.MAX_LINE_BYTES + 1) + b"\n")
+        self.assertTrue(history.append_snapshot(snapshot(25), now=NOW))
+        with mock.patch.object(history.time, "time", return_value=NOW):
+            loaded = history.load_series(1)
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["accounts"][0]["windows"]["5h"][
+            "used_percent"], 25.0)
+
+    def test_remove_account_rewrites_rows_and_drops_empty_rows(self):
+        only_a = row(NOW - 3, 10, name="a")
+        only_b = row(NOW - 2, 20, name="b")
+        both = row(NOW - 1, 30, name="a")
+        both["accounts"].extend(only_b["accounts"])
+        history._write_rows_atomic([only_a, only_b, both])
+        with mock.patch.object(history.os, "replace",
+                               wraps=os.replace) as replace:
+            self.assertTrue(history.remove_account("a"))
+        replace.assert_called_once()
+        with mock.patch.object(history.time, "time", return_value=NOW):
+            loaded = history.load_series(1)
+        self.assertEqual([value["ts"] for value in loaded],
+                         [NOW - 2, NOW - 1])
+        self.assertTrue(all([account["name"] for account in value["accounts"]]
+                            == ["b"] for value in loaded))
+
+    def test_remove_account_is_fail_safe(self):
+        history.append_snapshot(snapshot(), now=NOW)
+        with mock.patch.object(history.os, "replace",
+                               side_effect=OSError("disk full")):
+            self.assertFalse(history.remove_account("alpha"))
+
+    def test_throttle_carryover_accounts_are_not_projected(self):
+        carried = snapshot(name="carried")["accounts"][0]
+        carried["throttle_carryover"] = True
+        fresh = snapshot(name="fresh")["accounts"][0]
+        value = snapshot()
+        value["accounts"] = [carried, fresh]
+        projected = history.project_snapshot(value, ts=NOW)
+        self.assertEqual([account["name"] for account in projected["accounts"]],
+                         ["fresh"])
 
     def test_extreme_numeric_sample_is_ignored_without_escaping(self):
         paths.ensure_private(paths.history_dir())

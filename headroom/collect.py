@@ -1397,6 +1397,7 @@ def remove_slot(name):
         if _prune_snapshot_slot(public, name):
             paths.write_json_atomic(paths.public_snapshot_path(), public,
                                     mode=0o644)
+        history.remove_account(name)
         route.remove_slot_state(name)
         return removed
 

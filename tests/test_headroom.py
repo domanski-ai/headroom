@@ -21,8 +21,8 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from headroom import (  # noqa: E402
-    __main__, collect, connect, dashboard, handoff, paths, registry, route,
-    statusline,
+    __main__, collect, connect, dashboard, handoff, history, paths, registry,
+    route, statusline,
 )
 
 
@@ -2255,6 +2255,7 @@ class RemoveCommand(unittest.TestCase):
         public = collect.public_snapshot(private, redact_emails=True)
         paths.write_json_atomic(paths.private_snapshot_path(), private)
         paths.write_json_atomic(paths.public_snapshot_path(), public, mode=0o644)
+        history.append_snapshot(public, now=int(time.time()))
         paths.write_json_atomic(paths.cooldowns_path(), {
             "a:*": 100, "a:sonnet": 200, "b:*": 300})
         paths.write_json_atomic(paths.quarantine_path(), {
@@ -2285,6 +2286,10 @@ class RemoveCommand(unittest.TestCase):
         self.assertEqual(paths.load_json(paths.private_snapshot_path())["integrity_warnings"],
                          ["unrelated warning"])
         self.assertEqual(public["integrity_warnings"], ["unrelated warning"])
+        history_rows = history.load_series(1)
+        self.assertEqual(len(history_rows), 1)
+        self.assertEqual([row["name"] for row in history_rows[0]["accounts"]],
+                         ["b"])
         self.assertEqual(route.cooldowns(), {"b:*": 300})
         self.assertEqual(route.quarantines(), {"b": {"reason": "other"}})
         self.assertIn("anthropic_usage_api",

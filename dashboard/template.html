@@ -254,7 +254,7 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
           padding-top: 14px; border-top: 1px solid var(--line);
           color: var(--ink-3); font: 500 9px/1.4 var(--mono);
           text-transform: uppercase; letter-spacing: .05em; }
-.legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.legend .legend-item { display: inline-flex; align-items: center; gap: 6px; }
 .swatch { width: 16px; height: 5px; border-radius: 2px; background: var(--tone); }
 .credit { margin-top: 26px; color: var(--ink-3); font: 500 9px var(--mono); }
 .credit a { color: var(--ink-2); }
@@ -322,13 +322,13 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
               vector-effect: non-scaling-stroke; }
 .chart-peak-dot { stroke: var(--panel); stroke-width: 1; vector-effect: non-scaling-stroke; }
 .chart-legend { display: flex; flex-wrap: wrap; gap: 4px 6px; }
-.legend-item { display: inline-flex; align-items: center; gap: 6px; padding: 4px 7px;
-               border: 0; border-radius: var(--radius); background: none;
-               color: var(--ink-2); font: 600 9px var(--mono); cursor: pointer; }
-.legend-item:hover { background: var(--panel-2); color: var(--ink); }
-.legend-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.legend-item[aria-pressed="false"] { opacity: .4; }
-.legend-item i { display: block; width: 14px; height: 2px; background: var(--series); }
+.chart-legend .legend-item { display: inline-flex; align-items: center; gap: 6px; padding: 4px 7px;
+                             border: 0; border-radius: var(--radius); background: none;
+                             color: var(--ink-2); font: 600 9px var(--mono); cursor: pointer; }
+.chart-legend .legend-item:hover { background: var(--panel-2); color: var(--ink); }
+.chart-legend .legend-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.chart-legend .legend-item[aria-pressed="false"] { opacity: .4; }
+.chart-legend .legend-item i { display: block; width: 14px; height: 2px; background: var(--series); }
 .chart-endlabel { font: 700 9.5px var(--mono); }
 .stats-meter { display: flex; gap: 3px; margin: 0 0 13px; }
 .stats-meter i { flex: 1 1 0; height: 7px; border-radius: var(--cell-radius);
@@ -1022,7 +1022,7 @@ async function load(manual){
         renderError(error&&error.message?error.message:"unknown feed error");}
     }
   }finally{
-    if(manual&&requestId===requestNumber){button.disabled=false;button.textContent="Refresh";}
+    if(manual){button.disabled=false;button.textContent="Refresh";}
   }
 }
 
@@ -1048,6 +1048,10 @@ function validateHistory(data){
       });
     });
   });
+  data.summary=data.summary.filter(entry=>entry&&typeof entry==="object"&&!Array.isArray(entry)&&
+    typeof entry.name==="string");
+  data.leaderboard=data.leaderboard.filter(entry=>entry&&typeof entry==="object"&&!Array.isArray(entry)&&
+    typeof entry.name==="string");
   return data;
 }
 function statsPct(value){
@@ -1095,6 +1099,7 @@ function renderHistoryChart(data,key){
   const legend=document.getElementById("history-legend");
   const series=data.series.map(account=>({
     name:account.name,provider:account.provider,
+    key:account.provider+"/"+account.name,
     points:(account.windows||{})[key]||[]
   })).filter(account=>account.points.length);
   if(!series.length){
@@ -1102,25 +1107,27 @@ function renderHistoryChart(data,key){
     legend.innerHTML="";
     return;
   }
+  const visibleNames={};
+  series.filter(account=>!hiddenSeries.has(account.key)).forEach(account=>{
+    visibleNames[account.name]=(visibleNames[account.name]||0)+1;
+  });
   legend.innerHTML=series.map((account,index)=>'<button type="button" class="legend-item" data-series="'+
-    esc(account.name)+'" aria-pressed="'+(hiddenSeries.has(account.name)?"false":"true")+
-    '" style="--series:'+SERIES_COLORS[index%SERIES_COLORS.length]+'"><i></i>'+esc(account.name)+"</button>").join("");
+    esc(account.key)+'" aria-pressed="'+(hiddenSeries.has(account.key)?"false":"true")+
+    '" style="--series:'+SERIES_COLORS[index%SERIES_COLORS.length]+'"><i></i>'+esc(account.name+
+      (visibleNames[account.name]>1?" · "+account.provider:""))+"</button>").join("");
   legend.querySelectorAll(".legend-item").forEach(item=>item.addEventListener("click",()=>{
-    const name=item.getAttribute("data-series");
-    if(hiddenSeries.has(name))hiddenSeries.delete(name);else hiddenSeries.add(name);
+    const identity=item.getAttribute("data-series");
+    if(hiddenSeries.has(identity))hiddenSeries.delete(identity);else hiddenSeries.add(identity);
     renderHistoryChart(historyData,document.getElementById("history-window").value);
   }));
   const visible=series.map((account,index)=>({account:account,
     color:SERIES_COLORS[index%SERIES_COLORS.length]}))
-    .filter(entry=>!hiddenSeries.has(entry.account.name));
+    .filter(entry=>!hiddenSeries.has(entry.account.key));
   if(!visible.length){
     chart.innerHTML='<div class="stats-inline-empty">All accounts hidden — click a legend item to show it.</div>';
     return;
   }
-  const all=visible.flatMap(entry=>entry.account.points);
-  let start=Math.min(...all.map(point=>point.ts));
-  let end=Math.max(...all.map(point=>point.ts));
-  if(start===end)end=start+1;
+  const start=data.generated-data.days*86400,end=data.generated;
   const width=960,height=320,left=50,right=56,top=14,bottom=36;
   const plotWidth=width-left-right,plotHeight=height-top-bottom;
   const grid=[0,25,50,75,100].map(value=>{
@@ -1146,7 +1153,7 @@ function renderHistoryChart(data,key){
         '" cx="'+point.x.toFixed(2)+'" cy="'+point.peak.toFixed(2)+'" r="2"></circle>';
     }).join("");
     const last=points[points.length-1];
-    labels.push({y:last.y,x:last.x,color:color,
+    labels.push({y:last.y+3,x:last.x,color:color,
       value:statsPct(entry.account.points[entry.account.points.length-1].mean)});
     drawing+=peaks+'<path class="chart-line" stroke="'+color+'" d="'+line+
       '"><title>'+esc(entry.account.name)+" "+esc(windowLabel(key))+"</title></path>"+
@@ -1157,8 +1164,14 @@ function renderHistoryChart(data,key){
   labels.forEach((label,index)=>{
     if(index&&label.y-labels[index-1].y<11)label.y=labels[index-1].y+11;
   });
+  const labelTop=top+4,labelBottom=top+plotHeight;
+  if(labels.length&&labels[labels.length-1].y>labelBottom){
+    const shift=labels[labels.length-1].y-labelBottom;
+    labels.forEach(label=>{label.y-=shift;});
+  }
+  labels.forEach(label=>{label.y=Math.min(labelBottom,Math.max(labelTop,label.y));});
   const endLabels=labels.map(label=>'<text class="chart-endlabel" fill="'+label.color+
-    '" x="'+(width-right+8)+'" y="'+(label.y+3).toFixed(2)+'">'+esc(label.value)+"</text>").join("");
+    '" x="'+(width-right+8)+'" y="'+label.y.toFixed(2)+'">'+esc(label.value)+"</text>").join("");
   chart.innerHTML='<svg viewBox="0 0 '+width+" "+height+'" role="img" aria-label="'+esc(windowLabel(key))+
     ' window percentage used over time">'+grid+dates+drawing+endLabels+"</svg>";
 }
@@ -1213,17 +1226,22 @@ function renderLeaderboard(data){
 }
 function renderStats(){
   if(!historyData)return;
-  const keys=populateHistoryWindows(historyData);
-  if(!keys.length){
-    showStatsState("No usable samples yet","History exists, but no current window percentages are available.",false);
-    return;
+  try{
+    const keys=populateHistoryWindows(historyData);
+    if(!keys.length){
+      showStatsState("No usable samples yet","History exists, but no current window percentages are available.",false);
+      return;
+    }
+    const key=document.getElementById("history-window").value;
+    document.getElementById("stats-state").hidden=true;
+    document.getElementById("stats-content").hidden=false;
+    renderHistoryChart(historyData,key);
+    renderAccountStats(historyData,key);
+    renderLeaderboard(historyData);
+  }catch(error){
+    historyData=null;
+    showStatsState("History render failed","The saved history could not be displayed. Refresh to try again.",false);
   }
-  const key=document.getElementById("history-window").value;
-  document.getElementById("stats-state").hidden=true;
-  document.getElementById("stats-content").hidden=false;
-  renderHistoryChart(historyData,key);
-  renderAccountStats(historyData,key);
-  renderLeaderboard(historyData);
 }
 function showHistoryFailure(error){
   if(error&&error.code==="history_disabled")
@@ -1250,10 +1268,10 @@ async function loadHistory(manual){
       error.code=payload&&payload.error;throw error;}
     const data=validateHistory(payload);
     if(requestId===historyRequest){historyData=data;renderStats();}
-  }catch(error){if(requestId===historyRequest)showHistoryFailure(error);}
+  }catch(error){if(requestId===historyRequest){historyData=null;showHistoryFailure(error);}}
   finally{
     if(timer!==null)clearTimeout(timer);
-    if(manual&&requestId===historyRequest){button.disabled=false;button.textContent="Refresh";}
+    if(manual){button.disabled=false;button.textContent="Refresh";}
   }
 }
 function syncTabs(){
@@ -1263,7 +1281,6 @@ function syncTabs(){
   document.querySelectorAll("[data-tab]").forEach(link=>{
     const selected=link.getAttribute("data-tab")===active;
     link.setAttribute("aria-selected",selected?"true":"false");
-    link.tabIndex=selected?0:-1;
   });
   if(active==="stats")loadHistory(false);
 }

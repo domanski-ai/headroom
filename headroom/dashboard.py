@@ -299,34 +299,34 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def _serve_history(self):
-        query = urllib.parse.parse_qs(
-            urllib.parse.urlsplit(self.path).query)
         try:
-            days = int((query.get("days") or [7])[0])
-        except (TypeError, ValueError):
-            days = 7
-        days = min(history.retention_days(), max(1, days))
-        if self.demo:
-            snapshot = paths.load_json(
-                os.path.join(self.directory, "usage.json"))
-            rows = history.demo_rows(snapshot, days) \
-                if isinstance(snapshot, dict) else []
-        else:
             if not history.enabled():
                 self._send_body(
                     503, "application/json", b'{"error":"history_disabled"}')
                 return
-            rows = history.load_series(days)
-        if not rows:
-            self._send_body(
-                503, "application/json", b'{"error":"no history yet"}')
-            return
-        try:
+            query = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(self.path).query)
+            try:
+                days = int((query.get("days") or [7])[0])
+            except (TypeError, ValueError):
+                days = 7
+            days = min(history.retention_days(), max(1, days))
+            if self.demo:
+                snapshot = paths.load_json(
+                    os.path.join(self.directory, "usage.json"))
+                rows = history.demo_rows(snapshot, days) \
+                    if isinstance(snapshot, dict) else []
+            else:
+                rows = history.load_series(days)
+            if not rows:
+                self._send_body(
+                    503, "application/json", b'{"error":"no history yet"}')
+                return
             value = history.response(
                 days, rows=rows, generated=int(time.time()))
             body = json.dumps(value, allow_nan=False,
                               separators=(",", ":")).encode("utf-8")
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             self._send_body(
                 503, "application/json", b'{"error":"invalid history"}')
             return

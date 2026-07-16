@@ -1,4 +1,10 @@
-"""Private rolling history of public usage-window percentages."""
+"""Private rolling history of public usage-window percentages.
+
+Ordinary writes are O(1) appends. Retention rewrites are amortized by waiting
+until the oldest row exceeds retention by a full day, while a configurable
+``HEADROOM_HISTORY_MAX_BYTES`` cap (32 MiB by default, 1 MiB minimum) forces
+an earlier prune and trims an oversized retained set to 80%.
+"""
 import json
 import math
 import os
@@ -11,6 +17,9 @@ from . import paths
 SCHEMA_VERSION = 1
 DEFAULT_MIN_INTERVAL = 60
 DEFAULT_RETENTION_DAYS = 30
+DEFAULT_MAX_BYTES = 32 * 1024 * 1024
+MIN_MAX_BYTES = 1024 * 1024
+MAX_LINE_BYTES = 1024 * 1024
 MAX_CHART_POINTS = 200
 
 
@@ -26,6 +35,11 @@ def retention_days():
 def min_interval():
     return max(0, paths.env_int(
         "HEADROOM_HISTORY_MIN_INTERVAL", DEFAULT_MIN_INTERVAL))
+
+
+def max_bytes():
+    return max(MIN_MAX_BYTES, paths.env_int(
+        "HEADROOM_HISTORY_MAX_BYTES", DEFAULT_MAX_BYTES))
 
 
 def _finite_number(value, low=None, high=None):
@@ -90,6 +104,8 @@ def project_snapshot(snapshot, ts=None):
         raise ValueError("history timestamp must be finite")
     accounts = []
     for account in snapshot.get("accounts") or []:
+        if isinstance(account, dict) and account.get("throttle_carryover"):
+            continue
         projected = _project_account(account)
         if projected is not None:
             accounts.append(projected)
@@ -114,21 +130,70 @@ def _normalize_row(value):
     return {"ts": ts, "accounts": projected}
 
 
+def _parse_line(line):
+    payload = line.rstrip(b"\r\n")
+    if not payload or len(payload) > MAX_LINE_BYTES:
+        return None
+    try:
+        return _normalize_row(json.loads(
+            payload.decode("utf-8", errors="replace")))
+    except Exception:
+        return None
+
+
 def _read_rows(path):
     rows = []
     try:
-        with open(path, encoding="utf-8") as handle:
+        with open(path, "rb") as handle:
             for line in handle:
-                try:
-                    row = _normalize_row(json.loads(line))
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    row = None
+                row = _parse_line(line)
                 if row is not None:
                     rows.append(row)
     except OSError:
         return []
     rows.sort(key=lambda row: row["ts"])
     return rows
+
+
+def _oldest_row(path):
+    try:
+        with open(path, "rb") as handle:
+            for line in handle:
+                row = _parse_line(line)
+                if row is not None:
+                    return row
+    except OSError:
+        pass
+    return None
+
+
+def _tail_row(path):
+    """Read only the final physical row; a corrupt tail is treated as empty."""
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            end = handle.tell()
+            if end == 0:
+                return None
+            handle.seek(end - 1)
+            if handle.read(1) == b"\n":
+                end -= 1
+            start = max(0, end - MAX_LINE_BYTES - 1)
+            handle.seek(start)
+            data = handle.read(end - start)
+            newline = data.rfind(b"\n")
+            if newline < 0 and start:
+                return None
+            return _parse_line(data[newline + 1:])
+    except OSError:
+        return None
+
+
+def _file_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
 
 
 def _ensure_storage():
@@ -158,6 +223,23 @@ def _write_rows_atomic(rows):
         raise
 
 
+def _row_size(row):
+    return len(json.dumps(
+        row, allow_nan=False, separators=(",", ":")).encode("utf-8")) + 1
+
+
+def _rows_within_bytes(rows, limit):
+    kept = []
+    size = 0
+    for row in reversed(rows):
+        row_size = _row_size(row)
+        if size + row_size > limit:
+            break
+        kept.append(row)
+        size += row_size
+    return list(reversed(kept))
+
+
 def _append_row(row):
     _ensure_storage()
     descriptor = os.open(
@@ -175,17 +257,48 @@ def append_snapshot(snapshot, now=None):
     if not enabled():
         return False
     now = int(time.time() if now is None else now)
-    rows = _read_rows(paths.history_path())
-    if rows and now - rows[-1]["ts"] < min_interval():
+    path = paths.history_path()
+    cap = max_bytes()
+    oldest = _oldest_row(path)
+    over_cap = _file_size(path) > cap
+    prune_before = now - (retention_days() + 1) * 86400
+    if over_cap or (oldest is not None and oldest["ts"] < prune_before):
+        cutoff = now - retention_days() * 86400
+        rows = [old for old in _read_rows(path) if old["ts"] >= cutoff]
+        if over_cap and sum(_row_size(old) for old in rows) > cap:
+            rows = _rows_within_bytes(rows, int(cap * .8))
+        _write_rows_atomic(rows)
+        newest = rows[-1] if rows else None
+    else:
+        newest = _tail_row(path)
+    age = now - newest["ts"] if newest is not None else None
+    if age is not None and 0 <= age < min_interval():
         return False
     row = project_snapshot(snapshot, ts=now)
-    cutoff = now - retention_days() * 86400
-    retained = [old for old in rows if old["ts"] >= cutoff]
-    if len(retained) != len(rows):
-        _write_rows_atomic(retained + [row])
-    else:
-        _append_row(row)
+    _append_row(row)
     return True
+
+
+def remove_account(name):
+    """Atomically remove one account from all history, never raising out."""
+    try:
+        path = paths.history_path()
+        if not os.path.exists(path):
+            return False
+        rows = []
+        changed = False
+        for row in _read_rows(path):
+            accounts = [account for account in row["accounts"]
+                        if account["name"] != name]
+            changed = changed or len(accounts) != len(row["accounts"])
+            if accounts:
+                rows.append({"ts": row["ts"], "accounts": accounts})
+            else:
+                changed = True
+        _write_rows_atomic(rows)
+        return changed
+    except Exception:
+        return False
 
 
 def load_series(days):

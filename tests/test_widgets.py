@@ -673,6 +673,30 @@ class HistoryHttpTests(unittest.TestCase):
         self.assertEqual(malformed[0], 503)
         self.assertEqual(json.loads(malformed[2]), {"error": "no history yet"})
 
+    def test_binary_garbage_is_skipped_when_valid_history_follows(self):
+        with self.live_server(with_history=False) as server:
+            paths.ensure_private(paths.history_dir())
+            valid = history.project_snapshot(
+                usage_snapshot(usage_account()), ts=int(time.time()))
+            with open(paths.history_path(), "wb") as handle:
+                handle.write(b"\xff\xfe corrupt\n")
+                handle.write(b"[" * 2000 + b"]" * 2000 + b"\n")
+                handle.write(json.dumps(valid).encode("utf-8") + b"\n")
+            status, headers, body = memory_get(*server, "/history.json")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["content-type"], "application/json")
+        self.assertTrue(json.loads(body)["series"])
+
+    def test_unexpected_history_error_returns_json_503(self):
+        with self.live_server() as server, \
+                mock.patch.object(history, "load_series",
+                                  side_effect=RecursionError("corrupt")) as load:
+            status, headers, body = memory_get(*server, "/history.json")
+        load.assert_called_once()
+        self.assertEqual(status, 503)
+        self.assertEqual(headers["content-type"], "application/json")
+        self.assertEqual(json.loads(body), {"error": "invalid history"})
+
     def test_disabled_wins_even_when_history_exists(self):
         with self.live_server() as server, \
                 mock.patch.dict(os.environ, {"HEADROOM_HISTORY": "0"}):
@@ -775,6 +799,13 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertEqual(payload["days"], 7)
         self.assertTrue(payload["series"])
         self.assertTrue(payload["summary"])
+
+    def test_demo_history_respects_kill_switch(self):
+        with self.demo_server() as server, \
+                mock.patch.dict(os.environ, {"HEADROOM_HISTORY": "0"}):
+            status, _, body = memory_get(*server, "/history.json")
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body), {"error": "history_disabled"})
 
     def test_all_responses_have_security_headers(self):
         with mock.patch.object(widget.time, "time", return_value=NOW):
