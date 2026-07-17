@@ -1,12 +1,14 @@
-"""headroom test suite — stdlib unittest only, no pytest, no network.
+"""headroom test suite — stdlib unittest only, no network.
 
 Run:  python3 -m unittest discover -s tests   (from the repo root)
 
 Covers the load-bearing safety logic: config validation, the fail-closed
 router (`block_reason`), redaction, and the public-snapshot projection.
 """
+import ast
+import errno
+import importlib
 import json
-import fcntl
 import hashlib
 import io
 import os
@@ -22,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from headroom import (  # noqa: E402
     __main__, collect, connect, dashboard, handoff, history, paths, registry,
-    route, statusline, tokens,
+    locks, route, statusline, supervisor, tokens,
 )
 
 
@@ -52,6 +54,138 @@ def _claude_row(name="a", used5h=10.0, used7d=20.0, ok=True, **over):
 
 def _account(name="a", provider="claude"):
     return {"name": name, "provider": provider, "home": "/tmp/hr-t/" + name}
+
+
+def _install_fake_claude(directory):
+    os.makedirs(directory)
+    fake = os.path.join(os.path.dirname(__file__), "fake_claude.py")
+    if os.name == "nt":
+        launcher = os.path.join(directory, "claude.cmd")
+        with open(launcher, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(f'@"{sys.executable}" "{fake}" %*\n')
+    else:
+        os.symlink(fake, os.path.join(directory, "claude"))
+
+
+class LockAbstraction(unittest.TestCase):
+    def test_unix_backend_is_a_direct_flock_passthrough(self):
+        backend = mock.Mock(LOCK_EX=2, LOCK_NB=4, LOCK_SH=1, LOCK_UN=8)
+        handle = object()
+        with mock.patch.object(locks, "_msvcrt", None), \
+                mock.patch.object(locks, "_fcntl", backend):
+            self.assertTrue(locks.exclusive(handle, blocking=False))
+            self.assertTrue(locks.shared(handle))
+            locks.unlock(handle)
+        self.assertEqual(backend.flock.call_args_list, [
+            mock.call(handle, 6), mock.call(handle, 1), mock.call(handle, 8)])
+
+    def test_windows_backend_locks_byte_zero_and_unlocks_before_close(self):
+        class Shim:
+            LK_LOCK = 1
+            LK_NBLCK = 2
+            LK_UNLCK = 3
+
+            def __init__(self):
+                self.calls = []
+
+            def locking(self, descriptor, mode, count):
+                self.calls.append(
+                    (os.lseek(descriptor, 0, os.SEEK_CUR), mode, count))
+
+        shim = Shim()
+        with tempfile.TemporaryFile("w+b") as handle, \
+                mock.patch.object(locks, "_msvcrt", shim):
+            handle.write(b"lock")
+            handle.seek(3)
+            self.assertTrue(locks.exclusive(handle))
+            handle.seek(2)
+            locks.unlock(handle)
+            descriptor = os.dup(handle.fileno())
+            locks.exclusive(descriptor)
+            locks.close(descriptor)
+        self.assertEqual(shim.calls, [(0, shim.LK_LOCK, 1),
+                                      (0, shim.LK_UNLCK, 1),
+                                      (0, shim.LK_LOCK, 1),
+                                      (0, shim.LK_UNLCK, 1)])
+
+    def test_windows_nonblocking_contention_and_shared_refusal(self):
+        backend = mock.Mock(LK_LOCK=1, LK_NBLCK=2, LK_UNLCK=3)
+        backend.locking.side_effect = OSError(errno.EACCES, "held")
+        with tempfile.TemporaryFile("w+b") as handle, \
+                mock.patch.object(locks, "_msvcrt", backend):
+            self.assertFalse(locks.exclusive(handle, blocking=False))
+            with self.assertRaises(locks.UnsupportedOnWindows):
+                locks.shared(handle)
+
+    def test_real_backend_reports_nonblocking_contention(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock_path = os.path.join(directory, "real.lock")
+            with open(lock_path, "w+b") as first, open(lock_path, "r+b") as second:
+                first.write(b"x")
+                first.flush()
+                locks.exclusive(first)
+                try:
+                    self.assertFalse(locks.exclusive(second, blocking=False))
+                finally:
+                    locks.unlock(first)
+
+    def test_permission_helpers_are_noops_on_windows(self):
+        with mock.patch.object(paths.os, "name", "nt"), \
+                mock.patch.object(paths.os, "chmod") as chmod, \
+                mock.patch.object(paths.os, "fchmod", create=True) as fchmod:
+            paths.chmod_private("ignored", 0o700)
+            paths.fchmod_private(7, 0o600)
+        chmod.assert_not_called()
+        fchmod.assert_not_called()
+
+
+class PlatformImportCleanliness(unittest.TestCase):
+    def test_platform_imports_are_isolated_or_guarded(self):
+        package_dir = os.path.dirname(paths.__file__)
+        seen_termios = []
+        for name in os.listdir(package_dir):
+            if not name.endswith(".py"):
+                continue
+            filename = os.path.join(package_dir, name)
+            with open(filename, encoding="utf-8") as handle:
+                tree = ast.parse(handle.read(), filename=filename)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported = {alias.name for alias in node.names}
+                    if "fcntl" in imported:
+                        self.assertEqual(name, "locks.py")
+                    if "termios" in imported:
+                        seen_termios.append((name, node))
+            direct = [node for node in tree.body if isinstance(node, ast.Import)]
+            self.assertFalse(any(alias.name in {"fcntl", "termios"}
+                                 for node in direct for alias in node.names))
+            importlib.import_module("headroom." + name[:-3])
+        self.assertEqual([name for name, _ in seen_termios], ["supervisor.py"])
+        with open(supervisor.__file__, encoding="utf-8") as handle:
+            supervisor_tree = ast.parse(handle.read())
+        self.assertTrue(any(
+            isinstance(node, ast.Try) and any(
+                isinstance(child, ast.Import)
+                and any(alias.name == "termios" for alias in child.names)
+                for child in node.body)
+            for node in supervisor_tree.body))
+
+
+class WindowsSupervisionDegradation(unittest.TestCase):
+    def test_claude_launches_directly_with_one_clear_message(self):
+        errors = io.StringIO()
+        with mock.patch.object(supervisor, "termios", None), \
+                mock.patch.object(route, "cmd_exec", return_value=17) as execute, \
+                redirect_stderr(errors):
+            result = __main__._launch(
+                "claude", ["--headroom-auto-handoff",
+                           "--headroom-launch-fallback"])
+        self.assertEqual(result, 17)
+        self.assertEqual(errors.getvalue(), supervisor.UNSUPERVISED_MESSAGE + "\n")
+        execute.assert_called_once_with(
+            "claude", ["claude"],
+            launch_note="supervision unavailable on this platform",
+            fallback=True)
 
 
 class RegistryValidation(unittest.TestCase):
@@ -369,6 +503,16 @@ class Redaction(unittest.TestCase):
 
 
 class ClaudeIdentity(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        bin_dir = os.path.join(self.temp.name, "bin")
+        _install_fake_claude(bin_dir)
+        self.env = mock.patch.dict(os.environ, {
+            "PATH": bin_dir + os.pathsep + os.environ.get("PATH", "")})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
     def _make_runner(self, payload):
         import subprocess
         class FakeResult:
@@ -917,6 +1061,7 @@ class StatuslineJournal(unittest.TestCase):
             os.environ["HEADROOM_DIR"] = self.old_headroom
         self.temp.cleanup()
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits do not apply")
     def test_writes_payload_and_throttles_for_60_seconds(self):
         with mock.patch.object(statusline.time, "time",
                                side_effect=[1000, 1030, 1061]):
@@ -952,12 +1097,17 @@ class StatuslineJournal(unittest.TestCase):
         self.assertIn("capped -> /exit, then: headroom handoff", output.getvalue())
 
 
+@unittest.skipIf(os.name == "nt", "transactional handoff is Unix-gated in v1")
 class HandoffSafety(unittest.TestCase):
     SID = "11111111-1111-4111-8111-111111111111"
     OTHER_SID = "22222222-2222-4222-8222-222222222222"
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        self.old_path = os.environ.get("PATH")
+        bin_dir = os.path.join(self.temp.name, "bin")
+        _install_fake_claude(bin_dir)
+        os.environ["PATH"] = bin_dir + os.pathsep + (self.old_path or "")
         self.old_headroom = os.environ.get("HEADROOM_DIR")
         os.environ["HEADROOM_DIR"] = os.path.join(self.temp.name, "headroom")
         self.old_cwd = os.getcwd()
@@ -987,6 +1137,10 @@ class HandoffSafety(unittest.TestCase):
     def tearDown(self):
         self.binding.stop()
         os.chdir(self.old_cwd)
+        if self.old_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = self.old_path
         if self.old_headroom is None:
             os.environ.pop("HEADROOM_DIR", None)
         else:
@@ -1002,7 +1156,8 @@ class HandoffSafety(unittest.TestCase):
     def _journal(self, rows):
         state = os.path.join(os.environ["HEADROOM_DIR"], "state")
         os.makedirs(state, exist_ok=True)
-        with open(os.path.join(state, "sessions.jsonl"), "w") as handle:
+        with open(os.path.join(state, "sessions.jsonl"), "w",
+                  encoding="utf-8", newline="\n") as handle:
             for row in rows:
                 handle.write(json.dumps(row) + "\n")
 
@@ -1013,7 +1168,7 @@ class HandoffSafety(unittest.TestCase):
 
     def test_explicit_session_wins_over_ambiguous_journal(self):
         other = self._transcript(self.source_home, self.OTHER_SID)
-        with open(other, "w") as handle:
+        with open(other, "w", encoding="utf-8", newline="\n") as handle:
             handle.write("{}\n")
         self._journal([self._journal_row(self.OTHER_SID, other),
                        self._journal_row("33333333-3333-4333-8333-333333333333",
@@ -1073,14 +1228,16 @@ class HandoffSafety(unittest.TestCase):
     def test_unresolved_tool_use_refused(self):
         event = {"type": "assistant", "message": {"content": [
             {"type": "tool_use", "id": "x", "name": "Read"}]}}
-        with open(self.transcript, "w") as handle:
+        with open(self.transcript, "w", encoding="utf-8",
+                  newline="\n") as handle:
             handle.write(json.dumps(event) + "\n")
         with self.assertRaisesRegex(handoff.HandoffError, "mid-tool-call"):
             handoff.inspect_transcript(self.transcript)
 
     def test_destination_collision_refused(self):
         destination = self._transcript(self.target_home, self.SID)
-        with open(destination, "w") as handle:
+        with open(destination, "w", encoding="utf-8",
+                  newline="\n") as handle:
             handle.write("existing")
         digest = hashlib.sha256(self.bytes).hexdigest()
         with self.assertRaisesRegex(handoff.HandoffError, "does not overwrite"):
@@ -1091,7 +1248,8 @@ class HandoffSafety(unittest.TestCase):
         destination = handoff.destination_path(self.target_home, self.transcript,
                                                self.SID)
         os.makedirs(os.path.dirname(destination))
-        with open(destination, "w") as handle:
+        with open(destination, "w", encoding="utf-8",
+                  newline="\n") as handle:
             handle.write("existing")
         errors = io.StringIO()
         collision = handoff.HandoffError("atomic collision sentinel")
@@ -1309,6 +1467,7 @@ class HandoffSafety(unittest.TestCase):
         self.assertIn("identity or credential changed", errors.getvalue())
         self.assertTrue(os.path.exists(handoff.destination_path(
             self.target_home, self.transcript, self.SID)))
+@unittest.skipIf(os.name == "nt", "transactional handoff is Unix-gated in v1")
 class ClaudePlan(unittest.TestCase):
     """rateLimitTier is unreliable on team seats — one seat of an org can
     carry a per-user tier (default_claude_max_5x) while another carries the
@@ -2221,13 +2380,11 @@ class CollectionLockOrdering(unittest.TestCase):
 
         def guarded_load():
             with open(paths.collect_lock_path(), "a") as handle:
-                try:
-                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
+                if not locks.exclusive(handle, blocking=False):
                     observed.append(True)
                 else:
                     observed.append(False)
-                    fcntl.flock(handle, fcntl.LOCK_UN)
+                    locks.unlock(handle)
             return config
 
         snapshot = {"schema_version": 1, "run_id": "fixture", "generated": 1,
@@ -2268,7 +2425,8 @@ class AuthRefreshCommand(unittest.TestCase):
 
     def test_refresh_relogs_owned_slot_without_changing_registry_or_pins(self):
         def login(_argv, env):
-            self.assertEqual(env["CLAUDE_CONFIG_DIR"], self.home)
+            self.assertTrue(os.path.samefile(
+                env["CLAUDE_CONFIG_DIR"], self.home))
             self.assertNotIn("ANTHROPIC_API_KEY", env)
             with open(self.credentials, "w") as handle:
                 json.dump({"claudeAiOauth": {"accessToken": "new"}}, handle)

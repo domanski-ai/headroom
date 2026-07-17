@@ -1,12 +1,12 @@
 """v0.2 transactional handoff and resident supervisor tests."""
 import errno
-import fcntl
 import hashlib
 import io
 import json
 import multiprocessing
 import os
-import pty
+if os.name != "nt":
+    import pty
 import select
 import signal
 import sys
@@ -16,11 +16,17 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from headroom import (  # noqa: E402
-    __main__, collect, handoff, paths, registry, route, statusline, supervisor,
+    __main__, collect, handoff, locks, paths, registry, route, statusline,
+    supervisor,
 )
+
+pytestmark = pytest.mark.skipif(
+    os.name == "nt", reason="resident supervision is Unix-gated in v1")
 
 
 IDENTITY = {"account_fingerprint": "AAAA", "credential_digest": "BBBB"}
@@ -144,9 +150,9 @@ class RealCollectorBinding(unittest.TestCase):
                 self.assertEqual((identity["account_fingerprint"],
                                   identity["credential_digest"]), expected)
                 with open(paths.collect_lock_path(), "w") as held:
-                    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locks.exclusive(held, blocking=False)
                     locked_snapshot = collect.run_collect(quiet=True)
-                    fcntl.flock(held, fcntl.LOCK_UN)
+                    locks.unlock(held)
                 self.assertEqual(locked_snapshot["run_id"], snapshot["run_id"])
 
 
@@ -251,7 +257,10 @@ class TranscriptAndTransaction(unittest.TestCase):
         destination = handoff.destination_path(
             self.target_home, self.transcript, self.SID)
         with open(destination, "rb") as copied, open(self.transcript, "rb") as source_f:
-            self.assertEqual(copied.read(), source_f.read())
+            copied_bytes = copied.read()
+            source_bytes = source_f.read()
+        self.assertTrue(copied_bytes.startswith(source_bytes))
+        self.assertEqual(copied_bytes.count(b'"type":"headroom_handoff"'), 1)
 
     def test_manual_dangling_requires_force_even_when_snapshot_is_capped(self):
         self.write([{"type": "assistant", "message": {"content": [

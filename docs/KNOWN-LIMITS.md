@@ -4,6 +4,25 @@ Findings from an adversarial cross-model review (GPT-5.6, x-high effort,
 2026-07-11) that are deliberate tradeoffs or blocked on upstream, documented
 here so users can judge them for their own threat model.
 
+## Windows v1 locking and launch boundaries
+
+Windows uses `msvcrt.locking` on byte zero. Unlike Unix `fcntl.flock`, these
+locks are mandatory rather than advisory and Windows has no shared-lock mode,
+so the resident supervisor and transactional handoff remain Unix-only. A
+Windows lock must be explicitly unlocked before its file is closed. Locks on
+both platforms are released when the process dies; after an abrupt Windows
+termination, release happens when the OS closes the process handle. The CRT's
+blocking `LK_LOCK` retries once per second for ten attempts, then reports an
+error instead of waiting indefinitely like Unix `flock`.
+
+Windows v1 therefore routes `headroom claude` through the normal direct launch
+path and prints `supervision requires a Unix terminal — launching
+unsupervised`. The auto-handoff override cannot enable supervision there; the
+opt-in launch-fallback still applies to failures before the unsupervised CLI
+starts. Token-log walks keep `followlinks=False`, use no-follow open flags only
+when Python exposes them, and retain the realpath containment check on every
+platform, including Windows junctions and symlinks.
+
 ## Stats/history v1 known limits
 
 - Cap-hit episode counting does not split episodes across provider window

@@ -5,7 +5,6 @@ commit.  The manual CLI adapter may exec Claude after commit; resident callers
 use :func:`resume_argv` and keep control of their own process lifecycle.
 """
 import contextlib
-import fcntl
 import glob
 import hashlib
 import json
@@ -21,7 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from . import collect, paths, registry, route, tokens
+from . import collect, locks, paths, registry, route, tokens
 
 SCHEMA = "headroom_handoff@2"
 MAX_SCAN_AGE = 48 * 3600
@@ -632,12 +631,12 @@ def _handoff_lock():
     state = paths.ensure_private(paths.state_dir())
     handle = open(os.path.join(state, "handoffs.lock"), "a+")
     try:
-        os.chmod(handle.name, 0o600)
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        paths.chmod_private(handle.name, 0o600)
+        locks.exclusive(handle)
         _reconcile_incomplete_unlocked()
         yield
     finally:
-        fcntl.flock(handle, fcntl.LOCK_UN)
+        locks.unlock(handle)
         handle.close()
 
 
@@ -981,7 +980,7 @@ def _stage_transcript(source, destination, expected_sha256):
     descriptor, temporary = tempfile.mkstemp(prefix=".handoff-", suffix=".tmp",
                                               dir=directory)
     try:
-        os.fchmod(descriptor, 0o600)
+        paths.fchmod_private(descriptor, 0o600)
         digest = hashlib.sha256()
         with open(source, "rb") as incoming, os.fdopen(descriptor, "wb") as outgoing:
             descriptor = None
@@ -1028,7 +1027,7 @@ def _append_ledger_unlocked(record):
     ledger = os.path.join(state, "handoffs.jsonl")
     descriptor = os.open(ledger, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        os.fchmod(descriptor, 0o600)
+        paths.fchmod_private(descriptor, 0o600)
         payload = (json.dumps(record, separators=(",", ":"),
                               allow_nan=False) + "\n").encode("utf-8")
         if os.write(descriptor, payload) != len(payload):

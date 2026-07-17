@@ -22,7 +22,6 @@ Fail-closed rules:
 import base64
 import contextlib
 import email.utils
-import fcntl
 import glob
 import hashlib
 import json
@@ -39,7 +38,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-from . import history, paths, registry, tokens
+from . import history, locks, paths, registry, tokens
 
 IDENTITY_TIMEOUT = paths.env_int("HEADROOM_IDENTITY_TIMEOUT", 15)
 CODEX_STALE_AFTER = paths.env_int("HEADROOM_CODEX_STALE_AFTER", 1800)
@@ -1272,17 +1271,14 @@ def collection_lock(blocking=True):
     """
     lock_path = paths.collect_lock_path()
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    with open(lock_path, "w") as lock:
-        try:
-            flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
-            fcntl.flock(lock, flags)
-        except BlockingIOError:
+    with open(lock_path, "a+") as lock:
+        if not locks.exclusive(lock, blocking=blocking):
             yield False
             return
         try:
             yield True
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+            locks.unlock(lock)
 
 
 def _run_token_scan(scan):

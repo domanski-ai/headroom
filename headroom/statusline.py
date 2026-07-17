@@ -9,14 +9,13 @@ Wire it up in ~/.claude/settings.json:
 
     {"statusLine": {"type": "command", "command": "headroom statusline"}}
 """
-import fcntl
 import json
 import os
 import re
 import sys
 import time
 
-from . import paths, registry
+from . import locks, paths, registry
 
 GREEN, YELLOW, ORANGE, RED, DIM, RESET = (
     "\x1b[32m", "\x1b[33m", "\x1b[38;5;208m", "\x1b[31m", "\x1b[2m", "\x1b[0m")
@@ -54,15 +53,15 @@ def _journal_session(payload, now=None):
     markers = paths.ensure_private(os.path.join(state, "session-journal"))
     marker = os.path.join(markers, session_id)
     try:
-        marker_fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        marker_fd = os.open(marker, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
         created = True
     except FileNotFoundError:
         return False
     except FileExistsError:
-        marker_fd = os.open(marker, os.O_WRONLY)
+        marker_fd = os.open(marker, os.O_RDWR)
         created = False
     try:
-        fcntl.flock(marker_fd, fcntl.LOCK_EX)
+        locks.exclusive(marker_fd)
         if not created and now - os.fstat(marker_fd).st_mtime < 60:
             return False
         model = payload.get("model")
@@ -78,13 +77,13 @@ def _journal_session(payload, now=None):
         }
         journal_lock = open(os.path.join(state, "sessions.lock"), "a+")
         try:
-            os.chmod(journal_lock.name, 0o600)
-            fcntl.flock(journal_lock, fcntl.LOCK_EX)
+            paths.chmod_private(journal_lock.name, 0o600)
+            locks.exclusive(journal_lock)
             flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
             descriptor = os.open(os.path.join(state, "sessions.jsonl"),
                                  flags, 0o600)
             try:
-                os.fchmod(descriptor, 0o600)
+                paths.fchmod_private(descriptor, 0o600)
                 encoded = (json.dumps(entry, separators=(",", ":"))
                            + "\n").encode()
                 if os.write(descriptor, encoded) != len(encoded):
@@ -93,12 +92,12 @@ def _journal_session(payload, now=None):
             finally:
                 os.close(descriptor)
         finally:
-            fcntl.flock(journal_lock, fcntl.LOCK_UN)
+            locks.unlock(journal_lock)
             journal_lock.close()
         os.utime(marker, (now, now))
         return True
     finally:
-        fcntl.flock(marker_fd, fcntl.LOCK_UN)
+        locks.unlock(marker_fd)
         os.close(marker_fd)
 
 

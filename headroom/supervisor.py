@@ -6,7 +6,6 @@ narrow subscription-cap phrase, and be corroborated by a fresh identity-bound
 usage collect before every remaining pre-stop check succeeds.
 """
 import contextlib
-import fcntl
 import json
 import math
 import os
@@ -16,12 +15,19 @@ import shutil
 import signal
 import subprocess
 import sys
-import termios
 import time
 import uuid
 from dataclasses import dataclass, field, replace
 
-from . import collect, handoff, notify, paths, registry, route
+try:
+    import termios
+except ImportError:  # Windows has no POSIX terminal settings API.
+    termios = None
+
+from . import collect, handoff, locks, notify, paths, registry, route
+
+UNSUPERVISED_MESSAGE = (
+    "supervision requires a Unix terminal — launching unsupervised")
 
 POLL_SECONDS = 0.25
 BIND_TIMEOUT = 30.0
@@ -237,15 +243,15 @@ def write_hook_event(stream=None, environ=None, now=None):
         descriptor = os.open(destination,
                              os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
-            os.fchmod(descriptor, 0o600)
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            paths.fchmod_private(descriptor, 0o600)
+            locks.exclusive(descriptor)
             encoded = (json.dumps(record, separators=(",", ":"),
                                   allow_nan=False) + "\n").encode("utf-8")
             if os.write(descriptor, encoded) != len(encoded):
                 raise SupervisorError("hook event append was incomplete")
             os.fsync(descriptor)
         finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            locks.unlock(descriptor)
             os.close(descriptor)
         return 0
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError,
@@ -543,10 +549,10 @@ def _read_events(child):
         return []
     try:
         with open(child.event_path, "rb") as handle:
-            fcntl.flock(handle, fcntl.LOCK_SH)
+            locks.shared(handle)
             handle.seek(child.event_offset)
             data = handle.read()
-            fcntl.flock(handle, fcntl.LOCK_UN)
+            locks.unlock(handle)
         if not data:
             return []
         if not data.endswith(b"\n"):
@@ -616,12 +622,12 @@ def _event_stop_guard(child):
         raise SupervisorError("cannot lock hook event journal before stop") \
             from error
     try:
-        fcntl.flock(handle, fcntl.LOCK_SH)
+        locks.shared(handle)
         if os.fstat(handle.fileno()).st_size != child.event_offset:
             raise SupervisorError("cap proof expired after a newer hook event")
         yield
     finally:
-        fcntl.flock(handle, fcntl.LOCK_UN)
+        locks.unlock(handle)
         handle.close()
 
 
@@ -1080,6 +1086,8 @@ class Supervisor:
 
     @staticmethod
     def _save_terminal():
+        if termios is None:
+            return None
         try:
             if sys.stdin.isatty():
                 return termios.tcgetattr(sys.stdin.fileno())
@@ -1089,7 +1097,7 @@ class Supervisor:
 
     @staticmethod
     def _restore_terminal(saved):
-        if saved is None:
+        if saved is None or termios is None:
             return
         try:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved)

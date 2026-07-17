@@ -224,6 +224,11 @@ def _prepare_launch(command, args):
             print("headroom: auto-handoff overrides are mutually exclusive",
                   file=sys.stderr)
             return 2
+        if supervisor.termios is None:
+            print(supervisor.UNSUPERVISED_MESSAGE, file=sys.stderr)
+            launch_note = "supervision unavailable on this platform"
+            return (command, args, fam, fallback, use_supervisor, launch_note,
+                    supervisor)
         configured = registry.auto_handoff()
         enabled = auto_flag or (configured and not no_auto_flag)
         if enabled:

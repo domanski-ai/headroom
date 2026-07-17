@@ -24,16 +24,17 @@ Codex reports cached input as a subset of input, so it is split into uncached
 import collections
 import contextlib
 import datetime
-import fcntl
 import hashlib
 import json
 import math
+import ntpath
 import os
+import posixpath
 import re
 import stat
 import time
 
-from . import paths, registry
+from . import locks, paths, registry
 
 
 SCHEMA_VERSION = 7
@@ -90,9 +91,46 @@ def _empty_day():
 
 def _safe_project_label(value):
     return (isinstance(value, str) and 1 <= len(value) <= 24
-            and "@" not in value and os.sep not in value
+            and "@" not in value and "/" not in value and "\\" not in value
             and not any(ord(character) < 32 or ord(character) == 127
                         for character in value))
+
+
+def _label_under_home(cwd, home, path_module):
+    if not isinstance(home, str) or not path_module.isabs(home):
+        return None
+    cwd = path_module.normpath(cwd)
+    home = path_module.normpath(home)
+    try:
+        common = path_module.commonpath((cwd, home))
+    except (OSError, TypeError, ValueError):
+        return None
+    if path_module.normcase(common) != path_module.normcase(home):
+        return None
+    if path_module.normcase(cwd) == path_module.normcase(home):
+        return "~"
+    return path_module.relpath(cwd, home).split(path_module.sep, 1)[0]
+
+
+def _recorded_home(cwd, path_module):
+    """Infer the user-profile root from a path recorded on another host."""
+    if path_module is posixpath:
+        parts = cwd.split("/")
+        if len(parts) >= 3 and parts[1] in ("home", "Users"):
+            return "/".join(parts[:3])
+        if len(parts) >= 2 and parts[1] == "root":
+            return "/root"
+        return None
+    drive, tail = ntpath.splitdrive(cwd)
+    parts = [part for part in tail.split("\\") if part]
+    if parts and parts[0].casefold() in ("users", "documents and settings") \
+            and len(parts) >= 2:
+        return drive + "\\" + "\\".join(parts[:2])
+    if drive.startswith("\\\\"):
+        if ntpath.basename(drive).casefold() == "users" and parts:
+            return drive + "\\" + parts[0]
+        return drive + "\\"
+    return None
 
 
 def _project_label(cwd, home=None):
@@ -100,16 +138,24 @@ def _project_label(cwd, home=None):
     if not isinstance(cwd, str) or not cwd:
         return None
     try:
-        home = os.path.realpath(os.path.abspath(
-            os.path.expanduser("~") if home is None else home))
-        if not os.path.isabs(cwd):
+        if "/" in cwd:
+            path_module = posixpath
+        elif re.match(r"^[A-Za-z]:\\", cwd) or cwd.startswith("\\\\"):
+            path_module = ntpath
+        else:
             return "other"
-        cwd = os.path.realpath(os.path.abspath(cwd))
-        if cwd == home:
-            return "~"
-        if os.path.commonpath((cwd, home)) != home:
+        if not path_module.isabs(cwd):
             return "other"
-        label = os.path.relpath(cwd, home).split(os.sep, 1)[0]
+        cwd = path_module.normpath(cwd)
+        homes = (home, os.environ.get("HOME"), os.environ.get("USERPROFILE"))
+        label = next((candidate for candidate in (
+            _label_under_home(cwd, value, path_module) for value in homes)
+            if candidate is not None), None)
+        if label is None:
+            label = _label_under_home(
+                cwd, _recorded_home(cwd, path_module), path_module)
+        if label is None:
+            return "other"
         return label if _safe_project_label(label) else "other"
     except (OSError, TypeError, ValueError):
         return "other"
@@ -756,7 +802,9 @@ def _open_contained(home, relative_path):
     path = os.path.join(home, *_relative_parts(relative_path))
     if not _inside_home(os.path.realpath(path), real_home):
         raise OSError("token source escapes account home")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     descriptor = os.open(path, flags)
     try:
         opened = os.fstat(descriptor)
@@ -902,20 +950,15 @@ def scan_lock(blocking=False):
     _ensure_storage()
     descriptor = os.open(
         paths.token_scan_lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
-    os.fchmod(descriptor, 0o600)
+    paths.fchmod_private(descriptor, 0o600)
     with os.fdopen(descriptor, "a+") as lock:
-        try:
-            flags = fcntl.LOCK_EX
-            if not blocking:
-                flags |= fcntl.LOCK_NB
-            fcntl.flock(lock, flags)
-        except BlockingIOError:
+        if not locks.exclusive(lock, blocking=blocking):
             yield False
             return
         try:
             yield True
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+            locks.unlock(lock)
 
 
 def _file_identity(entry):

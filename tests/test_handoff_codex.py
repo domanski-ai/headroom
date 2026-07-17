@@ -12,7 +12,6 @@ publish; only the process/network boundaries (codex app-server via
 collect.codex_live, collect.run_collect, local token reads) are stubbed.
 """
 import copy
-import fcntl
 import hashlib
 import inspect
 import io
@@ -25,9 +24,16 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from headroom import collect, handoff, handoff_codex, paths, route, tokens  # noqa: E402
+from headroom import (  # noqa: E402
+    collect, handoff, handoff_codex, locks, paths, route, tokens,
+)
+
+pytestmark = pytest.mark.skipif(
+    os.name == "nt", reason="transactional handoff is Unix-gated in v1")
 
 SID = "0199aaaa-bbbb-4ccc-8ddd-eeeeffff0001"
 OTHER_SID = "0199aaaa-bbbb-4ccc-8ddd-eeeeffff0002"
@@ -1039,9 +1045,11 @@ class PublishGateRaces(CodexHandoffBase):
             for name, lock_path in checks.items():
                 with open(lock_path, "a+") as handle:
                     try:
-                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        fcntl.flock(handle, fcntl.LOCK_UN)
-                        seen[name] = "free"
+                        if locks.exclusive(handle, blocking=False):
+                            locks.unlock(handle)
+                            seen[name] = "free"
+                        else:
+                            seen[name] = "held"
                     except OSError:
                         seen[name] = "held"
             return real_link(*args, **kwargs)
@@ -1081,9 +1089,11 @@ class ExecGate(CodexHandoffBase):
             for name, lock_path in checks.items():
                 with open(lock_path, "a+") as handle:
                     try:
-                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        fcntl.flock(handle, fcntl.LOCK_UN)
-                        seen[name] = "free"
+                        if locks.exclusive(handle, blocking=False):
+                            locks.unlock(handle)
+                            seen[name] = "free"
+                        else:
+                            seen[name] = "held"
                     except OSError:
                         seen[name] = "held"
             return "launched"

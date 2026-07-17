@@ -119,7 +119,7 @@ def backup_credentials(home, provider):
         source = os.path.join(home, filename)
         if os.path.exists(source):
             os.makedirs(directory, mode=0o700, exist_ok=True)
-            os.chmod(os.path.dirname(directory), 0o700)
+            paths.chmod_private(os.path.dirname(directory), 0o700)
             shutil.copy2(source, os.path.join(directory, filename))
             saved.append(filename)
     return directory if saved else None, saved
