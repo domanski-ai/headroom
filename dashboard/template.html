@@ -378,8 +378,8 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
 .proj-rows { padding: 3px 8px 10px 42px; border-top: 1px dashed var(--line); }
 .proj-row { display: flex; align-items: center; gap: 9px; padding: 3.5px 0;
             font: 500 9.5px/1.4 var(--mono); color: var(--ink-2); }
-.proj-label { flex: none; min-width: 96px; overflow: hidden;
-              text-overflow: ellipsis; white-space: nowrap; }
+.proj-label { flex: 0 1 96px; min-width: 48px; max-width: 40%;
+              overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .proj-bar { flex: 1 1 0; height: 5px; border-radius: 999px;
             background: var(--cell-bg); overflow: hidden; }
 .proj-bar i { display: block; width: var(--w); height: 100%;
@@ -418,8 +418,9 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
 .token-account-row .share + .val { margin-left: 0; }
 .token-account-row .rank-n { flex: none; width: 16px; color: var(--ink-3);
                              font-size: 9px; }
-.token-account-row .acct { color: var(--ink); overflow: hidden;
-                           text-overflow: ellipsis; white-space: nowrap; }
+.token-account-row .acct { flex: 0 1 auto; min-width: 0; color: var(--ink);
+                           overflow: hidden; text-overflow: ellipsis;
+                           white-space: nowrap; }
 .token-account-row .prov { flex: none; color: var(--ink-3); font-size: 8px;
                            letter-spacing: .06em; text-transform: uppercase; }
 .token-account-row .val { flex: none; margin-left: auto; color: var(--ink);
@@ -1646,6 +1647,8 @@ function renderTokenAccounts(){
   }
   const top=Math.max(ranked[0].lifetime_grand_total,1);
   const fleet=Math.max(ranked.reduce((sum,account)=>sum+account.lifetime_grand_total,0),1);
+  const expanded=new Set(Array.from(target.querySelectorAll(".proj-rows:not([hidden])"))
+    .map(panel=>panel.getAttribute("data-id")).filter(Boolean));
   target.innerHTML=ranked.map((account,index)=>{
     const rel=Math.max(1.5,account.lifetime_grand_total/top*100);
     const share=(account.lifetime_grand_total/fleet*100).toFixed(1);
@@ -1657,7 +1660,8 @@ function renderTokenAccounts(){
     let detail="";
     if(hasDetail){
       const pTop=Math.max(projects[0].grand_total,1);
-      detail='<div class="proj-rows" hidden>'+projects.map(item=>
+      const open=expanded.has(account.id);
+      detail='<div class="proj-rows" data-id="'+esc(account.id)+'"'+(open?"":" hidden")+">"+projects.map(item=>
         '<div class="proj-row"><span class="proj-label">'+esc(item.label)+
         '</span><span class="proj-bar"><i style="--w:'+
         Math.max(2,item.grand_total/pTop*100).toFixed(1)+'%"></i></span><span class="proj-val">'+
@@ -1674,7 +1678,8 @@ function renderTokenAccounts(){
       rankMedal(index+1)+
       '<span class="acct">'+esc(account.name)+'</span><span class="prov">'+
       esc(account.provider||"")+'</span>'+
-      (hasDetail?'<button type="button" class="row-toggle" aria-expanded="false" aria-label="Toggle breakdown for '+
+      (hasDetail?'<button type="button" class="row-toggle'+(expanded.has(account.id)?" open":"")+
+        '" aria-expanded="'+(expanded.has(account.id)?"true":"false")+'" aria-label="Toggle breakdown for '+
         esc(account.name)+'"><svg viewBox="0 0 10 10" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M3 2l4 3-4 3"/></svg></button>':"")+
       '<span class="share">'+esc(share)+'%</span><span class="val">'+
       esc(formatTokens(account.lifetime_grand_total))+
