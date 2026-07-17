@@ -254,6 +254,19 @@ class TokenParserTests(unittest.TestCase):
             "headroom": 120})
         self.assertEqual(parsed["last_project"], "headroom")
 
+    def test_cwd_bucketing_uses_the_recorded_path_convention(self):
+        with mock.patch.dict(os.environ, {
+                "HOME": r"C:\Users\scanner",
+                "USERPROFILE": r"C:\Users\scanner"}):
+            self.assertEqual(tokens._project_label(
+                "/home/recorder/headroom/feature"), "headroom")
+        self.assertEqual(tokens._project_label(
+            r"C:\Users\recorder\headroom\feature", home="/home/scanner"),
+            "headroom")
+        self.assertEqual(tokens._project_label(
+            r"\\server\recorder\dispatch\nested", home="/home/scanner"),
+            "dispatch")
+
     def test_project_cap_folds_thirteenth_label_into_other(self):
         day = "2026-07-11"
         files = {"slot": {
@@ -465,10 +478,12 @@ class TokenStoreTests(unittest.TestCase):
         self.env.stop()
         self.temp.cleanup()
 
-    def write(self, name, text, mode="w"):
+    def write(self, name, payload, mode="w"):
         path = os.path.join(self.project, name)
-        with open(path, mode, encoding="utf-8") as handle:
-            handle.write(text)
+        payload = payload.encode("utf-8") if isinstance(payload, str) else payload
+        binary_mode = "ab" if "a" in mode else "wb"
+        with open(path, binary_mode) as handle:
+            handle.write(payload)
         return path
 
     def state_entry(self, name):
@@ -490,7 +505,7 @@ class TokenStoreTests(unittest.TestCase):
         scan_day = datetime.datetime.fromtimestamp(
             NOW, datetime.timezone.utc).date().isoformat()
         with open(os.path.join(extra_project, "session.jsonl"), "w",
-                  encoding="utf-8") as handle:
+                  encoding="utf-8", newline="\n") as handle:
             handle.write(claude_line(
                 scan_day + "T00:00:00Z", "extra-r", "extra-m"))
         virtual_id = self.add_extra_root(
@@ -518,7 +533,7 @@ class TokenStoreTests(unittest.TestCase):
         sessions = os.path.join(extra_home, "sessions", "2026", "07")
         os.makedirs(sessions)
         with open(os.path.join(sessions, "rollout-extra.jsonl"), "w",
-                  encoding="utf-8") as handle:
+                  encoding="utf-8", newline="\n") as handle:
             handle.write(codex_line(
                 "2026-07-10T00:00:00Z", 20, 5, 10))
         virtual_id = self.add_extra_root(
@@ -542,7 +557,7 @@ class TokenStoreTests(unittest.TestCase):
         extra_project = os.path.join(extra_home, "projects", "pooled")
         os.makedirs(extra_project)
         first_path = os.path.join(extra_project, "first.jsonl")
-        with open(first_path, "w", encoding="utf-8") as handle:
+        with open(first_path, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(claude_line(
                 "2026-07-10T00:00:00Z", "first-r", "first-m",
                 cwd="/home/operator/headroom/private"))
@@ -558,7 +573,7 @@ class TokenStoreTests(unittest.TestCase):
         self.assertEqual(first_entry["attributed_slot"], "alpha")
 
         with open(os.path.join(extra_project, "second.jsonl"), "w",
-                  encoding="utf-8") as handle:
+                  encoding="utf-8", newline="\n") as handle:
             handle.write(claude_line(
                 "2026-07-10T00:01:00Z", "second-r", "second-m",
                 cwd="/home/operator/dispatch/nested"))
@@ -602,7 +617,7 @@ class TokenStoreTests(unittest.TestCase):
         extra_project = os.path.join(extra_home, "projects", "pooled")
         os.makedirs(extra_project)
         with open(os.path.join(extra_project, "legacy.jsonl"), "w",
-                  encoding="utf-8") as handle:
+                  encoding="utf-8", newline="\n") as handle:
             handle.write(claude_line(
                 "2026-07-10T00:00:00Z", "legacy-r", "legacy-m",
                 cwd="/home/operator/headroom/nested"))
@@ -644,7 +659,7 @@ class TokenStoreTests(unittest.TestCase):
         project = os.path.join(extra_home, "projects", "p")
         os.makedirs(project)
         with open(os.path.join(project, "session.jsonl"), "w",
-                  encoding="utf-8") as handle:
+                  encoding="utf-8", newline="\n") as handle:
             handle.write(claude_line(
                 "2026-07-10T00:00:00Z", "remove-r", "remove-m"))
         virtual_id = self.add_extra_root("Removable home", "claude", extra_home)
@@ -675,7 +690,7 @@ class TokenStoreTests(unittest.TestCase):
             project = os.path.join(home, "projects", "p")
             os.makedirs(project)
             with open(os.path.join(project, "session.jsonl"), "w",
-                      encoding="utf-8") as handle:
+                      encoding="utf-8", newline="\n") as handle:
                 handle.write(claude_line(
                     "2026-07-10T00:00:00Z", request, request))
 
@@ -700,11 +715,11 @@ class TokenStoreTests(unittest.TestCase):
         os.makedirs(project)
         os.makedirs(outside)
         with open(os.path.join(project, "inside.jsonl"), "w",
-                  encoding="utf-8") as handle:
+                  encoding="utf-8", newline="\n") as handle:
             handle.write(claude_line(
                 "2026-07-10T00:00:00Z", "inside-r", "inside-m"))
         with open(os.path.join(outside, "escaped.jsonl"), "w",
-                  encoding="utf-8") as handle:
+                  encoding="utf-8", newline="\n") as handle:
             handle.write(claude_line(
                 "2026-07-10T00:00:00Z", "outside-r", "outside-m"))
         os.symlink(outside, os.path.join(project, "escape"))
@@ -740,7 +755,7 @@ class TokenStoreTests(unittest.TestCase):
         project = os.path.join(extra_home, "projects", "p")
         os.makedirs(project)
         with open(os.path.join(project, "extra.jsonl"), "w",
-                  encoding="utf-8") as handle:
+                  encoding="utf-8", newline="\n") as handle:
             handle.write(claude_line(
                 "2026-07-10T00:00:00Z", "extra-r", "extra-m"))
         self.add_extra_root("Budget home", "claude", extra_home)
@@ -828,7 +843,7 @@ class TokenStoreTests(unittest.TestCase):
         path = self.write("one.jsonl", claude_line(
             "2026-07-10T00:00:00Z", "r1", "m1", output_tokens=4))
         tokens.collect([self.account], config=self.config, now=NOW, force=True)
-        with open(path, "a", encoding="utf-8") as handle:
+        with open(path, "a", encoding="utf-8", newline="\n") as handle:
             handle.write(claude_line(
                 "2026-07-10T00:00:01Z", "r1", "m1", output_tokens=10))
         tokens.collect(
@@ -885,7 +900,7 @@ class TokenStoreTests(unittest.TestCase):
             "2026-07-10T00:00:00Z", "r1", "m1"))
         tokens.collect([self.account], config=self.config, now=NOW, force=True)
         before = paths.load_json(paths.token_daily_path())
-        with open(path, "a", encoding="utf-8") as handle:
+        with open(path, "a", encoding="utf-8", newline="\n") as handle:
             handle.write("{malformed\n")
         with mock.patch.object(tokens, "_scan_file", side_effect=OSError("no")):
             self.assertTrue(tokens.collect(
@@ -894,18 +909,18 @@ class TokenStoreTests(unittest.TestCase):
         self.assertEqual(after["accounts"], before["accounts"])
 
     def test_unterminated_eof_fragment_is_re_read_after_completion(self):
-        prefix = "{}\n" * 1500 + claude_line(
-            "2026-07-10T00:00:00Z", "r1", "m1")
+        prefix = ("{}\n" * 1500 + claude_line(
+            "2026-07-10T00:00:00Z", "r1", "m1")).encode("utf-8")
         second = claude_line(
             "2026-07-10T00:00:01Z", "r2", "m2",
             input_tokens=2, output_tokens=4, cache_read=6,
-            cache_creation=8)
+            cache_creation=8).encode("utf-8")
         path = self.write("fragment.jsonl", prefix + second[:120])
         tokens.collect([self.account], config=self.config, now=NOW, force=True)
         first = self.state_entry("fragment.jsonl")
-        self.assertEqual(first["offset"], len(prefix.encode()))
+        self.assertEqual(first["offset"], len(prefix))
         self.assertLess(first["offset"], first["size"])
-        with open(path, "a", encoding="utf-8") as handle:
+        with open(path, "ab") as handle:
             handle.write(second[120:])
         tokens.collect(
             [self.account], config=self.config, now=NOW + 1, force=True)
@@ -934,7 +949,7 @@ class TokenStoreTests(unittest.TestCase):
             nonlocal appended
             if not appended:
                 appended = True
-                with open(path, "a", encoding="utf-8") as writer:
+                with open(path, "a", encoding="utf-8", newline="\n") as writer:
                     writer.write(second_line)
             return original(handle, provider, start=start, previous=previous,
                             end=end, now=now)
@@ -963,7 +978,7 @@ class TokenStoreTests(unittest.TestCase):
         tokens.collect([self.account], config=self.config, now=NOW, force=True)
         before = self.state_entry("rotate.jsonl")
         replacement = os.path.join(self.project, "replacement.jsonl")
-        with open(replacement, "w", encoding="utf-8") as handle:
+        with open(replacement, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(claude_line(
                 "2026-07-11T00:00:00Z", "r2", "m2",
                 input_tokens=1, output_tokens=1, cache_read=1,
@@ -982,17 +997,17 @@ class TokenStoreTests(unittest.TestCase):
             families={"sonnet": 4}))
 
     def test_same_inode_copy_truncate_checkpoint_mismatch_full_rescans(self):
-        prefix = "{}\n" * 1500
+        prefix = ("{}\n" * 1500).encode("utf-8")
         path = self.write("rewrite.jsonl", prefix + claude_line(
-            "2026-07-10T00:00:00Z", "old", "old"))
+            "2026-07-10T00:00:00Z", "old", "old").encode("utf-8"))
         tokens.collect(now=NOW, force=True)
         before = self.state_entry("rewrite.jsonl")
         inode = os.stat(path).st_ino
 
         replacement = prefix + claude_line(
-            "2026-07-11T00:00:00Z", "new", "new")
-        self.assertEqual(len(replacement.encode()), before["size"])
-        with open(path, "r+", encoding="utf-8") as handle:
+            "2026-07-11T00:00:00Z", "new", "new").encode("utf-8")
+        self.assertEqual(len(replacement), before["size"])
+        with open(path, "r+b") as handle:
             handle.seek(0)
             handle.write(replacement)
             handle.truncate()
@@ -1015,7 +1030,7 @@ class TokenStoreTests(unittest.TestCase):
         outside = os.path.join(self.temp.name, "outside")
         os.makedirs(outside)
         with open(os.path.join(outside, "escape.jsonl"), "w",
-                  encoding="utf-8") as handle:
+                  encoding="utf-8", newline="\n") as handle:
             handle.write(claude_line(
                 "2026-07-10T00:00:00Z", "outside", "outside"))
         os.symlink(outside, os.path.join(self.project, "escape"))
@@ -1332,7 +1347,7 @@ class TokenStoreTests(unittest.TestCase):
         paths.write_json_atomic(
             paths.token_scan_state_path(), state, mode=0o600)
 
-        with open(path, "a", encoding="utf-8") as handle:
+        with open(path, "a", encoding="utf-8", newline="\n") as handle:
             handle.write(claude_line(
                 "2026-07-10T00:00:01Z", "new-r", "new-m"))
         with mock.patch.object(

@@ -56,6 +56,17 @@ def _account(name="a", provider="claude"):
     return {"name": name, "provider": provider, "home": "/tmp/hr-t/" + name}
 
 
+def _install_fake_claude(directory):
+    os.makedirs(directory)
+    fake = os.path.join(os.path.dirname(__file__), "fake_claude.py")
+    if os.name == "nt":
+        launcher = os.path.join(directory, "claude.cmd")
+        with open(launcher, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(f'@"{sys.executable}" "{fake}" %*\n')
+    else:
+        os.symlink(fake, os.path.join(directory, "claude"))
+
+
 class LockAbstraction(unittest.TestCase):
     def test_unix_backend_is_a_direct_flock_passthrough(self):
         backend = mock.Mock(LOCK_EX=2, LOCK_NB=4, LOCK_SH=1, LOCK_UN=8)
@@ -492,6 +503,16 @@ class Redaction(unittest.TestCase):
 
 
 class ClaudeIdentity(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        bin_dir = os.path.join(self.temp.name, "bin")
+        _install_fake_claude(bin_dir)
+        self.env = mock.patch.dict(os.environ, {
+            "PATH": bin_dir + os.pathsep + os.environ.get("PATH", "")})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
     def _make_runner(self, payload):
         import subprocess
         class FakeResult:
@@ -1083,6 +1104,10 @@ class HandoffSafety(unittest.TestCase):
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        self.old_path = os.environ.get("PATH")
+        bin_dir = os.path.join(self.temp.name, "bin")
+        _install_fake_claude(bin_dir)
+        os.environ["PATH"] = bin_dir + os.pathsep + (self.old_path or "")
         self.old_headroom = os.environ.get("HEADROOM_DIR")
         os.environ["HEADROOM_DIR"] = os.path.join(self.temp.name, "headroom")
         self.old_cwd = os.getcwd()
@@ -1112,6 +1137,10 @@ class HandoffSafety(unittest.TestCase):
     def tearDown(self):
         self.binding.stop()
         os.chdir(self.old_cwd)
+        if self.old_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = self.old_path
         if self.old_headroom is None:
             os.environ.pop("HEADROOM_DIR", None)
         else:
@@ -1127,7 +1156,8 @@ class HandoffSafety(unittest.TestCase):
     def _journal(self, rows):
         state = os.path.join(os.environ["HEADROOM_DIR"], "state")
         os.makedirs(state, exist_ok=True)
-        with open(os.path.join(state, "sessions.jsonl"), "w") as handle:
+        with open(os.path.join(state, "sessions.jsonl"), "w",
+                  encoding="utf-8", newline="\n") as handle:
             for row in rows:
                 handle.write(json.dumps(row) + "\n")
 
@@ -1138,7 +1168,7 @@ class HandoffSafety(unittest.TestCase):
 
     def test_explicit_session_wins_over_ambiguous_journal(self):
         other = self._transcript(self.source_home, self.OTHER_SID)
-        with open(other, "w") as handle:
+        with open(other, "w", encoding="utf-8", newline="\n") as handle:
             handle.write("{}\n")
         self._journal([self._journal_row(self.OTHER_SID, other),
                        self._journal_row("33333333-3333-4333-8333-333333333333",
@@ -1198,14 +1228,16 @@ class HandoffSafety(unittest.TestCase):
     def test_unresolved_tool_use_refused(self):
         event = {"type": "assistant", "message": {"content": [
             {"type": "tool_use", "id": "x", "name": "Read"}]}}
-        with open(self.transcript, "w") as handle:
+        with open(self.transcript, "w", encoding="utf-8",
+                  newline="\n") as handle:
             handle.write(json.dumps(event) + "\n")
         with self.assertRaisesRegex(handoff.HandoffError, "mid-tool-call"):
             handoff.inspect_transcript(self.transcript)
 
     def test_destination_collision_refused(self):
         destination = self._transcript(self.target_home, self.SID)
-        with open(destination, "w") as handle:
+        with open(destination, "w", encoding="utf-8",
+                  newline="\n") as handle:
             handle.write("existing")
         digest = hashlib.sha256(self.bytes).hexdigest()
         with self.assertRaisesRegex(handoff.HandoffError, "does not overwrite"):
@@ -1216,7 +1248,8 @@ class HandoffSafety(unittest.TestCase):
         destination = handoff.destination_path(self.target_home, self.transcript,
                                                self.SID)
         os.makedirs(os.path.dirname(destination))
-        with open(destination, "w") as handle:
+        with open(destination, "w", encoding="utf-8",
+                  newline="\n") as handle:
             handle.write("existing")
         errors = io.StringIO()
         collision = handoff.HandoffError("atomic collision sentinel")
@@ -2392,7 +2425,8 @@ class AuthRefreshCommand(unittest.TestCase):
 
     def test_refresh_relogs_owned_slot_without_changing_registry_or_pins(self):
         def login(_argv, env):
-            self.assertEqual(env["CLAUDE_CONFIG_DIR"], self.home)
+            self.assertTrue(os.path.samefile(
+                env["CLAUDE_CONFIG_DIR"], self.home))
             self.assertNotIn("ANTHROPIC_API_KEY", env)
             with open(self.credentials, "w") as handle:
                 json.dump({"claudeAiOauth": {"accessToken": "new"}}, handle)

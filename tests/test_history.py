@@ -133,10 +133,19 @@ class HistoryPersistenceTests(unittest.TestCase):
     def test_byte_cap_prunes_retention_then_oldest_rows_to_eighty_percent(self):
         paths.ensure_private(paths.history_dir())
         cap = history.MIN_MAX_BYTES
-        line = (json.dumps(row(NOW - 10, 10), separators=(",", ":")) +
-                "\n").encode("utf-8")
+        rows = []
+        serialized = []
+        size = 0
+        while size <= cap:
+            value = row(NOW - 100_000 + len(rows), 10,
+                        name=r"C:\Users\runner\headroom")
+            line = (json.dumps(value, separators=(",", ":")) +
+                    "\n").encode("utf-8")
+            rows.append(value)
+            serialized.append(line)
+            size += len(line)
         with open(paths.history_path(), "wb") as handle:
-            handle.write(line * (cap // len(line) + 100))
+            handle.writelines(serialized)
         self.assertGreater(os.path.getsize(paths.history_path()), cap)
         with mock.patch.dict(os.environ, {
                 "HEADROOM_HISTORY_MAX_BYTES": "1",
@@ -145,10 +154,16 @@ class HistoryPersistenceTests(unittest.TestCase):
                                   wraps=os.replace) as replace:
             self.assertTrue(history.append_snapshot(snapshot(20), now=NOW))
         replace.assert_called_once()
-        appended_size = history._row_size(
-            history.project_snapshot(snapshot(20), ts=NOW))
-        self.assertLessEqual(os.path.getsize(paths.history_path()),
-                             int(cap * .8) + appended_size)
+        with open(paths.history_path(), "rb") as handle:
+            persisted = [json.loads(line) for line in handle]
+        kept = persisted[:-1]
+        self.assertLess(len(kept), len(rows))
+        self.assertEqual(kept, rows[-len(kept):])
+        self.assertEqual(persisted[-1],
+                         history.project_snapshot(snapshot(20), ts=NOW))
+        actual_size = sum(history._row_size(value) for value in persisted)
+        self.assertEqual(os.path.getsize(paths.history_path()), actual_size)
+        self.assertLessEqual(actual_size, cap)
 
     def test_pruning_happens_before_throttle(self):
         with mock.patch.dict(os.environ, {

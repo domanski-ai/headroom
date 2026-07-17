@@ -32,7 +32,7 @@ def session_id(slot, generation, transition=""):
 
 
 def append_event(path, event):
-    with open(path, "a", encoding="utf-8") as out:
+    with open(path, "a", encoding="utf-8", newline="\n") as out:
         out.write(json.dumps(event) + "\n")
         out.flush()
         os.fsync(out.fileno())
@@ -50,7 +50,8 @@ def main():
     generation = int(os.environ.get("HEADROOM_CHILD_GENERATION", "0"))
     state = os.environ.get("FAKE_CLAUDE_STATE", "/tmp")
     os.makedirs(state, exist_ok=True)
-    with open(os.path.join(state, "launches.jsonl"), "a", encoding="utf-8") as out:
+    with open(os.path.join(state, "launches.jsonl"), "a", encoding="utf-8",
+              newline="\n") as out:
         out.write(json.dumps({
             "args": args, "config_dir": os.environ.get("CLAUDE_CONFIG_DIR", ""),
             "cwd": os.getcwd(), "slot": slot, "generation": generation,
@@ -92,7 +93,7 @@ def main():
                  "message": {"model": "<synthetic>", "content": [
                  {"type": "text", "text":
                   "You've hit your session limit · resets 12:20pm (UTC)"}]}}
-    with open(transcript, "w", encoding="utf-8") as out:
+    with open(transcript, "w", encoding="utf-8", newline="\n") as out:
         if scenario == "corrupt":
             out.write('{"type":')
         else:
@@ -145,7 +146,7 @@ def main():
             reason="clear" if scenario == "clear" else "resume"))
         next_sid = session_id(slot, generation, scenario)
         next_transcript = os.path.join(directory, next_sid + ".jsonl")
-        with open(next_transcript, "w", encoding="utf-8") as out:
+        with open(next_transcript, "w", encoding="utf-8", newline="\n") as out:
             out.write(json.dumps({"type": "user", "message": {
                 "content": [{"type": "text", "text": "replacement"}]}}) + "\n")
             out.flush()
