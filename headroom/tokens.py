@@ -11,7 +11,7 @@ individual token counts are at most 10**12, only UTC days from 2020-01-01
 through scan-time +2 days are accepted. One file retains at most 512 distinct days;
 the daily store retains at most 3000 account/day entries. Scan state
 tracks at most 50,000 files and 24 MiB of serialized data; cold files unchanged
-for 30 days are compacted, then folded into per-slot archived subtotals before
+for 30 days are compacted, then folded into per-file subtotal sentinels before
 any last-resort entries are dropped. Crossing a cap after folding marks
 telemetry partial.
 
@@ -35,7 +35,7 @@ import time
 from . import paths, registry
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DEFAULT_SCAN_INTERVAL = 900
 MAX_PAYLOAD_DAYS = 400
 MAX_SESSION_SECONDS = 48 * 60 * 60
@@ -828,17 +828,16 @@ def _fold_entry(state, slot_id, relative_path, entry):
     if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
            for value in sentinel_values):
         return False
-    archived = state.setdefault("archived", {})
-    slot_archive = archived.setdefault(slot_id, {})
     entry_days, capped = _entry_days(entry)
     if capped:
         entry["partial"] = True
         return False
-    for day, counts in entry_days.items():
-        _add_day_record(slot_archive, day, counts)
     state["files"][slot_id][relative_path] = {
         "size": entry.get("size"),
         "mtime_ns": entry.get("mtime_ns"),
+        "st_dev": entry.get("st_dev"),
+        "st_ino": entry.get("st_ino"),
+        "days": entry_days,
         "folded": True,
     }
     return True
@@ -847,7 +846,6 @@ def _fold_entry(state, slot_id, relative_path, entry):
 def _enforce_state_budgets(state, now):
     """Compact, fold, then last-resort drop until global budgets hold."""
     files = state["files"]
-    state.setdefault("archived", {})
     entries = _state_entries(files)
     state["compacted_file_count"] = 0
     state["budget_dropped_files"] = {}
@@ -906,7 +904,9 @@ def _enforce_state_budgets(state, now):
 
     dropped = collections.Counter()
     remaining = len(entries)
-    drop_entries = _state_entries(files)
+    drop_entries = sorted(
+        _state_entries(files),
+        key=lambda item: (item[3].get("folded") is True, item[:3]))
     next_index = 0
     while next_index < len(drop_entries) and (
             remaining > MAX_TRACKED_FILES
@@ -948,17 +948,13 @@ def _enforce_state_budgets(state, now):
     return compacted, sum(dropped.values())
 
 
-def _daily_from_files(files, include_status=False, archived=None):
+def _daily_from_files(files, include_status=False):
     accounts = {}
     cardinality = 0
     partial = False
     seen_identities = set()
     if not isinstance(files, dict):
         return (accounts, partial) if include_status else accounts
-    archived = archived if isinstance(archived, dict) else {}
-    slot_ids = list(files)
-    slot_ids.extend(slot_id for slot_id in archived if slot_id not in files)
-
     def merge_days(target, days, owner=None):
         nonlocal cardinality, partial
         for day, counts in days.items():
@@ -971,13 +967,9 @@ def _daily_from_files(files, include_status=False, archived=None):
                 cardinality += 1
             _add_day_record(target, day, counts)
 
-    for slot_id in slot_ids:
-        slot_files = files.get(slot_id, {})
+    for slot_id, slot_files in files.items():
         if not isinstance(slot_id, str) or not isinstance(slot_files, dict):
             continue
-        archived_days = _normalized_days(archived.get(slot_id))
-        if archived_days:
-            merge_days(accounts.setdefault(slot_id, {}), archived_days)
         for entry in slot_files.values():
             if not isinstance(entry, dict):
                 continue
@@ -1045,15 +1037,12 @@ def collect(accounts=None, config=None, now=None, force=False):
         paths.write_json_atomic(paths.token_daily_path(), attempted, mode=0o600)
         old_files = old_state.get("files")
         old_files = old_files if isinstance(old_files, dict) else {}
-        old_archived = old_state.get("archived")
-        old_archived = old_archived if isinstance(old_archived, dict) else {}
         live = [account for account in accounts
                 if isinstance(account, dict)
                 and isinstance(account.get("id"), str)
                 and account.get("provider") in registry.PROVIDERS
                 and isinstance(account.get("home"), str)]
         files = {}
-        archived = {}
         failed_files = 0
         failed_root_slot_ids = []
         folded_changed_files = collections.Counter()
@@ -1063,9 +1052,6 @@ def collect(accounts=None, config=None, now=None, force=False):
             previous_files = old_files.get(slot_id)
             previous_files = previous_files \
                 if isinstance(previous_files, dict) else {}
-            previous_archive = _normalized_days(old_archived.get(slot_id))
-            if previous_archive:
-                archived[slot_id] = previous_archive
             slot_files = {}
             seen = set()
             successful_identities = set()
@@ -1126,15 +1112,14 @@ def collect(accounts=None, config=None, now=None, force=False):
             "extra_roots_partial": extra_roots_partial,
             "folded_changed_files": dict(folded_changed_files),
             "files": files,
-            "archived": archived,
         }
         # Materialize aggregation-only markers before measuring serialized
         # state; the second pass below recomputes totals after any evictions.
-        _daily_from_files(files, archived=archived)
+        _daily_from_files(files)
         compacted_files, budget_dropped_files = _enforce_state_budgets(
             state, now)
         daily_accounts, aggregate_partial = _daily_from_files(
-            files, include_status=True, archived=archived)
+            files, include_status=True)
         partial_files = sum(
             1 for slot_files in files.values() if isinstance(slot_files, dict)
             for entry in slot_files.values()
@@ -1187,11 +1172,6 @@ def remove_account(slot_id):
         state_changed = False
         if slot_id in state_files:
             del state_files[slot_id]
-            state_changed = True
-        state_archived = state.get("archived") \
-            if isinstance(state, dict) else None
-        if isinstance(state_archived, dict) and slot_id in state_archived:
-            del state_archived[slot_id]
             state_changed = True
         failed_root_slots = state.get("failed_root_slot_ids") \
             if isinstance(state, dict) else None

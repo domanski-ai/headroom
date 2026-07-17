@@ -108,8 +108,10 @@ registry slot name; provider is `claude` or `codex`; path is an absolute,
 existing directory. An invalid or disappeared path is skipped and makes the
 token result partial rather than breaking registry collection. Each usable
 entry is projected as a virtual slot with stable ID
-`x-<first 12 hex characters of sha256(label)>`. The `x-` namespace cannot
-collide with registry generation IDs, which are lowercase hexadecimal only.
+`x-<first 24 hex characters of sha256(label + NUL + provider + NUL +
+canonical-realpath(path))>`. Rebinding any of those three fields produces a
+fresh ID. The `x-` namespace cannot collide with registry generation IDs, which
+are lowercase hexadecimal only.
 
 The parser necessarily reads each JSONL record to reach its usage block, but
 message content is immediately discarded. Extra roots use the same discovery,

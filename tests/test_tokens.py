@@ -422,7 +422,7 @@ class TokenStoreTests(unittest.TestCase):
             "label": label, "provider": provider, "path": home,
         }]
         registry.save(self.config)
-        return registry.virtual_slot_id(label)
+        return registry.virtual_slot_id(label, provider, home)
 
     def test_extra_claude_root_scans_aggregates_and_enters_ranking(self):
         extra_home = os.path.join(self.temp.name, "interactive-claude")
@@ -497,6 +497,30 @@ class TokenStoreTests(unittest.TestCase):
             paths.token_scan_state_path())["files"])
         self.assertNotIn(virtual_id, paths.load_json(
             paths.token_daily_path())["accounts"])
+
+    def test_extra_root_rebinding_gets_fresh_id_and_prunes_old_state(self):
+        first_home = os.path.join(self.temp.name, "first-extra")
+        second_home = os.path.join(self.temp.name, "second-extra")
+        for home, request in ((first_home, "first"), (second_home, "second")):
+            project = os.path.join(home, "projects", "p")
+            os.makedirs(project)
+            with open(os.path.join(project, "session.jsonl"), "w",
+                      encoding="utf-8") as handle:
+                handle.write(claude_line(
+                    "2026-07-10T00:00:00Z", request, request))
+
+        old_id = self.add_extra_root("Rebound home", "claude", first_home)
+        tokens.collect(now=NOW, force=True)
+        new_id = self.add_extra_root("Rebound home", "claude", second_home)
+        self.assertNotEqual(new_id, old_id)
+
+        tokens.collect(now=NOW + 1, force=True)
+        state = paths.load_json(paths.token_scan_state_path())
+        daily = paths.load_json(paths.token_daily_path())
+        self.assertNotIn(old_id, state["files"])
+        self.assertNotIn(old_id, daily["accounts"])
+        self.assertIn(new_id, state["files"])
+        self.assertIn(new_id, daily["accounts"])
 
     def test_extra_root_containment_skips_symlinked_subdirectories(self):
         extra_home = os.path.join(self.temp.name, "contained")
@@ -986,22 +1010,32 @@ class TokenStoreTests(unittest.TestCase):
         state = {
             "schema_version": tokens.SCHEMA_VERSION,
             "files": {self.account["id"]: {"cold": entry}},
-            "archived": {}, "folded_changed_files": {},
+            "folded_changed_files": {},
         }
-        before = tokens._daily_from_files(
-            state["files"], archived=state["archived"])
+        expected_days = tokens._entry_days(entry)[0]
+        expected_state = {
+            "schema_version": tokens.SCHEMA_VERSION,
+            "files": {self.account["id"]: {"cold": {
+                "size": 5000, "mtime_ns": 0, "st_dev": 1, "st_ino": 2,
+                "days": expected_days, "folded": True,
+            }}},
+            "folded_changed_files": {}, "compacted_file_count": 1,
+            "budget_dropped_files": {}, "budget_partial": False,
+        }
+        budget = tokens._serialized_state_size(expected_state) + 1
+        before = tokens._daily_from_files(state["files"])
         with mock.patch.object(tokens, "MAX_TRACKED_FILES", 10), \
-                mock.patch.object(tokens, "MAX_SERIALIZED_STATE_BYTES", 1000):
+                mock.patch.object(tokens, "MAX_SERIALIZED_STATE_BYTES", budget):
             compacted, dropped = tokens._enforce_state_budgets(state, NOW)
-        after = tokens._daily_from_files(
-            state["files"], archived=state["archived"])
+        after = tokens._daily_from_files(state["files"])
 
         self.assertEqual((compacted, dropped), (1, 0))
         self.assertEqual(after, before)
         self.assertEqual(state["files"][self.account["id"]]["cold"], {
-            "size": 5000, "mtime_ns": 0, "folded": True})
+            "size": 5000, "mtime_ns": 0, "st_dev": 1, "st_ino": 2,
+            "days": expected_days, "folded": True})
         self.assertFalse(state["budget_partial"])
-        self.assertLessEqual(tokens._serialized_state_size(state), 1000)
+        self.assertLessEqual(tokens._serialized_state_size(state), budget)
 
     def test_folded_unchanged_file_skips_open_and_parse(self):
         path = self.write("cold.jsonl", claude_line(
@@ -1029,14 +1063,16 @@ class TokenStoreTests(unittest.TestCase):
             f"cold-{index}": {
                 "provider": "claude", "size": 100 + index,
                 "mtime_ns": 0 if index < 150 else NOW * 1_000_000_000,
+                "st_dev": 1, "st_ino": index,
                 "days": {
-                    "2026-07-10": day_counts(1, 1)},
+                    "2026-07-10": day_counts(
+                        1, 1, families={"other": 2})},
             }
             for index in range(300)
         }
         state = {
             "schema_version": tokens.SCHEMA_VERSION,
-            "files": {slot: files}, "archived": {},
+            "files": {slot: files},
             "folded_changed_files": {},
         }
         expected = {
@@ -1044,12 +1080,11 @@ class TokenStoreTests(unittest.TestCase):
             "files": {slot: {
                 path: {"size": entry["size"],
                        "mtime_ns": entry["mtime_ns"],
+                       "st_dev": entry["st_dev"],
+                       "st_ino": entry["st_ino"],
+                       "days": entry["days"],
                        "folded": True}
                 for path, entry in files.items()
-            }},
-            "archived": {slot: {
-                "2026-07-10": day_counts(
-                    300, 300, families={"other": 600}),
             }},
             "folded_changed_files": {},
             "compacted_file_count": 0,
@@ -1069,7 +1104,43 @@ class TokenStoreTests(unittest.TestCase):
         self.assertEqual(state, expected)
         self.assertLessEqual(serialized.call_count, 6)
 
-    def test_folded_changed_and_missing_stay_archived_without_double_count(self):
+    def test_folded_hardlink_identity_prevents_recount_on_next_scan(self):
+        source = self.write("hardlink-a.jsonl", claude_line(
+            "2026-07-10T00:00:00Z", "hardlink-r", "hardlink-m"))
+        linked = os.path.join(self.project, "hardlink-b.jsonl")
+        os.link(source, linked)
+        tokens.collect(now=NOW, force=True)
+        state = paths.load_json(paths.token_scan_state_path())
+        slot_files = state["files"][self.account["id"]]
+        folded_path = next(path for path, entry in slot_files.items()
+                           if not entry.get("duplicate_identity"))
+        candidate = json.loads(json.dumps(state))
+        self.assertTrue(tokens._fold_entry(
+            candidate, self.account["id"], folded_path,
+            candidate["files"][self.account["id"]][folded_path]))
+        budget = tokens._serialized_state_size(candidate)
+
+        with mock.patch.object(tokens, "COMPACT_AFTER_SECONDS", NOW * 2), \
+                mock.patch.object(tokens, "MAX_SERIALIZED_STATE_BYTES", budget):
+            _compacted, dropped = tokens._enforce_state_budgets(state, NOW)
+        self.assertEqual(dropped, 0)
+        sentinel = state["files"][self.account["id"]][folded_path]
+        current = os.stat(source)
+        self.assertEqual((sentinel["st_dev"], sentinel["st_ino"]),
+                         (current.st_dev, current.st_ino))
+        paths.write_json_atomic(
+            paths.token_scan_state_path(), state, mode=0o600)
+
+        other_path = next(path for path in slot_files if path != folded_path)
+        with mock.patch.object(
+                tokens, "_files", return_value=iter((folded_path, other_path))):
+            tokens.collect(now=NOW + 1, force=True)
+        daily = paths.load_json(paths.token_daily_path())
+        self.assertEqual(daily["accounts"][self.account["id"]][
+            "2026-07-10"]["grand_total"], 26)
+        self.assertEqual(daily["duplicate_file_count"], 1)
+
+    def test_folded_changed_and_missing_keep_subtotal_without_double_count(self):
         path = self.write("cold.jsonl", claude_line(
             "2026-07-10T00:00:00Z", "cold-r", "cold-m"))
         tokens.collect(now=NOW, force=True)
@@ -1111,10 +1182,10 @@ class TokenStoreTests(unittest.TestCase):
         self.assertEqual(missing["folded_changed_file_count"], 1)
         self.assertTrue(self.state_entry("cold.jsonl")["folded"])
 
-    def test_remove_account_purges_archived_totals(self):
+    def test_remove_account_purges_folded_totals(self):
         target = self.account["id"]
         survivor = slot_id("survivor")
-        archived = {
+        daily_accounts = {
             target: {"2026-07-10": day_counts(1, 2)},
             survivor: {"2026-07-11": day_counts(3, 4)},
         }
@@ -1122,10 +1193,12 @@ class TokenStoreTests(unittest.TestCase):
             "schema_version": tokens.SCHEMA_VERSION,
             "files": {
                 target: {"cold": {"size": 1, "mtime_ns": 2,
+                                    "days": daily_accounts[target],
                                     "folded": True}},
-                survivor: {},
+                survivor: {"cold": {"size": 3, "mtime_ns": 4,
+                                      "days": daily_accounts[survivor],
+                                      "folded": True}},
             },
-            "archived": archived,
             "failed_root_slot_ids": [], "failed_root_count": 0,
             "folded_changed_files": {target: 1, survivor: 2},
             "budget_dropped_files": {}, "budget_partial": False,
@@ -1137,42 +1210,42 @@ class TokenStoreTests(unittest.TestCase):
             "failed_root_slot_ids": [], "partial_file_count": 0,
             "duplicate_file_count": 0, "folded_changed_file_count": 3,
             "budget_dropped_file_count": 0,
-            "accounts": archived,
+            "accounts": daily_accounts,
         })
 
         tokens.remove_account(target)
         state = paths.load_json(paths.token_scan_state_path())
         daily = paths.load_json(paths.token_daily_path())
         self.assertNotIn(target, state["files"])
-        self.assertNotIn(target, state["archived"])
         self.assertNotIn(target, state["folded_changed_files"])
-        self.assertEqual(state["archived"], {survivor: archived[survivor]})
+        self.assertIn(survivor, state["files"])
         self.assertNotIn(target, daily["accounts"])
         self.assertEqual(daily["folded_changed_file_count"], 2)
         self.assertTrue(daily["partial"])
 
-    def test_last_resort_entry_drop_still_marks_partial(self):
+    def test_three_files_two_cap_never_recounts_evicted_folded_sentinel(self):
         for index in range(3):
             self.write(f"{index}.jsonl", claude_line(
                 "2026-07-10T00:00:00Z", f"r{index}", f"m{index}"))
         with mock.patch.object(tokens, "MAX_TRACKED_FILES", 2), \
                 mock.patch.object(tokens, "MAX_SERIALIZED_STATE_BYTES",
                                   10 * 1024 * 1024):
-            tokens.collect(now=NOW, force=True)
-        state = paths.load_json(paths.token_scan_state_path())
-        daily = paths.load_json(paths.token_daily_path())
-        entries = state["files"][self.account["id"]]
+            for scan_now in (NOW, NOW + 1):
+                tokens.collect(now=scan_now, force=True)
+                state = paths.load_json(paths.token_scan_state_path())
+                daily = paths.load_json(paths.token_daily_path())
+                entries = state["files"][self.account["id"]]
 
-        self.assertEqual(len(entries), 2)
-        self.assertTrue(all(entry.get("folded") is True
-                            for entry in entries.values()))
-        self.assertTrue(state["budget_partial"])
-        self.assertEqual(state["budget_dropped_files"], {
-            self.account["id"]: 1})
-        self.assertTrue(daily["partial"])
-        self.assertEqual(daily["budget_dropped_file_count"], 1)
-        self.assertEqual(daily["accounts"][self.account["id"]][
-            "2026-07-10"]["grand_total"], 78)
+                self.assertEqual(len(entries), 2)
+                self.assertTrue(all(entry.get("folded") is True
+                                    for entry in entries.values()))
+                self.assertTrue(state["budget_partial"])
+                self.assertEqual(state["budget_dropped_files"], {
+                    self.account["id"]: 1})
+                self.assertTrue(daily["partial"])
+                self.assertEqual(daily["budget_dropped_file_count"], 1)
+                self.assertEqual(daily["accounts"][self.account["id"]][
+                    "2026-07-10"]["grand_total"], 52)
 
     def test_scan_health_persists_attempt_and_success_separately(self):
         self.write("one.jsonl", claude_line(

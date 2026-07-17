@@ -118,12 +118,49 @@ class RegistryValidation(unittest.TestCase):
         self.assertEqual([root["name"] for root in roots], ["valid"])
 
     def test_virtual_slot_id_is_stable_and_outside_registry_namespace(self):
-        slot = registry.virtual_slot_id("Primary CLI home")
-        self.assertEqual(slot, registry.virtual_slot_id("Primary CLI home"))
-        self.assertNotEqual(slot, registry.virtual_slot_id("Another home"))
+        home = "/tmp/headroom-roots/../primary"
+        canonical = registry.expand(home)
+        expected = "x-" + hashlib.sha256(
+            f"Primary CLI home\0claude\0{canonical}".encode()).hexdigest()[:24]
+        slot = registry.virtual_slot_id(
+            "Primary CLI home", "claude", home)
+        self.assertEqual(slot, expected)
+        self.assertEqual(slot, registry.virtual_slot_id(
+            "Primary CLI home", "claude", canonical))
+        self.assertNotEqual(slot, registry.virtual_slot_id(
+            "Primary CLI home", "codex", canonical))
+        self.assertNotEqual(slot, registry.virtual_slot_id(
+            "Primary CLI home", "claude", "/tmp/another-home"))
         self.assertRegex(slot, registry.VIRTUAL_ID_RE)
         self.assertNotRegex(slot, registry.ID_RE)
         self.assertNotEqual(slot, _slot_id("Primary CLI home"))
+
+    def test_token_extra_roots_reject_derived_id_and_canonical_root_collisions(self):
+        base = {"schema_version": 1, "accounts": [_account("alpha")]}
+        duplicate_roots = (
+            [
+                {"label": "one", "provider": "claude", "path": "/tmp/root"},
+                {"label": "two", "provider": "codex", "path": "/tmp/./root"},
+            ],
+            [{"label": "one", "provider": "claude",
+              "path": _account("alpha")["home"]}],
+        )
+        for roots in duplicate_roots:
+            config = dict(base, dashboard={"token_extra_roots": roots})
+            with self.subTest(roots=roots), \
+                    self.assertRaisesRegex(
+                        registry.RegistryError, "canonical root"):
+                registry.validate(config)
+
+        collision = dict(base, dashboard={"token_extra_roots": [
+            {"label": "one", "provider": "claude", "path": "/tmp/one"},
+            {"label": "two", "provider": "codex", "path": "/tmp/two"},
+        ]})
+        with mock.patch.object(
+                registry, "virtual_slot_id", return_value="x-" + "a" * 24), \
+                self.assertRaisesRegex(registry.RegistryError,
+                                       "duplicate derived id"):
+            registry.validate(collision)
 
     def test_rejects_invalid_or_duplicate_slot_ids(self):
         invalid = {"schema_version": 1, "accounts": [

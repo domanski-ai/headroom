@@ -41,7 +41,7 @@ from . import paths
 PROVIDERS = ("claude", "codex")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 ID_RE = re.compile(r"^[0-9a-f]{12,32}$")
-VIRTUAL_ID_RE = re.compile(r"^x-[0-9a-f]{12}$")
+VIRTUAL_ID_RE = re.compile(r"^x-[0-9a-f]{24}$")
 DEFAULT_DASHBOARD = {
     "theme": "midnight",
     "title": "AI Fleet",
@@ -90,9 +90,10 @@ def expand(path):
     return os.path.realpath(os.path.abspath(os.path.expanduser(path)))
 
 
-def virtual_slot_id(label):
+def virtual_slot_id(label, provider, home):
     """Return the stable, non-registry namespace ID for an extra token root."""
-    return "x-" + hashlib.sha256(label.encode("utf-8")).hexdigest()[:12]
+    identity = "\0".join((label, provider, expand(home)))
+    return "x-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
 
 
 def _token_extra_root_entries(config):
@@ -104,6 +105,11 @@ def _token_extra_root_entries(config):
     if not isinstance(entries, list):
         raise RegistryError("dashboard.token_extra_roots must be a list")
     labels = {account.get("name") for account in config.get("accounts", [])}
+    roots = {expand(account["home"])
+             for account in config.get("accounts", [])
+             if isinstance(account, dict)
+             and isinstance(account.get("home"), str)}
+    derived_ids = set()
     for entry in entries:
         if not isinstance(entry, dict):
             raise RegistryError("dashboard.token_extra_roots entries must be objects")
@@ -118,6 +124,18 @@ def _token_extra_root_entries(config):
         if provider not in PROVIDERS:
             raise RegistryError(
                 f"token extra-root {label}: provider must be one of {PROVIDERS}")
+        home = entry.get("path")
+        if isinstance(home, str):
+            root = expand(home)
+            if root in roots:
+                raise RegistryError(
+                    f"token extra-root {label}: canonical root already used")
+            derived_id = virtual_slot_id(label, provider, root)
+            if derived_id in derived_ids:
+                raise RegistryError(
+                    f"token extra-root {label}: duplicate derived id")
+            roots.add(root)
+            derived_ids.add(derived_id)
         labels.add(label)
     return entries
 
@@ -216,7 +234,7 @@ def token_extra_roots(config=None, include_status=False):
             continue
         label = entry["label"]
         result.append({
-            "id": virtual_slot_id(label),
+            "id": virtual_slot_id(label, entry["provider"], path),
             "name": label,
             "provider": entry["provider"],
             "home": expand(path),

@@ -175,7 +175,9 @@ and be unique across extra-root labels and account-slot names. `provider` is
 `claude` or `codex`; `path` must be an absolute path to an existing directory.
 An unusable path is skipped and token telemetry is marked partial. Removing an
 entry removes its row from the next dashboard payload immediately; private scan
-state for it is pruned by the next token scan.
+state for it is pruned by the next token scan. Its virtual ID derives from the
+label, provider, and canonical real path, so rebinding any field creates a new
+row and retires the old state.
 
 An extra-root row represents the configured **home**, not a provider account.
 CLI transcripts contain no trustworthy account identity, so activity from
