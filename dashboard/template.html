@@ -367,6 +367,30 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
               font-size: 10px; }
 .hero-brand svg { width: 11px; height: 11px; }
 .hero-url { margin-left: auto; }
+.row-toggle { flex: none; display: inline-flex; align-items: center;
+              justify-content: center; width: 18px; height: 18px; border: 0;
+              border-radius: 4px; background: none; color: var(--ink-3);
+              cursor: pointer; }
+.row-toggle:hover { background: var(--panel-2); color: var(--ink); }
+.row-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.row-toggle svg { width: 9px; height: 9px; transition: transform .12s; }
+.row-toggle.open svg { transform: rotate(90deg); }
+.proj-rows { padding: 3px 8px 10px 42px; border-top: 1px dashed var(--line); }
+.proj-row { display: flex; align-items: center; gap: 9px; padding: 3.5px 0;
+            font: 500 9.5px/1.4 var(--mono); color: var(--ink-2); }
+.proj-label { flex: none; min-width: 96px; overflow: hidden;
+              text-overflow: ellipsis; white-space: nowrap; }
+.proj-bar { flex: 1 1 0; height: 5px; border-radius: 999px;
+            background: var(--cell-bg); overflow: hidden; }
+.proj-bar i { display: block; width: var(--w); height: 100%;
+              border-radius: inherit;
+              background: color-mix(in srgb, var(--accent) 65%, transparent); }
+.proj-val { flex: none; min-width: 64px; text-align: right; color: var(--ink);
+            font-weight: 700; }
+.proj-val small { color: var(--ink-3); font-weight: 500; }
+.proj-note { margin: 8px 0 2px; color: var(--ink-3);
+             font: 650 8px/1.3 var(--mono); letter-spacing: .1em;
+             text-transform: uppercase; }
 .mix-bar { display: flex; height: 9px; margin: 12px 0 8px; border-radius: 999px;
            overflow: hidden; background: var(--cell-bg); }
 .mix-bar i { display: block; height: 100%; }
@@ -1569,6 +1593,11 @@ function renderTokenStats(){
     insightRow("Active days",esc(summary.active_days))+
     insightRow("Most used model",esc(model.label||"n/a")+
       (model.share_pct!=null?" · "+esc(model.share_pct)+"%":""))+
+    (Array.isArray(summary.projects)?summary.projects.filter(item=>
+      item&&typeof item.label==="string"&&Number.isFinite(item.grand_total)).slice(0,3)
+      .map(item=>insightRow(item.label,
+        esc(formatTokens(item.grand_total))+
+        (Number.isFinite(item.share_pct)?" · "+esc(item.share_pct)+"%":""))).join(""):"")+
     (mix.length?'<div class="mix-bar" aria-hidden="true">'+mix.map(item=>
       '<i style="width:'+Math.min(100,Math.max(1,item.share_pct))+"%;background:"+
       (MIX_COLORS[item.label]||MIX_COLORS.other)+'"></i>').join("")+"</div>"+
@@ -1620,13 +1649,45 @@ function renderTokenAccounts(){
   target.innerHTML=ranked.map((account,index)=>{
     const rel=Math.max(1.5,account.lifetime_grand_total/top*100);
     const share=(account.lifetime_grand_total/fleet*100).toFixed(1);
-    return '<div class="token-account-row"><span class="row-fill" style="--w:'+rel.toFixed(1)+'%" aria-hidden="true"></span>'+
+    const projects=Array.isArray(account.projects)?account.projects.filter(item=>
+      item&&typeof item.label==="string"&&Number.isFinite(item.grand_total)):[];
+    const attributed=Array.isArray(account.attributed_breakdown)?account.attributed_breakdown.filter(item=>
+      item&&typeof item.name==="string"&&Number.isFinite(item.grand_total)):[];
+    const hasDetail=projects.length>0;
+    let detail="";
+    if(hasDetail){
+      const pTop=Math.max(projects[0].grand_total,1);
+      detail='<div class="proj-rows" hidden>'+projects.map(item=>
+        '<div class="proj-row"><span class="proj-label">'+esc(item.label)+
+        '</span><span class="proj-bar"><i style="--w:'+
+        Math.max(2,item.grand_total/pTop*100).toFixed(1)+'%"></i></span><span class="proj-val">'+
+        esc(formatTokens(item.grand_total))+
+        (Number.isFinite(item.share_pct)?' <small>'+esc(item.share_pct)+"%</small>":"")+"</span></div>").join("")+
+        (attributed.length>1||attributed.some(item=>item.name!=="earlier")?
+          '<div class="proj-note">by account (stamped going forward)</div>'+
+          attributed.map(item=>'<div class="proj-row"><span class="proj-label">'+esc(item.name)+
+          '</span><span class="proj-val">'+esc(formatTokens(item.grand_total))+"</span></div>").join(""):"")+
+        "</div>";
+    }
+    return '<div class="token-account-row'+(hasDetail?" has-detail":"")+
+      '"><span class="row-fill" style="--w:'+rel.toFixed(1)+'%" aria-hidden="true"></span>'+
       rankMedal(index+1)+
       '<span class="acct">'+esc(account.name)+'</span><span class="prov">'+
-      esc(account.provider||"")+'</span><span class="share">'+esc(share)+'%</span><span class="val">'+
+      esc(account.provider||"")+'</span>'+
+      (hasDetail?'<button type="button" class="row-toggle" aria-expanded="false" aria-label="Toggle breakdown for '+
+        esc(account.name)+'"><svg viewBox="0 0 10 10" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M3 2l4 3-4 3"/></svg></button>':"")+
+      '<span class="share">'+esc(share)+'%</span><span class="val">'+
       esc(formatTokens(account.lifetime_grand_total))+
-      "<small>7d "+esc(formatTokens(account.last7d_grand_total))+"</small></span></div>";
+      "<small>7d "+esc(formatTokens(account.last7d_grand_total))+"</small></span></div>"+detail;
   }).join("");
+  target.querySelectorAll(".row-toggle").forEach(button=>button.addEventListener("click",()=>{
+    const row=button.closest(".token-account-row"),panel=row&&row.nextElementSibling;
+    if(!panel||!panel.classList.contains("proj-rows"))return;
+    const open=panel.hidden;
+    panel.hidden=!open;
+    button.setAttribute("aria-expanded",open?"true":"false");
+    button.classList.toggle("open",open);
+  }));
 }
 
 function validateHistory(data){
