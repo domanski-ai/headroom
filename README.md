@@ -156,10 +156,32 @@ Enable it in `~/.headroom/config.json`:
 ```json
 {
   "dashboard": {
-    "token_stats": true
+    "token_stats": true,
+    "token_extra_roots": [
+      {
+        "label": "Primary Claude home",
+        "provider": "claude",
+        "path": "/home/you/.claude"
+      }
+    ]
   }
 }
 ```
+
+`token_extra_roots` adds local CLI homes that are not registered account
+slots. Each entry becomes its own labeled row in token rankings and contributes
+to the fleet activity heatmap. Labels must be 1–40 characters, contain no `@`,
+and be unique across extra-root labels and account-slot names. `provider` is
+`claude` or `codex`; `path` must be an absolute path to an existing directory.
+An unusable path is skipped and token telemetry is marked partial. Removing an
+entry removes its row from the next dashboard payload immediately; private scan
+state for it is pruned by the next token scan. Its virtual ID derives from the
+label, provider, and canonical real path, so rebinding any field creates a new
+row and retires the old state.
+
+An extra-root row represents the configured **home**, not a provider account.
+CLI transcripts contain no trustworthy account identity, so activity from
+rotating logins that shared one home cannot be split or attributed per account.
 
 Or set `HEADROOM_TOKEN_STATS=1` for the headroom process. Disable it by removing
 that environment variable and removing the setting or changing it to `false`.
@@ -167,18 +189,19 @@ The off state does not scan session logs or attach token data to the dashboard
 payload.
 
 When enabled, headroom streams Claude Code's `projects/**/*.jsonl` and Codex's
-`sessions/**/rollout-*.jsonl` under each registered account home. It stores
-daily numeric aggregates and private incremental byte-offset state under
-`state/tokens/`; it never stores message content, emails, or raw provider
-identities. The headline count is input + output + cache creation. Cache reads
-are kept as a separate number, so total tokens processed can still be derived
-without inflating the headline. Scans run at most every 15 minutes by default
-and only read new files or appended tails after the first backfill; override
-the interval with `HEADROOM_TOKEN_SCAN_INTERVAL` (seconds).
+`sessions/**/rollout-*.jsonl` under each registered account home and valid extra
+root. It stores daily numeric aggregates and private incremental byte-offset
+state under `state/tokens/`; it never stores message content, emails, or raw
+provider identities. The headline count is input + output + cache creation.
+Cache reads are kept as a separate number, so total tokens processed can still
+be derived without inflating the headline. Scans run at most every 15 minutes
+by default and only read new files or appended tails after the first backfill;
+override the interval with `HEADROOM_TOKEN_SCAN_INTERVAL` (seconds).
 
-Coverage is local to this machine and these registered homes. Sessions run on
-another machine do not appear until their logs exist here. Static dashboard
-exports can show the embedded token aggregates without adding an endpoint.
+Coverage is local to this machine and the configured registered/extra homes.
+Sessions run on another machine do not appear until their logs exist here.
+Static dashboard exports can show the embedded token aggregates without adding
+an endpoint.
 
 ## Widgets
 

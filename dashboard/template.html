@@ -310,30 +310,88 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
 .token-stats[hidden] { display: none; }
 .token-partial { margin: 0; color: var(--ink-3); font: 500 9px/1.4 var(--mono); }
 .token-partial[hidden] { display: none; }
-.token-summary { display: flex; border: 1px solid var(--line);
-                 border-radius: var(--radius); background: var(--panel);
-                 box-shadow: var(--panel-shadow); }
-.token-tile { flex: 1 1 0; min-width: 0; padding: 16px 12px 14px;
-              border-left: 1px solid var(--line); text-align: center; }
-.token-tile:first-child { border-left: 0; }
-.token-tile strong { display: block; overflow: hidden; text-overflow: ellipsis;
-                     white-space: nowrap; color: var(--ink);
-                     font: 800 20px/1.1 var(--mono); letter-spacing: -.03em; }
-.token-tile span { display: block; margin-top: 6px; color: var(--ink-3);
-                   font: 600 8.5px/1.3 var(--mono); letter-spacing: .07em;
-                   text-transform: uppercase; }
-.token-tile small { display: block; margin-top: 3px; color: var(--ink-3);
-                    font: 500 8px/1.3 var(--mono); }
+.token-hero { position: relative; display: grid;
+              grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+              gap: 8px 30px; padding: 24px 24px 12px;
+              border: 1px solid var(--line-strong); border-radius: 14px;
+              background: var(--panel); box-shadow: var(--panel-shadow);
+              overflow: hidden; }
+.token-hero::before { content: ""; position: absolute; inset: 0;
+  background:
+    radial-gradient(ellipse 60% 90% at 12% -10%,
+      color-mix(in srgb, var(--accent) 13%, transparent), transparent 70%);
+  pointer-events: none; }
+.hero-main { position: relative; min-width: 0; }
+.hero-figure { color: var(--ink); font: 800 46px/1 var(--mono);
+               letter-spacing: -.05em;
+               text-shadow: 0 0 26px color-mix(in srgb, var(--accent) 40%, transparent); }
+.hero-figure-label { margin-top: 7px; color: var(--ink-3);
+                     font: 650 9px/1.3 var(--mono); letter-spacing: .14em;
+                     text-transform: uppercase; }
+.hero-badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 16px; }
+.hero-badge { display: inline-flex; align-items: baseline; padding: 5px 9px;
+              border: 1px solid var(--line); border-radius: 999px;
+              color: var(--ink-3); font: 500 9px/1.2 var(--mono);
+              background: color-mix(in srgb, var(--panel-2) 60%, transparent); }
+.hero-badge svg { width: 9px; height: 9px; margin-right: 5px;
+                  align-self: center; color: var(--accent); }
+.hero-badge b { color: var(--ink); font-weight: 750; }
+.hero-badge small { color: var(--ink-3); font-size: 8px; }
+.hero-podium { position: relative; min-width: 0; align-self: center; }
+.podium-title { margin-bottom: 9px; color: var(--ink-3);
+                font: 650 9px/1.3 var(--mono); letter-spacing: .14em;
+                text-transform: uppercase; }
+.podium-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+.podium-medal { flex: none; width: 18px; height: 18px; }
+.podium-name { flex: none; max-width: 34%; overflow: hidden;
+               text-overflow: ellipsis; white-space: nowrap;
+               color: var(--ink); font: 700 10.5px/1.2 var(--mono); }
+.podium-crown { flex: none; color: var(--accent); font: 650 7.5px/1 var(--mono);
+                letter-spacing: .1em; text-transform: uppercase;
+                border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+                border-radius: 3px; padding: 2px 4px; }
+.podium-bar { flex: 1 1 0; height: 8px; border-radius: 999px;
+              background: var(--cell-bg); overflow: hidden; }
+.podium-bar i { display: block; width: var(--w); height: 100%;
+                border-radius: inherit;
+                background: linear-gradient(90deg,
+                  color-mix(in srgb, var(--accent) 55%, transparent), var(--accent)); }
+.podium-val { flex: none; min-width: 44px; text-align: right;
+              color: var(--ink); font: 750 10.5px/1.2 var(--mono); }
+.hero-foot { position: relative; grid-column: 1 / -1; display: flex;
+             align-items: center; gap: 14px; margin-top: 12px; padding-top: 10px;
+             border-top: 1px solid var(--line); color: var(--ink-3);
+             font: 600 8.5px/1.2 var(--mono); letter-spacing: .04em; }
+.hero-brand { display: inline-flex; align-items: center; gap: 5px;
+              color: var(--ink-2); font-weight: 800; letter-spacing: -.03em;
+              font-size: 10px; }
+.hero-brand svg { width: 11px; height: 11px; }
+.hero-url { margin-left: auto; }
+.mix-bar { display: flex; height: 9px; margin: 12px 0 8px; border-radius: 999px;
+           overflow: hidden; background: var(--cell-bg); }
+.mix-bar i { display: block; height: 100%; }
+.mix-legend { display: flex; flex-wrap: wrap; gap: 5px 14px; }
+.mix-legend span { display: inline-flex; align-items: center; gap: 5px;
+                   color: var(--ink-2); font: 600 9px var(--mono); }
+.mix-legend i { display: block; width: 8px; height: 8px; border-radius: 2px; }
 .token-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 .insight-row { display: flex; justify-content: space-between; gap: 12px;
                padding: 9px 2px; border-top: 1px solid var(--line);
                color: var(--ink-2); font: 500 10.5px/1.4 var(--mono); }
 .insight-row:first-child { border-top: 0; }
 .insight-row b { color: var(--ink); font-weight: 700; text-align: right; }
-.token-account-row { display: flex; align-items: baseline; gap: 9px;
-                     padding: 9px 2px; border-top: 1px solid var(--line);
+.token-account-row { position: relative; display: flex; align-items: center;
+                     gap: 9px; padding: 9px 8px; border-top: 1px solid var(--line);
                      font: 600 10.5px/1.4 var(--mono); }
 .token-account-row:first-child { border-top: 0; }
+.token-account-row .row-fill { position: absolute; inset: 2px auto 2px 0;
+  width: var(--w); border-radius: 4px; pointer-events: none;
+  background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.token-account-row > :not(.row-fill) { position: relative; }
+.token-account-row .podium-medal { flex: none; width: 17px; height: 17px; }
+.token-account-row .share { flex: none; margin-left: auto; color: var(--ink-3);
+                            font: 600 9px/1.2 var(--mono); }
+.token-account-row .share + .val { margin-left: 0; }
 .token-account-row .rank-n { flex: none; width: 16px; color: var(--ink-3);
                              font-size: 9px; }
 .token-account-row .acct { color: var(--ink); overflow: hidden;
@@ -387,6 +445,15 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
 .token-heat-legend i:nth-of-type(3) { opacity: .43; }
 .token-heat-legend i:nth-of-type(4) { opacity: .68; }
 .token-heat-legend i:nth-of-type(5) { opacity: 1; }
+.week-bar { fill: var(--accent); opacity: .82; }
+.week-bar:hover { opacity: 1; }
+.cum-line { fill: none; stroke: var(--accent); stroke-width: 2.2;
+            stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.cum-cap { fill: var(--accent); stroke: var(--bg); stroke-width: 1.4; }
+.cum-total { fill: var(--accent); font: 800 13px var(--mono);
+             letter-spacing: -.03em; }
+.milestone-dot { fill: var(--bg); stroke: var(--accent); stroke-width: 1.6; }
+.milestone-label { fill: var(--ink-3); font: 650 8.5px var(--mono); }
 .token-mode-toggle { display: flex; gap: 14px; }
 .token-mode-toggle button { border: 0; background: none; padding: 2px 0;
   color: var(--ink-3); font: 600 10px var(--mono); cursor: pointer; }
@@ -450,10 +517,10 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
   .side-nav a[aria-current="page"] { border-bottom-color: var(--accent); }
   .side-note { display: none; }
   .shell { padding-top: 12px; }
-  .token-summary { flex-wrap: wrap; }
-  .token-tile { flex: 1 1 33%; border-left: 0; border-top: 1px solid var(--line); }
-  .token-tile:nth-child(-n+3) { border-top: 0; }
+  .token-hero { grid-template-columns: 1fr; gap: 16px; padding: 18px 16px 10px; }
+  .hero-figure { font-size: 34px; }
   .token-columns { grid-template-columns: 1fr; }
+  .token-account-row .share { display: none; }
   .stats-accounts { grid-template-columns: 1fr; }
 }
 @media (max-width: 560px) {
@@ -463,7 +530,7 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
   .stats-control select { width: 100%; }
   .stats-controls button { flex: 1 1 auto; align-self: end; }
   .stats-panel { padding: 13px; }
-  .token-tile strong { font-size: 18px; }
+  .hero-figure { font-size: 30px; }
   .stats-metrics { grid-template-columns: 1fr 1fr; }
 }
 
@@ -803,17 +870,27 @@ body.is-widget .shell { display: none; }
   <div class="token-stats" id="token-stats" hidden>
     <p class="token-partial" id="token-partial" hidden>Partial data</p>
     <p class="token-partial" id="token-stale" hidden>telemetry stale</p>
-    <section class="token-summary" aria-label="Token summary">
-      <article class="token-tile"><strong id="token-lifetime">–</strong>
-        <span>Lifetime tokens</span></article>
-      <article class="token-tile"><strong id="token-peak">–</strong>
-        <span>Peak tokens</span><small id="token-peak-date">–</small></article>
-      <article class="token-tile"><strong id="token-longest-session">–</strong>
-        <span>Longest session</span><small id="token-longest-session-note">–</small></article>
-      <article class="token-tile"><strong id="token-current-streak">–</strong>
-        <span>Current streak</span></article>
-      <article class="token-tile"><strong id="token-longest-streak">–</strong>
-        <span>Longest streak</span></article>
+    <section class="token-hero" aria-label="Fleet token summary">
+      <div class="hero-main">
+        <div class="hero-figure" id="token-lifetime">–</div>
+        <div class="hero-figure-label">tokens processed · all time</div>
+        <div class="hero-badges">
+          <span class="hero-badge"><svg viewBox="0 0 12 12" aria-hidden="true"><path fill="currentColor" d="M6.4.6C7 2.5 9.8 3.9 9.8 7a3.8 3.8 0 0 1-7.6 0c0-1.5.7-2.4 1.4-3.3 0 1 .3 1.7 1 2.2C4.7 4 5 2 6.4.6z"/></svg><b id="token-current-streak">–</b>&nbsp;streak</span>
+          <span class="hero-badge">best&nbsp;<b id="token-longest-streak">–</b></span>
+          <span class="hero-badge"><svg viewBox="0 0 12 12" aria-hidden="true"><path fill="currentColor" d="M6.8.8 2.4 7h2.8l-.9 4.2L8.9 5H6.1z"/></svg><b id="hero-sessions">–</b>&nbsp;sessions</span>
+          <span class="hero-badge">peak&nbsp;<b id="token-peak">–</b>&nbsp;<small id="token-peak-date">–</small></span>
+          <span class="hero-badge">longest session&nbsp;<b id="token-longest-session">–</b>&nbsp;<small id="token-longest-session-note">–</small></span>
+        </div>
+      </div>
+      <div class="hero-podium">
+        <div class="podium-title">Power users</div>
+        <div id="hero-podium"></div>
+      </div>
+      <footer class="hero-foot">
+        <span class="hero-brand"><svg viewBox="0 0 16 16" aria-hidden="true"><rect class="wm-a" x="1" y="9" width="3.4" height="6" rx="1.1"/><rect class="wm-b" x="6.3" y="5" width="3.4" height="10" rx="1.1"/><rect class="wm-c" x="11.6" y="1" width="3.4" height="14" rx="1.1"/></svg>headroom</span>
+        <span class="hero-date" id="hero-date">–</span>
+        <span class="hero-url">domanski.ai/usage</span>
+      </footer>
     </section>
     <section class="stats-panel panel" aria-labelledby="token-activity-title">
       <header class="stats-panel-head">
@@ -1374,18 +1451,52 @@ function renderTokenSeries(series,mode){
     (labelIndex===0?"start":labelIndex===tickIndexes.length-1?"end":"middle")+'">'+esc(tokenDate(series[index].date))+"</text>").join("");
   let drawing="";
   if(mode==="weekly"){
-    const gap=series.length>1?x(series[1])-x(series[0]):plotWidth,bar=Math.max(2,gap*.68);
-    drawing=series.map((point,index)=>'<rect class="token-heat-cell" data-level="4" x="'+
-      (x(point)-bar/2)+'" y="'+y(point.total)+'" width="'+bar+'" height="'+
-      Math.max(point.total>0?1:0,top+plotHeight-y(point.total))+'"><title>'+esc(point.date+": "+formatTokens(point.total)+" tokens")+
-      "</title></rect>").join("");
+    const gap=series.length>1?x(series[1])-x(series[0]):plotWidth,bar=Math.max(2,gap*.62);
+    const best=series.reduce((a,b)=>b.total>a.total?b:a,series[0]);
+    drawing=series.map(point=>'<rect class="week-bar" rx="2.5" x="'+
+      (x(point)-bar/2).toFixed(2)+'" y="'+y(point.total).toFixed(2)+'" width="'+bar.toFixed(2)+'" height="'+
+      Math.max(point.total>0?1.5:0,top+plotHeight-y(point.total)).toFixed(2)+'"><title>'+esc(point.date+": "+formatTokens(point.total)+" tokens")+
+      "</title></rect>").join("")+
+      (best.total>0?'<text class="chart-endlabel" fill="var(--accent)" text-anchor="middle" x="'+
+        x(best).toFixed(2)+'" y="'+(y(best.total)-6).toFixed(2)+'">'+esc(formatTokens(best.total))+"</text>":"");
   }else{
-    let line="M"+x(series[0]).toFixed(2)+" "+y(series[0].total).toFixed(2);
-    series.slice(1).forEach(point=>{line+=" H"+x(point).toFixed(2)+" V"+y(point.total).toFixed(2);});
-    drawing='<path class="chart-line" stroke="var(--accent)" d="'+line+'"></path>'+
-      '<circle fill="var(--accent)" cx="'+x(series[series.length-1]).toFixed(2)+'" cy="'+
-      y(series[series.length-1].total).toFixed(2)+'" r="2.8"><title>'+esc(formatTokens(series[series.length-1].total)+
-      " cumulative tokens")+"</title></circle>";
+    const pts=series.map(point=>({X:x(point),Y:y(point.total)}));
+    let line="M"+pts[0].X.toFixed(2)+" "+pts[0].Y.toFixed(2);
+    if(pts.length<3){
+      pts.slice(1).forEach(p=>{line+=" L"+p.X.toFixed(2)+" "+p.Y.toFixed(2);});
+    }else{
+      for(let i=1;i<pts.length-1;i++){
+        const mx=(pts[i].X+pts[i+1].X)/2,my=(pts[i].Y+pts[i+1].Y)/2;
+        line+=" Q"+pts[i].X.toFixed(2)+" "+pts[i].Y.toFixed(2)+" "+mx.toFixed(2)+" "+my.toFixed(2);
+      }
+      line+=" L"+pts[pts.length-1].X.toFixed(2)+" "+pts[pts.length-1].Y.toFixed(2);
+    }
+    const base=(top+plotHeight).toFixed(2);
+    const area=line+" L"+pts[pts.length-1].X.toFixed(2)+" "+base+
+      " L"+pts[0].X.toFixed(2)+" "+base+" Z";
+    // milestone markers: the largest crossed thresholds, max four labels
+    const THRESHOLDS=[1e9,2.5e9,5e9,1e10,2.5e10,5e10,1e11,2.5e11,5e11,1e12];
+    const crossed=THRESHOLDS.filter(t=>t>series[0].total&&t<=maximum).slice(-4);
+    let milestones="";
+    crossed.forEach(t=>{
+      const idx=series.findIndex(point=>point.total>=t);
+      if(idx<1)return;
+      const mx=x(series[idx]),my=y(t);
+      milestones+='<circle class="milestone-dot" cx="'+mx.toFixed(2)+'" cy="'+my.toFixed(2)+
+        '" r="3"><title>'+esc(formatTokens(t)+" · "+series[idx].date)+"</title></circle>"+
+        '<text class="milestone-label" x="'+(mx-7).toFixed(2)+'" y="'+(my-7).toFixed(2)+
+        '" text-anchor="end">'+esc(formatTokens(t))+"</text>";
+    });
+    const last=pts[pts.length-1];
+    drawing='<defs><linearGradient id="cumgrad" x1="0" y1="0" x2="0" y2="1">'+
+      '<stop offset="0" style="stop-color:var(--accent);stop-opacity:.28"/>'+
+      '<stop offset="1" style="stop-color:var(--accent);stop-opacity:0"/></linearGradient></defs>'+
+      '<path fill="url(#cumgrad)" d="'+area+'"></path>'+
+      '<path class="cum-line" d="'+line+'"></path>'+milestones+
+      '<circle class="cum-cap" cx="'+last.X.toFixed(2)+'" cy="'+last.Y.toFixed(2)+'" r="3.6"></circle>'+
+      '<text class="cum-total" x="'+Math.min(last.X-8,width-right-8).toFixed(2)+'" y="'+
+      Math.max(last.Y-10,top+10).toFixed(2)+'" text-anchor="end">'+
+      esc(formatTokens(series[series.length-1].total))+"</text>";
   }
   target.innerHTML='<svg viewBox="0 0 '+width+" "+height+'" role="img" aria-label="'+
     esc(mode==="weekly"?"Weekly grand-total token activity":"Cumulative grand-total token activity")+'">'+
@@ -1444,35 +1555,78 @@ function renderTokenStats(){
   document.getElementById("token-current-streak").textContent=streakLabel(summary.current_streak);
   document.getElementById("token-longest-streak").textContent=streakLabel(summary.longest_streak);
   const model=summary.most_used_model||{},families=summary.families||[];
+  document.getElementById("hero-sessions").textContent=formatTokens(summary.total_sessions);
+  document.getElementById("hero-date").textContent=statsDate(tokenStats.generated,false);
+  renderPodium();
   const insightRow=(label,value)=>'<div class="insight-row"><span>'+esc(label)+
     "</span><b>"+value+"</b></div>";
+  const MIX_COLORS={gpt:"var(--accent)",fable:"var(--green)",opus:"var(--yellow)",
+    sonnet:"var(--orange)",haiku:"var(--red)",other:"var(--ink-3)"};
+  const mix=families.filter(item=>Number.isFinite(item.share_pct)&&item.share_pct>0)
+    .slice().sort((a,b)=>b.share_pct-a.share_pct);
   document.getElementById("token-insights").innerHTML=
     insightRow("Total sessions",esc(summary.total_sessions))+
     insightRow("Active days",esc(summary.active_days))+
     insightRow("Most used model",esc(model.label||"n/a")+
       (model.share_pct!=null?" · "+esc(model.share_pct)+"%":""))+
-    families.slice(0,3).map(item=>insightRow(item.label+" tokens",
-      esc(formatTokens(item.tokens))+" · "+esc(item.share_pct)+"%")).join("");
+    (mix.length?'<div class="mix-bar" aria-hidden="true">'+mix.map(item=>
+      '<i style="width:'+Math.min(100,Math.max(1,item.share_pct))+"%;background:"+
+      (MIX_COLORS[item.label]||MIX_COLORS.other)+'"></i>').join("")+"</div>"+
+    '<div class="mix-legend">'+mix.map(item=>"<span><i style=\"background:"+
+      (MIX_COLORS[item.label]||MIX_COLORS.other)+'"></i>'+esc(item.label)+" "+
+      esc(item.share_pct)+"%</span>").join("")+"</div>":"");
   renderTokenAccounts();
   renderTokenActivity();
   renderLeaderboard(historyData);
 }
-function renderTokenAccounts(){
-  const target=document.getElementById("token-accounts");
-  const ranked=tokenStats.accounts.slice().sort((a,b)=>
+function rankMedal(rank){
+  if(rank>3)return '<span class="rank-n">'+rank+"</span>";
+  return '<svg class="podium-medal" viewBox="0 0 18 18" aria-label="rank '+rank+'">'+
+    (rank===1?'<circle cx="9" cy="9" r="7.4" fill="var(--accent)"></circle>'
+      +'<text x="9" y="12.2" text-anchor="middle" style="fill:var(--bg)" font-size="8.6" font-weight="800">1</text>'
+    :'<circle cx="9" cy="9" r="6.9" fill="none" stroke="var(--accent)" stroke-opacity=".55" stroke-width="1.4"></circle>'
+      +'<text x="9" y="12" text-anchor="middle" fill="var(--ink-2)" font-size="8.4" font-weight="750">'+rank+"</text>")+
+    "</svg>";
+}
+function rankedTokenAccounts(){
+  return tokenStats.accounts.slice().sort((a,b)=>
     b.lifetime_grand_total-a.lifetime_grand_total||
     b.last7d_grand_total-a.last7d_grand_total||
     a.name.localeCompare(b.name)||a.id.localeCompare(b.id));
+}
+function renderPodium(){
+  const target=document.getElementById("hero-podium");
+  const ranked=rankedTokenAccounts().slice(0,3);
+  if(!ranked.length){target.innerHTML='<div class="stats-inline-empty">No accounts yet.</div>';return;}
+  const top=Math.max(ranked[0].lifetime_grand_total,1);
+  target.innerHTML=ranked.map((account,index)=>{
+    const width=Math.max(3,Math.round(account.lifetime_grand_total/top*100));
+    return '<div class="podium-row">'+rankMedal(index+1)+
+      '<span class="podium-name">'+esc(account.name)+"</span>"+
+      (index===0?'<span class="podium-crown">power user</span>':"")+
+      '<div class="podium-bar"><i style="--w:'+width+'%"></i></div>'+
+      '<span class="podium-val">'+esc(formatTokens(account.lifetime_grand_total))+"</span></div>";
+  }).join("");
+}
+function renderTokenAccounts(){
+  const target=document.getElementById("token-accounts");
+  const ranked=rankedTokenAccounts();
   if(!ranked.length){
     target.innerHTML='<div class="stats-inline-empty">No live account slots yet.</div>';
     return;
   }
-  target.innerHTML=ranked.map((account,index)=>
-    '<div class="token-account-row"><span class="rank-n">'+(index+1)+
-    '</span><span class="acct">'+esc(account.name)+'</span><span class="prov">'+
-    esc(account.provider||"")+'</span><span class="val">'+
-    esc(formatTokens(account.lifetime_grand_total))+
-    "<small>7d "+esc(formatTokens(account.last7d_grand_total))+"</small></span></div>").join("");
+  const top=Math.max(ranked[0].lifetime_grand_total,1);
+  const fleet=Math.max(ranked.reduce((sum,account)=>sum+account.lifetime_grand_total,0),1);
+  target.innerHTML=ranked.map((account,index)=>{
+    const rel=Math.max(1.5,account.lifetime_grand_total/top*100);
+    const share=(account.lifetime_grand_total/fleet*100).toFixed(1);
+    return '<div class="token-account-row"><span class="row-fill" style="--w:'+rel.toFixed(1)+'%" aria-hidden="true"></span>'+
+      rankMedal(index+1)+
+      '<span class="acct">'+esc(account.name)+'</span><span class="prov">'+
+      esc(account.provider||"")+'</span><span class="share">'+esc(share)+'%</span><span class="val">'+
+      esc(formatTokens(account.lifetime_grand_total))+
+      "<small>7d "+esc(formatTokens(account.last7d_grand_total))+"</small></span></div>";
+  }).join("");
 }
 
 function validateHistory(data){

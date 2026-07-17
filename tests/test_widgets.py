@@ -530,9 +530,11 @@ console.log(JSON.stringify({
             for left, right in zip(
                 value["cumulative"], value["cumulative"][1:])))
         path_data = re.search(r' d="([^"]+)"', value["path"]).group(1)
-        self.assertIn(" H", path_data)
-        self.assertIn(" V", path_data)
-        self.assertNotIn(" L", path_data)
+        # cumulative renders as a smoothed monotone curve (midpoint quadratics
+        # with a straight closing segment), never the old step series
+        self.assertIn(" Q", path_data)
+        self.assertNotIn(" H", path_data)
+        self.assertNotIn(" V", path_data)
         self.assertEqual(value["clampedDays"],
                          ["2024-12-07", "2026-01-10"])
         self.assertEqual(value["futureClampedDays"],
@@ -1343,7 +1345,8 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertIn(
             'historyData&&!document.getElementById("stats-content").hidden',
             token_render)
-        self.assertIn('insightRow(item.label+" tokens"', token_render)
+        self.assertIn('class="mix-bar"', token_render)
+        self.assertIn("renderPodium();", token_render)
         render = template.split("function render(data,forceNoncurrent){",
                                 1)[1].split("\n}", 1)[0]
         self.assertIn(

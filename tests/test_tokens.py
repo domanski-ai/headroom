@@ -417,6 +417,172 @@ class TokenStoreTests(unittest.TestCase):
         return state["files"][self.account["id"]][
             "projects/project/" + name]
 
+    def add_extra_root(self, label, provider, home):
+        self.config["dashboard"]["token_extra_roots"] = [{
+            "label": label, "provider": provider, "path": home,
+        }]
+        registry.save(self.config)
+        return registry.virtual_slot_id(label, provider, home)
+
+    def test_extra_claude_root_scans_aggregates_and_enters_ranking(self):
+        extra_home = os.path.join(self.temp.name, "interactive-claude")
+        extra_project = os.path.join(extra_home, "projects", "interactive")
+        os.makedirs(extra_project)
+        scan_day = datetime.datetime.fromtimestamp(
+            NOW, datetime.timezone.utc).date().isoformat()
+        with open(os.path.join(extra_project, "session.jsonl"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(claude_line(
+                scan_day + "T00:00:00Z", "extra-r", "extra-m"))
+        virtual_id = self.add_extra_root(
+            "Primary CLI home", "claude", extra_home)
+
+        self.assertTrue(tokens.collect(now=NOW, force=True))
+        state = paths.load_json(paths.token_scan_state_path())
+        self.assertIn(virtual_id, state["files"])
+        payload = dashboard.display_snapshot(
+            usage_snapshot(self.account["id"]), evaluated_at=NOW,
+            config=self.config)["token_stats"]
+        rows = {row["id"]: row for row in payload["accounts"]}
+        self.assertEqual(rows[virtual_id]["name"], "Primary CLI home")
+        self.assertEqual(rows[virtual_id]["provider"], "claude")
+        self.assertEqual(rows[virtual_id]["lifetime_grand_total"], 26)
+        self.assertEqual(payload["days"][scan_day]["grand_total"], 26)
+        ranked = sorted(payload["accounts"], key=lambda row: (
+            -row["lifetime_grand_total"], -row["last7d_grand_total"],
+            row["name"], row["id"]))
+        self.assertEqual(ranked[0]["id"], virtual_id)
+
+    def test_extra_codex_root_uses_rollout_discovery(self):
+        extra_home = os.path.join(self.temp.name, "interactive-codex")
+        sessions = os.path.join(extra_home, "sessions", "2026", "07")
+        os.makedirs(sessions)
+        with open(os.path.join(sessions, "rollout-extra.jsonl"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(codex_line(
+                "2026-07-10T00:00:00Z", 20, 5, 10))
+        virtual_id = self.add_extra_root(
+            "Codex interactive", "codex", extra_home)
+
+        tokens.collect(now=NOW, force=True)
+        daily = paths.load_json(paths.token_daily_path())
+        self.assertEqual(daily["accounts"][virtual_id]["2026-07-10"][
+            "grand_total"], 30)
+
+    def test_extra_root_removal_hides_immediately_then_lazy_prunes_state(self):
+        extra_home = os.path.join(self.temp.name, "removable")
+        project = os.path.join(extra_home, "projects", "p")
+        os.makedirs(project)
+        with open(os.path.join(project, "session.jsonl"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(claude_line(
+                "2026-07-10T00:00:00Z", "remove-r", "remove-m"))
+        virtual_id = self.add_extra_root("Removable home", "claude", extra_home)
+        tokens.collect(now=NOW, force=True)
+        self.assertIn(virtual_id, paths.load_json(
+            paths.token_scan_state_path())["files"])
+
+        self.config["dashboard"]["token_extra_roots"] = []
+        registry.save(self.config)
+        payload = dashboard.display_snapshot(
+            usage_snapshot(self.account["id"]), evaluated_at=NOW,
+            config=self.config)["token_stats"]
+        self.assertNotIn(virtual_id, {
+            row["id"] for row in payload["accounts"]})
+        self.assertIn(virtual_id, paths.load_json(
+            paths.token_scan_state_path())["files"])
+
+        tokens.collect(now=NOW + 1, force=True)
+        self.assertNotIn(virtual_id, paths.load_json(
+            paths.token_scan_state_path())["files"])
+        self.assertNotIn(virtual_id, paths.load_json(
+            paths.token_daily_path())["accounts"])
+
+    def test_extra_root_rebinding_gets_fresh_id_and_prunes_old_state(self):
+        first_home = os.path.join(self.temp.name, "first-extra")
+        second_home = os.path.join(self.temp.name, "second-extra")
+        for home, request in ((first_home, "first"), (second_home, "second")):
+            project = os.path.join(home, "projects", "p")
+            os.makedirs(project)
+            with open(os.path.join(project, "session.jsonl"), "w",
+                      encoding="utf-8") as handle:
+                handle.write(claude_line(
+                    "2026-07-10T00:00:00Z", request, request))
+
+        old_id = self.add_extra_root("Rebound home", "claude", first_home)
+        tokens.collect(now=NOW, force=True)
+        new_id = self.add_extra_root("Rebound home", "claude", second_home)
+        self.assertNotEqual(new_id, old_id)
+
+        tokens.collect(now=NOW + 1, force=True)
+        state = paths.load_json(paths.token_scan_state_path())
+        daily = paths.load_json(paths.token_daily_path())
+        self.assertNotIn(old_id, state["files"])
+        self.assertNotIn(old_id, daily["accounts"])
+        self.assertIn(new_id, state["files"])
+        self.assertIn(new_id, daily["accounts"])
+
+    def test_extra_root_containment_skips_symlinked_subdirectories(self):
+        extra_home = os.path.join(self.temp.name, "contained")
+        project = os.path.join(extra_home, "projects", "p")
+        outside = os.path.join(self.temp.name, "outside")
+        os.makedirs(project)
+        os.makedirs(outside)
+        with open(os.path.join(project, "inside.jsonl"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(claude_line(
+                "2026-07-10T00:00:00Z", "inside-r", "inside-m"))
+        with open(os.path.join(outside, "escaped.jsonl"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(claude_line(
+                "2026-07-10T00:00:00Z", "outside-r", "outside-m"))
+        os.symlink(outside, os.path.join(project, "escape"))
+        virtual_id = self.add_extra_root("Contained home", "claude", extra_home)
+
+        tokens.collect(now=NOW, force=True)
+        files = paths.load_json(paths.token_scan_state_path())[
+            "files"][virtual_id]
+        self.assertEqual(set(files), {"projects/p/inside.jsonl"})
+
+    def test_invalid_extra_path_marks_scan_and_payload_partial(self):
+        missing = os.path.join(self.temp.name, "missing")
+        virtual_id = self.add_extra_root("Missing home", "claude", missing)
+        accounts, roots_partial = registry.token_accounts(
+            self.config, include_status=True)
+        self.assertTrue(roots_partial)
+        self.assertNotIn(virtual_id, {account["id"] for account in accounts})
+
+        tokens.collect(now=NOW, force=True)
+        state = paths.load_json(paths.token_scan_state_path())
+        daily = paths.load_json(paths.token_daily_path())
+        self.assertTrue(state["extra_roots_partial"])
+        self.assertTrue(daily["partial"])
+        payload = dashboard.display_snapshot(
+            usage_snapshot(self.account["id"]), evaluated_at=NOW,
+            config=self.config)["token_stats"]
+        self.assertTrue(payload["partial"])
+
+    def test_registry_and_extra_roots_share_global_file_budget(self):
+        self.write("registry.jsonl", claude_line(
+            "2026-07-10T00:00:00Z", "registry-r", "registry-m"))
+        extra_home = os.path.join(self.temp.name, "budget-extra")
+        project = os.path.join(extra_home, "projects", "p")
+        os.makedirs(project)
+        with open(os.path.join(project, "extra.jsonl"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(claude_line(
+                "2026-07-10T00:00:00Z", "extra-r", "extra-m"))
+        self.add_extra_root("Budget home", "claude", extra_home)
+
+        with mock.patch.object(tokens, "MAX_TRACKED_FILES", 1), \
+                mock.patch.object(tokens, "MAX_SERIALIZED_STATE_BYTES",
+                                  10 * 1024 * 1024):
+            tokens.collect(now=NOW, force=True)
+        state = paths.load_json(paths.token_scan_state_path())
+        self.assertEqual(sum(len(files) for files in state["files"].values()), 1)
+        self.assertEqual(sum(state["budget_dropped_files"].values()), 1)
+        self.assertTrue(paths.load_json(paths.token_daily_path())["partial"])
+
     def test_incremental_grown_new_and_unchanged_files(self):
         first = self.write(
             "one.jsonl", "{}\n" * 1500 + claude_line(
@@ -823,76 +989,263 @@ class TokenStoreTests(unittest.TestCase):
                             for slot_files in files.values()
                             for entry in slot_files.values()))
 
-    def test_state_budgets_compact_cold_files_then_mark_evictions_partial(self):
+    def test_state_budget_folding_preserves_aggregate_exactly(self):
+        first = int(datetime.datetime(
+            2026, 7, 10, tzinfo=datetime.timezone.utc).timestamp())
+        entry = {
+            "provider": "claude", "size": 5000, "mtime_ns": 0,
+            "st_dev": 1, "st_ino": 2, "offset": 5000,
+            "days": {
+                "2026-07-10": day_counts(
+                    10, 5, 3, 2, families={"sonnet": 20}),
+                "2026-07-11": day_counts(
+                    7, 4, families={"sonnet": 11}),
+            },
+            "first_event_ts": first, "last_event_ts": first + 3600,
+            "dedupe_tail": [{"signature": "a" * 64,
+                             "maximum": counts(1, 1, 1, 1)}
+                            for _ in range(20)],
+            "fingerprint": "f" * 64, "checkpoint_hash": "c" * 64,
+        }
+        state = {
+            "schema_version": tokens.SCHEMA_VERSION,
+            "files": {self.account["id"]: {"cold": entry}},
+            "folded_changed_files": {},
+        }
+        expected_days = tokens._entry_days(entry)[0]
+        expected_state = {
+            "schema_version": tokens.SCHEMA_VERSION,
+            "files": {self.account["id"]: {"cold": {
+                "size": 5000, "mtime_ns": 0, "st_dev": 1, "st_ino": 2,
+                "days": expected_days, "folded": True,
+            }}},
+            "folded_changed_files": {}, "compacted_file_count": 1,
+            "budget_dropped_files": {}, "budget_partial": False,
+        }
+        budget = tokens._serialized_state_size(expected_state) + 1
+        before = tokens._daily_from_files(state["files"])
+        with mock.patch.object(tokens, "MAX_TRACKED_FILES", 10), \
+                mock.patch.object(tokens, "MAX_SERIALIZED_STATE_BYTES", budget):
+            compacted, dropped = tokens._enforce_state_budgets(state, NOW)
+        after = tokens._daily_from_files(state["files"])
+
+        self.assertEqual((compacted, dropped), (1, 0))
+        self.assertEqual(after, before)
+        self.assertEqual(state["files"][self.account["id"]]["cold"], {
+            "size": 5000, "mtime_ns": 0, "st_dev": 1, "st_ino": 2,
+            "days": expected_days, "folded": True})
+        self.assertFalse(state["budget_partial"])
+        self.assertLessEqual(tokens._serialized_state_size(state), budget)
+
+    def test_folded_unchanged_file_skips_open_and_parse(self):
+        path = self.write("cold.jsonl", claude_line(
+            "2026-07-10T00:00:00Z", "cold-r", "cold-m"))
+        current = os.stat(path)
+        sentinel = {
+            "size": current.st_size,
+            "mtime_ns": current.st_mtime_ns,
+            "folded": True,
+        }
+        with mock.patch.object(
+                tokens, "_open_contained",
+                side_effect=AssertionError("opened folded file")), \
+                mock.patch.object(
+                    tokens, "_parse_stream",
+                    side_effect=AssertionError("parsed folded file")):
+            scanned = tokens._scan_file(
+                self.home, "projects/project/cold.jsonl", "claude", sentinel,
+                now=NOW)
+        self.assertEqual(scanned, sentinel)
+
+    def test_state_budget_measures_folding_in_batches(self):
+        slot = self.account["id"]
+        files = {
+            f"cold-{index}": {
+                "provider": "claude", "size": 100 + index,
+                "mtime_ns": 0 if index < 150 else NOW * 1_000_000_000,
+                "st_dev": 1, "st_ino": index,
+                "days": {
+                    "2026-07-10": day_counts(
+                        1, 1, families={"other": 2})},
+            }
+            for index in range(300)
+        }
+        state = {
+            "schema_version": tokens.SCHEMA_VERSION,
+            "files": {slot: files},
+            "folded_changed_files": {},
+        }
+        expected = {
+            "schema_version": tokens.SCHEMA_VERSION,
+            "files": {slot: {
+                path: {"size": entry["size"],
+                       "mtime_ns": entry["mtime_ns"],
+                       "st_dev": entry["st_dev"],
+                       "st_ino": entry["st_ino"],
+                       "days": entry["days"],
+                       "folded": True}
+                for path, entry in files.items()
+            }},
+            "folded_changed_files": {},
+            "compacted_file_count": 0,
+            "budget_dropped_files": {},
+            "budget_partial": False,
+        }
+        budget = tokens._serialized_state_size(expected) + 1
+        original_size = tokens._serialized_state_size
+        with mock.patch.object(tokens, "MAX_TRACKED_FILES", 1000), \
+                mock.patch.object(tokens, "MAX_SERIALIZED_STATE_BYTES", budget), \
+                mock.patch.object(
+                    tokens, "_serialized_state_size",
+                    wraps=original_size) as serialized:
+            _compacted, dropped = tokens._enforce_state_budgets(state, NOW)
+
+        self.assertEqual(dropped, 0)
+        self.assertEqual(state, expected)
+        self.assertLessEqual(serialized.call_count, 6)
+
+    def test_folded_hardlink_identity_prevents_recount_on_next_scan(self):
+        source = self.write("hardlink-a.jsonl", claude_line(
+            "2026-07-10T00:00:00Z", "hardlink-r", "hardlink-m"))
+        linked = os.path.join(self.project, "hardlink-b.jsonl")
+        os.link(source, linked)
+        tokens.collect(now=NOW, force=True)
+        state = paths.load_json(paths.token_scan_state_path())
+        slot_files = state["files"][self.account["id"]]
+        folded_path = next(path for path, entry in slot_files.items()
+                           if not entry.get("duplicate_identity"))
+        candidate = json.loads(json.dumps(state))
+        self.assertTrue(tokens._fold_entry(
+            candidate, self.account["id"], folded_path,
+            candidate["files"][self.account["id"]][folded_path]))
+        budget = tokens._serialized_state_size(candidate)
+
+        with mock.patch.object(tokens, "COMPACT_AFTER_SECONDS", NOW * 2), \
+                mock.patch.object(tokens, "MAX_SERIALIZED_STATE_BYTES", budget):
+            _compacted, dropped = tokens._enforce_state_budgets(state, NOW)
+        self.assertEqual(dropped, 0)
+        sentinel = state["files"][self.account["id"]][folded_path]
+        current = os.stat(source)
+        self.assertEqual((sentinel["st_dev"], sentinel["st_ino"]),
+                         (current.st_dev, current.st_ino))
+        paths.write_json_atomic(
+            paths.token_scan_state_path(), state, mode=0o600)
+
+        other_path = next(path for path in slot_files if path != folded_path)
+        with mock.patch.object(
+                tokens, "_files", return_value=iter((folded_path, other_path))):
+            tokens.collect(now=NOW + 1, force=True)
+        daily = paths.load_json(paths.token_daily_path())
+        self.assertEqual(daily["accounts"][self.account["id"]][
+            "2026-07-10"]["grand_total"], 26)
+        self.assertEqual(daily["duplicate_file_count"], 1)
+
+    def test_folded_changed_and_missing_keep_subtotal_without_double_count(self):
+        path = self.write("cold.jsonl", claude_line(
+            "2026-07-10T00:00:00Z", "cold-r", "cold-m"))
+        tokens.collect(now=NOW, force=True)
+        before = paths.load_json(paths.token_daily_path())["accounts"]
+        state = paths.load_json(paths.token_scan_state_path())
+        entry = state["files"][self.account["id"]][
+            "projects/project/cold.jsonl"]
+        entry["padding"] = "x" * 5000
+        budget = tokens._serialized_state_size(state) - 2500
+        with mock.patch.object(tokens, "MAX_SERIALIZED_STATE_BYTES", budget):
+            _compacted, dropped = tokens._enforce_state_budgets(state, NOW)
+        self.assertEqual(dropped, 0)
+        self.assertTrue(state["files"][self.account["id"]][
+            "projects/project/cold.jsonl"]["folded"])
+        paths.write_json_atomic(
+            paths.token_scan_state_path(), state, mode=0o600)
+
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(claude_line(
+                "2026-07-10T00:00:01Z", "new-r", "new-m"))
+        with mock.patch.object(
+                tokens, "_parse_stream",
+                side_effect=AssertionError("parsed changed folded file")):
+            tokens.collect(now=NOW + 1, force=True)
+        changed = paths.load_json(paths.token_daily_path())
+        self.assertEqual(changed["accounts"], before)
+        self.assertTrue(changed["partial"])
+        self.assertEqual(changed["folded_changed_file_count"], 1)
+        self.assertEqual(tokens.summarize(
+            changed, [self.account], now=NOW + 1)[
+                "folded_changed_file_count"], 1)
+        self.assertTrue(self.state_entry("cold.jsonl")["folded"])
+
+        os.unlink(path)
+        tokens.collect(now=NOW + 2, force=True)
+        missing = paths.load_json(paths.token_daily_path())
+        self.assertEqual(missing["accounts"], before)
+        self.assertTrue(missing["partial"])
+        self.assertEqual(missing["folded_changed_file_count"], 1)
+        self.assertTrue(self.state_entry("cold.jsonl")["folded"])
+
+    def test_remove_account_purges_folded_totals(self):
+        target = self.account["id"]
+        survivor = slot_id("survivor")
+        daily_accounts = {
+            target: {"2026-07-10": day_counts(1, 2)},
+            survivor: {"2026-07-11": day_counts(3, 4)},
+        }
+        paths.write_json_atomic(paths.token_scan_state_path(), {
+            "schema_version": tokens.SCHEMA_VERSION,
+            "files": {
+                target: {"cold": {"size": 1, "mtime_ns": 2,
+                                    "days": daily_accounts[target],
+                                    "folded": True}},
+                survivor: {"cold": {"size": 3, "mtime_ns": 4,
+                                      "days": daily_accounts[survivor],
+                                      "folded": True}},
+            },
+            "failed_root_slot_ids": [], "failed_root_count": 0,
+            "folded_changed_files": {target: 1, survivor: 2},
+            "budget_dropped_files": {}, "budget_partial": False,
+        })
+        paths.write_json_atomic(paths.token_daily_path(), {
+            "schema_version": tokens.SCHEMA_VERSION,
+            "generated": NOW, "partial": True,
+            "failed_file_count": 0, "failed_root_count": 0,
+            "failed_root_slot_ids": [], "partial_file_count": 0,
+            "duplicate_file_count": 0, "folded_changed_file_count": 3,
+            "budget_dropped_file_count": 0,
+            "accounts": daily_accounts,
+        })
+
+        tokens.remove_account(target)
+        state = paths.load_json(paths.token_scan_state_path())
+        daily = paths.load_json(paths.token_daily_path())
+        self.assertNotIn(target, state["files"])
+        self.assertNotIn(target, state["folded_changed_files"])
+        self.assertIn(survivor, state["files"])
+        self.assertNotIn(target, daily["accounts"])
+        self.assertEqual(daily["folded_changed_file_count"], 2)
+        self.assertTrue(daily["partial"])
+
+    def test_three_files_two_cap_never_recounts_evicted_folded_sentinel(self):
         for index in range(3):
             self.write(f"{index}.jsonl", claude_line(
                 "2026-07-10T00:00:00Z", f"r{index}", f"m{index}"))
         with mock.patch.object(tokens, "MAX_TRACKED_FILES", 2), \
                 mock.patch.object(tokens, "MAX_SERIALIZED_STATE_BYTES",
                                   10 * 1024 * 1024):
-            tokens.collect(now=NOW, force=True)
-        state = paths.load_json(paths.token_scan_state_path())
-        entries = state["files"][self.account["id"]]
-        self.assertEqual(len(entries), 2)
-        self.assertTrue(state["budget_partial"])
-        self.assertEqual(state["budget_dropped_files"], {
-            self.account["id"]: 1})
-        self.assertTrue(all("days" in entry for entry in entries.values()))
-        self.assertTrue(all("dedupe_tail" not in entry
-                            and "fingerprint" not in entry
-                            and "checkpoint_hash" not in entry
-                            for entry in entries.values()))
-        relative_path, compacted_entry = next(iter(entries.items()))
-        absolute_path = os.path.join(self.home, *relative_path.split("/"))
-        with open(absolute_path, "a", encoding="utf-8") as handle:
-            handle.write(claude_line(
-                "2026-07-10T00:00:01Z", "changed", "changed"))
-        starts = []
-        original_parse = tokens._parse_stream
+            for scan_now in (NOW, NOW + 1):
+                tokens.collect(now=scan_now, force=True)
+                state = paths.load_json(paths.token_scan_state_path())
+                daily = paths.load_json(paths.token_daily_path())
+                entries = state["files"][self.account["id"]]
 
-        def track_parse(handle, provider, start=0, previous=None, end=None,
-                        now=None):
-            starts.append(start)
-            return original_parse(
-                handle, provider, start=start, previous=previous, end=end,
-                now=now)
-
-        with mock.patch.object(tokens, "_parse_stream", side_effect=track_parse):
-            tokens._scan_file(
-                self.home, relative_path, "claude", compacted_entry,
-                now=NOW + 1)
-        self.assertEqual(starts, [0])
-        daily = paths.load_json(paths.token_daily_path())
-        self.assertTrue(daily["partial"])
-        self.assertEqual(daily["budget_dropped_file_count"], 1)
-
-        cold_entry = {
-            "provider": "claude", "mtime_ns": 0, "days": {
-                "2026-07-10": day_counts(1, 1)},
-            "dedupe_tail": [{"signature": "a" * 64,
-                             "maximum": counts(1, 1)} for _ in range(20)],
-            "fingerprint": "f" * 64, "checkpoint_hash": "c" * 64,
-        }
-        compacted_state = {
-            "schema_version": tokens.SCHEMA_VERSION,
-            "files": {self.account["id"]: {"cold": cold_entry}},
-        }
-        compacted_limit = tokens._serialized_state_size({
-            "schema_version": tokens.SCHEMA_VERSION,
-            "files": {self.account["id"]: {"cold": {
-                "provider": "claude", "mtime_ns": 0, "days": {
-                    "2026-07-10": day_counts(1, 1)}}}},
-            "compacted_file_count": 1,
-            "budget_dropped_files": {}, "budget_partial": False,
-        }) + 32
-        with mock.patch.object(tokens, "MAX_TRACKED_FILES", 10), \
-                mock.patch.object(tokens, "MAX_SERIALIZED_STATE_BYTES",
-                                  compacted_limit):
-            compacted, dropped = tokens._enforce_state_budgets(
-                compacted_state, NOW)
-        self.assertEqual((compacted, dropped), (1, 0))
-        self.assertLessEqual(tokens._serialized_state_size(compacted_state),
-                             compacted_limit)
+                self.assertEqual(len(entries), 2)
+                self.assertTrue(all(entry.get("folded") is True
+                                    for entry in entries.values()))
+                self.assertTrue(state["budget_partial"])
+                self.assertEqual(state["budget_dropped_files"], {
+                    self.account["id"]: 1})
+                self.assertTrue(daily["partial"])
+                self.assertEqual(daily["budget_dropped_file_count"], 1)
+                self.assertEqual(daily["accounts"][self.account["id"]][
+                    "2026-07-10"]["grand_total"], 52)
 
     def test_scan_health_persists_attempt_and_success_separately(self):
         self.write("one.jsonl", claude_line(
@@ -1168,10 +1521,14 @@ class TokenSummaryTests(unittest.TestCase):
 
         with mock.patch.object(registry, "load",
                                return_value=self.config) as load, \
+                mock.patch.object(registry, "token_accounts",
+                                  wraps=registry.token_accounts) as token_accounts, \
                 mock.patch.object(registry, "accounts",
                                   wraps=registry.accounts) as accounts:
             dashboard.display_snapshot(poisoned, evaluated_at=NOW)
         load.assert_called_once_with()
+        token_accounts.assert_called_once_with(
+            self.config, include_status=True)
         accounts.assert_called_once_with(self.config)
 
     def test_enabled_without_store_omits_payload_key(self):
