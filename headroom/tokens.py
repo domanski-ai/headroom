@@ -1,7 +1,8 @@
 """Opt-in, local-only token telemetry from Claude Code and Codex session logs.
 
-Only timestamps and numeric usage counters survive parsing. Message content,
-emails, and provider identities are never written to the token store. The
+Only timestamps, numeric usage counters, sanitized one-segment project labels,
+and registry slot names survive parsing. Message content, cwd paths, emails,
+and provider identities are never written to the token store. The
 private incremental state necessarily records home-relative source paths,
 byte offsets, mtimes, file identity/fingerprints, per-file daily subtotals,
 and the bounded counter/dedupe metadata needed to resume an append-only log.
@@ -35,7 +36,8 @@ import time
 from . import paths, registry
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
+PREVIOUS_SCHEMA_VERSION = 6
 DEFAULT_SCAN_INTERVAL = 900
 MAX_PAYLOAD_DAYS = 400
 MAX_SESSION_SECONDS = 48 * 60 * 60
@@ -57,6 +59,10 @@ COUNT_KEYS = ("input", "output", "cache_read", "cache_creation", "total",
               "grand_total")
 FAMILY_LABELS = ("fable", "opus", "sonnet", "haiku", "gpt", "other")
 EFFORT_LABELS = ("none", "minimal", "low", "medium", "high", "xhigh")
+MAX_PROJECT_LABELS = 12
+MAX_TOP_PROJECTS = 6
+PROJECT_SCHEMA_VERSION = 1
+EARLIER_ATTRIBUTION = "earlier"
 DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -76,8 +82,82 @@ def _empty_day():
         "longest_session_s": 0,
         "families": {},
         "efforts": {},
+        "projects": {},
+        "attributed": {},
     })
     return result
+
+
+def _safe_project_label(value):
+    return (isinstance(value, str) and 1 <= len(value) <= 24
+            and "@" not in value and os.sep not in value
+            and not any(ord(character) < 32 or ord(character) == 127
+                        for character in value))
+
+
+def _project_label(cwd, home=None):
+    """Reduce one cwd to a private, single-segment operator-home label."""
+    if not isinstance(cwd, str) or not cwd:
+        return None
+    try:
+        home = os.path.realpath(os.path.abspath(
+            os.path.expanduser("~") if home is None else home))
+        if not os.path.isabs(cwd):
+            return "other"
+        cwd = os.path.realpath(os.path.abspath(cwd))
+        if cwd == home:
+            return "~"
+        if os.path.commonpath((cwd, home)) != home:
+            return "other"
+        label = os.path.relpath(cwd, home).split(os.sep, 1)[0]
+        return label if _safe_project_label(label) else "other"
+    except (OSError, TypeError, ValueError):
+        return "other"
+
+
+def _safe_attribution_label(value):
+    return (value == EARLIER_ATTRIBUTION
+            or isinstance(value, str) and registry.NAME_RE.fullmatch(value))
+
+
+def _is_extra_root(account):
+    slot_id = account.get("id") if isinstance(account, dict) else None
+    return isinstance(slot_id, str) and registry.VIRTUAL_ID_RE.fullmatch(slot_id)
+
+
+def _current_extra_root_attribution(account, accounts):
+    """Resolve a verified Claude extra-root email to one registry slot name."""
+    if account.get("provider") != "claude" or not _is_extra_root(account):
+        return None
+    names_by_email = collections.defaultdict(set)
+    for candidate in accounts:
+        if _is_extra_root(candidate):
+            continue
+        email = candidate.get("expected_email")
+        name = candidate.get("name")
+        if isinstance(email, str) and isinstance(name, str):
+            names_by_email[email.strip().casefold()].add(name)
+    try:
+        # Local import avoids collect.py -> tokens.py's module-load cycle. The
+        # collector identity probe is read-only for the selected config home.
+        from . import collect as usage_collect
+        identity = usage_collect.claude_identity(account["home"])
+        email = identity.get("email") if isinstance(identity, dict) else None
+        if identity.get("verified") is not True or not isinstance(email, str):
+            return None
+        matches = names_by_email.get(email.strip().casefold(), set())
+        return next(iter(matches)) if len(matches) == 1 else None
+    except Exception:
+        return None
+
+
+def _sticky_attribution(previous, current):
+    if isinstance(previous, dict):
+        stamped = previous.get("attributed_slot")
+        return stamped if _safe_attribution_label(stamped) \
+            else EARLIER_ATTRIBUTION
+    return current if _safe_attribution_label(current) \
+        else EARLIER_ATTRIBUTION
 
 
 def _count(value):
@@ -176,7 +256,7 @@ def _effort_label(effort):
 
 
 def parse_claude_record(line):
-    """Return day, counts, identity hash, and model family for a record."""
+    """Return day, counts, identity hash, model family, and project label."""
     value = _record(line)
     if value is None:
         return None
@@ -210,7 +290,8 @@ def parse_claude_record(line):
     if any(isinstance(part, str) and part for part in identity):
         raw = json.dumps(identity, separators=(",", ":"))
         signature = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    return day, source, signature, _model_family(message.get("model"))
+    return (day, source, signature, _model_family(message.get("model")),
+            _project_label(value.get("cwd")))
 
 
 def _codex_total_usage(value):
@@ -274,6 +355,15 @@ def _codex_context(value):
                           or payload.get("reasoning_effort")))
 
 
+def _codex_project(value):
+    payload = value.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    kind = value.get("type") or payload.get("type")
+    if kind != "session_meta":
+        return None
+    return _project_label(payload.get("cwd") or value.get("cwd"))
+
+
 def _normalized_counts(value):
     if not isinstance(value, dict):
         return None
@@ -302,6 +392,36 @@ def _normalized_mix(value, labels):
     return result
 
 
+def _normalized_projects(value):
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    admitted = set()
+    for raw_label, raw_count in value.items():
+        count = _count(raw_count)
+        if not count or not _safe_project_label(raw_label):
+            continue
+        label = raw_label
+        if label != "other" and label not in admitted:
+            if len(admitted) >= MAX_PROJECT_LABELS:
+                label = "other"
+            else:
+                admitted.add(label)
+        result[label] = result.get(label, 0) + count
+    return result
+
+
+def _normalized_attributed(value):
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for label, raw_count in value.items():
+        count = _count(raw_count)
+        if count and _safe_attribution_label(label):
+            result[label] = result.get(label, 0) + count
+    return result
+
+
 def _normalized_day(value):
     result = _normalized_counts(value)
     if result is None:
@@ -313,11 +433,19 @@ def _normalized_day(value):
     if classified < result["grand_total"]:
         families["other"] = (families.get("other", 0)
                              + result["grand_total"] - classified)
+    projects = _normalized_projects(value.get("projects"))
+    if sum(projects.values()) > result["grand_total"]:
+        projects = {}
+    attributed = _normalized_attributed(value.get("attributed"))
+    if sum(attributed.values()) > result["grand_total"]:
+        attributed = {}
     result.update({
         "session_count": _count(value.get("session_count", 0)) or 0,
         "longest_session_s": _count(value.get("longest_session_s", 0)) or 0,
         "families": families,
         "efforts": _normalized_mix(value.get("efforts"), EFFORT_LABELS),
+        "projects": projects,
+        "attributed": attributed,
     })
     return result
 
@@ -351,7 +479,8 @@ def _add_mix(target, source):
         target[label] = target.get(label, 0) + count
 
 
-def _add_day(days, day, counts, family=None, effort=None, limit=None):
+def _add_day(days, day, counts, family=None, effort=None, project=None,
+             limit=None):
     if day not in days and limit is not None and len(days) >= limit:
         return False
     target = days.setdefault(day, _empty_day())
@@ -362,6 +491,9 @@ def _add_day(days, day, counts, family=None, effort=None, limit=None):
     if effort in EFFORT_LABELS:
         target["efforts"][effort] = (
             target["efforts"].get(effort, 0) + counts["grand_total"])
+    if _safe_project_label(project):
+        target["projects"][project] = (
+            target["projects"].get(project, 0) + counts["grand_total"])
     return True
 
 
@@ -373,6 +505,8 @@ def _add_day_record(days, day, source):
         target["longest_session_s"], source["longest_session_s"])
     _add_mix(target["families"], source["families"])
     _add_mix(target["efforts"], source["efforts"])
+    _add_mix(target["projects"], source["projects"])
+    _add_mix(target["attributed"], source["attributed"])
 
 
 def _counter_delta(current, previous):
@@ -475,6 +609,9 @@ def _parse_stream(handle, provider, start=0, previous=None, end=None, now=None):
     if provider == "codex" and current_family not in FAMILY_LABELS:
         current_family = "gpt"
     current_effort = previous.get("last_effort") if start else None
+    current_project = previous.get("last_project") if start else None
+    if not _safe_project_label(current_project):
+        current_project = None
     seen = _dedupe_tail(previous.get("dedupe_tail")) if start else \
         collections.OrderedDict()
     valid_offset = start
@@ -484,7 +621,7 @@ def _parse_stream(handle, provider, start=0, previous=None, end=None, now=None):
 
     def consume(line):
         nonlocal days, file_partial, last_counter, first_event_ts
-        nonlocal last_event_ts, current_family, current_effort
+        nonlocal last_event_ts, current_family, current_effort, current_project
         record = _record(line)
         if record is None:
             return
@@ -523,11 +660,12 @@ def _parse_stream(handle, provider, start=0, previous=None, end=None, now=None):
             parsed = parse_claude_record(record)
             if parsed is None:
                 return
-            day, counts, signature, family = parsed
+            day, counts, signature, family, project = parsed
             if signature is not None:
                 delta, maximum = _message_delta(counts, seen.get(signature))
                 if delta["grand_total"] > 0:
                     if not _add_day(days, day, delta, family=family,
+                                    project=project,
                                     limit=MAX_FILE_DAYS):
                         file_partial = True
                 seen.pop(signature, None)
@@ -536,9 +674,13 @@ def _parse_stream(handle, provider, start=0, previous=None, end=None, now=None):
                     seen.popitem(last=False)
             else:
                 if not _add_day(days, day, counts, family=family,
+                                project=project,
                                 limit=MAX_FILE_DAYS):
                     file_partial = True
         else:
+            project = _codex_project(record)
+            if project is not None:
+                current_project = project
             family, effort = _codex_context(record)
             if family is not None:
                 current_family = family
@@ -552,6 +694,7 @@ def _parse_stream(handle, provider, start=0, previous=None, end=None, now=None):
             if delta["grand_total"] > 0:
                 if not _add_day(days, day, delta, family=current_family,
                                 effort=current_effort,
+                                project=current_project,
                                 limit=MAX_FILE_DAYS):
                     file_partial = True
             last_counter = counter
@@ -587,6 +730,8 @@ def _parse_stream(handle, provider, start=0, previous=None, end=None, now=None):
             result["last_family"] = current_family
         if current_effort is not None:
             result["last_effort"] = current_effort
+        if current_project is not None:
+            result["last_project"] = current_project
     return result
 
 
@@ -698,6 +843,7 @@ def _scan_file(home, relative_path, provider, previous=None, now=None):
         "st_ino": bound.st_ino,
         "fingerprint": fingerprint,
         "provider": provider,
+        "project_schema": PROJECT_SCHEMA_VERSION,
     })
     return result
 
@@ -840,6 +986,13 @@ def _fold_entry(state, slot_id, relative_path, entry):
         "days": entry_days,
         "folded": True,
     }
+    if entry.get("project_schema") == PROJECT_SCHEMA_VERSION:
+        state["files"][slot_id][relative_path]["project_schema"] = \
+            PROJECT_SCHEMA_VERSION
+    attributed_slot = entry.get("attributed_slot")
+    if _safe_attribution_label(attributed_slot):
+        state["files"][slot_id][relative_path]["attributed_slot"] = \
+            attributed_slot
     return True
 
 
@@ -955,7 +1108,8 @@ def _daily_from_files(files, include_status=False):
     seen_identities = set()
     if not isinstance(files, dict):
         return (accounts, partial) if include_status else accounts
-    def merge_days(target, days, owner=None):
+    def merge_days(target, days, project_labels, owner=None,
+                   attributed_slot=None):
         nonlocal cardinality, partial
         for day, counts in days.items():
             if day not in target and cardinality >= MAX_GLOBAL_DAYS:
@@ -965,11 +1119,28 @@ def _daily_from_files(files, include_status=False):
                 continue
             if day not in target:
                 cardinality += 1
-            _add_day_record(target, day, counts)
+            projects = {}
+            for label, count in counts["projects"].items():
+                if label != "other" and label not in project_labels:
+                    if len(project_labels) >= MAX_PROJECT_LABELS:
+                        label = "other"
+                    else:
+                        project_labels.add(label)
+                projects[label] = projects.get(label, 0) + count
+            source = dict(counts)
+            source["projects"] = projects
+            source["attributed"] = {}
+            _add_day_record(target, day, source)
+            if _safe_attribution_label(attributed_slot):
+                aggregate = target[day]["attributed"]
+                aggregate[attributed_slot] = (
+                    aggregate.get(attributed_slot, 0)
+                    + counts["grand_total"])
 
     for slot_id, slot_files in files.items():
         if not isinstance(slot_id, str) or not isinstance(slot_files, dict):
             continue
+        project_labels = set()
         for entry in slot_files.values():
             if not isinstance(entry, dict):
                 continue
@@ -986,7 +1157,8 @@ def _daily_from_files(files, include_status=False):
             partial = partial or capped or entry.get("partial") is True
             if capped:
                 entry["partial"] = True
-            merge_days(target, entry_days, owner=entry)
+            merge_days(target, entry_days, project_labels, owner=entry,
+                       attributed_slot=entry.get("attributed_slot"))
     return (accounts, partial) if include_status else accounts
 
 
@@ -1008,16 +1180,21 @@ def collect(accounts=None, config=None, now=None, force=False):
                 authoritative_config, include_status=True)
         now = int(time.time() if now is None else now)
         old_state = paths.load_json(paths.token_scan_state_path()) or {}
-        if not isinstance(old_state, dict) \
-                or old_state.get("schema_version") != SCHEMA_VERSION:
+        state_version = old_state.get("schema_version") \
+            if isinstance(old_state, dict) else None
+        legacy_state = state_version == PREVIOUS_SCHEMA_VERSION
+        if not isinstance(old_state, dict) or state_version not in (
+                PREVIOUS_SCHEMA_VERSION, SCHEMA_VERSION):
             old_state = {}
+            legacy_state = False
         last_scan = old_state.get("last_scan")
-        if not force and isinstance(last_scan, int) \
+        if not force and not legacy_state and isinstance(last_scan, int) \
                 and 0 <= now - last_scan < scan_interval():
             return False
         old_daily = paths.load_json(paths.token_daily_path())
         if not isinstance(old_daily, dict) \
-                or old_daily.get("schema_version") != SCHEMA_VERSION:
+                or old_daily.get("schema_version") not in (
+                    PREVIOUS_SCHEMA_VERSION, SCHEMA_VERSION):
             old_daily = {
                 "schema_version": SCHEMA_VERSION,
                 "generated": 0,
@@ -1031,6 +1208,7 @@ def collect(accounts=None, config=None, now=None, force=False):
             last_success = generated if isinstance(generated, int) \
                 and generated > 0 else None
         attempted = dict(old_daily)
+        attempted["schema_version"] = SCHEMA_VERSION
         attempted["last_attempt"] = now
         if last_success is not None:
             attempted["last_success"] = last_success
@@ -1052,6 +1230,14 @@ def collect(accounts=None, config=None, now=None, force=False):
             previous_files = old_files.get(slot_id)
             previous_files = previous_files \
                 if isinstance(previous_files, dict) else {}
+            previous_by_identity = {
+                identity: entry for entry in previous_files.values()
+                if (identity := _file_identity(entry)) is not None
+            }
+            current_attribution = _current_extra_root_attribution(
+                account, live)
+            stamps_sessions = (account.get("provider") == "claude"
+                               and _is_extra_root(account))
             slot_files = {}
             seen = set()
             successful_identities = set()
@@ -1069,7 +1255,15 @@ def collect(accounts=None, config=None, now=None, force=False):
                     try:
                         scanned = _scan_file(
                             account["home"], relative_path, provider,
-                            previous if compatible else None, now=now)
+                            previous if compatible and not legacy_state else None,
+                            now=now)
+                        stamp_source = previous
+                        if not isinstance(stamp_source, dict):
+                            stamp_source = previous_by_identity.get(
+                                _file_identity(scanned))
+                        if stamps_sessions:
+                            scanned["attributed_slot"] = _sticky_attribution(
+                                stamp_source, current_attribution)
                         if scanned.pop("_folded_changed", False):
                             folded_changed_files[slot_id] += 1
                         slot_files[relative_path] = scanned
@@ -1081,6 +1275,9 @@ def collect(accounts=None, config=None, now=None, force=False):
                         retained = dict(previous) if compatible else {
                             "provider": provider, "days": {}, "offset": 0,
                         }
+                        if stamps_sessions:
+                            retained["attributed_slot"] = _sticky_attribution(
+                                previous, current_attribution)
                         retained["last_error"] = type(error).__name__
                         retained["last_error_at"] = now
                         slot_files[relative_path] = retained
@@ -1094,12 +1291,20 @@ def collect(accounts=None, config=None, now=None, force=False):
                                  or previous.get("folded") is True):
                         if _file_identity(previous) in successful_identities:
                             continue
-                        slot_files[relative_path] = dict(previous)
+                        retained = dict(previous)
+                        if stamps_sessions:
+                            retained["attributed_slot"] = _sticky_attribution(
+                                previous, current_attribution)
+                        slot_files[relative_path] = retained
             else:
                 for relative_path, previous in previous_files.items():
                     if relative_path not in seen and isinstance(previous, dict) \
                             and previous.get("folded") is True:
-                        slot_files[relative_path] = dict(previous)
+                        retained = dict(previous)
+                        if stamps_sessions:
+                            retained["attributed_slot"] = _sticky_attribution(
+                                previous, current_attribution)
+                        slot_files[relative_path] = retained
                         folded_changed_files[slot_id] += 1
             files[slot_id] = slot_files
         state = {
@@ -1322,6 +1527,25 @@ def _breakdown(totals, labels):
     } for label in labels]
 
 
+def _top_projects(totals, grand_total):
+    ranked = sorted(
+        ((label, count) for label, count in totals.items() if count > 0),
+        key=lambda item: (-item[1], item[0]))[:MAX_TOP_PROJECTS]
+    return [{
+        "label": label,
+        "grand_total": count,
+        "share_pct": round(count * 100 / grand_total, 1)
+        if grand_total else 0,
+    } for label, count in ranked]
+
+
+def _attributed_breakdown(totals):
+    return [{"name": name, "grand_total": count}
+            for name, count in sorted(
+                totals.items(), key=lambda item: (-item[1], item[0]))
+            if count > 0]
+
+
 def _streaks(active_days, today):
     active = sorted({_date(day) for day in active_days if _date(day) is not None})
     if not active:
@@ -1357,6 +1581,7 @@ def summarize(store, accounts, now=None, partial=False):
     fleet_days = {}
     family_totals = {label: 0 for label in FAMILY_LABELS}
     effort_totals = {label: 0 for label in EFFORT_LABELS}
+    project_totals = {}
     longest_session = {"seconds": 0, "date": None, "account": None}
     account_rows = []
     for account in accounts:
@@ -1366,10 +1591,15 @@ def summarize(store, accounts, now=None, partial=False):
         days = _normalized_days(raw_accounts.get(slot_id))
         days = {day: counts for day, counts in days.items()
                 if _date(day) <= today}
+        account_project_totals = {}
+        attributed_totals = {}
         for day, counts in days.items():
             _add_day_record(fleet_days, day, counts)
             _add_mix(family_totals, counts["families"])
             _add_mix(effort_totals, counts["efforts"])
+            _add_mix(project_totals, counts["projects"])
+            _add_mix(account_project_totals, counts["projects"])
+            _add_mix(attributed_totals, counts["attributed"])
             if counts["session_count"]:
                 candidate = (counts["longest_session_s"], day,
                              account.get("name", ""))
@@ -1383,20 +1613,27 @@ def summarize(store, accounts, now=None, partial=False):
                         "account": account.get("name", ""),
                     }
         last7_cutoff = today - datetime.timedelta(days=6)
-        account_rows.append({
+        account_grand_total = sum(
+            counts["grand_total"] for counts in days.values())
+        row = {
             "id": slot_id,
             "name": account.get("name", ""),
             "provider": account.get("provider", ""),
             "lifetime": sum(counts["total"] for counts in days.values()),
-            "lifetime_grand_total": sum(
-                counts["grand_total"] for counts in days.values()),
+            "lifetime_grand_total": account_grand_total,
             "last7d": sum(counts["total"] for day, counts in days.items()
                           if _date(day) >= last7_cutoff),
             "last7d_grand_total": sum(
                 counts["grand_total"] for day, counts in days.items()
                 if _date(day) >= last7_cutoff),
             "peak": _peak(days),
-        })
+            "projects": _top_projects(
+                account_project_totals, account_grand_total),
+        }
+        if _is_extra_root(account):
+            row["attributed_breakdown"] = _attributed_breakdown(
+                attributed_totals)
+        account_rows.append(row)
     lifetime = sum(counts["total"] for counts in fleet_days.values())
     grand_total = sum(counts["grand_total"] for counts in fleet_days.values())
     active = [day for day, counts in fleet_days.items()
@@ -1405,8 +1642,12 @@ def summarize(store, accounts, now=None, partial=False):
     generated_day = _date(_day(generated)) or today
     payload_end = min(generated_day, today)
     cutoff = payload_end - datetime.timedelta(days=MAX_PAYLOAD_DAYS - 1)
-    payload_days = {day: fleet_days[day] for day in sorted(fleet_days)
-                    if cutoff <= _date(day) <= payload_end}
+    payload_days = {
+        day: {key: value for key, value in fleet_days[day].items()
+              if key not in ("projects", "attributed")}
+        for day in sorted(fleet_days)
+        if cutoff <= _date(day) <= payload_end
+    }
     families = _breakdown(family_totals, FAMILY_LABELS)
     efforts = _breakdown(effort_totals, EFFORT_LABELS)
     most_used = max(families, key=lambda item: (
@@ -1449,6 +1690,7 @@ def summarize(store, accounts, now=None, partial=False):
             "most_used_model": most_used_model,
             "families": families,
             "efforts": efforts,
+            "projects": _top_projects(project_totals, grand_total),
         },
     }
 

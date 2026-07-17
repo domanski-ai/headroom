@@ -51,6 +51,16 @@ here so users can judge them for their own threat model.
 - If provider-managed logs are deleted, moved, or rewritten, the next scan may
   reduce historical totals because the store is an aggregate of the logs that
   remain locally available.
+- Project breakdowns require record-level `cwd` (Claude) or `session_meta.cwd`
+  (Codex). Missing cwd is unclassified. Only the first directory below the
+  operator home is retained, up to 12 project labels per slot; later labels
+  fold into `other`.
+- Extra-root account stamping is forward-only and scan-time approximate. A
+  Claude file is permanently assigned to the uniquely matching registry slot
+  whose verified OAuth identity was active when the scanner first saw it. A
+  file can predate that scan or span later login changes. Pre-feature and
+  unverifiable files remain `earlier`, and these totals stay only on the virtual
+  row rather than changing real account totals.
 
 ## Supervised-launch residuals (opt-in launch safety)
 

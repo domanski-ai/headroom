@@ -159,7 +159,7 @@ Enable it in `~/.headroom/config.json`:
     "token_stats": true,
     "token_extra_roots": [
       {
-        "label": "Primary Claude home",
+        "label": "server-cli",
         "provider": "claude",
         "path": "/home/you/.claude"
       }
@@ -180,8 +180,16 @@ label, provider, and canonical real path, so rebinding any field creates a new
 row and retires the old state.
 
 An extra-root row represents the configured **home**, not a provider account.
-CLI transcripts contain no trustworthy account identity, so activity from
-rotating logins that shared one home cannot be split or attributed per account.
+For a shared bare-CLI home, `server-cli` is a useful label. Historical activity
+is split exactly by project when a record has `cwd`: headroom keeps only the
+first directory name below the operator's home (`~` for the home itself), never
+the full path. Account attribution is forward-only and deliberately stays on
+the virtual row. When a Claude session file is first seen, headroom read-only
+checks that home's current OAuth identity and, when its verified email uniquely
+matches a registry `expected_email`, stamps the file with that slot name. The
+stamp never changes. This is scan-time attribution, not proof of which login
+created every turn; older and unverifiable sessions are shown as `earlier`, and
+the attributed totals are never merged into real account rows.
 
 Or set `HEADROOM_TOKEN_STATS=1` for the headroom process. Disable it by removing
 that environment variable and removing the setting or changing it to `false`.
@@ -191,8 +199,8 @@ payload.
 When enabled, headroom streams Claude Code's `projects/**/*.jsonl` and Codex's
 `sessions/**/rollout-*.jsonl` under each registered account home and valid extra
 root. It stores daily numeric aggregates and private incremental byte-offset
-state under `state/tokens/`; it never stores message content, emails, or raw
-provider identities. The headline count is input + output + cache creation.
+state under `state/tokens/`; it never stores message content, emails, full cwd
+paths, or raw provider identities. The headline count is input + output + cache creation.
 Cache reads are kept as a separate number, so total tokens processed can still
 be derived without inflating the headline. Scans run at most every 15 minutes
 by default and only read new files or appended tails after the first backfill;
