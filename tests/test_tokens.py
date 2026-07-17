@@ -965,7 +965,193 @@ class TokenStoreTests(unittest.TestCase):
                             for slot_files in files.values()
                             for entry in slot_files.values()))
 
-    def test_state_budgets_compact_cold_files_then_mark_evictions_partial(self):
+    def test_state_budget_folding_preserves_aggregate_exactly(self):
+        first = int(datetime.datetime(
+            2026, 7, 10, tzinfo=datetime.timezone.utc).timestamp())
+        entry = {
+            "provider": "claude", "size": 5000, "mtime_ns": 0,
+            "st_dev": 1, "st_ino": 2, "offset": 5000,
+            "days": {
+                "2026-07-10": day_counts(
+                    10, 5, 3, 2, families={"sonnet": 20}),
+                "2026-07-11": day_counts(
+                    7, 4, families={"sonnet": 11}),
+            },
+            "first_event_ts": first, "last_event_ts": first + 3600,
+            "dedupe_tail": [{"signature": "a" * 64,
+                             "maximum": counts(1, 1, 1, 1)}
+                            for _ in range(20)],
+            "fingerprint": "f" * 64, "checkpoint_hash": "c" * 64,
+        }
+        state = {
+            "schema_version": tokens.SCHEMA_VERSION,
+            "files": {self.account["id"]: {"cold": entry}},
+            "archived": {}, "folded_changed_files": {},
+        }
+        before = tokens._daily_from_files(
+            state["files"], archived=state["archived"])
+        with mock.patch.object(tokens, "MAX_TRACKED_FILES", 10), \
+                mock.patch.object(tokens, "MAX_SERIALIZED_STATE_BYTES", 1000):
+            compacted, dropped = tokens._enforce_state_budgets(state, NOW)
+        after = tokens._daily_from_files(
+            state["files"], archived=state["archived"])
+
+        self.assertEqual((compacted, dropped), (1, 0))
+        self.assertEqual(after, before)
+        self.assertEqual(state["files"][self.account["id"]]["cold"], {
+            "size": 5000, "mtime_ns": 0, "folded": True})
+        self.assertFalse(state["budget_partial"])
+        self.assertLessEqual(tokens._serialized_state_size(state), 1000)
+
+    def test_folded_unchanged_file_skips_open_and_parse(self):
+        path = self.write("cold.jsonl", claude_line(
+            "2026-07-10T00:00:00Z", "cold-r", "cold-m"))
+        current = os.stat(path)
+        sentinel = {
+            "size": current.st_size,
+            "mtime_ns": current.st_mtime_ns,
+            "folded": True,
+        }
+        with mock.patch.object(
+                tokens, "_open_contained",
+                side_effect=AssertionError("opened folded file")), \
+                mock.patch.object(
+                    tokens, "_parse_stream",
+                    side_effect=AssertionError("parsed folded file")):
+            scanned = tokens._scan_file(
+                self.home, "projects/project/cold.jsonl", "claude", sentinel,
+                now=NOW)
+        self.assertEqual(scanned, sentinel)
+
+    def test_state_budget_measures_folding_in_batches(self):
+        slot = self.account["id"]
+        files = {
+            f"cold-{index}": {
+                "provider": "claude", "size": 100 + index,
+                "mtime_ns": 0 if index < 150 else NOW * 1_000_000_000,
+                "days": {
+                    "2026-07-10": day_counts(1, 1)},
+            }
+            for index in range(300)
+        }
+        state = {
+            "schema_version": tokens.SCHEMA_VERSION,
+            "files": {slot: files}, "archived": {},
+            "folded_changed_files": {},
+        }
+        expected = {
+            "schema_version": tokens.SCHEMA_VERSION,
+            "files": {slot: {
+                path: {"size": entry["size"],
+                       "mtime_ns": entry["mtime_ns"],
+                       "folded": True}
+                for path, entry in files.items()
+            }},
+            "archived": {slot: {
+                "2026-07-10": day_counts(
+                    300, 300, families={"other": 600}),
+            }},
+            "folded_changed_files": {},
+            "compacted_file_count": 0,
+            "budget_dropped_files": {},
+            "budget_partial": False,
+        }
+        budget = tokens._serialized_state_size(expected) + 1
+        original_size = tokens._serialized_state_size
+        with mock.patch.object(tokens, "MAX_TRACKED_FILES", 1000), \
+                mock.patch.object(tokens, "MAX_SERIALIZED_STATE_BYTES", budget), \
+                mock.patch.object(
+                    tokens, "_serialized_state_size",
+                    wraps=original_size) as serialized:
+            _compacted, dropped = tokens._enforce_state_budgets(state, NOW)
+
+        self.assertEqual(dropped, 0)
+        self.assertEqual(state, expected)
+        self.assertLessEqual(serialized.call_count, 6)
+
+    def test_folded_changed_and_missing_stay_archived_without_double_count(self):
+        path = self.write("cold.jsonl", claude_line(
+            "2026-07-10T00:00:00Z", "cold-r", "cold-m"))
+        tokens.collect(now=NOW, force=True)
+        before = paths.load_json(paths.token_daily_path())["accounts"]
+        state = paths.load_json(paths.token_scan_state_path())
+        entry = state["files"][self.account["id"]][
+            "projects/project/cold.jsonl"]
+        entry["padding"] = "x" * 5000
+        budget = tokens._serialized_state_size(state) - 2500
+        with mock.patch.object(tokens, "MAX_SERIALIZED_STATE_BYTES", budget):
+            _compacted, dropped = tokens._enforce_state_budgets(state, NOW)
+        self.assertEqual(dropped, 0)
+        self.assertTrue(state["files"][self.account["id"]][
+            "projects/project/cold.jsonl"]["folded"])
+        paths.write_json_atomic(
+            paths.token_scan_state_path(), state, mode=0o600)
+
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(claude_line(
+                "2026-07-10T00:00:01Z", "new-r", "new-m"))
+        with mock.patch.object(
+                tokens, "_parse_stream",
+                side_effect=AssertionError("parsed changed folded file")):
+            tokens.collect(now=NOW + 1, force=True)
+        changed = paths.load_json(paths.token_daily_path())
+        self.assertEqual(changed["accounts"], before)
+        self.assertTrue(changed["partial"])
+        self.assertEqual(changed["folded_changed_file_count"], 1)
+        self.assertEqual(tokens.summarize(
+            changed, [self.account], now=NOW + 1)[
+                "folded_changed_file_count"], 1)
+        self.assertTrue(self.state_entry("cold.jsonl")["folded"])
+
+        os.unlink(path)
+        tokens.collect(now=NOW + 2, force=True)
+        missing = paths.load_json(paths.token_daily_path())
+        self.assertEqual(missing["accounts"], before)
+        self.assertTrue(missing["partial"])
+        self.assertEqual(missing["folded_changed_file_count"], 1)
+        self.assertTrue(self.state_entry("cold.jsonl")["folded"])
+
+    def test_remove_account_purges_archived_totals(self):
+        target = self.account["id"]
+        survivor = slot_id("survivor")
+        archived = {
+            target: {"2026-07-10": day_counts(1, 2)},
+            survivor: {"2026-07-11": day_counts(3, 4)},
+        }
+        paths.write_json_atomic(paths.token_scan_state_path(), {
+            "schema_version": tokens.SCHEMA_VERSION,
+            "files": {
+                target: {"cold": {"size": 1, "mtime_ns": 2,
+                                    "folded": True}},
+                survivor: {},
+            },
+            "archived": archived,
+            "failed_root_slot_ids": [], "failed_root_count": 0,
+            "folded_changed_files": {target: 1, survivor: 2},
+            "budget_dropped_files": {}, "budget_partial": False,
+        })
+        paths.write_json_atomic(paths.token_daily_path(), {
+            "schema_version": tokens.SCHEMA_VERSION,
+            "generated": NOW, "partial": True,
+            "failed_file_count": 0, "failed_root_count": 0,
+            "failed_root_slot_ids": [], "partial_file_count": 0,
+            "duplicate_file_count": 0, "folded_changed_file_count": 3,
+            "budget_dropped_file_count": 0,
+            "accounts": archived,
+        })
+
+        tokens.remove_account(target)
+        state = paths.load_json(paths.token_scan_state_path())
+        daily = paths.load_json(paths.token_daily_path())
+        self.assertNotIn(target, state["files"])
+        self.assertNotIn(target, state["archived"])
+        self.assertNotIn(target, state["folded_changed_files"])
+        self.assertEqual(state["archived"], {survivor: archived[survivor]})
+        self.assertNotIn(target, daily["accounts"])
+        self.assertEqual(daily["folded_changed_file_count"], 2)
+        self.assertTrue(daily["partial"])
+
+    def test_last_resort_entry_drop_still_marks_partial(self):
         for index in range(3):
             self.write(f"{index}.jsonl", claude_line(
                 "2026-07-10T00:00:00Z", f"r{index}", f"m{index}"))
@@ -974,67 +1160,19 @@ class TokenStoreTests(unittest.TestCase):
                                   10 * 1024 * 1024):
             tokens.collect(now=NOW, force=True)
         state = paths.load_json(paths.token_scan_state_path())
+        daily = paths.load_json(paths.token_daily_path())
         entries = state["files"][self.account["id"]]
+
         self.assertEqual(len(entries), 2)
+        self.assertTrue(all(entry.get("folded") is True
+                            for entry in entries.values()))
         self.assertTrue(state["budget_partial"])
         self.assertEqual(state["budget_dropped_files"], {
             self.account["id"]: 1})
-        self.assertTrue(all("days" in entry for entry in entries.values()))
-        self.assertTrue(all("dedupe_tail" not in entry
-                            and "fingerprint" not in entry
-                            and "checkpoint_hash" not in entry
-                            for entry in entries.values()))
-        relative_path, compacted_entry = next(iter(entries.items()))
-        absolute_path = os.path.join(self.home, *relative_path.split("/"))
-        with open(absolute_path, "a", encoding="utf-8") as handle:
-            handle.write(claude_line(
-                "2026-07-10T00:00:01Z", "changed", "changed"))
-        starts = []
-        original_parse = tokens._parse_stream
-
-        def track_parse(handle, provider, start=0, previous=None, end=None,
-                        now=None):
-            starts.append(start)
-            return original_parse(
-                handle, provider, start=start, previous=previous, end=end,
-                now=now)
-
-        with mock.patch.object(tokens, "_parse_stream", side_effect=track_parse):
-            tokens._scan_file(
-                self.home, relative_path, "claude", compacted_entry,
-                now=NOW + 1)
-        self.assertEqual(starts, [0])
-        daily = paths.load_json(paths.token_daily_path())
         self.assertTrue(daily["partial"])
         self.assertEqual(daily["budget_dropped_file_count"], 1)
-
-        cold_entry = {
-            "provider": "claude", "mtime_ns": 0, "days": {
-                "2026-07-10": day_counts(1, 1)},
-            "dedupe_tail": [{"signature": "a" * 64,
-                             "maximum": counts(1, 1)} for _ in range(20)],
-            "fingerprint": "f" * 64, "checkpoint_hash": "c" * 64,
-        }
-        compacted_state = {
-            "schema_version": tokens.SCHEMA_VERSION,
-            "files": {self.account["id"]: {"cold": cold_entry}},
-        }
-        compacted_limit = tokens._serialized_state_size({
-            "schema_version": tokens.SCHEMA_VERSION,
-            "files": {self.account["id"]: {"cold": {
-                "provider": "claude", "mtime_ns": 0, "days": {
-                    "2026-07-10": day_counts(1, 1)}}}},
-            "compacted_file_count": 1,
-            "budget_dropped_files": {}, "budget_partial": False,
-        }) + 32
-        with mock.patch.object(tokens, "MAX_TRACKED_FILES", 10), \
-                mock.patch.object(tokens, "MAX_SERIALIZED_STATE_BYTES",
-                                  compacted_limit):
-            compacted, dropped = tokens._enforce_state_budgets(
-                compacted_state, NOW)
-        self.assertEqual((compacted, dropped), (1, 0))
-        self.assertLessEqual(tokens._serialized_state_size(compacted_state),
-                             compacted_limit)
+        self.assertEqual(daily["accounts"][self.account["id"]][
+            "2026-07-10"]["grand_total"], 78)
 
     def test_scan_health_persists_attempt_and_success_separately(self):
         self.write("one.jsonl", claude_line(
