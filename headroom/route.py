@@ -13,7 +13,6 @@ import atexit
 import contextlib
 import datetime
 import errno
-import fcntl
 import json
 import math
 import os
@@ -24,7 +23,7 @@ import sys
 import time
 
 from . import collect as collector
-from . import notify, paths, registry
+from . import locks, notify, paths, registry
 
 
 SNAPSHOT_MAX_AGE = paths.env_int("HEADROOM_SNAPSHOT_MAX_AGE", 900)
@@ -125,12 +124,12 @@ def _cooldown_lock():
     limits (a lost cooldown routes an exhausted account = fail-open)."""
     lock_path = paths.cooldowns_path() + ".lock"
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    handle = open(lock_path, "w")
+    handle = open(lock_path, "a+")
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        locks.exclusive(handle)
         yield
     finally:
-        fcntl.flock(handle, fcntl.LOCK_UN)
+        locks.unlock(handle)
         handle.close()
 
 
@@ -153,12 +152,12 @@ def _quarantine_lock():
     """Exclusive lock shared by all quarantine read-modify-write paths."""
     lock_path = paths.quarantine_path() + ".lock"
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    handle = open(lock_path, "w")
+    handle = open(lock_path, "a+")
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        locks.exclusive(handle)
         yield
     finally:
-        fcntl.flock(handle, fcntl.LOCK_UN)
+        locks.unlock(handle)
         handle.close()
 
 
@@ -284,19 +283,19 @@ def _account_leased_by_other(name):
     if name in _HELD_LEASES:
         return False  # our own commitment never blocks us
     try:
-        fd = os.open(_lease_path(name), os.O_RDONLY)
+        fd = os.open(_lease_path(name), os.O_RDWR)
     except FileNotFoundError:
         return False
     except OSError:
         return False
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            return error.errno in _LEASE_CONTENDED
+        if not locks.exclusive(fd, blocking=False):
+            return True
         # nobody holds it — release the probe lock immediately
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        locks.unlock(fd)
         return False
+    except OSError as error:
+        return error.errno in _LEASE_CONTENDED
     finally:
         os.close(fd)
 
@@ -342,7 +341,9 @@ def acquire_slot_lease(account, fam):
         raise LeaseError(
             f"cannot open slot lease for {name}: {error}") from error
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not locks.exclusive(fd, blocking=False):
+            os.close(fd)
+            return False
     except OSError as error:
         os.close(fd)
         if error.errno in _LEASE_CONTENDED:
@@ -371,14 +372,14 @@ def acquire_slot_lease(account, fam):
 
 
 def _close_lease_fd(fd):
-    """Drop this process's hold on a lease by CLOSING the fd — never
-    fcntl.LOCK_UN. flock lives on the open file DESCRIPTION, which a supervised
-    child shares via Popen pass_fds; an explicit LOCK_UN would release that
-    shared lock out from under a still-live child. Closing releases the lock
-    only when the LAST fd on the description closes, so the lease correctly
-    rides on the child under an ambiguous spawn and frees on true last-close."""
+    """Drop this process's lease via the backend's close discipline.
+
+    Unix stays close-only because a supervised child may share the open file
+    description. Windows supervision is gated off, and the backend explicitly
+    unlocks its mandatory byte-range lock before closing the descriptor.
+    """
     try:
-        os.close(fd)
+        locks.close(fd)
     except OSError:
         pass
 
@@ -772,10 +773,10 @@ def write_launch_marker(mode, account, note=""):
     # is ever overwritten.
     temporary = f"{destination}.{os.getpid()}.tmp"
     try:
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, 0o600)
         try:
             with os.fdopen(descriptor, "w") as handle:
                 json.dump(payload, handle, indent=2)

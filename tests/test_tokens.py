@@ -692,6 +692,7 @@ class TokenStoreTests(unittest.TestCase):
         self.assertIn(new_id, state["files"])
         self.assertIn(new_id, daily["accounts"])
 
+    @unittest.skipIf(os.name == "nt", "symlink creation may require privileges")
     def test_extra_root_containment_skips_symlinked_subdirectories(self):
         extra_home = os.path.join(self.temp.name, "contained")
         project = os.path.join(extra_home, "projects", "p")
@@ -753,6 +754,7 @@ class TokenStoreTests(unittest.TestCase):
         self.assertEqual(sum(state["budget_dropped_files"].values()), 1)
         self.assertTrue(paths.load_json(paths.token_daily_path())["partial"])
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits do not apply")
     def test_incremental_grown_new_and_unchanged_files(self):
         first = self.write(
             "one.jsonl", "{}\n" * 1500 + claude_line(
@@ -1008,6 +1010,7 @@ class TokenStoreTests(unittest.TestCase):
         self.assertNotIn("2026-07-10", days)
         self.assertEqual(days["2026-07-11"]["grand_total"], 26)
 
+    @unittest.skipIf(os.name == "nt", "symlink creation may require privileges")
     def test_symlinked_directory_escape_is_not_walked_or_opened(self):
         outside = os.path.join(self.temp.name, "outside")
         os.makedirs(outside)
@@ -1112,6 +1115,7 @@ class TokenStoreTests(unittest.TestCase):
         self.assertTrue(files[self.account["id"]]["second"][
             "duplicate_identity"])
 
+    @unittest.skipIf(os.name == "nt", "symlink creation may require privileges")
     def test_symlinked_provider_root_is_rejected_and_marked_partial(self):
         self.write("one.jsonl", claude_line(
             "2026-07-10T00:00:00Z", "r1", "m1"))

@@ -39,8 +39,20 @@ def base_dir():
 
 def ensure_private(directory):
     os.makedirs(directory, exist_ok=True)
-    os.chmod(directory, 0o700)
+    chmod_private(directory, 0o700)
     return directory
+
+
+def chmod_private(path, mode):
+    """Apply owner-only permissions where POSIX modes are meaningful."""
+    if os.name != "nt":
+        os.chmod(path, mode)
+
+
+def fchmod_private(descriptor, mode):
+    """Descriptor form of :func:`chmod_private`; a no-op on Windows."""
+    if os.name != "nt":
+        os.fchmod(descriptor, mode)
 
 
 def config_path():
@@ -124,7 +136,7 @@ def write_json_atomic(path, value, mode=0o600):
         prefix=".headroom-", suffix=".json.tmp", dir=directory
     )
     try:
-        os.fchmod(descriptor, mode)
+        fchmod_private(descriptor, mode)
         with os.fdopen(descriptor, "w") as handle:
             json.dump(value, handle, indent=2, allow_nan=False)
             handle.write("\n")

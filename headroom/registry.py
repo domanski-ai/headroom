@@ -30,13 +30,12 @@ and never as a rotation/handoff target. Use it for a slot that belongs to
 some other workflow and must not be consumed by automatic rotation.
 """
 import contextlib
-import fcntl
 import hashlib
 import os
 import re
 import uuid
 
-from . import paths
+from . import locks, paths
 
 PROVIDERS = ("claude", "codex")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
@@ -340,12 +339,12 @@ def save(config):
 def config_lock():
     lock_path = paths.config_path() + ".lock"
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    handle = open(lock_path, "w")
+    handle = open(lock_path, "a+")
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        locks.exclusive(handle)
         yield
     finally:
-        fcntl.flock(handle, fcntl.LOCK_UN)
+        locks.unlock(handle)
         handle.close()
 
 

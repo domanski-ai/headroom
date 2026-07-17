@@ -17,7 +17,6 @@ re-logged-in, quarantined, capped, re-grouped, or re-configured DURING staging
 aborts before any publication or launch.
 """
 import contextlib
-import fcntl
 import glob
 import hashlib
 import json
@@ -31,7 +30,7 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from . import collect, paths, registry, route
+from . import collect, locks, paths, registry, route
 from . import handoff
 from .handoff import HandoffError, HandoffPlan, SourceSession
 
@@ -701,12 +700,12 @@ def _quarantine_lock():
     and the protected action (hard-link publication / exec) it guards."""
     lock_path = paths.quarantine_path() + ".lock"
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    with open(lock_path, "w") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+    with open(lock_path, "a+") as handle:
+        locks.exclusive(handle)
         try:
             yield
         finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+            locks.unlock(handle)
 
 
 def _guard_reservation(plan, now):

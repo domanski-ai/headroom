@@ -27,11 +27,16 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from headroom import (  # noqa: E402
     __main__, notify, paths, registry, route, supervisor,
 )
+
+pytestmark = pytest.mark.skipif(
+    os.name == "nt", reason="resident supervision and handoff are Unix-gated in v1")
 
 IDENTITY = {"account_fingerprint": "AAAA", "credential_digest": "BBBB"}
 

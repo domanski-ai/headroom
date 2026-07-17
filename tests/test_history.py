@@ -71,6 +71,7 @@ class HistoryPersistenceTests(unittest.TestCase):
         self.env.stop()
         self.temp.cleanup()
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits do not apply")
     def test_append_creates_private_jsonl_and_throttles(self):
         self.assertTrue(history.append_snapshot(snapshot(), now=NOW))
         self.assertFalse(history.append_snapshot(snapshot(50), now=NOW + 59))

@@ -1698,6 +1698,7 @@ class LiquidGlassWidgetTests(unittest.TestCase):
             self.assertIn('"%s"' % state, script)
 
 
+@unittest.skipIf(os.name == "nt", "Übersicht integration is Unix-only")
 class UbersichtWidgetTests(unittest.TestCase):
     """The Übersicht desktop port and the shared fail-closed guards.
 
@@ -2144,6 +2145,7 @@ class UbersichtWidgetTests(unittest.TestCase):
         self.assertIn("parseFeed(MALFORMED)", wiring.split("}", 1)[0])
 
 
+@unittest.skipIf(os.name == "nt", "SwiftBar integration is macOS-only")
 class SwiftBarPluginTests(unittest.TestCase):
     @staticmethod
     def valid_body(port=8377):

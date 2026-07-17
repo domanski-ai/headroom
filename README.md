@@ -95,14 +95,34 @@ prints a notice because a side effect could therefore execute twice. See
 [Known limits](docs/KNOWN-LIMITS.md) before enabling automation on a new
 platform.
 
+## Platform support
+
+Linux and macOS support the complete CLI, including supervised Claude
+auto-handoff. Windows v1 supports collection, `status`, `pick`/`env`, token
+stats and history, and dashboard build/serve. Invoke it from PowerShell or
+Command Prompt with the stdlib entrypoint:
+
+```powershell
+python -m headroom collect
+python -m headroom status
+python -m headroom serve --demo
+```
+
+On Windows, `headroom claude` still selects an account but launches the CLI
+unsupervised. Supervised auto-handoff, transactional handoff, and the menu-bar
+app are not yet supported. Git Bash/MSYS2 users may also use `bin/headroom`;
+the launcher converts its checkout path for the native Python interpreter.
+
 ## Quickstart
 
-Requirements: Python 3.9+ (stdlib only — no pip installs), macOS or Linux,
-and the `claude` and/or `codex` CLIs you already use. (On macOS the Claude
-token lives in the login Keychain; headroom reads it directly — approve the
-Keychain prompt on first run. Multiple Claude accounts on one Mac need a
+Requirements: Python 3.9+ (stdlib only — no pip installs) on Windows, macOS,
+or Linux, and the `claude` and/or `codex` CLIs you already use. (On macOS the
+Claude token lives in the login Keychain; headroom reads it directly — approve
+the Keychain prompt on first run. Multiple Claude accounts on one Mac need a
 current Claude Code version — see
 [docs/KNOWN-LIMITS.md](docs/KNOWN-LIMITS.md).)
+
+On macOS or Linux:
 
 ```bash
 git clone https://github.com/domanski-ai/headroom

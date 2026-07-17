@@ -7,8 +7,16 @@ while [ -L "$SOURCE" ]; do  # resolve symlinks (install.sh links from ~/.local/b
   SOURCE="$(readlink "$SOURCE")"
   [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
 done
-HEADROOM_REPO="$(cd "$(dirname "$SOURCE")/.." && pwd)" \
-exec python3 -c 'import os, sys
+HEADROOM_REPO="$(cd "$(dirname "$SOURCE")/.." && pwd)"
+PYTHON=python3
+case "$(uname -s)" in
+  CYGWIN*|MINGW*|MSYS*)
+    HEADROOM_REPO="$(cygpath -w "$HEADROOM_REPO")"
+    PYTHON=python
+    ;;
+esac
+export HEADROOM_REPO
+exec "$PYTHON" -c 'import os, sys
 sys.path.insert(0, os.environ["HEADROOM_REPO"])
 from headroom.__main__ import main
 raise SystemExit(main())' "$@"

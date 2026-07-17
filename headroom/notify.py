@@ -9,13 +9,13 @@ transitions with a single JSON argument describing the event:
     {"event": "supervision_lost", "account": ..., "reason": ...}
     {"event": "fallback", "reason": ...}
 
-Delivery is best-effort and bounded: the command runs in its own process
-group with a hard timeout (default 10s, override with
-``HEADROOM_NOTIFY_TIMEOUT``); on timeout the WHOLE group is SIGKILLed so a
-``worker & wait`` observer can't leave descendants alive. A broken, missing,
-or hung notify command is swallowed with a stderr line — it must never block,
-materially delay, or kill the launch. This replaces external marker-polling
-with events; it composes with, and is independent of, the
+Delivery is best-effort and bounded: the command has a hard timeout (default
+10s, override with ``HEADROOM_NOTIFY_TIMEOUT``). Unix runs it in its own
+process group and kills that whole group on timeout; Windows can only promise
+to kill the direct observer process. A broken, missing, or hung notify command
+is swallowed with a stderr line — it must never block, materially delay, or
+kill the launch. This replaces external marker-polling with events; it
+composes with, and is independent of, the
 ``HEADROOM_LAUNCH_MARKER`` handshake.
 
 SECURITY: ``HEADROOM_NOTIFY_CMD`` is TRUSTED code — it runs as the invoking
@@ -60,29 +60,34 @@ def emit(event):
         if not argv:
             return False
         payload = json.dumps(event, sort_keys=True, allow_nan=False)
-        # start_new_session makes the command its own session/group leader
-        # (pgid == pid), so a hung command is killed without touching the
-        # launch's terminal/process group; all stdio detached so a chatty
-        # observer can never corrupt the CLI's screen
+        # Unix observers get a private process group. Windows has no killpg;
+        # CREATE_NEW_PROCESS_GROUP isolates console signals, and timeout
+        # cleanup honestly falls back to killing the direct observer process.
+        platform_options = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                            if os.name == "nt" else {"start_new_session": True})
         process = subprocess.Popen(
             argv + [payload],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True)
+            stderr=subprocess.DEVNULL, **platform_options)
         try:
             process.wait(timeout=_timeout())
         except subprocess.TimeoutExpired:
-            # SIGKILL the WHOLE group, not just the direct child: a shell that
-            # backgrounded workers (`worker & wait`) would otherwise leave them
-            # alive to accumulate. Then reap the leader so it isn't a zombie.
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                process.kill()  # group gone/unavailable — fall back to the pid
+            # Unix kills the WHOLE group so a shell that backgrounded workers
+            # cannot leave descendants alive. Windows kills the direct process.
+            # Then reap the leader so it does not remain a zombie.
+            if os.name == "nt":
+                process.kill()
+            else:
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    process.kill()  # group gone/unavailable — use the pid
             try:
                 process.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 pass
-            print("[headroom] notify command timed out; its process group was "
+            target = "process" if os.name == "nt" else "process group"
+            print(f"[headroom] notify command timed out; its {target} was "
                   "killed (launch continues)", file=sys.stderr)
             return False
         return True

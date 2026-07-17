@@ -10,7 +10,6 @@ authoritative: removed rows may remain on disk, but are never served or merged
 with a later slot that reuses the same display name.
 """
 import errno
-import fcntl
 import json
 import math
 import os
@@ -18,7 +17,7 @@ import re
 import tempfile
 import time
 
-from . import paths
+from . import locks, paths
 
 
 SCHEMA_VERSION = 1
@@ -263,7 +262,7 @@ def _write_rows_atomic(rows):
     descriptor, temporary = tempfile.mkstemp(
         prefix=".headroom-", suffix=".jsonl.tmp", dir=directory)
     try:
-        os.fchmod(descriptor, 0o600)
+        paths.fchmod_private(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             for row in rows:
                 json.dump(row, handle, allow_nan=False, separators=(",", ":"))
@@ -319,9 +318,9 @@ def _append_row(row):
     _ensure_storage()
     descriptor = os.open(
         paths.history_path(), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
-    os.fchmod(descriptor, 0o600)
+    paths.fchmod_private(descriptor, 0o600)
     with os.fdopen(descriptor, "a+b") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        locks.exclusive(handle)
         try:
             handle.seek(0, os.SEEK_END)
             end = handle.tell()
@@ -334,7 +333,7 @@ def _append_row(row):
             handle.flush()
             os.fsync(handle.fileno())
         finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+            locks.unlock(handle)
 
 
 def append_snapshot(snapshot, now=None, live_ids=None):

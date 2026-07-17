@@ -24,7 +24,6 @@ Codex reports cached input as a subset of input, so it is split into uncached
 import collections
 import contextlib
 import datetime
-import fcntl
 import hashlib
 import json
 import math
@@ -33,7 +32,7 @@ import re
 import stat
 import time
 
-from . import paths, registry
+from . import locks, paths, registry
 
 
 SCHEMA_VERSION = 7
@@ -756,7 +755,9 @@ def _open_contained(home, relative_path):
     path = os.path.join(home, *_relative_parts(relative_path))
     if not _inside_home(os.path.realpath(path), real_home):
         raise OSError("token source escapes account home")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     descriptor = os.open(path, flags)
     try:
         opened = os.fstat(descriptor)
@@ -902,20 +903,15 @@ def scan_lock(blocking=False):
     _ensure_storage()
     descriptor = os.open(
         paths.token_scan_lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
-    os.fchmod(descriptor, 0o600)
+    paths.fchmod_private(descriptor, 0o600)
     with os.fdopen(descriptor, "a+") as lock:
-        try:
-            flags = fcntl.LOCK_EX
-            if not blocking:
-                flags |= fcntl.LOCK_NB
-            fcntl.flock(lock, flags)
-        except BlockingIOError:
+        if not locks.exclusive(lock, blocking=blocking):
             yield False
             return
         try:
             yield True
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+            locks.unlock(lock)
 
 
 def _file_identity(entry):
