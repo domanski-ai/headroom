@@ -37,21 +37,23 @@ def counts(input_tokens, output, cache_read=0, cache_creation=0):
 
 def day_counts(input_tokens, output, cache_read=0, cache_creation=0,
                session_count=0, longest_session_s=0, families=None,
-               efforts=None):
+               efforts=None, projects=None, attributed=None):
     result = counts(input_tokens, output, cache_read, cache_creation)
     result.update({
         "session_count": session_count,
         "longest_session_s": longest_session_s,
         "families": families or {},
         "efforts": efforts or {},
+        "projects": projects or {},
+        "attributed": attributed or {},
     })
     return result
 
 
 def claude_line(timestamp, request_id, message_id, input_tokens=5,
                 output_tokens=3, cache_read=11, cache_creation=7,
-                model="claude-sonnet-4-5-20250929"):
-    return json.dumps({
+                model="claude-sonnet-4-5-20250929", cwd=None):
+    row = {
         "type": "assistant",
         "timestamp": timestamp,
         "requestId": request_id,
@@ -68,7 +70,10 @@ def claude_line(timestamp, request_id, message_id, input_tokens=5,
                 "output_tokens": output_tokens,
             },
         },
-    }) + "\n"
+    }
+    if cwd is not None:
+        row["cwd"] = cwd
+    return json.dumps(row) + "\n"
 
 
 def codex_line(timestamp, input_tokens, cached, output):
@@ -100,6 +105,14 @@ def codex_context_line(timestamp, model="gpt-5.6-sol", effort="xhigh"):
         "timestamp": timestamp,
         "type": "turn_context",
         "payload": {"model": model, "effort": effort},
+    }) + "\n"
+
+
+def codex_session_line(timestamp, cwd):
+    return json.dumps({
+        "timestamp": timestamp,
+        "type": "session_meta",
+        "payload": {"cwd": cwd},
     }) + "\n"
 
 
@@ -207,6 +220,52 @@ class TokenParserTests(unittest.TestCase):
             with self.subTest(model=model):
                 self.assertEqual(tokens._model_family(
                     model, provider="codex"), "gpt")
+
+    def test_cwd_bucketing_is_single_segment_sanitized_and_absent_safe(self):
+        rows = "".join([
+            claude_line("2026-07-11T00:00:00Z", "r1", "m1",
+                        cwd="/home/u/dispatch/nested/work"),
+            claude_line("2026-07-11T00:01:00Z", "r2", "m2",
+                        cwd="/home/u"),
+            claude_line("2026-07-11T00:02:00Z", "r3", "m3",
+                        cwd="/home/u/hostile@example/private"),
+            claude_line("2026-07-11T00:03:00Z", "r4", "m4",
+                        cwd="/home/u/" + "x" * 25 + "/private"),
+            claude_line("2026-07-11T00:04:00Z", "r5", "m5"),
+        ])
+        with mock.patch.dict(os.environ, {"HOME": "/home/u"}):
+            parsed = tokens._parse_stream(
+                io.BytesIO(rows.encode()), "claude")
+        self.assertEqual(parsed["days"]["2026-07-11"]["projects"], {
+            "dispatch": 26, "~": 26, "other": 52})
+        serialized = json.dumps(parsed)
+        self.assertNotIn("/home/u", serialized)
+        self.assertNotIn("hostile@example", serialized)
+
+    def test_codex_session_meta_cwd_applies_to_later_token_counts(self):
+        rows = (codex_session_line(
+            "2026-07-11T00:00:00Z", "/home/u/headroom/feature")
+            + codex_context_line("2026-07-11T00:00:01Z")
+            + codex_line("2026-07-11T00:00:02Z", 100, 60, 20))
+        with mock.patch.dict(os.environ, {"HOME": "/home/u"}):
+            parsed = tokens._parse_stream(
+                io.BytesIO(rows.encode()), "codex")
+        self.assertEqual(parsed["days"]["2026-07-11"]["projects"], {
+            "headroom": 120})
+        self.assertEqual(parsed["last_project"], "headroom")
+
+    def test_project_cap_folds_thirteenth_label_into_other(self):
+        day = "2026-07-11"
+        files = {"slot": {
+            f"file-{index}": {"days": {day: day_counts(
+                1, 0, projects={f"project-{index}": 1})}}
+            for index in range(tokens.MAX_PROJECT_LABELS + 1)
+        }}
+        projects = tokens._daily_from_files(files)["slot"][day]["projects"]
+        self.assertEqual(projects["other"], 1)
+        self.assertEqual(sum(projects.values()), 13)
+        self.assertEqual(len([label for label in projects if label != "other"]),
+                         tokens.MAX_PROJECT_LABELS)
 
     def test_session_duration_uses_file_endpoints_with_clamp_and_cap(self):
         files = {"slot": {}}
@@ -447,6 +506,7 @@ class TokenStoreTests(unittest.TestCase):
         self.assertEqual(rows[virtual_id]["name"], "Primary CLI home")
         self.assertEqual(rows[virtual_id]["provider"], "claude")
         self.assertEqual(rows[virtual_id]["lifetime_grand_total"], 26)
+        self.assertEqual(rows[virtual_id]["projects"], [])
         self.assertEqual(payload["days"][scan_day]["grand_total"], 26)
         ranked = sorted(payload["accounts"], key=lambda row: (
             -row["lifetime_grand_total"], -row["last7d_grand_total"],
@@ -468,6 +528,116 @@ class TokenStoreTests(unittest.TestCase):
         daily = paths.load_json(paths.token_daily_path())
         self.assertEqual(daily["accounts"][virtual_id]["2026-07-10"][
             "grand_total"], 30)
+
+    def test_extra_root_stamps_new_files_and_keeps_stamps_across_identity_flip(self):
+        self.account["expected_email"] = "alpha@example.test"
+        beta_home = os.path.join(self.temp.name, "beta-home")
+        os.makedirs(os.path.join(beta_home, "projects"))
+        beta = {
+            "id": slot_id("beta"), "name": "beta", "provider": "claude",
+            "home": beta_home, "expected_email": "beta@example.test",
+        }
+        self.config["accounts"].append(beta)
+        extra_home = os.path.join(self.temp.name, "workstation")
+        extra_project = os.path.join(extra_home, "projects", "pooled")
+        os.makedirs(extra_project)
+        first_path = os.path.join(extra_project, "first.jsonl")
+        with open(first_path, "w", encoding="utf-8") as handle:
+            handle.write(claude_line(
+                "2026-07-10T00:00:00Z", "first-r", "first-m",
+                cwd="/home/operator/headroom/private"))
+        virtual_id = self.add_extra_root("server-cli", "claude", extra_home)
+
+        with mock.patch.dict(os.environ, {"HOME": "/home/operator"}), \
+                mock.patch.object(usage_collect, "claude_identity", return_value={
+                    "verified": True, "email": "alpha@example.test"}):
+            tokens.collect(now=NOW, force=True)
+        first_state = paths.load_json(paths.token_scan_state_path())
+        first_entry = first_state["files"][virtual_id][
+            "projects/pooled/first.jsonl"]
+        self.assertEqual(first_entry["attributed_slot"], "alpha")
+
+        with open(os.path.join(extra_project, "second.jsonl"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(claude_line(
+                "2026-07-10T00:01:00Z", "second-r", "second-m",
+                cwd="/home/operator/dispatch/nested"))
+        with mock.patch.dict(os.environ, {"HOME": "/home/operator"}), \
+                mock.patch.object(usage_collect, "claude_identity", return_value={
+                    "verified": True, "email": "beta@example.test"}):
+            tokens.collect(now=NOW + 1, force=True)
+
+        state = paths.load_json(paths.token_scan_state_path())
+        entries = state["files"][virtual_id]
+        self.assertEqual(entries["projects/pooled/first.jsonl"][
+            "attributed_slot"], "alpha")
+        self.assertEqual(entries["projects/pooled/second.jsonl"][
+            "attributed_slot"], "beta")
+        daily = paths.load_json(paths.token_daily_path())
+        day = daily["accounts"][virtual_id]["2026-07-10"]
+        self.assertEqual(day["attributed"], {"alpha": 26, "beta": 26})
+        self.assertEqual(day["projects"], {"headroom": 26, "dispatch": 26})
+
+        payload = dashboard.display_snapshot(
+            usage_snapshot(self.account["id"]), evaluated_at=NOW + 1,
+            config=self.config)["token_stats"]
+        rows = {row["id"]: row for row in payload["accounts"]}
+        self.assertEqual(rows[virtual_id]["attributed_breakdown"], [
+            {"name": "alpha", "grand_total": 26},
+            {"name": "beta", "grand_total": 26},
+        ])
+        self.assertNotIn("attributed_breakdown", rows[self.account["id"]])
+        self.assertNotIn("attributed_breakdown", rows[beta["id"]])
+        self.assertEqual(rows[virtual_id]["projects"][0]["grand_total"], 26)
+        self.assertEqual(len(payload["summary"]["projects"]), 2)
+        serialized = json.dumps({
+            "state": state, "daily": daily, "payload": payload})
+        for secret in ("/home/operator", "alpha@example.test",
+                       "beta@example.test"):
+            self.assertNotIn(secret, serialized)
+
+    def test_schema_six_sessions_migrate_to_earlier_and_reparse_cwd(self):
+        self.account["expected_email"] = "alpha@example.test"
+        extra_home = os.path.join(self.temp.name, "legacy-workstation")
+        extra_project = os.path.join(extra_home, "projects", "pooled")
+        os.makedirs(extra_project)
+        with open(os.path.join(extra_project, "legacy.jsonl"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(claude_line(
+                "2026-07-10T00:00:00Z", "legacy-r", "legacy-m",
+                cwd="/home/operator/headroom/nested"))
+        virtual_id = self.add_extra_root("server-cli", "claude", extra_home)
+        identity = {"verified": True, "email": "alpha@example.test"}
+        with mock.patch.dict(os.environ, {"HOME": "/home/operator"}), \
+                mock.patch.object(usage_collect, "claude_identity",
+                                  return_value=identity):
+            tokens.collect(now=NOW, force=True)
+
+        state = paths.load_json(paths.token_scan_state_path())
+        state["schema_version"] = tokens.PREVIOUS_SCHEMA_VERSION
+        legacy = state["files"][virtual_id]["projects/pooled/legacy.jsonl"]
+        legacy.pop("attributed_slot")
+        legacy.pop("project_schema")
+        legacy["days"]["2026-07-10"].pop("projects")
+        paths.write_json_atomic(paths.token_scan_state_path(), state)
+        daily = paths.load_json(paths.token_daily_path())
+        daily["schema_version"] = tokens.PREVIOUS_SCHEMA_VERSION
+        paths.write_json_atomic(paths.token_daily_path(), daily)
+
+        with mock.patch.dict(os.environ, {"HOME": "/home/operator"}), \
+                mock.patch.object(usage_collect, "claude_identity",
+                                  return_value=identity):
+            self.assertTrue(tokens.collect(now=NOW + 1))
+        migrated_state = paths.load_json(paths.token_scan_state_path())
+        migrated = migrated_state["files"][virtual_id][
+            "projects/pooled/legacy.jsonl"]
+        self.assertEqual(migrated["attributed_slot"], "earlier")
+        self.assertEqual(migrated["project_schema"],
+                         tokens.PROJECT_SCHEMA_VERSION)
+        migrated_day = paths.load_json(paths.token_daily_path())[
+            "accounts"][virtual_id]["2026-07-10"]
+        self.assertEqual(migrated_day["projects"], {"headroom": 26})
+        self.assertEqual(migrated_day["attributed"], {"earlier": 26})
 
     def test_extra_root_removal_hides_immediately_then_lazy_prunes_state(self):
         extra_home = os.path.join(self.temp.name, "removable")
@@ -1425,7 +1595,8 @@ class TokenSummaryTests(unittest.TestCase):
         live_days[self.day(-2)] = day_counts(
             100, 20, cache_read=50, session_count=2,
             longest_session_s=3700, families={"fable": 170},
-            efforts={"xhigh": 170})
+            efforts={"xhigh": 170},
+            projects={"headroom": 100, "dispatch": 70})
         store = {
             "schema_version": tokens.SCHEMA_VERSION,
             "generated": NOW - 10,
@@ -1467,6 +1638,11 @@ class TokenSummaryTests(unittest.TestCase):
         self.assertEqual(value["summary"]["families"][0]["tokens"], 170)
         self.assertEqual(value["summary"]["efforts"][-1], {
             "label": "xhigh", "tokens": 170, "share_pct": 100.0})
+        self.assertEqual(row["projects"][0], {
+            "label": "headroom", "grand_total": 100,
+            "share_pct": round(100 * 100 / row["lifetime_grand_total"], 1),
+        })
+        self.assertEqual(value["summary"]["projects"], row["projects"])
 
     def test_missing_new_derived_fields_are_zero_safe(self):
         day = self.day(0)
@@ -1480,6 +1656,26 @@ class TokenSummaryTests(unittest.TestCase):
             "seconds": 0, "date": None, "account": None})
         self.assertEqual(value["summary"]["most_used_model"], {
             "label": "other", "share_pct": 100.0})
+        self.assertEqual(value["accounts"][0]["projects"], [])
+        self.assertEqual(value["summary"]["projects"], [])
+        self.assertNotIn("attributed_breakdown", value["accounts"][0])
+
+    def test_project_payload_lists_are_capped_at_top_six(self):
+        day = self.day(0)
+        project_counts = {f"project-{index}": index + 1
+                          for index in range(8)}
+        grand_total = sum(project_counts.values())
+        value = tokens.summarize({
+            "schema_version": tokens.SCHEMA_VERSION,
+            "generated": NOW,
+            "accounts": {self.account["id"]: {
+                day: day_counts(grand_total, 0, projects=project_counts)}},
+        }, [self.account], now=NOW)
+        self.assertEqual(len(value["accounts"][0]["projects"]), 6)
+        self.assertEqual(value["accounts"][0]["projects"],
+                         value["summary"]["projects"])
+        self.assertEqual(value["summary"]["projects"][0]["label"],
+                         "project-7")
 
     def test_session_only_day_does_not_become_token_peak(self):
         day = self.day(0)

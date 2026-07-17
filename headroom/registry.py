@@ -13,7 +13,7 @@ Config shape (schema_version 1)::
       "dashboard": {"theme": "midnight", "title": "AI Fleet",
                      "redact_emails": false, "port": 8377,
                      "token_extra_roots": [
-                       {"label": "Primary CLI home", "provider": "claude",
+                       {"label": "server-cli", "provider": "claude",
                         "path": "/home/me/.claude"}
                      ]},
       "accounts": [

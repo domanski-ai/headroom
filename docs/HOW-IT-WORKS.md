@@ -119,13 +119,18 @@ containment, symlink, inode-dedupe, cardinality, file-count, and serialized-stat
 budgets as registry homes; the budgets are shared across the whole scan. Walks
 never follow directory symlinks, and every opened file is rechecked against the
 real configured home.
-`state/tokens/daily.json` contains
-only slot IDs, UTC dates, and numeric `input`, `output`, `cache_read`,
-`cache_creation`, and `total` fields. The private `scan-state.json` additionally
-keys files by slot ID and home-relative path, and stores sizes, mtimes, device
-and inode identity, a first-4KB fingerprint, safe byte offsets, per-file
-numeric subtotals, bounded hashed dedupe metadata, and last-error status. It
-contains no absolute home paths, emails, or message text. Both files and the
+`state/tokens/daily.json` contains only slot IDs, UTC dates, numeric token
+counts, and bounded `families`, `efforts`, `projects`, and `attributed` numeric
+maps. Project labels come from `cwd`, but only as the first path segment below
+the operator's home (`~` for the home itself). Labels containing `@`, longer
+than 24 characters, or otherwise unsafe fold into `other`; missing cwd data is
+skipped. Each slot admits 12 project labels before later labels fold into
+`other`. Claude records carry cwd directly; Codex uses the cwd from
+`session_meta` when present. The private `scan-state.json` additionally keys
+files by slot ID and home-relative path, and stores sizes, mtimes, device and
+inode identity, a first-4KB fingerprint, safe byte offsets, per-file numeric
+subtotals, bounded hashed dedupe metadata, and last-error status. It contains
+no raw cwd values, absolute home paths, emails, or message text. Both files and the
 scan lock are mode `0600` under a mode `0700` directory.
 
 `total` is the headline token count: input + output + cache creation. Cache
@@ -150,11 +155,26 @@ whose logs live only on another machine are outside the collector's coverage.
 A scan with unreadable files keeps their previous subtotals and marks the
 embedded result as partial with a failed-file count.
 
-Registry rows are attributable to isolated slot homes. A virtual extra-root row
-is intentionally aggregate-only: transcripts do not carry trustworthy account
-identity, so rotating logins used inside one CLI home cannot be split per
-account. Its label always means “activity found under this home,” not “activity
-owned by this login.”
+Project totals are exact for records that carry cwd. Each account row exposes
+its top six project labels with `grand_total` and share of that row's total; the
+summary exposes the fleet top six on the same basis.
+
+Registry rows remain attributable to isolated slot homes. A virtual Claude
+extra-root row adds a separate, forward-only approximation. Once per scan,
+headroom calls the same read-only identity probe used by the collector for that
+Claude home. If its current verified OAuth email uniquely matches a registry
+slot's `expected_email`, every newly discovered session file is stamped with
+the slot name. The file keeps that stamp across later identity changes, and its
+daily totals accrue to `attributed` under that name. Schema-6 files that existed
+before this feature, and files first seen without a unique verified match, are
+stamped `earlier`. The payload exposes the totals only as
+`attributed_breakdown` on the virtual row; it never moves or merges them into a
+real account row.
+
+This boundary is intentional: the stamp records the identity active when the
+scanner first saw a file, not necessarily the identity that created every turn
+inside it. A long-lived file spanning a login change therefore remains with its
+first stamp. The extra-root label still means “activity found under this home.”
 
 ## Cooldowns
 
