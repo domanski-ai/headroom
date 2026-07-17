@@ -522,6 +522,28 @@ class ClaudeIdentity(unittest.TestCase):
             return FakeResult()
         return runner
 
+    def test_default_profile_metadata_read_from_profile_root(self):
+        """The default layout (config dir named .claude) keeps oauthAccount in
+        the PROFILE ROOT ~/.claude.json — the file inside the config dir is a
+        stub. Windows single-account setups hit this; the binding must fall
+        back to the sibling, and managed slot homes must never look up."""
+        profile = os.path.join(self.temp.name, "profile")
+        home = os.path.join(profile, ".claude")
+        os.makedirs(home)
+        with open(os.path.join(home, ".claude.json"), "w") as handle:
+            json.dump({"installMethod": "unknown"}, handle)  # the stub
+        with open(os.path.join(profile, ".claude.json"), "w") as handle:
+            json.dump({"oauthAccount": {
+                "emailAddress": "shaun@example.com",
+                "organizationUuid": "org-1234"}}, handle)
+        result = collect.claude_local_identity(home)
+        self.assertEqual(result["email"], "shaun@example.com")
+        self.assertEqual(result["method"], "claude_local_metadata")
+        managed = os.path.join(profile, "claude-slot")
+        os.makedirs(managed)
+        with self.assertRaises(collect.IdentityBindingError):
+            collect.claude_local_identity(managed)
+
     def test_null_org_id_returns_none_fingerprint(self):
         """Personal Max accounts return orgId=null from claude auth status.
         This must not raise — account_fingerprint should be None so the

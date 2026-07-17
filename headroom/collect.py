@@ -157,10 +157,30 @@ def decode_jwt_payload(token):
         raise ValueError("invalid local identity token") from error
 
 
+def _claude_metadata_candidates(home):
+    """Where Claude Code may keep the oauthAccount block for this home.
+
+    Headroom-managed homes (CLAUDE_CONFIG_DIR pointed at the slot) store
+    ``<home>/.claude.json``. The DEFAULT profile — the common Windows and
+    single-account layout — uses ``~/.claude`` as the config dir but keeps
+    ``.claude.json`` one level up in the profile root, leaving only a stub
+    inside the config dir. Yield both, preferred location first.
+    """
+    yield os.path.join(home, ".claude.json")
+    parent = os.path.dirname(os.path.abspath(home))
+    if os.path.basename(os.path.abspath(home)) == ".claude":
+        yield os.path.join(parent, ".claude.json")
+
+
 def claude_local_identity(home):
     """Identity bound inside the slot from local metadata only (no network)."""
-    metadata = paths.load_json(os.path.join(home, ".claude.json")) or {}
-    oauth = metadata.get("oauthAccount") or {}
+    oauth = {}
+    for candidate in _claude_metadata_candidates(home):
+        metadata = paths.load_json(candidate) or {}
+        found = metadata.get("oauthAccount") or {}
+        if found.get("emailAddress") and found.get("organizationUuid"):
+            oauth = found
+            break
     email_address = oauth.get("emailAddress")
     org = oauth.get("organizationUuid")
     if not email_address or not org:
