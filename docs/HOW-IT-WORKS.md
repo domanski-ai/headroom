@@ -90,8 +90,8 @@ created). When enabled, the scan runs after the normal collection lock is
 released, uses its own `state/tokens/scan.lock`, and cannot fail the main
 collection.
 
-For every live registry slot, the collector streams only that provider's local
-CLI logs:
+For every live registry slot and valid `dashboard.token_extra_roots` entry, the
+collector streams only that provider's local CLI logs:
 
 - Claude Code: `<home>/projects/**/*.jsonl`, using timestamped assistant
   `message.usage` counters. Progressive or repeated records with the same
@@ -102,9 +102,21 @@ CLI logs:
   deltas are assigned to each event's UTC day, so repeated cumulative
   emissions are not summed.
 
+An extra-root entry has `label`, `provider`, and `path` fields. The label is
+1–40 characters without `@` and cannot duplicate another extra label or a
+registry slot name; provider is `claude` or `codex`; path is an absolute,
+existing directory. An invalid or disappeared path is skipped and makes the
+token result partial rather than breaking registry collection. Each usable
+entry is projected as a virtual slot with stable ID
+`x-<first 12 hex characters of sha256(label)>`. The `x-` namespace cannot
+collide with registry generation IDs, which are lowercase hexadecimal only.
+
 The parser necessarily reads each JSONL record to reach its usage block, but
-message content is immediately discarded. Walks never follow directory
-symlinks, and every opened file is rechecked against the real account home.
+message content is immediately discarded. Extra roots use the same discovery,
+containment, symlink, inode-dedupe, cardinality, file-count, and serialized-state
+budgets as registry homes; the budgets are shared across the whole scan. Walks
+never follow directory symlinks, and every opened file is rechecked against the
+real configured home.
 `state/tokens/daily.json` contains
 only slot IDs, UTC dates, and numeric `input`, `output`, `cache_read`,
 `cache_creation`, and `total` fields. The private `scan-state.json` additionally
@@ -124,14 +136,23 @@ newline-terminated valid records advance a checkpoint; an incomplete EOF
 fragment is retried. Handoff target copies carry one content-free boundary
 record, so their copied prefix is attributed only to the source slot.
 
-At payload time, the store is projected through the current registry slot-ID
-allow-list. Removed slot generations are never served. Lifetime, per-account
-trailing-seven-day totals, peak days, and fleet streaks are derived then, and
-the daily fleet map is capped to the trailing 400 UTC days. The result is
-embedded in the existing usage payload; there is no token endpoint or extra
-network surface. Sessions whose logs live only on another machine are outside
-the collector's coverage. A scan with unreadable files keeps their previous
-subtotals and marks the embedded result as partial with a failed-file count.
+At payload time, the store is projected through one current config view: live
+registry slot IDs plus virtual IDs for the extra-root entries still present and
+usable in that view. Removed slot generations and deleted extra-root entries
+are never served. A later token scan prunes their private state through the same
+dead-ID path. Lifetime, per-row trailing-seven-day totals, peak days, and fleet
+streaks are derived then, and every included row contributes to the daily fleet
+map capped to the trailing 400 UTC days. The result is embedded in the existing
+usage payload; there is no token endpoint or extra network surface. Sessions
+whose logs live only on another machine are outside the collector's coverage.
+A scan with unreadable files keeps their previous subtotals and marks the
+embedded result as partial with a failed-file count.
+
+Registry rows are attributable to isolated slot homes. A virtual extra-root row
+is intentionally aggregate-only: transcripts do not carry trustworthy account
+identity, so rotating logins used inside one CLI home cannot be split per
+account. Its label always means “activity found under this home,” not “activity
+owned by this login.”
 
 ## Cooldowns
 

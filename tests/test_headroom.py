@@ -77,6 +77,54 @@ class RegistryValidation(unittest.TestCase):
             {"name": "personal", "provider": "claude", "home": "~/.claude"}]}
         self.assertEqual(registry.validate(cfg), cfg)
 
+    def test_token_extra_roots_reject_bad_labels_providers_and_duplicates(self):
+        base = {"schema_version": 1, "accounts": [_account("alpha")]}
+        entries = [
+            [{"label": "", "provider": "claude", "path": "/tmp"}],
+            [{"label": "bad@example", "provider": "claude",
+              "path": "/tmp"}],
+            [{"label": "x" * 41, "provider": "claude", "path": "/tmp"}],
+            [{"label": "interactive", "provider": "other", "path": "/tmp"}],
+            [{"label": "alpha", "provider": "claude", "path": "/tmp"}],
+            [{"label": "interactive", "provider": "claude", "path": "/tmp"},
+             {"label": "interactive", "provider": "codex", "path": "/tmp"}],
+        ]
+        for roots in entries:
+            config = dict(base, dashboard={"token_extra_roots": roots})
+            with self.subTest(roots=roots), \
+                    self.assertRaises(registry.RegistryError):
+                registry.validate(config)
+
+    def test_token_extra_root_bad_paths_are_skipped_and_partial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            regular_file = os.path.join(directory, "file")
+            with open(regular_file, "w", encoding="utf-8") as handle:
+                handle.write("x")
+            config = {"schema_version": 1, "accounts": [_account("alpha")],
+                      "dashboard": {"token_extra_roots": [
+                          {"label": "valid", "provider": "claude",
+                           "path": directory},
+                          {"label": "relative", "provider": "codex",
+                           "path": "sessions"},
+                          {"label": "missing", "provider": "claude",
+                           "path": os.path.join(directory, "missing")},
+                          {"label": "file", "provider": "claude",
+                           "path": regular_file},
+                      ]}}
+            self.assertEqual(registry.validate(config), config)
+            roots, partial = registry.token_extra_roots(
+                config, include_status=True)
+        self.assertTrue(partial)
+        self.assertEqual([root["name"] for root in roots], ["valid"])
+
+    def test_virtual_slot_id_is_stable_and_outside_registry_namespace(self):
+        slot = registry.virtual_slot_id("Primary CLI home")
+        self.assertEqual(slot, registry.virtual_slot_id("Primary CLI home"))
+        self.assertNotEqual(slot, registry.virtual_slot_id("Another home"))
+        self.assertRegex(slot, registry.VIRTUAL_ID_RE)
+        self.assertNotRegex(slot, registry.ID_RE)
+        self.assertNotEqual(slot, _slot_id("Primary CLI home"))
+
     def test_rejects_invalid_or_duplicate_slot_ids(self):
         invalid = {"schema_version": 1, "accounts": [
             dict(_account("a"), id="NOT-HEX")]}

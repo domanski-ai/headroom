@@ -919,11 +919,11 @@ def _daily_from_files(files, include_status=False):
 
 
 def collect(accounts=None, config=None, now=None, force=False):
-    """Incrementally scan the authoritative registry; return False if gated.
+    """Incrementally scan authoritative registry and extra roots.
 
     ``accounts`` and ``config`` remain accepted for source compatibility but
     are intentionally ignored: opt-out and enumeration must come from one
-    registry view loaded under the config lock after the scan lock is held.
+    config view loaded under the config lock after the scan lock is held.
     """
     with scan_lock(blocking=False) as locked:
         if not locked:
@@ -932,7 +932,8 @@ def collect(accounts=None, config=None, now=None, force=False):
             authoritative_config = registry.load()
             if not registry.token_stats_enabled(authoritative_config):
                 return False
-            accounts = registry.accounts(authoritative_config)
+            accounts, extra_roots_partial = registry.token_accounts(
+                authoritative_config, include_status=True)
         now = int(time.time() if now is None else now)
         old_state = paths.load_json(paths.token_scan_state_path()) or {}
         if not isinstance(old_state, dict) \
@@ -1025,6 +1026,7 @@ def collect(accounts=None, config=None, now=None, force=False):
             "last_success": now,
             "failed_root_count": len(failed_root_slot_ids),
             "failed_root_slot_ids": failed_root_slot_ids,
+            "extra_roots_partial": extra_roots_partial,
             "files": files,
         }
         # Materialize aggregation-only markers before measuring serialized
@@ -1042,7 +1044,8 @@ def collect(accounts=None, config=None, now=None, force=False):
             1 for slot_files in files.values() if isinstance(slot_files, dict)
             for entry in slot_files.values()
             if isinstance(entry, dict) and entry.get("duplicate_identity") is True)
-        partial = bool(failed_files or failed_root_slot_ids or partial_files
+        partial = bool(extra_roots_partial or failed_files
+                       or failed_root_slot_ids or partial_files
                        or duplicate_files or budget_dropped_files
                        or aggregate_partial)
         daily = {
@@ -1136,6 +1139,8 @@ def remove_account(slot_id):
             if isinstance(entry, dict)
             and entry.get("duplicate_identity") is True
         ) if state_authoritative else None
+        extra_roots_partial = state.get("extra_roots_partial") is True \
+            if isinstance(state, dict) else False
 
         daily_path = paths.token_daily_path()
         daily = paths.load_json(daily_path)
@@ -1152,8 +1157,9 @@ def remove_account(slot_id):
                 budget_dropped_file_count = _count(
                     daily.get("budget_dropped_file_count", 0)) or 0
             recalculated_partial = failed_file_count is not None and bool(
-                failed_file_count or failed_root_count or partial_file_count
-                or duplicate_file_count or budget_dropped_file_count)
+                extra_roots_partial or failed_file_count or failed_root_count
+                or partial_file_count or duplicate_file_count
+                or budget_dropped_file_count)
             partial_changed = failed_file_count is not None and any((
                 daily.get("failed_file_count") != failed_file_count,
                 daily.get("failed_root_count") != failed_root_count,
@@ -1231,7 +1237,7 @@ def _streaks(active_days, today):
     return current, longest
 
 
-def summarize(store, accounts, now=None):
+def summarize(store, accounts, now=None, partial=False):
     """Project private daily aggregates through the live slot allow-list."""
     if not isinstance(store, dict) \
             or store.get("schema_version") != SCHEMA_VERSION:
@@ -1314,7 +1320,7 @@ def summarize(store, accounts, now=None):
         store.get("budget_dropped_file_count", 0)) or 0
     return {
         "generated": generated,
-        "partial": store.get("partial") is True,
+        "partial": store.get("partial") is True or partial is True,
         "failed_file_count": failed_file_count,
         "failed_root_count": failed_root_count,
         "partial_file_count": partial_file_count,
@@ -1340,6 +1346,7 @@ def summarize(store, accounts, now=None):
     }
 
 
-def load_summary(accounts, now=None):
+def load_summary(accounts, now=None, partial=False):
     store = paths.load_json(paths.token_daily_path())
-    return summarize(store, accounts, now=now) if store is not None else None
+    return summarize(store, accounts, now=now, partial=partial) \
+        if store is not None else None

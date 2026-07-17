@@ -11,7 +11,11 @@ Config shape (schema_version 1)::
     {
       "schema_version": 1,
       "dashboard": {"theme": "midnight", "title": "AI Fleet",
-                     "redact_emails": false, "port": 8377},
+                     "redact_emails": false, "port": 8377,
+                     "token_extra_roots": [
+                       {"label": "Primary CLI home", "provider": "claude",
+                        "path": "/home/me/.claude"}
+                     ]},
       "accounts": [
         {"id": "3f62ad91b7c4", "name": "personal", "provider": "claude",
          "home": "~/.claude",  # or ~/.headroom/homes/personal
@@ -27,6 +31,7 @@ some other workflow and must not be consumed by automatic rotation.
 """
 import contextlib
 import fcntl
+import hashlib
 import os
 import re
 import uuid
@@ -36,6 +41,7 @@ from . import paths
 PROVIDERS = ("claude", "codex")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 ID_RE = re.compile(r"^[0-9a-f]{12,32}$")
+VIRTUAL_ID_RE = re.compile(r"^x-[0-9a-f]{12}$")
 DEFAULT_DASHBOARD = {
     "theme": "midnight",
     "title": "AI Fleet",
@@ -82,6 +88,38 @@ def expand(path):
     # realpath so two paths that resolve to the same home (one via a symlink)
     # canonicalize identically for storage and duplicate detection
     return os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+
+
+def virtual_slot_id(label):
+    """Return the stable, non-registry namespace ID for an extra token root."""
+    return "x-" + hashlib.sha256(label.encode("utf-8")).hexdigest()[:12]
+
+
+def _token_extra_root_entries(config):
+    dashboard = config.get("dashboard")
+    if not isinstance(dashboard, dict) \
+            or "token_extra_roots" not in dashboard:
+        return []
+    entries = dashboard["token_extra_roots"]
+    if not isinstance(entries, list):
+        raise RegistryError("dashboard.token_extra_roots must be a list")
+    labels = {account.get("name") for account in config.get("accounts", [])}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise RegistryError("dashboard.token_extra_roots entries must be objects")
+        label = entry.get("label")
+        if not isinstance(label, str) or not 1 <= len(label) <= 40 \
+                or "@" in label:
+            raise RegistryError(
+                "token extra-root label must be 1-40 characters without @")
+        if label in labels:
+            raise RegistryError(f"token extra-root label duplicate: {label!r}")
+        provider = entry.get("provider")
+        if provider not in PROVIDERS:
+            raise RegistryError(
+                f"token extra-root {label}: provider must be one of {PROVIDERS}")
+        labels.add(label)
+    return entries
 
 
 def validate(config):
@@ -135,6 +173,7 @@ def validate(config):
             raise RegistryError(f"account {name}: home {resolved} already used by another account")
         names.add(name)
         homes.add(resolved)
+    _token_extra_root_entries(config)
     return config
 
 
@@ -158,6 +197,39 @@ def accounts(config=None):
         row["home"] = expand(row["home"])
         result.append(row)
     return result
+
+
+def token_extra_roots(config=None, include_status=False):
+    """Project usable configured token roots as virtual account-shaped rows.
+
+    A path can disappear after config validation, so unusable paths are skipped
+    and reported as partial instead of making the whole registry unloadable.
+    """
+    config = load() if config is None else config
+    result = []
+    partial = False
+    for entry in _token_extra_root_entries(config):
+        path = entry.get("path")
+        if not isinstance(path, str) or not os.path.isabs(path) \
+                or not os.path.isdir(path):
+            partial = True
+            continue
+        label = entry["label"]
+        result.append({
+            "id": virtual_slot_id(label),
+            "name": label,
+            "provider": entry["provider"],
+            "home": expand(path),
+        })
+    return (result, partial) if include_status else result
+
+
+def token_accounts(config=None, include_status=False):
+    """Registry slots plus virtual extra roots for token scanning and feeds."""
+    config = load() if config is None else config
+    extra, partial = token_extra_roots(config, include_status=True)
+    result = accounts(config) + extra
+    return (result, partial) if include_status else result
 
 
 def new_slot_id(config):

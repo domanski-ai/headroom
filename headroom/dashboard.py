@@ -44,8 +44,10 @@ def display_snapshot(snapshot, evaluated_at=None, force_noncurrent_reason=None,
         enabled = registry.token_stats_enabled(live_config)
         value["token_stats_enabled"] = enabled
         if enabled:
+            token_accounts, roots_partial = registry.token_accounts(
+                live_config, include_status=True)
             token_stats = tokens.load_summary(
-                registry.accounts(live_config), now=evaluated_at)
+                token_accounts, now=evaluated_at, partial=roots_partial)
             if token_stats is not None:
                 value["token_stats"] = token_stats
     except Exception:

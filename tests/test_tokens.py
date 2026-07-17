@@ -417,6 +417,148 @@ class TokenStoreTests(unittest.TestCase):
         return state["files"][self.account["id"]][
             "projects/project/" + name]
 
+    def add_extra_root(self, label, provider, home):
+        self.config["dashboard"]["token_extra_roots"] = [{
+            "label": label, "provider": provider, "path": home,
+        }]
+        registry.save(self.config)
+        return registry.virtual_slot_id(label)
+
+    def test_extra_claude_root_scans_aggregates_and_enters_ranking(self):
+        extra_home = os.path.join(self.temp.name, "interactive-claude")
+        extra_project = os.path.join(extra_home, "projects", "interactive")
+        os.makedirs(extra_project)
+        scan_day = datetime.datetime.fromtimestamp(
+            NOW, datetime.timezone.utc).date().isoformat()
+        with open(os.path.join(extra_project, "session.jsonl"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(claude_line(
+                scan_day + "T00:00:00Z", "extra-r", "extra-m"))
+        virtual_id = self.add_extra_root(
+            "Primary CLI home", "claude", extra_home)
+
+        self.assertTrue(tokens.collect(now=NOW, force=True))
+        state = paths.load_json(paths.token_scan_state_path())
+        self.assertIn(virtual_id, state["files"])
+        payload = dashboard.display_snapshot(
+            usage_snapshot(self.account["id"]), evaluated_at=NOW,
+            config=self.config)["token_stats"]
+        rows = {row["id"]: row for row in payload["accounts"]}
+        self.assertEqual(rows[virtual_id]["name"], "Primary CLI home")
+        self.assertEqual(rows[virtual_id]["provider"], "claude")
+        self.assertEqual(rows[virtual_id]["lifetime_grand_total"], 26)
+        self.assertEqual(payload["days"][scan_day]["grand_total"], 26)
+        ranked = sorted(payload["accounts"], key=lambda row: (
+            -row["lifetime_grand_total"], -row["last7d_grand_total"],
+            row["name"], row["id"]))
+        self.assertEqual(ranked[0]["id"], virtual_id)
+
+    def test_extra_codex_root_uses_rollout_discovery(self):
+        extra_home = os.path.join(self.temp.name, "interactive-codex")
+        sessions = os.path.join(extra_home, "sessions", "2026", "07")
+        os.makedirs(sessions)
+        with open(os.path.join(sessions, "rollout-extra.jsonl"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(codex_line(
+                "2026-07-10T00:00:00Z", 20, 5, 10))
+        virtual_id = self.add_extra_root(
+            "Codex interactive", "codex", extra_home)
+
+        tokens.collect(now=NOW, force=True)
+        daily = paths.load_json(paths.token_daily_path())
+        self.assertEqual(daily["accounts"][virtual_id]["2026-07-10"][
+            "grand_total"], 30)
+
+    def test_extra_root_removal_hides_immediately_then_lazy_prunes_state(self):
+        extra_home = os.path.join(self.temp.name, "removable")
+        project = os.path.join(extra_home, "projects", "p")
+        os.makedirs(project)
+        with open(os.path.join(project, "session.jsonl"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(claude_line(
+                "2026-07-10T00:00:00Z", "remove-r", "remove-m"))
+        virtual_id = self.add_extra_root("Removable home", "claude", extra_home)
+        tokens.collect(now=NOW, force=True)
+        self.assertIn(virtual_id, paths.load_json(
+            paths.token_scan_state_path())["files"])
+
+        self.config["dashboard"]["token_extra_roots"] = []
+        registry.save(self.config)
+        payload = dashboard.display_snapshot(
+            usage_snapshot(self.account["id"]), evaluated_at=NOW,
+            config=self.config)["token_stats"]
+        self.assertNotIn(virtual_id, {
+            row["id"] for row in payload["accounts"]})
+        self.assertIn(virtual_id, paths.load_json(
+            paths.token_scan_state_path())["files"])
+
+        tokens.collect(now=NOW + 1, force=True)
+        self.assertNotIn(virtual_id, paths.load_json(
+            paths.token_scan_state_path())["files"])
+        self.assertNotIn(virtual_id, paths.load_json(
+            paths.token_daily_path())["accounts"])
+
+    def test_extra_root_containment_skips_symlinked_subdirectories(self):
+        extra_home = os.path.join(self.temp.name, "contained")
+        project = os.path.join(extra_home, "projects", "p")
+        outside = os.path.join(self.temp.name, "outside")
+        os.makedirs(project)
+        os.makedirs(outside)
+        with open(os.path.join(project, "inside.jsonl"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(claude_line(
+                "2026-07-10T00:00:00Z", "inside-r", "inside-m"))
+        with open(os.path.join(outside, "escaped.jsonl"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(claude_line(
+                "2026-07-10T00:00:00Z", "outside-r", "outside-m"))
+        os.symlink(outside, os.path.join(project, "escape"))
+        virtual_id = self.add_extra_root("Contained home", "claude", extra_home)
+
+        tokens.collect(now=NOW, force=True)
+        files = paths.load_json(paths.token_scan_state_path())[
+            "files"][virtual_id]
+        self.assertEqual(set(files), {"projects/p/inside.jsonl"})
+
+    def test_invalid_extra_path_marks_scan_and_payload_partial(self):
+        missing = os.path.join(self.temp.name, "missing")
+        virtual_id = self.add_extra_root("Missing home", "claude", missing)
+        accounts, roots_partial = registry.token_accounts(
+            self.config, include_status=True)
+        self.assertTrue(roots_partial)
+        self.assertNotIn(virtual_id, {account["id"] for account in accounts})
+
+        tokens.collect(now=NOW, force=True)
+        state = paths.load_json(paths.token_scan_state_path())
+        daily = paths.load_json(paths.token_daily_path())
+        self.assertTrue(state["extra_roots_partial"])
+        self.assertTrue(daily["partial"])
+        payload = dashboard.display_snapshot(
+            usage_snapshot(self.account["id"]), evaluated_at=NOW,
+            config=self.config)["token_stats"]
+        self.assertTrue(payload["partial"])
+
+    def test_registry_and_extra_roots_share_global_file_budget(self):
+        self.write("registry.jsonl", claude_line(
+            "2026-07-10T00:00:00Z", "registry-r", "registry-m"))
+        extra_home = os.path.join(self.temp.name, "budget-extra")
+        project = os.path.join(extra_home, "projects", "p")
+        os.makedirs(project)
+        with open(os.path.join(project, "extra.jsonl"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(claude_line(
+                "2026-07-10T00:00:00Z", "extra-r", "extra-m"))
+        self.add_extra_root("Budget home", "claude", extra_home)
+
+        with mock.patch.object(tokens, "MAX_TRACKED_FILES", 1), \
+                mock.patch.object(tokens, "MAX_SERIALIZED_STATE_BYTES",
+                                  10 * 1024 * 1024):
+            tokens.collect(now=NOW, force=True)
+        state = paths.load_json(paths.token_scan_state_path())
+        self.assertEqual(sum(len(files) for files in state["files"].values()), 1)
+        self.assertEqual(sum(state["budget_dropped_files"].values()), 1)
+        self.assertTrue(paths.load_json(paths.token_daily_path())["partial"])
+
     def test_incremental_grown_new_and_unchanged_files(self):
         first = self.write(
             "one.jsonl", "{}\n" * 1500 + claude_line(
@@ -1168,10 +1310,14 @@ class TokenSummaryTests(unittest.TestCase):
 
         with mock.patch.object(registry, "load",
                                return_value=self.config) as load, \
+                mock.patch.object(registry, "token_accounts",
+                                  wraps=registry.token_accounts) as token_accounts, \
                 mock.patch.object(registry, "accounts",
                                   wraps=registry.accounts) as accounts:
             dashboard.display_snapshot(poisoned, evaluated_at=NOW)
         load.assert_called_once_with()
+        token_accounts.assert_called_once_with(
+            self.config, include_status=True)
         accounts.assert_called_once_with(self.config)
 
     def test_enabled_without_store_omits_payload_key(self):
