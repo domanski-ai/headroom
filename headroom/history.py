@@ -263,7 +263,7 @@ def _write_rows_atomic(rows):
         prefix=".headroom-", suffix=".jsonl.tmp", dir=directory)
     try:
         paths.fchmod_private(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
             for row in rows:
                 json.dump(row, handle, allow_nan=False, separators=(",", ":"))
                 handle.write("\n")

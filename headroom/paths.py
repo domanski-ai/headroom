@@ -137,7 +137,11 @@ def write_json_atomic(path, value, mode=0o600):
     )
     try:
         fchmod_private(descriptor, mode)
-        with os.fdopen(descriptor, "w") as handle:
+        # byte-exact output on every platform: UTF-8 and bare \n — Windows
+        # text-mode CRLF translation and locale encodings would otherwise
+        # shift the byte offsets and sizes the persistence math depends on
+        with os.fdopen(descriptor, "w", encoding="utf-8",
+                       newline="\n") as handle:
             json.dump(value, handle, indent=2, allow_nan=False)
             handle.write("\n")
             handle.flush()
