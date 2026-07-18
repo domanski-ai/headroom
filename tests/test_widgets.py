@@ -1813,6 +1813,15 @@ class UbersichtWidgetTests(unittest.TestCase):
       { current_accounts: 3, total_accounts: 2,
         fullest_5h_left_percent: 82 }),
   };
+  const grokNo5h = mkAcct("current", 50);
+  grokNo5h.provider = "grok";
+  delete grokNo5h.windows["5h"];
+  scenarios.grok_no_5h = mkFeed(
+    { state: "current", age_seconds: 5, reason: "snapshot_current",
+      evaluated_at: NOW },
+    [grokNo5h],
+    { current_accounts: 1, total_accounts: 1,
+      fullest_5h_left_percent: null });
   const okHead = { current_accounts: 1, total_accounts: 1,
                    fullest_5h_left_percent: 50 };
   const okFresh = { state: "current", age_seconds: 5,
@@ -2003,6 +2012,9 @@ class UbersichtWidgetTests(unittest.TestCase):
                 self.assertFalse(stale["live_tones"])
                 self.assertFalse(stale["red_tone"])
                 self.assertFalse(stale["dot_live"])
+                grok = views["grok_no_5h"]
+                self.assertTrue(grok["accepted"])
+                self.assertTrue(grok["live_tones"])
 
     # ------------------------------------------------- static port contract
     @classmethod
@@ -2103,7 +2115,7 @@ class UbersichtWidgetTests(unittest.TestCase):
                     self.assertEqual(argv[-1], fetch)
 
     def test_ubersicht_state_mapping_is_byte_identical_across_ports(self):
-        functions = ("hrTone", "hrPct", "hrWindow", "hrDemoteWindow",
+        functions = ("no5h", "hrTone", "hrPct", "hrWindow", "hrDemoteWindow",
                      "hrFreshness", "hrAccount", "hrView", "hrOfflineView",
                      "hrFiniteOrNull", "hrValidWindow", "hrValidFeed",
                      "parseFeed")

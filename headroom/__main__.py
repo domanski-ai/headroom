@@ -3,8 +3,9 @@ for Claude Code and Codex subscriptions.
 
 usage:
   headroom setup                    first-run wizard (accounts + dashboard style)
-  headroom connect [name] [--provider claude|codex] [--adopt PATH]
-                                    add an account (fresh login or adopt existing)
+  headroom connect [name] [--provider claude|codex|grok] [--adopt PATH]
+                                    add an account (fresh login or adopt existing;
+                                    grok is adopt-only — log in with the grok CLI)
   headroom auth refresh <slot>     interactively re-login an owned Claude slot
                                     (then run `headroom collect`; never automatic)
   headroom remove <slot> [--yes]   unregister one non-final slot; keeps its home
@@ -383,6 +384,12 @@ def _dispatch(argv):
             print(f"headroom: no connected account named {args[0]!r} "
                   f"(have: {', '.join(sorted(known)) or 'none'})", file=sys.stderr)
             return 2
+        family = registry.family(args[1])
+        # cool against the window this provider resets on — no-5h providers
+        # (codex/grok) reset weekly, so mark() must default to 7d, not +5h
+        window = "7d" if registry.family_provider(family) \
+            in registry.NO_5H_PROVIDERS else "5h"
+        epoch = None  # None => mark() uses its window-aware default (7d vs 5h)
         if len(args) > 2:
             try:
                 epoch = float(args[2])
@@ -390,11 +397,8 @@ def _dispatch(argv):
                 print("usage: headroom mark <name> <model> "
                       "[epoch-unix-timestamp]", file=sys.stderr)
                 return 2
-        else:
-            epoch = time.time() + 5 * 3600
-        epoch = route.mark(args[0], registry.family(args[1]), epoch)
-        print(f"cooled {args[0]}:{registry.family(args[1])} "
-              f"until {route.tfmt(epoch)}")
+        epoch = route.mark(args[0], family, epoch, window=window)
+        print(f"cooled {args[0]}:{family} until {route.tfmt(epoch)}")
         return 0
     if command == "clear":
         from . import route

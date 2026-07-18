@@ -1013,6 +1013,12 @@ let tokenStats = null,tokenTelemetryStale=false,tokenStatsEnabled=false;
 function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function clamp(v,lo,hi){return Math.min(hi,Math.max(lo,v));}
 function tone(left){if(left==null)return"unknown";if(left<=10)return"red";if(left<=30)return"orange";if(left<=50)return"yellow";return"green";}
+/* Providers rendered on the default dashboard, in preference order, + labels.
+   no5h() (which providers have no 5h window) is defined in the liquid-glass
+   widget section so the compact-widget port extracts it too — a plain function
+   declaration, so it hoists for the main-dashboard callers above it. */
+const PROVIDER_ORDER=["claude","codex","grok"];
+const PROVIDER_TITLES={claude:"Claude",codex:"Codex",grok:"Grok"};
 function age(epoch){if(!Number.isFinite(epoch))return"time unknown";const s=Math.max(0,Math.floor(Date.now()/1e3-epoch));if(s<60)return s+"s ago";if(s<3600)return Math.floor(s/60)+"m ago";if(s<86400)return Math.floor(s/3600)+"h "+Math.floor(s%3600/60)+"m ago";return Math.floor(s/86400)+"d ago";}
 function untilReset(epoch){if(!Number.isFinite(epoch))return"reset not reported";const s=epoch-Math.floor(Date.now()/1e3);if(s<=0)return"reset due";if(s<86400){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return"resets in "+(h?h+"h ":"")+m+"m";}return"resets "+new Intl.DateTimeFormat(undefined,{weekday:"short",hour:"2-digit",minute:"2-digit"}).format(new Date(1e3*epoch));}
 let snapshotState="held",sourceFailed=false; /* old/failed sources demote every row */
@@ -1034,12 +1040,12 @@ function displayState(a){
   if(d.state==="stale")return"stale";
   const captured=epochState(a&&a.captured_at,OBSERVATION_MAX_AGE);
   if(captured!=="current")return captured;
-  /* 5h is optional only for a live codex seat (OpenAI lifted it): skip an
+  /* 5h is optional only for a no-5h provider (codex/grok — see no5h()): skip an
      absent 5h so it can't force "held". 7d is always counted (mandatory), and
-     a non-codex seat always counts 5h too, so a missing 5h there still holds
+     any other provider always counts 5h too, so a missing 5h there still holds
      (fail-closed). */
   const win=(d&&d.windows)||{};
-  const states=["5h","7d"].filter(k=>k==="7d"||a.provider!=="codex"||win[k]!==undefined).map(k=>intrinsicWindowState(a,k));
+  const states=["5h","7d"].filter(k=>k==="7d"||!no5h(a.provider)||win[k]!==undefined).map(k=>intrinsicWindowState(a,k));
   if(states.includes("held"))return"held";
   if(states.includes("stale"))return"stale";
   return states.includes("limited")?"limited":"current";
@@ -1085,12 +1091,12 @@ function windowMarkup(account,key){
   const w=(account.windows||{})[key]||null;
   const view=windowView(account,key),left=view.left;
   const unknown=left==null;
-  /* A standard window absent from a live CODEX account is a lifted limit
-     (OpenAI removed Codex's 5h), not a failed read: render it neutrally, never
-     as a fake 0% or an n/a error. Gate on codex + not-held (not isCurrent) so a
-     LIMITED codex seat — 7d capped, 5h lifted — still reads "no 5h limit", and
-     a non-codex absent window still fails closed to "n/a". */
-  const absentLimit=!w&&!key.startsWith("scoped:")&&account.provider==="codex"&&displayState(account)!=="held";
+  /* A standard window absent from a live no-5h-provider account (codex, grok)
+     is a lifted/absent limit, not a failed read: render it neutrally, never as
+     a fake 0% or an n/a error. Gate on no5h() + not-held (not isCurrent) so a
+     LIMITED seat — 7d capped, 5h lifted — still reads "no 5h limit", and any
+     other provider's absent window still fails closed to "n/a". */
+  const absentLimit=!w&&!key.startsWith("scoped:")&&no5h(account.provider)&&displayState(account)!=="held";
   const value=unknown?(absentLimit?"—":"n/a"):Math.round(left)+"% left";
   const note=unknown?(absentLimit?"no "+key+" limit":(w?"reading unavailable":(key.startsWith("scoped:")?"no scoped cap":"no reading yet"))):untilReset(w.resets_at);
   return '<div class="win"><span class="win-name">'+esc(windowLabel(key))+
@@ -1131,7 +1137,7 @@ function accountMarkup(account,columns){
 function providerMarkup(provider,accounts){
   if(!accounts.length)return"";
   const columns=windowColumns(accounts);
-  const title=provider==="claude"?"Claude":"Codex";
+  const title=PROVIDER_TITLES[provider]||provider;
   const sub="real-time";
   return '<section class="provider"><header class="provider-head">'+
     '<h2 class="provider-name">'+title+'</h2><span class="provider-count">'+
@@ -1183,8 +1189,8 @@ function render(data,forceNoncurrent){
     const v=windowView(a,k);if(v.left!=null&&v.state==="current")readings.push({left:v.left,who:a.email||a.name});}));
   const avg=readings.length?Math.round(readings.reduce((s,r)=>s+r.left,0)/readings.length):null;
   const lowest=readings.length?readings.reduce((b,r)=>r.left<b.left?r:b):null;
-  const claude=accounts.filter(a=>a.provider==="claude");
-  const codex=accounts.filter(a=>a.provider==="codex");
+  const providerGroups=PROVIDER_ORDER.map(p=>({provider:p,label:PROVIDER_TITLES[p],
+    accts:accounts.filter(a=>a.provider===p)}));
   tokenStatsEnabled=data.token_stats_enabled===true;
   const tokenState=tokenTelemetryState(tokenStatsEnabled?data.token_stats:null,now);
   tokenStats=tokenStatsEnabled&&!tokenState.suppressed?data.token_stats:null;
@@ -1195,7 +1201,7 @@ function render(data,forceNoncurrent){
   set("lowest",lowest?Math.round(lowest.left)+"%":"n/a");
   set("lowest-account",lowest?lowest.who:"no current readings");
   set("account-count",String(accounts.length));
-  set("account-note",(claude.length?("Claude "+claude.length):"")+(claude.length&&codex.length?" · ":"")+(codex.length?("Codex "+codex.length):""));
+  set("account-note",providerGroups.filter(g=>g.accts.length).map(g=>g.label+" "+g.accts.length).join(" · "));
   /* top-bar instruments */
   document.getElementById("verified-viz").innerHTML=accounts.map(a=>
     '<span class="seg '+(isCurrent(a)?"is-on":"is-off")+'" title="'+esc(a.name)+": "+(isCurrent(a)?"verified":"held")+'"></span>').join("");
@@ -1211,7 +1217,7 @@ function render(data,forceNoncurrent){
   set("snapshot-age","snapshot "+age(data.generated));
   set("source-line",current.length+" of "+accounts.length+" verified");
   document.getElementById("providers").innerHTML=
-    providerMarkup("claude",claude)+providerMarkup("codex",codex);
+    providerGroups.map(g=>providerMarkup(g.provider,g.accts)).join("");
   const warnings=(data.integrity_warnings||[]).slice();
   if(sourceFailed)warnings.unshift("refresh failed — readings shown as held until collection succeeds");
   if(snapshotState!=="current")warnings.unshift("snapshot is noncurrent (maximum "+Math.floor(SNAPSHOT_MAX_AGE/60)+" minutes) — readings shown as held until a fresh collect");
@@ -1998,6 +2004,11 @@ function initTabs(){
    FAIL-CLOSED IS SACRED: the single place a live tone can be produced is the
    `st==="current"` branch of hrWindow(); stale/held/offline readings render
    the unknown grey with the last-observed value (or n/a), never a live color. */
+/* Providers with NO 5h window (codex — OpenAI lifted it; grok — one weekly
+   pool). Mirrors widget.py NO_5H_PROVIDERS. Declared here (not up in helpers)
+   so the compact-widget port extracts it too; a plain function declaration
+   hoists for the main-dashboard callers defined earlier in the script. */
+function no5h(p){return p==="codex"||p==="grok";}
 const HR_URL="widget.json";
 let hrData=null,hrSize="popup",hrLastOffline=false,hrRequest=0;
 function hrTone(left){return left==null?"unknown":left<=10?"red":left<=30?"orange":left<=50?"yellow":"green";}
@@ -2057,11 +2068,11 @@ function hrValidFeed(data){
     &&["current","limited","stale","held"].includes(a.state)
     &&a.windows&&typeof a.windows==="object"&&!Array.isArray(a.windows)
     &&hrValidWindow(a.windows["7d"])
-    /* 5h is optional ONLY for codex (OpenAI lifted it): a live codex seat
+    /* 5h is optional ONLY for a no-5h provider (codex, grok): such a seat
        reports only the weekly window. For any other provider 5h stays
        mandatory (fail-closed); a present 5h must always be valid. 7d is
        mandatory for everyone. */
-    &&((a.provider==="codex"&&a.windows["5h"]===undefined)||hrValidWindow(a.windows["5h"]))))return false;
+    &&((no5h(a.provider)&&a.windows["5h"]===undefined)||hrValidWindow(a.windows["5h"]))))return false;
   const h=data.headline;
   if(!h||typeof h!=="object"||Array.isArray(h))return false;
   if(!Number.isInteger(h.current_accounts)||h.current_accounts<0)return false;
@@ -2093,13 +2104,13 @@ function hrAccount(raw,demote){
   let st=["current","limited","stale","held"].includes(a.state)?a.state:"held";
   if(demote&&st!=="held")st="stale";
   const w5=a.windows&&a.windows["5h"]||null,w7=a.windows&&a.windows["7d"]||null;
-  /* OpenAI lifted Codex's 5h: a live codex seat reports only the weekly window,
-     so an absent 5h is a lifted limit, not a failed read. Omit its row/note and
-     drive the per-account battery tile, cool clock, and timing from 7d instead
-     of a phantom "n/a" 5h. Provider-scoped: a non-codex seat (or a codex seat
-     that still has a 5h) is unchanged, and a non-codex missing 5h never reaches
-     here (hrValidFeed rejects it). */
-  const has5h=provider!=="codex"||w5!=null;
+  /* A no-5h provider (codex, grok) reports only the weekly window, so an absent
+     5h is a lifted/absent limit, not a failed read. Omit its row/note and drive
+     the per-account battery tile, cool clock, and timing from 7d instead of a
+     phantom "n/a" 5h. Provider-scoped: any other provider (or a codex seat that
+     still has a 5h) is unchanged, and their missing 5h never reaches here
+     (hrValidFeed rejects it). */
+  const has5h=!no5h(provider)||w5!=null;
   const wp=has5h?w5:w7; /* window backing the tile / clock / stale timing */
   const v5=demote?hrDemoteWindow(w5):hrWindow(w5);
   const v7=demote?hrDemoteWindow(w7):hrWindow(w7);

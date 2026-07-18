@@ -11,7 +11,7 @@ import time
 import unicodedata
 from urllib.parse import urlsplit
 
-from . import paths
+from . import paths, registry
 
 
 SCHEMA = "headroom_widget@1"
@@ -182,17 +182,18 @@ def project(snapshot, evaluated_at=None, force_noncurrent_reason=None):
         windows = {}
         for key in WINDOW_KEYS:
             raw_window = raw_windows.get(key)
-            # The 5h window is optional ONLY for codex: OpenAI lifted Codex's
-            # 5h, so a live codex seat reports only the weekly window. A
-            # genuinely ABSENT 5h on a live codex account is a lifted limit —
-            # omit it so it neither renders as a failed read nor poisons the
-            # account state below. A PRESENT but malformed 5h (e.g. "5h": null
-            # in a corrupt snapshot) is NOT lifted: it falls through and
-            # projects held (fail-closed). For any other provider a missing 5h
-            # is a failed read that must project held, and the weekly (7d) stays
-            # mandatory for everyone: a missing 7d still holds the seat.
+            # The 5h window is optional ONLY for the providers that lifted/omit
+            # it (codex, grok — see NO_5H_PROVIDERS): a live codex seat reports
+            # only weekly, and grok exposes a single weekly pool. A genuinely
+            # ABSENT 5h on such an account is a lifted limit — omit it so it
+            # neither renders as a failed read nor poisons the account state
+            # below. A PRESENT but malformed 5h (e.g. "5h": null in a corrupt
+            # snapshot) is NOT lifted: it falls through and projects held
+            # (fail-closed). For any other provider a missing 5h is a failed read
+            # that must project held, and the weekly (7d) stays mandatory for
+            # everyone: a missing 7d still holds the seat.
             if (key == "5h" and key not in raw_windows and base_state != "held"
-                    and raw.get("provider") == "codex"):
+                    and raw.get("provider") in registry.NO_5H_PROVIDERS):
                 continue
             windows[key] = _window_projection(raw_window, captured_at,
                                               base_state, evaluated_at)
@@ -376,10 +377,10 @@ def render_swiftbar(value, evaluated_at=None, force_noncurrent_reason=None,
             if account.get("state") in {"current", "limited", "stale", "held"} \
             else "held"
         windows_map = account.get("windows") or {}
-        # OpenAI lifted Codex's 5h: when the session window is absent, color the
-        # account row from the weekly (7d) so a current codex seat reads green,
-        # not grey. Every other provider always carries a 5h, so this falls back
-        # to 7d only for a lifted-5h codex seat.
+        # A lifted/absent 5h (codex, grok — NO_5H_PROVIDERS): when the session
+        # window is absent, color the account row from the weekly (7d) so a
+        # current seat reads green, not grey. project() already omitted the 5h
+        # for those providers, so this fallback is reached only for them.
         primary = windows_map.get("5h") or windows_map.get("7d") or {}
         account_value = primary.get("left_percent")
         color = _tone(account_value) if state == "current" \
@@ -387,8 +388,8 @@ def render_swiftbar(value, evaluated_at=None, force_noncurrent_reason=None,
         lines.append("{} · {} · {} | color={}".format(
             name, provider, state.upper(), color))
         for key in WINDOW_KEYS:
-            # project() omits an absent 5h on a live codex seat (OpenAI lifted
-            # it); skip the dropped key so a current seat gets no phantom
+            # project() omits an absent 5h for a lifted-5h provider (codex, grok);
+            # skip the dropped key so a current seat gets no phantom
             # "--5h: -- (held)" sub-row. 7d is always present (mandatory).
             if key not in windows_map:
                 continue

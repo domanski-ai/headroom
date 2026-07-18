@@ -30,12 +30,14 @@ Every account is a *slot*: a name, a provider, and an isolated CLI config
 home. The provider's own login flow binds an identity (email + org/account
 id) *into* that home. headroom then:
 
-1. reads the bound identity back (via `claude auth status` / the OpenAI
-   userinfo endpoint, falling back to local metadata when offline),
+1. reads the bound identity back (via `claude auth status`, the OpenAI
+   userinfo endpoint, or Grok's local OIDC metadata, with provider-specific
+   local fallbacks),
 2. fingerprints the provider account id (SHA-256, truncated — the raw id
    never leaves the private snapshot),
-3. verifies at usage-read time that the usage response belongs to the same
-   fingerprint (Claude returns the organization id in a response header).
+3. verifies the strongest binding each provider exposes at usage-read time
+   (Claude returns the organization id in a response header; Grok's billing
+   endpoint does not, so its seat fingerprint remains locally bound).
 
 Consequences:
 
@@ -51,9 +53,15 @@ Consequences:
 
 | window | provider | meaning |
 |---|---|---|
-| `5h` | both | rolling session window |
-| `7d` | both | weekly all-models window |
+| `5h` | Claude; Codex when exposed | rolling session window |
+| `7d` | Claude, Codex, Grok | weekly all-models window |
 | `scoped:<Model>` | Claude | weekly cap for a specific model tier (e.g. Opus) |
+
+Grok collection is metadata-only and never spends inference tokens. Adopted
+Grok CLI homes are read-only. If an isolated home under
+`~/.headroom/homes/` has an expiring bearer, the collector serializes a
+standard OAuth refresh-token grant and atomically replaces that owned
+`auth.json` before binding the snapshot to the new credential digest.
 
 The dashboard and router treat *remaining* capacity (100 − used) as the
 primary number. The router additionally honours provider `severity` flags and

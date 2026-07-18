@@ -5,12 +5,13 @@ job is to be trustworthy. Here is exactly what it does and doesn't do.
 
 ## What headroom touches
 
-- **Reads** the credential/identity files your `claude` and `codex` CLIs
-  already wrote (`~/.claude/.credentials.json`, `~/.codex/auth.json`, etc.)
-  and the Codex session logs. It never writes to them (except `headroom
-  connect`, which runs the provider's OWN `login` flow inside an isolated
-  config home and rolls back on failure).
-- **Sends**, per collection, exactly these read-only requests and nothing else:
+- **Reads** the credential/identity files your `claude`, `codex`, and `grok`
+  CLIs already wrote (`~/.claude/.credentials.json`, `~/.codex/auth.json`,
+  `~/.grok/auth.json`, etc.) and the Codex session logs. Adopted CLI homes are
+  never written. `headroom connect` may run a provider's own login flow inside
+  an isolated home; an expiring Grok token in such a Headroom-owned home may be
+  refreshed and atomically written there.
+- **Sends**, per collection, these provider requests and nothing else:
   - one to `api.anthropic.com/api/oauth/usage` per Claude account (the endpoint
     the Claude apps use for their own usage UI), authenticated with that
     account's existing token;
@@ -18,7 +19,11 @@ job is to be trustworthy. Here is exactly what it does and doesn't do.
     (`account/rateLimits/read` + `account/read`), which the Codex CLI itself
     uses; this returns real-time, identity-bound usage. (The older fallback
     path reads usage from disk and hits `auth.openai.com/oauth/userinfo` for
-    identity instead.)
+    identity instead.);
+  - one metadata-only billing read to
+    `grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig` per Grok
+    account; and, only for an expiring Headroom-owned Grok home, one standard
+    refresh grant to `auth.x.ai/oauth2/token`.
   No other outbound traffic.
 - **Writes** its own state under `~/.headroom/` (override with `HEADROOM_DIR`):
   the private snapshot and config are `0600`; the sanitized public snapshot is
