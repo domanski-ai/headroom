@@ -1687,8 +1687,10 @@ class CodexBlockReasonFailClosed(unittest.TestCase):
 
 
 class GreatestHeadroom(unittest.TestCase):
-    """Candidate order prefers the greatest PROVEN headroom —
-    min(100-used_5h, 100-used_7d) — with registry order as the tie-break."""
+    """Candidate order follows REGISTRY preference for every family
+    (operator 2026-07-18, reversing the 2026-07-14 Codex greatest-headroom
+    scoping): the registry lists accounts primary-first and overflow happens
+    only through eligibility, never emptiest-first hopping."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -1718,21 +1720,24 @@ class GreatestHeadroom(unittest.TestCase):
                                   return_value=0.0):
             return route.candidates(fam, snapshot)
 
-    def test_codex_picks_greatest_headroom(self):
+    def test_codex_keeps_registry_order_while_primary_is_eligible(self):
+        # cx2 has more room, but cx1 is the registry primary and eligible —
+        # the sticky primary wins until it is actually blocked.
         accounts = [_codex_account("cx1"), _codex_account("cx2")]
         rows = [_codex_row("cx1", used5h=60.0, used7d=30.0),
                 _codex_row("cx2", used5h=10.0, used7d=20.0)]
         ranked = self.ranked("codex", accounts, rows)
         self.assertEqual([a["name"] for a, r in ranked if r is None],
-                         ["cx2", "cx1"])
+                         ["cx1", "cx2"])
 
-    def test_score_is_min_of_both_windows(self):
-        # cx1: 5h says 90 free but 7d only 5 free -> score 5; cx2 -> score 40
+    def test_registry_order_holds_even_with_thin_primary_windows(self):
+        # cx1 is nearly out of weekly room but still ELIGIBLE — registry
+        # preference keeps it first; overflow only happens on a real block.
         accounts = [_codex_account("cx1"), _codex_account("cx2")]
         rows = [_codex_row("cx1", used5h=10.0, used7d=95.0),
                 _codex_row("cx2", used5h=60.0, used7d=40.0)]
         ranked = self.ranked("codex", accounts, rows)
-        self.assertEqual(ranked[0][0]["name"], "cx2")
+        self.assertEqual(ranked[0][0]["name"], "cx1")
 
     def test_tie_breaks_on_registry_order(self):
         accounts = [_codex_account("cx1"), _codex_account("cx2")]
@@ -1762,17 +1767,15 @@ class GreatestHeadroom(unittest.TestCase):
 
     def test_lifted_5h_seats_are_routable_and_scored_on_weekly(self):
         # both codex seats have their 5h lifted (absent). They must stay
-        # ROUTABLE (reason None), and _headroom_score must rank them by their
-        # remaining WEEKLY room rather than dropping both to the worst score
-        # (which would tie them and lose the greatest-headroom ordering).
+        # ROUTABLE (reason None) in registry order — a lifted 5h window must
+        # never block a seat or perturb the preference ordering.
         accounts = [_codex_account("cx1"), _codex_account("cx2")]
         rows = [_codex_row("cx1", used7d=70.0), _codex_row("cx2", used7d=20.0)]
         for row in rows:
             del row["windows"]["5h"]
         ranked = self.ranked("codex", accounts, rows)
-        # cx2 has more weekly room (80 vs 30) -> ranked first; both eligible
         self.assertEqual([a["name"] for a, r in ranked if r is None],
-                         ["cx2", "cx1"])
+                         ["cx1", "cx2"])
 
     def test_pick_returns_lifted_5h_codex_seat(self):
         account = _codex_account("cx1")

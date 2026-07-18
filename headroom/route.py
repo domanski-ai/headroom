@@ -640,31 +640,6 @@ def _codex_gate(account, snapshot_row, identity):
 _UNSET = object()
 
 
-def _headroom_score(row):
-    """min(100 - used_5h, 100 - used_7d): how much PROVEN room is left before
-    the tightest window caps. Only meaningful for rows that already passed
-    block_reason; anything unreadable scores worst (fail-closed ordering)."""
-    windows = row.get("windows") if isinstance(row, dict) else None
-    if not isinstance(windows, dict):
-        return -1.0
-    # 5h is optional for codex (OpenAI lifted it): score on whatever standard
-    # windows are present. Reachable for codex now that block_reason no longer
-    # blocks an absent 5h. 7d stays required — its absence, or any unreadable
-    # percent, scores worst (fail-closed ordering).
-    codex = row.get("provider") == "codex"
-    values = []
-    for key in ("5h", "7d"):
-        window = windows.get(key)
-        if not isinstance(window, dict):
-            if key == "5h" and codex:
-                continue
-            return -1.0
-        percent = window.get("used_percent")
-        if not _number(percent):
-            return -1.0
-        values.append(100.0 - percent)
-    return min(values) if values else -1.0
-
 
 def candidates(fam, snapshot=_UNSET):
     """[(account, reason-or-None), ...] in preference order. Pass an explicit
@@ -683,20 +658,17 @@ def candidates(fam, snapshot=_UNSET):
         else:
             reason = block_reason(account, fam, rows.get(account["name"]),
                                   cool, now, reserve=reserve)
-        # Greatest-headroom ordering is scoped to Codex for now (Paul 2026-07-14):
-        # Claude keeps its established registry-order preference so daily Claude
-        # routing is unchanged; Codex picks the account with the most proven room.
-        greatest_headroom = registry.family_provider(fam) == "codex"
-        score = _headroom_score(rows.get(account["name"])) \
-            if (reason is None and greatest_headroom) else None
-        ranked.append((account, reason, index, score))
-    # Eligible before blocked; then (Codex only) greatest PROVEN headroom first
-    # (min of 5h/7d room); registry order as the final tie-break/Claude order.
+        # Registry-order preference for EVERY family (operator 2026-07-18,
+        # reversing the 2026-07-14 Codex greatest-headroom scoping): the
+        # registry lists accounts primary-first, and overflow happens through
+        # eligibility, not through emptiest-first hopping — a sticky primary
+        # keeps sessions, caches, and mental models on one seat until it is
+        # actually blocked.
+        ranked.append((account, reason, index))
+    # Eligible before blocked; registry order decides among the eligible.
     # Ordering never overrides eligibility — block_reason already decided that.
-    ranked.sort(key=lambda entry: (entry[1] is not None,
-                                   -entry[3] if entry[3] is not None else 0.0,
-                                   entry[2]))
-    return [(account, reason) for account, reason, _, _ in ranked]
+    ranked.sort(key=lambda entry: (entry[1] is not None, entry[2]))
+    return [(account, reason) for account, reason, _ in ranked]
 
 
 def pick(fam):
