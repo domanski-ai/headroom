@@ -64,6 +64,7 @@ function esc(v) {
   }[c]));
 }
 function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+function no5h(p) { return p === "codex" || p === "grok"; }
 function hrTone(left) {
   return left == null ? "unknown"
     : left <= 10 ? "red" : left <= 30 ? "orange" : left <= 50 ? "yellow" : "green";
@@ -113,10 +114,13 @@ function hrFreshness(data) {
 function hrAccount(raw, demote) {
   const a = raw && typeof raw === "object" ? raw : {};
   const name = typeof a.name === "string" ? a.name : "unknown";
+  const provider = typeof a.provider === "string" ? a.provider : "unknown";
   let st = ["current", "limited", "stale", "held"].includes(a.state) ? a.state : "held";
   if (demote && st !== "held") st = "stale";
   const w5 = (a.windows && a.windows["5h"]) || null;
-  const v5 = demote ? hrDemoteWindow(w5) : hrWindow(w5);
+  const w7 = (a.windows && a.windows["7d"]) || null;
+  const primary = no5h(provider) && w5 == null ? w7 : w5;
+  const v5 = demote ? hrDemoteWindow(primary) : hrWindow(primary);
   return { name: name, state: st, v5: v5 };
 }
 function hrView(data) {
@@ -190,7 +194,9 @@ function hrValidFeed(data) {
       && typeof a.name === "string" && typeof a.provider === "string"
       && ["current", "limited", "stale", "held"].includes(a.state)
       && a.windows && typeof a.windows === "object" && !Array.isArray(a.windows)
-      && hrValidWindow(a.windows["5h"]) && hrValidWindow(a.windows["7d"]))) return false;
+      && hrValidWindow(a.windows["7d"])
+      && ((no5h(a.provider) && a.windows["5h"] === undefined)
+          || hrValidWindow(a.windows["5h"])))) return false;
   const h = data.headline;
   if (!h || typeof h !== "object" || Array.isArray(h)) return false;
   if (!Number.isInteger(h.current_accounts) || h.current_accounts < 0) return false;

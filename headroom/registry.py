@@ -37,7 +37,21 @@ import uuid
 
 from . import locks, paths
 
-PROVIDERS = ("claude", "codex")
+PROVIDERS = ("claude", "codex", "grok")
+# Providers that report NO 5h window and legitimately carry only a weekly one —
+# OpenAI lifted Codex's 5h (2026-07), and Grok exposes a single unified weekly
+# credit pool. Their absent 5h is a lifted/absent limit, NOT a failed read, so
+# the collector (validate_required_windows require_5h=False), the router
+# (block_reason / score_account), and the widget/dashboard projections all treat
+# it as optional. For every other provider a missing 5h fails closed. The
+# dashboard mirrors this set in its JS no5h() helper.
+NO_5H_PROVIDERS = ("codex", "grok")
+# Providers with a local per-session token-log format the token scanner can read
+# (Claude's projects/*.jsonl, Codex's sessions/rollout-*.jsonl). Grok is absent:
+# its usage is a server-side weekly pool with no per-session token counts, so it
+# never participates in token telemetry (scanning it as Codex would only mark the
+# feed partial/failed). token_accounts() enforces this.
+TOKEN_LOG_PROVIDERS = ("claude", "codex")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 ID_RE = re.compile(r"^[0-9a-f]{12,32}$")
 VIRTUAL_ID_RE = re.compile(r"^x-[0-9a-f]{24}$")
@@ -59,6 +73,7 @@ FAMILY_PROVIDER = {
     "claude": "claude",
     "codex": "codex",
     "gpt": "codex",
+    "grok": "grok",
 }
 
 
@@ -68,7 +83,7 @@ class RegistryError(ValueError):
 
 def family(model):
     model = (model or "").lower().strip()
-    for name in ("fable", "opus", "sonnet", "haiku", "codex", "gpt"):
+    for name in ("fable", "opus", "sonnet", "haiku", "codex", "gpt", "grok"):
         if name in model:
             return "codex" if name == "gpt" else name
     if not model or "claude" in model:
@@ -76,7 +91,8 @@ def family(model):
     # An unknown model must not silently route as generic Claude — a typo'd
     # scoped model would bypass its own weekly cap.
     raise RegistryError(
-        f"unknown model family: {model!r} (use opus/sonnet/haiku/claude/codex)")
+        f"unknown model family: {model!r} "
+        "(use opus/sonnet/haiku/claude/codex/grok)")
 
 
 def family_provider(fam):
@@ -120,9 +136,13 @@ def _token_extra_root_entries(config):
         if label in labels:
             raise RegistryError(f"token extra-root label duplicate: {label!r}")
         provider = entry.get("provider")
-        if provider not in PROVIDERS:
+        # extra roots exist ONLY for token scanning, so they are restricted to
+        # providers with a local token-log format — a grok extra root (no such
+        # logs) would be scanned as codex and mark the feed partial/failed
+        if provider not in TOKEN_LOG_PROVIDERS:
             raise RegistryError(
-                f"token extra-root {label}: provider must be one of {PROVIDERS}")
+                f"token extra-root {label}: provider must be one of "
+                f"{TOKEN_LOG_PROVIDERS}")
         home = entry.get("path")
         if isinstance(home, str):
             root = expand(home)
@@ -242,10 +262,16 @@ def token_extra_roots(config=None, include_status=False):
 
 
 def token_accounts(config=None, include_status=False):
-    """Registry slots plus virtual extra roots for token scanning and feeds."""
+    """Registry slots plus virtual extra roots for token scanning and feeds.
+
+    Only providers with a local per-session token-log format participate — a
+    grok slot (no such logs) is excluded so the scanner never treats it as Codex
+    and marks the token feed partial/failed on every run."""
     config = load() if config is None else config
     extra, partial = token_extra_roots(config, include_status=True)
-    result = accounts(config) + extra
+    scannable = [account for account in accounts(config)
+                 if account["provider"] in TOKEN_LOG_PROVIDERS]
+    result = scannable + extra
     return (result, partial) if include_status else result
 
 

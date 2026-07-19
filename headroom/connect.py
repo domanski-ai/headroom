@@ -26,12 +26,20 @@ from . import paths, registry
 CREDENTIAL_FILES = {
     "claude": [".credentials.json", ".claude.json"],
     "codex": ["auth.json"],
+    "grok": ["auth.json"],
 }
-DEFAULT_HOMES = {"claude": "~/.claude", "codex": "~/.codex"}
+# Auto-detection homes for the wizard's adopt flow. Grok is adopt-only:
+# headroom never RUNS the grok login (see connect_fresh's refusal below), but
+# an existing ~/.grok login is offered for adoption like any other credential.
+DEFAULT_HOMES = {"claude": "~/.claude", "codex": "~/.codex", "grok": "~/.grok"}
+# The provider CLIs' own home-override variables, honoured when detecting
+# existing logins so detection follows the same home the CLI itself would use.
+HOME_ENV = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME",
+            "grok": "GROK_HOME"}
 
 
 def provider_binary(provider):
-    return shutil.which("claude" if provider == "claude" else "codex")
+    return shutil.which(provider)
 
 
 def login_argv(provider, binary):
@@ -84,6 +92,8 @@ def slot_identity(provider, home):
     try:
         if provider == "claude":
             identity = collector.claude_identity(home)
+        elif provider == "grok":
+            identity = collector.grok_identity(home)
         else:
             identity = collector.codex_identity(home)
         return identity
@@ -95,12 +105,7 @@ def detect_existing():
     """Discover logins already on this machine, for the wizard/adopt flow."""
     found = []
     for provider, default in DEFAULT_HOMES.items():
-        home = os.path.expanduser(
-            os.environ.get(
-                "CLAUDE_CONFIG_DIR" if provider == "claude" else "CODEX_HOME",
-                default,
-            )
-        )
+        home = os.path.expanduser(os.environ.get(HOME_ENV[provider], default))
         if not os.path.isdir(home):
             continue
         identity = slot_identity(provider, home)
@@ -195,8 +200,8 @@ def _interactive_login(config, name, provider, home, expected_email=None,
     """
     binary = provider_binary(provider)
     if not binary:
-        print(f"cannot find the `{'claude' if provider == 'claude' else 'codex'}` "
-              f"CLI on PATH — install it first", file=sys.stderr)
+        print(f"cannot find the `{provider}` CLI on PATH — install it first",
+              file=sys.stderr)
         return None
     # BEFORE the login runs: on macOS a new claude login clobbers the shared
     # Keychain token that an existing slot may depend on — refusing afterwards
@@ -216,7 +221,7 @@ def _interactive_login(config, name, provider, home, expected_email=None,
                     os.remove(target)
 
     env = collector.scrubbed_env()
-    env["CLAUDE_CONFIG_DIR" if provider == "claude" else "CODEX_HOME"] = home
+    env[HOME_ENV[provider]] = home
     if not quiet:
         print(f"\nStarting the {provider} login for slot '{name}'.")
         print("Complete the browser flow with the account you want on THIS slot.\n")
@@ -350,7 +355,7 @@ def cmd_refresh(args):
 
 
 def cmd_connect(args):
-    """CLI: `headroom connect [name] [--provider claude|codex] [--adopt PATH]`."""
+    """CLI: `headroom connect [name] [--provider claude|codex|grok] [--adopt PATH]`."""
     try:
         config = registry.load()
     except registry.RegistryError:
@@ -377,7 +382,18 @@ def cmd_connect(args):
             name = arg
     if provider not in registry.PROVIDERS:
         provider = prompt_choice("Which provider is this account for?",
-                                 ["claude", "codex"])
+                                 list(registry.PROVIDERS))
+    if provider == "grok" and adopt_path is None:
+        # Auto-adopt the grok CLI's existing login when it isn't already
+        # connected; otherwise fall through to connect_fresh so the user
+        # can log in with a different account in an isolated home.
+        candidate = os.environ.get(HOME_ENV["grok"], DEFAULT_HOMES["grok"])
+        candidate_path = os.path.expanduser(candidate)
+        if os.path.exists(os.path.join(candidate_path, "auth.json")):
+            identity = slot_identity("grok", candidate_path)
+            fp = identity.get("account_fingerprint") if identity else None
+            if fp not in existing_fingerprints(config, "grok"):
+                adopt_path = candidate
     if name is None:
         taken = {account["name"] for account in config.get("accounts", [])}
         default = next(

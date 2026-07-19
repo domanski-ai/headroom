@@ -533,18 +533,20 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     windows = snapshot_row.get("windows")
     if not isinstance(windows, dict):
         return "windows invalid"
-    # OpenAI lifted Codex's 5h (2026-07): a live codex seat reports only the
-    # weekly window, so an absent 5h is a lifted limit, not a missing reading.
-    # Skip it for codex; the weekly (7d) stays mandatory for every provider,
-    # and a non-codex seat missing any standard window still holds (fail-closed).
-    codex = account.get("provider") == "codex"
+    # Some providers report NO 5h window and legitimately carry only a weekly one
+    # (codex — OpenAI lifted its 5h in 2026-07; grok — one unified weekly pool;
+    # see registry.NO_5H_PROVIDERS). Their absent 5h is a lifted/absent limit, not
+    # a missing reading — skip it. The weekly (7d) stays mandatory for every
+    # provider, and any other seat missing a standard window still holds
+    # (fail-closed).
+    no_5h = account.get("provider") in registry.NO_5H_PROVIDERS
     for key in ("5h", "7d"):
         window = windows.get(key)
         if not isinstance(window, dict):
             # Only a genuinely ABSENT 5h is the lifted limit. A PRESENT but
             # malformed 5h ("5h": null / a string, i.e. a corrupt or partially
             # written snapshot) is not lifted — fail closed and hold.
-            if key == "5h" and codex and key not in windows:
+            if key == "5h" and no_5h and key not in windows:
                 continue
             return f"{key} window missing"
         percent = window.get("used_percent")
@@ -678,8 +680,32 @@ def pick(fam):
     return None
 
 
+# The config-home environment variable each provider CLI reads, and its default
+# location. The launcher exports <env var>=<slot home> so the CLI loads the
+# routed account's isolated config rather than the ambient login. Unknown
+# providers keep the historical CODEX_HOME/~/.codex fallback.
+#
+# Grok is monitor + env/pick only, never launched by headroom: `headroom env/
+# pick grok` emit GROK_HOME so the user runs the grok CLI themselves, but every
+# exec path (`headroom run grok`, and the launch path) refuses a grok family via
+# _grok_launch_refused() — spawning a process on a grok seat could spend credits
+# or refresh its token, violating the read-only contract. There is also no
+# `headroom grok` launch command. Claude/Codex remain the only providers
+# headroom exec()s.
+PROVIDER_HOME_ENV = {
+    "claude": "CLAUDE_CONFIG_DIR",
+    "codex": "CODEX_HOME",
+    "grok": "GROK_HOME",
+}
+PROVIDER_HOME_DEFAULT = {
+    "claude": "~/.claude",
+    "codex": "~/.codex",
+    "grok": "~/.grok",
+}
+
+
 def env_key(account):
-    return "CLAUDE_CONFIG_DIR" if account["provider"] == "claude" else "CODEX_HOME"
+    return PROVIDER_HOME_ENV.get(account["provider"], "CODEX_HOME")
 
 
 def env_pinned_account(fam):
@@ -694,7 +720,7 @@ def env_pinned_account(fam):
     try:
         provider = registry.family_provider(fam)
         value = os.environ.get(
-            "CLAUDE_CONFIG_DIR" if provider == "claude" else "CODEX_HOME", "")
+            PROVIDER_HOME_ENV.get(provider, "CODEX_HOME"), "")
         value = value.strip()
         if not value:
             return None
@@ -919,7 +945,24 @@ def cmd_status(fam):
     return 0 if chosen else 2
 
 
+def _grok_launch_refused(fam):
+    """Grok is monitor + env/pick only: headroom must never spawn a process on a
+    grok seat (running the grok CLI could spend credits or trigger a credential
+    refresh — the read-only, zero-token-spend contract forbids it). Prints an
+    actionable message and returns True when ``fam`` routes to grok, so every
+    exec path can refuse early. Routing/monitoring still work: use
+    ``headroom env grok`` to get GROK_HOME, then launch the grok CLI yourself."""
+    if registry.family_provider(fam) == "grok":
+        print("[headroom] headroom does not launch grok (read-only, no token "
+              "spend) — use `headroom env grok` to route, then run grok "
+              "yourself", file=sys.stderr)
+        return True
+    return False
+
+
 def cmd_run(fam, command):
+    if _grok_launch_refused(fam):
+        return 2
     snapshot = ensure_fresh_snapshot()
     rows = _snapshot_accounts(snapshot)
     for account, reason in candidates(fam, snapshot):
@@ -1077,6 +1120,8 @@ def cmd_exec(fam, command, launch_note="", fallback=False):
 
 
 def _exec_routed(fam, command, launch_note=""):
+    if _grok_launch_refused(fam):
+        return 2
     if registry.family_provider(fam) == "codex" and not CODEX_ROUTING_ENABLED:
         # fail-closed: disabled routing means headroom REFUSES to launch a
         # Codex seat it cannot prove capacity for — never "just take the
@@ -1173,8 +1218,8 @@ def _exec_routed(fam, command, launch_note=""):
 def current_account(fam):
     """The registry account this process's environment actually points at."""
     provider = registry.family_provider(fam)
-    var = "CLAUDE_CONFIG_DIR" if provider == "claude" else "CODEX_HOME"
-    default = "~/.claude" if provider == "claude" else "~/.codex"
+    var = PROVIDER_HOME_ENV.get(provider, "CODEX_HOME")
+    default = PROVIDER_HOME_DEFAULT.get(provider, "~/.codex")
     home = os.path.realpath(os.path.expanduser(os.environ.get(var, default)))
     try:
         for account in registry.ordered_for(fam):
@@ -1206,9 +1251,13 @@ def cmd_rotate(fam):
         if earliest:
             print(f"earliest 5h reset: {tfmt(earliest)}")
         return 2
-    reset = window_reset(snapshot, current["name"], "5h") \
-        or time.time() + 5 * 3600
-    reset = mark(current["name"], fam, reset, account_wide=True)
+    # cool against the window this provider actually resets on: no-5h providers
+    # (codex/grok) have only a weekly window, so a 5h fallback would re-offer an
+    # exhausted seat far too early (grok's pool resets weekly, not in 5 hours)
+    window = "7d" if current["provider"] in registry.NO_5H_PROVIDERS else "5h"
+    reset = window_reset(snapshot, current["name"], window) \
+        or time.time() + (7 * 86400 if window == "7d" else 5 * 3600)
+    reset = mark(current["name"], fam, reset, account_wide=True, window=window)
     successor = pick(fam)
     if successor is None:
         print(f"rotated {current['name']} out (cools until {tfmt(reset)}) — "

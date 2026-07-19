@@ -6,6 +6,7 @@ Covers the load-bearing safety logic: config validation, the fail-closed
 router (`block_reason`), redaction, and the public-snapshot projection.
 """
 import ast
+import base64
 import errno
 import importlib
 import json
@@ -17,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
@@ -219,6 +221,9 @@ class RegistryValidation(unittest.TestCase):
               "path": "/tmp"}],
             [{"label": "x" * 41, "provider": "claude", "path": "/tmp"}],
             [{"label": "interactive", "provider": "other", "path": "/tmp"}],
+            # grok is a valid account provider but has no token-log format, so a
+            # grok token extra-root is rejected (would be scanned as codex)
+            [{"label": "grok-root", "provider": "grok", "path": "/tmp"}],
             [{"label": "alpha", "provider": "claude", "path": "/tmp"}],
             [{"label": "interactive", "provider": "claude", "path": "/tmp"},
              {"label": "interactive", "provider": "codex", "path": "/tmp"}],
@@ -1546,6 +1551,22 @@ def _codex_account(name="cx", **over):
     return account
 
 
+def _grok_row(name="g", used7d=20.0, **over):
+    now = int(time.time())
+    row = {
+        "name": name, "provider": "grok", "plan": "Grok", "ok": True,
+        "stale": False, "routable": True, "identity_verified": False,
+        "identity": {"account_fingerprint": "AAAA", "credential_digest": "BBBB"},
+        "trust_state": "verified_local", "captured_at": now - 10,
+        "source": "grok_build_billing",
+        "windows": {"7d": {"used_percent": used7d, "resets_at": now + 8 * 86400,
+                           "window_minutes": 10080, "observed_at": now - 10,
+                           "freshness": "fresh"}},
+    }
+    row.update(over)
+    return row
+
+
 class CodexBlockReasonFailClosed(unittest.TestCase):
     """Codex eligibility is stricter than Claude's and fully provider-gated:
     live app-server source, network-verified identity, ChatGPT subscription
@@ -2839,6 +2860,952 @@ class ActionableClaudeRefresh(unittest.TestCase):
         self.assertEqual(row["error_code"], "claude_usage_token_expired")
         self.assertIn("headroom auth refresh a", row["note"])
         self.assertNotIn("headroom connect a", row["note"])
+
+
+# =========================================================================
+# Grok (xAI SuperGrok / X Premium+) provider
+# =========================================================================
+
+# Real HTTP response bodies captured live (2026-07-18) from
+# GrokBuildBilling/GetGrokCreditsConfig — gRPC-web framed. Both must parse to
+# resets_at 1784839764; used_percent 0.0 (percent field omitted, a proto3 zero)
+# and 1.0 respectively. Embedding the raw wire proves the parser end-to-end.
+_GROK_ZERO_FIXTURE = bytes.fromhex(
+    "00000000480a4612001a00220c08d487e5d20610b0bbe8cf012a0c08d4fc89d3"
+    "0610b0bbe8cf01421e0802120c08d487e5d20610b0bbe8cf011a0c08d4fc89d3"
+    "0610b0bbe8cf01580162006801800000000f677270632d7374617475733a300d0a")
+_GROK_ONE_FIXTURE = bytes.fromhex(
+    "000000005a0a580d0000803f12001a00220c08d487e5d20610b0bbe8cf012a0c"
+    "08d4fc89d30610b0bbe8cf013a070802150000803f3a020804421e0802120c08"
+    "d487e5d20610b0bbe8cf011a0c08d4fc89d30610b0bbe8cf0158016200680180"
+    "0000000f677270632d7374617475733a300d0a")
+
+_GROK_AUTH = {
+    "key": "grok-bearer", "refresh_token": "r",
+    "expires_at": "2999-01-01T00:00:00.000000Z",
+    "email": "me@x.ai", "user_id": "u-1", "team_id": "t-1",
+    "auth_mode": "oidc",
+}
+_GROK_SCOPE = "https://auth.x.ai::client-uuid"
+
+
+class _GrokResp:
+    """Minimal context-manager HTTP response for a fake opener."""
+
+    def __init__(self, body):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, size=-1):
+        return self._body if size is None or size < 0 else self._body[:size]
+
+
+def _grok_opener(body):
+    return lambda request, timeout: _GrokResp(body)
+
+
+def _grok_http_error(code):
+    import urllib.error
+    return urllib.error.HTTPError(collect.GROK_USAGE_URL, code, "denied", {},
+                                  None)
+
+
+def _grok_frame(flag, payload):
+    return bytes([flag]) + len(payload).to_bytes(4, "big") + payload
+
+
+def _grok_response(payload, status=0):
+    """Build a gRPC-web body: optional data frame + a grpc-status trailer."""
+    body = b""
+    if payload is not None:
+        body += _grok_frame(0x00, payload)
+    body += _grok_frame(0x80, ("grpc-status:%d\r\n" % status).encode("ascii"))
+    return body
+
+
+class GrokAuth(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = self.temp.name
+
+    def _write(self, credential):
+        with open(os.path.join(self.home, "auth.json"), "w") as handle:
+            json.dump({"https://auth.x.ai::client-uuid": credential}, handle)
+
+    def test_refresh_owned_home_rotates_tokens_and_preserves_identity(self):
+        headroom = os.path.join(self.home, "headroom")
+        owned = os.path.join(headroom, "homes", "g")
+        os.makedirs(owned)
+        credential = dict(
+            _GROK_AUTH,
+            principal_type="user", principal_id="principal-1",
+            expires_at="2000-01-01T00:00:00.000000Z")
+        third_party = dict(
+            credential, key="enterprise-bearer",
+            oidc_issuer="https://login.example.com")
+        with open(os.path.join(owned, "auth.json"), "w") as handle:
+            json.dump({
+                "https://login.example.com::enterprise-client": third_party,
+                _GROK_SCOPE: credential,
+            }, handle)
+        opener = mock.Mock(return_value=_GrokResp(json.dumps({
+            "access_token": "new-bearer",
+            "refresh_token": "new-refresh",
+            "expires_in": 21600,
+        }).encode()))
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}):
+            self.assertTrue(collect.grok_refresh_token(
+                owned, "g", collect.fingerprint("u-1:t-1"), opener=opener,
+                now=1_700_000_000))
+
+        refreshed = collect.grok_auth(owned)
+        self.assertEqual(refreshed["key"], "new-bearer")
+        self.assertEqual(refreshed["refresh_token"], "new-refresh")
+        self.assertEqual(refreshed["email"], "me@x.ai")
+        self.assertEqual(collect.grok_expires_at(refreshed), 1_700_021_600)
+        with open(os.path.join(owned, "auth.json")) as handle:
+            written = json.load(handle)
+        self.assertEqual(
+            written["https://login.example.com::enterprise-client"],
+            third_party)
+        request = opener.call_args.args[0]
+        self.assertEqual(request.full_url, collect.GROK_TOKEN_URL)
+        self.assertEqual(
+            urllib.parse.parse_qs(request.data.decode()),
+            {"grant_type": ["refresh_token"], "refresh_token": ["r"],
+             "client_id": ["client-uuid"], "principal_type": ["user"],
+             "principal_id": ["principal-1"]})
+
+    def test_refresh_refuses_adopted_home_without_network_or_write(self):
+        credential = dict(
+            _GROK_AUTH, oidc_client_id="client-uuid",
+            expires_at="2000-01-01T00:00:00.000000Z")
+        self._write(credential)
+        auth_path = os.path.join(self.home, "auth.json")
+        with open(auth_path, "rb") as handle:
+            before = handle.read()
+        opener = mock.Mock(side_effect=AssertionError("network must not run"))
+
+        with mock.patch.dict(os.environ, {
+                "HEADROOM_DIR": os.path.join(self.home, "headroom")}):
+            self.assertFalse(collect.grok_refresh_token(
+                self.home, "g", collect.fingerprint("u-1:t-1"), opener=opener,
+                now=1_700_000_000))
+
+        opener.assert_not_called()
+        with open(auth_path, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_owned_home_accepts_canonical_path_under_symlinked_root(self):
+        real_headroom = os.path.join(self.home, "real-headroom")
+        linked_headroom = os.path.join(self.home, "linked-headroom")
+        owned = os.path.join(real_headroom, "homes", "g")
+        os.makedirs(owned)
+        os.symlink(real_headroom, linked_headroom)
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": linked_headroom}):
+            self.assertTrue(collect._grok_owned_home(
+                os.path.realpath(owned), "g"))
+
+    def test_owned_home_rejects_slot_symlink_to_adopted_home(self):
+        headroom = os.path.join(self.home, "headroom")
+        homes = os.path.join(headroom, "homes")
+        adopted = os.path.join(self.home, "adopted")
+        os.makedirs(homes)
+        os.makedirs(adopted)
+        linked_slot = os.path.join(homes, "g")
+        os.symlink(adopted, linked_slot)
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}):
+            self.assertFalse(collect._grok_owned_home(linked_slot, "g"))
+
+    def test_owned_home_rejects_other_direct_child_adopted_by_slot(self):
+        headroom = os.path.join(self.home, "headroom")
+        adopted = os.path.join(headroom, "homes", "external-login")
+        os.makedirs(adopted)
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}):
+            self.assertFalse(collect._grok_owned_home(adopted, "g"))
+
+    def test_refresh_refuses_auth_symlink_to_adopted_credential(self):
+        headroom = os.path.join(self.home, "headroom")
+        owned = os.path.join(headroom, "homes", "g")
+        adopted = os.path.join(self.home, "adopted")
+        os.makedirs(owned)
+        os.makedirs(adopted)
+        adopted_auth = os.path.join(adopted, "auth.json")
+        credential = dict(
+            _GROK_AUTH, oidc_client_id="client-uuid",
+            expires_at="2000-01-01T00:00:00.000000Z")
+        with open(adopted_auth, "w") as handle:
+            json.dump({_GROK_SCOPE: credential}, handle)
+        with open(adopted_auth, "rb") as handle:
+            before = handle.read()
+        os.symlink(adopted_auth, os.path.join(owned, "auth.json"))
+        opener = mock.Mock(side_effect=AssertionError("network must not run"))
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}):
+            self.assertFalse(collect.grok_refresh_token(
+                owned, "g", collect.fingerprint("u-1:t-1"), opener=opener,
+                now=1_700_000_000))
+
+        opener.assert_not_called()
+        with open(adopted_auth, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_refresh_refuses_hard_linked_adopted_credential(self):
+        headroom = os.path.join(self.home, "headroom")
+        owned = os.path.join(headroom, "homes", "g")
+        adopted = os.path.join(self.home, "adopted")
+        os.makedirs(owned)
+        os.makedirs(adopted)
+        adopted_auth = os.path.join(adopted, "auth.json")
+        credential = dict(
+            _GROK_AUTH, oidc_client_id="client-uuid",
+            expires_at="2000-01-01T00:00:00.000000Z")
+        with open(adopted_auth, "w") as handle:
+            json.dump({_GROK_SCOPE: credential}, handle)
+        with open(adopted_auth, "rb") as handle:
+            before = handle.read()
+        os.link(adopted_auth, os.path.join(owned, "auth.json"))
+        opener = mock.Mock(side_effect=AssertionError("network must not run"))
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}):
+            self.assertFalse(collect.grok_refresh_token(
+                owned, "g", collect.fingerprint("u-1:t-1"), opener=opener,
+                now=1_700_000_000))
+
+        opener.assert_not_called()
+        with open(adopted_auth, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_refresh_refuses_identity_changed_before_locked_read(self):
+        headroom = os.path.join(self.home, "headroom")
+        owned = os.path.join(headroom, "homes", "g")
+        os.makedirs(owned)
+        changed = dict(
+            _GROK_AUTH, user_id="u-2", oidc_client_id="client-uuid",
+            expires_at="2000-01-01T00:00:00.000000Z")
+        with open(os.path.join(owned, "auth.json"), "w") as handle:
+            json.dump({_GROK_SCOPE: changed}, handle)
+        opener = mock.Mock(side_effect=AssertionError("network must not run"))
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}):
+            self.assertFalse(collect.grok_refresh_token(
+                owned, "g", collect.fingerprint("u-1:t-1"), opener=opener,
+                now=1_700_000_000))
+
+        opener.assert_not_called()
+
+    def test_refresh_refuses_non_xai_oidc_issuer(self):
+        headroom = os.path.join(self.home, "headroom")
+        owned = os.path.join(headroom, "homes", "g")
+        os.makedirs(owned)
+        credential = dict(
+            _GROK_AUTH, oidc_client_id="enterprise-client",
+            oidc_issuer="https://login.example.com",
+            expires_at="2000-01-01T00:00:00.000000Z")
+        with open(os.path.join(owned, "auth.json"), "w") as handle:
+            json.dump({"https://login.example.com::enterprise-client":
+                       credential}, handle)
+        opener = mock.Mock(side_effect=AssertionError("network must not run"))
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}):
+            self.assertFalse(collect.grok_refresh_token(
+                owned, "g", collect.fingerprint("u-1:t-1"), opener=opener,
+                now=1_700_000_000))
+
+        opener.assert_not_called()
+
+    def test_refresh_busy_auth_lock_fails_without_network(self):
+        headroom = os.path.join(self.home, "headroom")
+        owned = os.path.join(headroom, "homes", "g")
+        os.makedirs(owned)
+        credential = dict(
+            _GROK_AUTH, oidc_client_id="client-uuid",
+            expires_at="2000-01-01T00:00:00.000000Z")
+        with open(os.path.join(owned, "auth.json"), "w") as handle:
+            json.dump({_GROK_SCOPE: credential}, handle)
+        lock_context = mock.MagicMock()
+        lock_context.__enter__.return_value = False
+        opener = mock.Mock(side_effect=AssertionError("network must not run"))
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}), \
+                mock.patch.object(collect.locks, "exclusive_lock",
+                                  return_value=lock_context):
+            self.assertFalse(collect.grok_refresh_token(
+                owned, "g", collect.fingerprint("u-1:t-1"), opener=opener,
+                now=1_700_000_000))
+
+        opener.assert_not_called()
+
+    def test_refresh_malformed_response_fails_without_overwrite(self):
+        headroom = os.path.join(self.home, "headroom")
+        owned = os.path.join(headroom, "homes", "g")
+        os.makedirs(owned)
+        credential = dict(
+            _GROK_AUTH, oidc_client_id="client-uuid",
+            expires_at="2000-01-01T00:00:00.000000Z")
+        auth_path = os.path.join(owned, "auth.json")
+        with open(auth_path, "w") as handle:
+            json.dump({_GROK_SCOPE: credential}, handle)
+        with open(auth_path, "rb") as handle:
+            before = handle.read()
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}):
+            self.assertFalse(collect.grok_refresh_token(
+                owned, "g", collect.fingerprint("u-1:t-1"),
+                opener=mock.Mock(return_value=_GrokResp(b"[]")),
+                now=1_700_000_000))
+
+        with open(auth_path, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_refresh_uses_access_token_exp_when_expires_in_is_absent(self):
+        headroom = os.path.join(self.home, "headroom")
+        owned = os.path.join(headroom, "homes", "g")
+        os.makedirs(owned)
+        credential = dict(
+            _GROK_AUTH, oidc_client_id="client-uuid",
+            expires_at="2000-01-01T00:00:00.000000Z")
+        with open(os.path.join(owned, "auth.json"), "w") as handle:
+            json.dump({_GROK_SCOPE: credential}, handle)
+        payload = base64.urlsafe_b64encode(json.dumps({
+            "exp": 1_700_021_600,
+        }).encode()).rstrip(b"=").decode()
+        bearer = f"header.{payload}.signature"
+        opener = mock.Mock(return_value=_GrokResp(json.dumps({
+            "access_token": bearer,
+        }).encode()))
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}):
+            self.assertTrue(collect.grok_refresh_token(
+                owned, "g", collect.fingerprint("u-1:t-1"), opener=opener,
+                now=1_700_000_000))
+
+        self.assertEqual(
+            collect.grok_expires_at(collect.grok_auth(owned)), 1_700_021_600)
+
+    def test_reads_first_scope_value(self):
+        self._write(dict(_GROK_AUTH))
+        auth = collect.grok_auth(self.home)
+        self.assertEqual(auth["key"], "grok-bearer")
+        self.assertEqual(auth["email"], "me@x.ai")
+
+    def test_reads_only_xai_oidc_scope(self):
+        third_party = dict(_GROK_AUTH, key="enterprise-bearer")
+        xai = dict(_GROK_AUTH)
+        with open(os.path.join(self.home, "auth.json"), "w") as handle:
+            json.dump({
+                "https://login.example.com::enterprise-client": third_party,
+                _GROK_SCOPE: xai,
+            }, handle)
+        self.assertEqual(collect.grok_auth(self.home)["key"], "grok-bearer")
+
+        with open(os.path.join(self.home, "auth.json"), "w") as handle:
+            json.dump({
+                "https://login.example.com::enterprise-client": third_party,
+            }, handle)
+        self.assertIsNone(collect.grok_auth(self.home))
+
+    def test_missing_file_is_none(self):
+        self.assertIsNone(collect.grok_auth(self.home))
+
+    def test_expires_at_parses_microseconds_z(self):
+        got = collect.grok_expires_at(
+            {"expires_at": "2026-07-18T11:15:41.558875Z"})
+        self.assertIsNotNone(got)
+        from datetime import datetime, timezone
+        self.assertEqual(int(got), int(datetime(
+            2026, 7, 18, 11, 15, 41, tzinfo=timezone.utc).timestamp()))
+
+    def test_expires_at_malformed_or_absent_is_none(self):
+        self.assertIsNone(collect.grok_expires_at({"expires_at": "nope"}))
+        self.assertIsNone(collect.grok_expires_at({}))
+        self.assertIsNone(collect.grok_expires_at({"expires_at": 123}))
+
+
+class GrokIdentity(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = self.temp.name
+
+    def _write(self, **fields):
+        credential = dict(_GROK_AUTH)
+        credential.update(fields)
+        credential = {k: v for k, v in credential.items() if v is not None}
+        with open(os.path.join(self.home, "auth.json"), "w") as handle:
+            json.dump({"https://auth.x.ai::client-uuid": credential}, handle)
+
+    def test_local_metadata_identity(self):
+        self._write()
+        identity = collect.grok_identity(self.home)
+        self.assertFalse(identity["verified"])
+        self.assertEqual(identity["email"], "me@x.ai")
+        self.assertEqual(identity["method"], "grok_local_metadata")
+
+    def test_fingerprint_is_seat_composite_with_team(self):
+        self._write()
+        identity = collect.grok_identity(self.home)
+        self.assertEqual(identity["account_fingerprint"],
+                         collect.fingerprint("u-1:t-1"))
+
+    def test_fingerprint_falls_back_to_user_without_team(self):
+        self._write(team_id=None)
+        identity = collect.grok_identity(self.home)
+        self.assertEqual(identity["account_fingerprint"],
+                         collect.fingerprint("u-1"))
+        # the composite (contains ":") and the bare UUID form never collide
+        self.assertNotEqual(identity["account_fingerprint"],
+                            collect.fingerprint("u-1:t-1"))
+
+    def test_missing_auth_holds(self):
+        with self.assertRaises(collect.IdentityBindingError) as caught:
+            collect.grok_identity(self.home)  # empty dir, no auth.json
+        self.assertEqual(caught.exception.code, "grok_local_binding_missing")
+
+    def test_missing_user_id_holds(self):
+        self._write(user_id=None)
+        with self.assertRaises(collect.IdentityBindingError) as caught:
+            collect.grok_identity(self.home)
+        self.assertEqual(caught.exception.code, "grok_local_binding_missing")
+
+
+class GrokLimits(unittest.TestCase):
+    def _auth(self, **over):
+        return mock.patch.object(collect, "grok_auth",
+                                 return_value=dict(_GROK_AUTH, **over))
+
+    def test_zero_fixture_parses_to_zero_percent(self):
+        with self._auth():
+            result = collect.grok_limits(
+                "/h", opener=_grok_opener(_GROK_ZERO_FIXTURE),
+                now=1_700_000_000)
+        windows = result["windows"]
+        self.assertEqual(set(windows), {"7d"})  # no 5h fabricated
+        self.assertEqual(windows["7d"]["used_percent"], 0.0)
+        self.assertEqual(windows["7d"]["resets_at"], 1784839764)
+        self.assertEqual(windows["7d"]["window_minutes"], 10080)
+        self.assertEqual(result["source"], "grok_build_billing")
+
+    def test_one_percent_fixture_parses(self):
+        with self._auth():
+            result = collect.grok_limits(
+                "/h", opener=_grok_opener(_GROK_ONE_FIXTURE), now=1_700_000_000)
+        self.assertEqual(result["windows"]["7d"]["used_percent"], 1.0)
+        self.assertEqual(result["windows"]["7d"]["resets_at"], 1784839764)
+
+    def test_expired_token_holds_without_network(self):
+        opener = mock.Mock(side_effect=AssertionError("probe must not run"))
+        with mock.patch.object(collect, "grok_auth", return_value={
+                "key": "tok", "expires_at": "2000-01-01T00:00:00.000000Z"}):
+            with self.assertRaises(collect.IdentityBindingError) as caught:
+                collect.grok_limits("/h", opener=opener)
+        self.assertEqual(caught.exception.code, "grok_token_expired")
+        opener.assert_not_called()
+
+    def test_absent_expiry_treated_expired_without_network(self):
+        opener = mock.Mock(side_effect=AssertionError("probe must not run"))
+        with mock.patch.object(collect, "grok_auth",
+                               return_value={"key": "tok"}):
+            with self.assertRaises(collect.IdentityBindingError) as caught:
+                collect.grok_limits("/h", opener=opener)
+        self.assertEqual(caught.exception.code, "grok_token_expired")
+        opener.assert_not_called()
+
+    def test_missing_key_holds_as_binding_missing(self):
+        opener = mock.Mock(side_effect=AssertionError("probe must not run"))
+        with mock.patch.object(collect, "grok_auth", return_value={}):
+            with self.assertRaises(collect.IdentityBindingError) as caught:
+                collect.grok_limits("/h", opener=opener)
+        self.assertEqual(caught.exception.code, "grok_local_binding_missing")
+        opener.assert_not_called()
+
+    def test_http_401_403_hold_as_rejected(self):
+        for code in (401, 403):
+            with self._auth():
+                with self.assertRaises(collect.IdentityBindingError) as caught:
+                    collect.grok_limits("/h", opener=mock.Mock(
+                        side_effect=_grok_http_error(code)))
+            self.assertEqual(caught.exception.code, "grok_usage_rejected")
+
+    def test_nonzero_grpc_status_holds_as_rejected(self):
+        body = _grok_response(bytes([0x0a, 0x00]), status=5)
+        with self._auth():
+            with self.assertRaises(collect.IdentityBindingError) as caught:
+                collect.grok_limits("/h", opener=_grok_opener(body))
+        self.assertEqual(caught.exception.code, "grok_usage_rejected")
+
+    def test_missing_weekly_holds(self):
+        # grpc-status 0, but the GrokCreditsConfig carries no period
+        body = _grok_response(bytes([0x0a, 0x00]), status=0)
+        with self._auth():
+            with self.assertRaises(collect.IdentityBindingError) as caught:
+                collect.grok_limits("/h", opener=_grok_opener(body))
+        self.assertEqual(caught.exception.code, "grok_missing_weekly")
+
+    def test_invalid_raw_usage_percent_holds_before_rounding(self):
+        body = _grok_response(b"payload", status=0)
+        for percent in (-0.04, 100.01, float("nan"), float("inf")):
+            with self.subTest(percent=percent), self._auth(), \
+                    mock.patch.object(
+                        collect, "_grok_parse_credits",
+                        return_value=(percent, 1_784_839_764)):
+                with self.assertRaises(
+                        collect.IdentityBindingError) as caught:
+                    collect.grok_limits("/h", opener=_grok_opener(body))
+                self.assertEqual(caught.exception.code, "grok_missing_weekly")
+
+    def test_oversized_response_holds(self):
+        # an abnormal/hostile response over the cap is held, never read unbounded
+        big = b"x" * (collect.GROK_MAX_RESPONSE_BYTES + 100)
+        with self._auth():
+            with self.assertRaises(collect.IdentityBindingError) as caught:
+                collect.grok_limits("/h", opener=_grok_opener(big))
+        self.assertEqual(caught.exception.code, "grok_missing_weekly")
+
+    def test_trailing_bytes_after_frames_hold(self):
+        # leftover bytes past the trailer = malformed response → fail closed
+        body = _grok_response(bytes([0x0a, 0x00]), status=0) + b"\x99\x99"
+        with self._auth():
+            with self.assertRaises(collect.IdentityBindingError) as caught:
+                collect.grok_limits("/h", opener=_grok_opener(body))
+        self.assertEqual(caught.exception.code, "grok_missing_weekly")
+
+
+class GrokCollect(unittest.TestCase):
+    """The collect() grok branch: healthy read, expected-email binding, and an
+    actionable hold note — all without spending a token."""
+
+    def _identity(self, email="me@x.ai"):
+        return {"verified": False, "email": email,
+                "account_fingerprint": collect.fingerprint("u-1:t-1"),
+                "method": "grok_local_metadata", "plan_type": None}
+
+    def _windows(self):
+        now = 1_700_000_000
+        return {"captured_at": now, "source": "grok_build_billing",
+                "stale": False,
+                "windows": {"7d": {"used_percent": 12.0, "resets_at": 1784839764,
+                                   "window_minutes": 10080, "observed_at": now,
+                                   "freshness": "fresh"}}}
+
+    def test_expired_owned_token_refreshes_before_snapshot_binding(self):
+        with tempfile.TemporaryDirectory() as headroom:
+            home = os.path.join(headroom, "homes", "g")
+            os.makedirs(home)
+            auth_path = os.path.join(home, "auth.json")
+            expired = dict(
+                _GROK_AUTH, oidc_client_id="client-uuid",
+                expires_at="2000-01-01T00:00:00.000000Z")
+            with open(auth_path, "w") as handle:
+                json.dump({_GROK_SCOPE: expired}, handle)
+            account = _account("g", "grok")
+            account["home"] = home
+
+            def refresh(_home, _slot_name, _fingerprint, now=None):
+                fresh = dict(expired, key="new-bearer",
+                             expires_at="2999-01-01T00:00:00.000000Z")
+                with open(auth_path, "w") as handle:
+                    json.dump({_GROK_SCOPE: fresh}, handle)
+                return True
+
+            with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}), \
+                    mock.patch.object(collect, "grok_refresh_token",
+                                      side_effect=refresh) as refresh_mock, \
+                    mock.patch.object(collect, "grok_limits",
+                                      return_value=self._windows()):
+                row = collect.collect([account])["accounts"][0]
+
+        refresh_mock.assert_called_once_with(
+            home, "g", collect.fingerprint("u-1:t-1"), now=mock.ANY)
+        self.assertTrue(row["ok"])
+        self.assertEqual(
+            row["identity"]["credential_digest"],
+            hashlib.sha256(b"new-bearer").hexdigest()[:16])
+
+    def test_failed_refresh_rebinds_identity_before_usage(self):
+        """A concurrent re-login can swap the seat while refresh fails closed.
+
+        ``grok_refresh_token`` returns False on fingerprint mismatch. The
+        collector must still re-read identity before ``grok_limits`` so the
+        new bearer's usage is never published under the preflight seat —
+        Grok billing has no identity header to catch the swap.
+        """
+        with tempfile.TemporaryDirectory() as headroom:
+            home = os.path.join(headroom, "homes", "g")
+            os.makedirs(home)
+            auth_path = os.path.join(home, "auth.json")
+            preflight = dict(
+                _GROK_AUTH, email="a@x.ai", user_id="u-a",
+                oidc_client_id="client-uuid", key="a-old",
+                expires_at="2000-01-01T00:00:00.000000Z")
+            swapped = dict(
+                _GROK_AUTH, email="b@x.ai", user_id="u-b",
+                oidc_client_id="client-uuid", key="b-new",
+                expires_at="2999-01-01T00:00:00.000000Z")
+            with open(auth_path, "w") as handle:
+                json.dump({_GROK_SCOPE: preflight}, handle)
+            account = _account("g", "grok")
+            account["home"] = home
+
+            def refresh(_home, _slot_name, _fingerprint, now=None):
+                with open(auth_path, "w") as handle:
+                    json.dump({_GROK_SCOPE: swapped}, handle)
+                return False  # fingerprint mismatch under the lock
+
+            with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}), \
+                    mock.patch.object(collect, "grok_refresh_token",
+                                      side_effect=refresh) as refresh_mock, \
+                    mock.patch.object(collect, "grok_limits",
+                                      return_value=self._windows()):
+                row = collect.collect([account])["accounts"][0]
+
+        refresh_mock.assert_called_once_with(
+            home, "g", collect.fingerprint("u-a:t-1"), now=mock.ANY)
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["email"], "b@x.ai")
+        self.assertEqual(
+            row["identity"]["account_fingerprint"],
+            collect.fingerprint("u-b:t-1"))
+        self.assertEqual(
+            row["identity"]["credential_digest"],
+            hashlib.sha256(b"b-new").hexdigest()[:16])
+
+    def test_failed_refresh_identity_swap_respects_expected_email(self):
+        """Same race as above, with expected_email: hold on the post-swap seat."""
+        with tempfile.TemporaryDirectory() as headroom:
+            home = os.path.join(headroom, "homes", "g")
+            os.makedirs(home)
+            auth_path = os.path.join(home, "auth.json")
+            preflight = dict(
+                _GROK_AUTH, email="a@x.ai", user_id="u-a",
+                oidc_client_id="client-uuid", key="a-old",
+                expires_at="2000-01-01T00:00:00.000000Z")
+            swapped = dict(
+                _GROK_AUTH, email="b@x.ai", user_id="u-b",
+                oidc_client_id="client-uuid", key="b-new",
+                expires_at="2999-01-01T00:00:00.000000Z")
+            with open(auth_path, "w") as handle:
+                json.dump({_GROK_SCOPE: preflight}, handle)
+            account = _account("g", "grok")
+            account["home"] = home
+            account["expected_email"] = "a@x.ai"
+
+            def refresh(_home, _slot_name, _fingerprint, now=None):
+                with open(auth_path, "w") as handle:
+                    json.dump({_GROK_SCOPE: swapped}, handle)
+                return False
+
+            with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}), \
+                    mock.patch.object(collect, "grok_refresh_token",
+                                      side_effect=refresh), \
+                    mock.patch.object(collect, "grok_limits") as limits_mock:
+                row = collect.collect([account])["accounts"][0]
+
+        limits_mock.assert_not_called()
+        self.assertFalse(row["ok"])
+        self.assertEqual(row["error_code"], "slot_bound_to_unexpected_email")
+        self.assertEqual(row["email"], "b@x.ai")
+
+    def test_unexpected_owned_identity_holds_before_refresh(self):
+        with tempfile.TemporaryDirectory() as headroom:
+            home = os.path.join(headroom, "homes", "g")
+            os.makedirs(home)
+            expired = dict(
+                _GROK_AUTH, oidc_client_id="client-uuid",
+                expires_at="2000-01-01T00:00:00.000000Z")
+            with open(os.path.join(home, "auth.json"), "w") as handle:
+                json.dump({_GROK_SCOPE: expired}, handle)
+            account = _account("g", "grok")
+            account["home"] = home
+            account["expected_email"] = "someone-else@x.ai"
+
+            with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}), \
+                    mock.patch.object(collect, "grok_refresh_token") \
+                    as refresh_mock:
+                row = collect.collect([account])["accounts"][0]
+
+        refresh_mock.assert_not_called()
+        self.assertFalse(row["ok"])
+        self.assertEqual(row["error_code"], "slot_bound_to_unexpected_email")
+        self.assertEqual(row["email"], "me@x.ai")
+        self.assertEqual(row["identity_method"], "grok_local_metadata")
+
+    def test_healthy_grok_account_reports_weekly_only(self):
+        account = _account("g", "grok")
+        with mock.patch.object(collect, "grok_identity",
+                               return_value=self._identity()), \
+                mock.patch.object(collect, "credential_digest",
+                                  return_value="digest"), \
+                mock.patch.object(collect, "grok_limits",
+                                  return_value=self._windows()):
+            row = collect.collect([account])["accounts"][0]
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["provider"], "grok")
+        self.assertEqual(row["plan"], "Grok")
+        self.assertEqual(set(row["windows"]), {"7d"})  # no fabricated 5h
+        self.assertEqual(row["windows"]["7d"]["used_percent"], 12.0)
+
+    def test_expected_email_mismatch_holds(self):
+        account = _account("g", "grok")
+        account["expected_email"] = "someone-else@x.ai"
+        with mock.patch.object(collect, "grok_identity",
+                               return_value=self._identity("me@x.ai")), \
+                mock.patch.object(collect, "credential_digest",
+                                  return_value="digest"), \
+                mock.patch.object(collect, "grok_limits",
+                                  side_effect=AssertionError("must not read")):
+            row = collect.collect([account])["accounts"][0]
+        self.assertFalse(row["ok"])
+        self.assertEqual(row["error_code"], "slot_bound_to_unexpected_email")
+
+    def test_token_expired_hold_note_is_actionable(self):
+        account = _account("g", "grok")
+        with mock.patch.object(collect, "grok_identity",
+                               return_value=self._identity()), \
+                mock.patch.object(collect, "credential_digest",
+                                  return_value="digest"), \
+                mock.patch.object(collect, "grok_limits", side_effect=
+                                  collect.IdentityBindingError(
+                                      "grok_token_expired")):
+            row = collect.collect([account])["accounts"][0]
+        self.assertEqual(row["error_code"], "grok_token_expired")
+        self.assertIn("grok", row["note"].lower())
+
+
+class GrokWidgetProjection(unittest.TestCase):
+    """The widget projection omits an absent 5h for grok (a no-5h provider)
+    without fabricating a phantom held 5h row."""
+
+    def test_projection_has_no_five_hour(self):
+        from headroom import widget
+        now = 1_700_000_000
+        snapshot = {"generated": now, "accounts": [{
+            "name": "g", "provider": "grok", "ok": True, "routable": True,
+            "trust_state": "verified_local", "stale": False,
+            "captured_at": now, "identity_verified": False,
+            "windows": {"7d": {"used_percent": 20.0,
+                               "resets_at": now + 7 * 86400,
+                               "window_minutes": 10080, "observed_at": now,
+                               "freshness": "fresh"}}}]}
+        projected = widget.project(snapshot, evaluated_at=now + 10)
+        account = projected["accounts"][0]
+        self.assertEqual(account["provider"], "grok")
+        self.assertNotIn("5h", account["windows"])
+        self.assertIn("7d", account["windows"])
+        self.assertEqual(account["state"], "current")
+
+
+class RegistryGrokSeats(unittest.TestCase):
+    def fleet(self):
+        return {"schema_version": 1, "accounts": [
+            {"name": "grok", "provider": "grok", "home": "~/.grok",
+             "expected_email": "me@x.ai"},
+        ]}
+
+    def test_grok_seat_validates(self):
+        config = self.fleet()
+        self.assertEqual(registry.validate(config), config)
+
+    def test_grok_is_a_recognized_family(self):
+        self.assertEqual(registry.family("grok"), "grok")
+        self.assertEqual(registry.family_provider("grok"), "grok")
+
+    def test_grok_excluded_from_token_scanning(self):
+        # grok has no local per-session token logs; it must not be fed to the
+        # token scanner (which would treat it as codex and mark the feed partial)
+        config = {"schema_version": 1, "accounts": [
+            {"name": "c", "provider": "claude", "home": "~/.claude"},
+            {"name": "x", "provider": "codex", "home": "~/.codex"},
+            {"name": "g", "provider": "grok", "home": "~/.grok"},
+        ]}
+        providers = {account["provider"]
+                     for account in registry.token_accounts(config)}
+        self.assertEqual(providers, {"claude", "codex"})
+
+
+class GrokRouting(unittest.TestCase):
+    """A healthy grok seat reports only a 7d window (no 5h). The router must
+    treat grok as a no-5h provider (like codex — see registry.NO_5H_PROVIDERS)
+    and route it, not reject the row as '5h window missing'."""
+
+    def setUp(self):
+        self.now = time.time()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        # isolate reserve_percent() from the real ~/.headroom config
+        self.env = mock.patch.dict(os.environ, {"HEADROOM_DIR": self.temp.name})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        # the router re-derives the slot's live identity+credential; return the
+        # fixture's bound values so the binding matches
+        self.binding = mock.patch.object(
+            collect, "local_binding", return_value=("AAAA", "BBBB"))
+        self.binding.start()
+        self.addCleanup(self.binding.stop)
+
+    def _row(self, **over):
+        row = {
+            "name": "g", "provider": "grok", "plan": "Grok", "ok": True,
+            "stale": False, "routable": True, "identity_verified": False,
+            "identity": {"account_fingerprint": "AAAA",
+                         "credential_digest": "BBBB"},
+            "trust_state": "verified_local", "captured_at": self.now - 10,
+            "source": "grok_build_billing",
+            "windows": {"7d": {"used_percent": 50.0,
+                               "resets_at": self.now + 8 * 86400,
+                               "window_minutes": 10080,
+                               "observed_at": self.now - 10,
+                               "freshness": "fresh"}},
+        }
+        row.update(over)
+        return row
+
+    def test_seven_day_only_routes(self):
+        # no 5h window present — must NOT be rejected as "5h window missing"
+        self.assertIsNone(route.block_reason(
+            _account("g", "grok"), "grok", self._row(), {}, self.now))
+
+    def test_missing_weekly_still_holds(self):
+        row = self._row()
+        row["windows"] = {}  # 7d stays mandatory for every provider
+        reason = route.block_reason(_account("g", "grok"), "grok", row, {},
+                                    self.now)
+        self.assertIsNotNone(reason)
+        self.assertIn("7d window missing", reason)
+
+    def test_run_refuses_grok(self):
+        # grok is monitor/env-pick only: `headroom run grok` must never spawn a
+        # process on a grok seat (read-only, no token spend)
+        buffer = io.StringIO()
+        with redirect_stderr(buffer):
+            rc = route.cmd_run("grok", ["/bin/echo", "hi"])
+        self.assertEqual(rc, 2)
+        self.assertIn("does not launch grok", buffer.getvalue())
+
+    def test_exec_routed_refuses_grok(self):
+        buffer = io.StringIO()
+        with redirect_stderr(buffer):
+            rc = route._exec_routed("grok", ["grok"])
+        self.assertEqual(rc, 2)
+
+    def test_rotate_cools_grok_for_the_weekly_window(self):
+        # a grok seat resets weekly, so cooling it must use the 7d window — a
+        # +5h fallback would re-offer an exhausted pool far too early
+        grok = _account("g", "grok")
+        with mock.patch.object(route, "ensure_fresh_snapshot", return_value={}), \
+                mock.patch.object(route, "candidates",
+                                  return_value=[(grok, None)]), \
+                mock.patch.object(route, "current_account", return_value=grok), \
+                mock.patch.object(route, "window_reset", return_value=None), \
+                mock.patch.object(route, "pick", return_value=None), \
+                redirect_stdout(io.StringIO()):
+            route.cmd_rotate("grok")
+        reset = (route.cooldowns() or {}).get("g:*")
+        self.assertIsNotNone(reset)
+        self.assertGreater(reset - self.now, 6 * 86400)  # ~weekly, not 5h
+
+
+class GrokConnect(unittest.TestCase):
+    """`grok` is in registry.PROVIDERS, so the connect CLI must handle it
+    coherently: fresh logins run `grok login` in an isolated home (same as
+    claude/codex), and adopting an existing ~/.grok reads its local identity."""
+
+    def test_fresh_connect_runs_grok_login(self):
+        """connect_fresh for grok creates an isolated home and calls
+        `grok login`, just like claude/codex."""
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.dict(os.environ, {"HEADROOM_DIR": root}), \
+                mock.patch.object(connect, "provider_binary",
+                                  return_value="/usr/bin/grok"), \
+                mock.patch("subprocess.run") as run, \
+                mock.patch.object(connect, "slot_identity") as ident:
+            config = {"schema_version": 1, "accounts": [],
+                      "dashboard": dict(registry.DEFAULT_DASHBOARD)}
+            with open(os.path.join(root, "config.json"), "w") as f:
+                json.dump(config, f)
+            run.return_value = mock.Mock(returncode=0)
+            ident.return_value = {"email": "new@x.ai",
+                                  "account_fingerprint": "new_fp",
+                                  "method": "grok_local_metadata"}
+            result = connect.connect_fresh(config, "g", "grok")
+        self.assertIsNotNone(result)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv, ["/usr/bin/grok", "login"])
+        env = run.call_args.kwargs.get("env") or run.call_args[1].get("env", {})
+        self.assertIn("GROK_HOME", env)
+
+    def test_slot_identity_reads_grok_for_adopt(self):
+        with tempfile.TemporaryDirectory() as home:
+            with open(os.path.join(home, "auth.json"), "w") as handle:
+                json.dump({"https://auth.x.ai::client": dict(_GROK_AUTH)},
+                          handle)
+            identity = connect.slot_identity("grok", home)
+        self.assertIsNotNone(identity)
+        self.assertEqual(identity["email"], "me@x.ai")
+        self.assertEqual(identity["method"], "grok_local_metadata")
+
+    def test_grok_offered_as_interactive_provider_choice(self):
+        """The provider prompt must list every registry provider — a grok
+        seat must be reachable without knowing the --provider flag."""
+        self.assertIn("grok", registry.PROVIDERS)
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.dict(os.environ, {
+                    "HEADROOM_DIR": root,
+                    # empty home: no auth.json, so the grok default-adopt
+                    # stays inert and the flow reaches connect_fresh
+                    "GROK_HOME": os.path.join(root, "empty")}), \
+                mock.patch.object(connect, "prompt_choice",
+                                  return_value="grok") as choice, \
+                mock.patch.object(connect, "connect_fresh",
+                                  return_value=None) as fresh, \
+                mock.patch("builtins.input", return_value="gk"):
+            connect.cmd_connect([])
+        choice.assert_called_once()
+        self.assertEqual(choice.call_args.args[1], list(registry.PROVIDERS))
+        fresh.assert_called_once()  # no login on disk -> fresh login flow
+
+    def test_cmd_connect_grok_defaults_to_adopting_grok_home(self):
+        """`headroom connect gk --provider grok` with a grok login on disk
+        adopts $GROK_HOME without needing an explicit --adopt path."""
+        with tempfile.TemporaryDirectory() as root:
+            grok_home = os.path.join(root, "grokhome")
+            os.makedirs(grok_home)
+            with open(os.path.join(grok_home, "auth.json"), "w") as handle:
+                json.dump({"https://auth.x.ai::client": dict(_GROK_AUTH)},
+                          handle)
+            with mock.patch.dict(os.environ, {"HEADROOM_DIR": root,
+                                              "GROK_HOME": grok_home}):
+                code = connect.cmd_connect(["gk", "--provider", "grok"])
+                config = registry.load()
+        self.assertEqual(code, 0)
+        slot = next(a for a in config["accounts"] if a["name"] == "gk")
+        self.assertEqual(slot["provider"], "grok")
+        self.assertEqual(slot["home"], registry.expand(grok_home))
+        self.assertEqual(slot["expected_email"], "me@x.ai")
+
+    def test_detect_existing_offers_grok_login(self):
+        """The wizard's adopt flow must surface an existing $GROK_HOME login
+        alongside claude/codex ones."""
+        with tempfile.TemporaryDirectory() as grok_home:
+            with open(os.path.join(grok_home, "auth.json"), "w") as handle:
+                json.dump({"https://auth.x.ai::client": dict(_GROK_AUTH)},
+                          handle)
+            with mock.patch.dict(os.environ, {"GROK_HOME": grok_home}):
+                found = connect.detect_existing()
+        rows = [row for row in found if row["provider"] == "grok"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["email"], "me@x.ai")
+        self.assertEqual(rows[0]["home"], grok_home)
 
 
 if __name__ == "__main__":
