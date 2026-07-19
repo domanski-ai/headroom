@@ -39,7 +39,7 @@ HOME_ENV = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME",
 
 
 def provider_binary(provider):
-    return shutil.which("claude" if provider == "claude" else "codex")
+    return shutil.which(provider)
 
 
 def login_argv(provider, binary):
@@ -200,8 +200,8 @@ def _interactive_login(config, name, provider, home, expected_email=None,
     """
     binary = provider_binary(provider)
     if not binary:
-        print(f"cannot find the `{'claude' if provider == 'claude' else 'codex'}` "
-              f"CLI on PATH — install it first", file=sys.stderr)
+        print(f"cannot find the `{provider}` CLI on PATH — install it first",
+              file=sys.stderr)
         return None
     # BEFORE the login runs: on macOS a new claude login clobbers the shared
     # Keychain token that an existing slot may depend on — refusing afterwards
@@ -221,7 +221,7 @@ def _interactive_login(config, name, provider, home, expected_email=None,
                     os.remove(target)
 
     env = collector.scrubbed_env()
-    env["CLAUDE_CONFIG_DIR" if provider == "claude" else "CODEX_HOME"] = home
+    env[HOME_ENV[provider]] = home
     if not quiet:
         print(f"\nStarting the {provider} login for slot '{name}'.")
         print("Complete the browser flow with the account you want on THIS slot.\n")
@@ -258,15 +258,6 @@ def _interactive_login(config, name, provider, home, expected_email=None,
 
 def connect_fresh(config, name, provider, quiet=False):
     """Isolated home + interactive provider login + verify + rollback."""
-    if provider == "grok":
-        # headroom is read-only for grok (never spends tokens, never runs the
-        # grok CLI), so it cannot drive a fresh grok login. Direct the user to
-        # log in themselves and adopt the existing home instead.
-        print("headroom does not run the grok login (it reads ~/.grok "
-              "read-only). Log in with the `grok` CLI, then adopt it:\n"
-              f"  headroom connect {name} --adopt ~/.grok --provider grok",
-              file=sys.stderr)
-        return None
     if not registry.NAME_RE.fullmatch(name):
         print(f"slot name {name!r} invalid: lowercase letters, digits, - and _ "
               f"only (max 32 chars)", file=sys.stderr)
@@ -393,14 +384,16 @@ def cmd_connect(args):
         provider = prompt_choice("Which provider is this account for?",
                                  list(registry.PROVIDERS))
     if provider == "grok" and adopt_path is None:
-        # Grok connects are adopt-only (headroom never runs the grok login).
-        # Default to the CLI's own home when a login is already sitting there,
-        # so plain `headroom connect --provider grok` just works; without one,
-        # fall through to connect_fresh's instructive refusal.
+        # Auto-adopt the grok CLI's existing login when it isn't already
+        # connected; otherwise fall through to connect_fresh so the user
+        # can log in with a different account in an isolated home.
         candidate = os.environ.get(HOME_ENV["grok"], DEFAULT_HOMES["grok"])
-        if os.path.exists(os.path.join(os.path.expanduser(candidate),
-                                       "auth.json")):
-            adopt_path = candidate
+        candidate_path = os.path.expanduser(candidate)
+        if os.path.exists(os.path.join(candidate_path, "auth.json")):
+            identity = slot_identity("grok", candidate_path)
+            fp = identity.get("account_fingerprint") if identity else None
+            if fp not in existing_fingerprints(config, "grok"):
+                adopt_path = candidate
     if name is None:
         taken = {account["name"] for account in config.get("accounts", [])}
         default = next(

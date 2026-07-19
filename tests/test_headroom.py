@@ -3717,16 +3717,32 @@ class GrokRouting(unittest.TestCase):
 
 class GrokConnect(unittest.TestCase):
     """`grok` is in registry.PROVIDERS, so the connect CLI must handle it
-    coherently: a fresh login is refused (headroom never runs the grok CLI),
-    while adopting an existing ~/.grok reads its local identity."""
+    coherently: fresh logins run `grok login` in an isolated home (same as
+    claude/codex), and adopting an existing ~/.grok reads its local identity."""
 
-    def test_fresh_connect_refused_with_adopt_guidance(self):
-        buffer = io.StringIO()
-        with redirect_stderr(buffer):
-            result = connect.connect_fresh({"accounts": []}, "g", "grok")
-        self.assertIsNone(result)  # refused, never spawned a login
-        self.assertIn("--adopt", buffer.getvalue())
-        self.assertIn("grok", buffer.getvalue().lower())
+    def test_fresh_connect_runs_grok_login(self):
+        """connect_fresh for grok creates an isolated home and calls
+        `grok login`, just like claude/codex."""
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.dict(os.environ, {"HEADROOM_DIR": root}), \
+                mock.patch.object(connect, "provider_binary",
+                                  return_value="/usr/bin/grok"), \
+                mock.patch("subprocess.run") as run, \
+                mock.patch.object(connect, "slot_identity") as ident:
+            config = {"schema_version": 1, "accounts": [],
+                      "dashboard": dict(registry.DEFAULT_DASHBOARD)}
+            with open(os.path.join(root, "config.json"), "w") as f:
+                json.dump(config, f)
+            run.return_value = mock.Mock(returncode=0)
+            ident.return_value = {"email": "new@x.ai",
+                                  "account_fingerprint": "new_fp",
+                                  "method": "grok_local_metadata"}
+            result = connect.connect_fresh(config, "g", "grok")
+        self.assertIsNotNone(result)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv, ["/usr/bin/grok", "login"])
+        env = run.call_args.kwargs.get("env") or run.call_args[1].get("env", {})
+        self.assertIn("GROK_HOME", env)
 
     def test_slot_identity_reads_grok_for_adopt(self):
         with tempfile.TemporaryDirectory() as home:
@@ -3756,7 +3772,7 @@ class GrokConnect(unittest.TestCase):
             connect.cmd_connect([])
         choice.assert_called_once()
         self.assertEqual(choice.call_args.args[1], list(registry.PROVIDERS))
-        fresh.assert_called_once()  # no login on disk -> instructive refusal
+        fresh.assert_called_once()  # no login on disk -> fresh login flow
 
     def test_cmd_connect_grok_defaults_to_adopting_grok_home(self):
         """`headroom connect gk --provider grok` with a grok login on disk
