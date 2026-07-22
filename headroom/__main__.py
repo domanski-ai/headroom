@@ -14,6 +14,10 @@ usage:
   headroom env <model>              print the export line for the best account
   headroom claude [args...]         launch Claude; supervise opted-in auto-handoff
     --headroom-auto-handoff / --headroom-no-auto-handoff   one-run override
+                                    (--headroom-auto-handoff also supervises a
+                                    headless/piped run so it rotates on a cap;
+                                    HEADROOM_HEADLESS_SUPERVISION=1 forces this,
+                                    =0 disables it)
     --headroom-launch-fallback      exec the bare CLI if the launch fails
                                     before the CLI ever started (opt-in)
   headroom codex [args...]          launch Codex on the best account
@@ -235,7 +239,24 @@ def _prepare_launch(command, args):
             incompatible = supervisor.incompatible_args(args)
             all_tty = (sys.stdin.isatty() and sys.stdout.isatty()
                        and sys.stderr.isatty())
-            if all_tty and not incompatible:
+            # Headless supervision (opt-in). A piped / non-TTY launch is
+            # normally exec-only, and an exec-only child CANNOT rotate when it
+            # hits a cap mid-run — it just stalls (the exact daily-pipeline
+            # failure). When auto-handoff was requested EXPLICITLY with
+            # --headroom-auto-handoff (every dispatched brief passes it) OR
+            # HEADROOM_HEADLESS_SUPERVISION=1 is set, supervise the non-TTY run
+            # too, so its stateful baton/resume handoff fires on a cap exactly
+            # like an interactive run — it stops the child, then RESUMES the
+            # same session on a fresh account (never replays completed work).
+            # HEADROOM_HEADLESS_SUPERVISION=0 forces the old exec-only path.
+            # `incompatible_args` still gates in every mode: a -p/--print/
+            # --output-format run has no resumable session, so it stays
+            # exec-only regardless of TTY or opt-in.
+            headless_env = os.environ.get(
+                "HEADROOM_HEADLESS_SUPERVISION", "").strip()
+            headless_ok = (headless_env != "0"
+                           and (auto_flag or headless_env == "1"))
+            if not incompatible and (all_tty or headless_ok):
                 use_supervisor = True
             else:
                 why = incompatible or "stdin/stdout/stderr are not all TTYs"

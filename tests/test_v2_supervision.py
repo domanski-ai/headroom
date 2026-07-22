@@ -1110,6 +1110,105 @@ class CliWiringV2(TempDirCase):
         self.assertEqual(found, {"--headroom-launch-fallback"})
 
 
+class HeadlessSupervision(TempDirCase):
+    """A headless (non-TTY) launch normally execs and cannot rotate on a cap.
+    With --headroom-auto-handoff (every dispatched brief sends it) or
+    HEADROOM_HEADLESS_SUPERVISION=1 the stateful supervisor runs headless too,
+    so the baton/resume handoff still fires on a cap — never a command replay.
+    incompatible_args still forces exec-only in every mode."""
+
+    @staticmethod
+    def _non_tty():
+        stream = mock.Mock()
+        stream.isatty.return_value = False
+        return stream
+
+    def _dispatch_non_tty(self, argv):
+        pipe = self._non_tty()
+        with mock.patch.object(__main__.sys, "stdin", pipe), \
+                mock.patch.object(__main__.sys, "stdout", pipe), \
+                mock.patch.object(__main__.sys, "stderr", pipe), \
+                mock.patch("headroom.supervisor.cmd_claude",
+                           return_value=41) as supervised, \
+                mock.patch("headroom.route.cmd_exec",
+                           return_value=42) as execed:
+            code = __main__._dispatch(argv)
+        return code, supervised, execed
+
+    def test_explicit_flag_supervises_a_headless_run(self):
+        # the exact dispatch shape: `claude --headroom-auto-handoff ...`, piped
+        with mock.patch.object(registry, "auto_handoff", return_value=False):
+            code, supervised, execed = self._dispatch_non_tty(
+                ["claude", "--headroom-auto-handoff", "--model", "sonnet"])
+        self.assertEqual(code, 41)
+        supervised.assert_called_once_with("sonnet", ["--model", "sonnet"])
+        execed.assert_not_called()
+
+    def test_env_opt_in_supervises_headless_without_the_flag(self):
+        # config-driven auto-handoff + the env switch, no explicit flag
+        with mock.patch.dict(os.environ,
+                             {"HEADROOM_HEADLESS_SUPERVISION": "1"}), \
+                mock.patch.object(registry, "auto_handoff", return_value=True):
+            code, supervised, execed = self._dispatch_non_tty(
+                ["claude", "--model", "sonnet"])
+        self.assertEqual(code, 41)
+        supervised.assert_called_once_with("sonnet", ["--model", "sonnet"])
+        execed.assert_not_called()
+
+    def test_env_zero_forces_exec_even_with_the_flag(self):
+        # explicit revert switch: HEADROOM_HEADLESS_SUPERVISION=0 keeps the old
+        # exec-only headless behaviour even when the flag is present
+        with mock.patch.dict(os.environ,
+                             {"HEADROOM_HEADLESS_SUPERVISION": "0"}), \
+                mock.patch.object(registry, "auto_handoff", return_value=False):
+            code, supervised, execed = self._dispatch_non_tty(
+                ["claude", "--headroom-auto-handoff", "--model", "sonnet"])
+        self.assertEqual(code, 42)
+        supervised.assert_not_called()
+        execed.assert_called_once_with(
+            "sonnet", ["claude", "--model", "sonnet"],
+            launch_note="auto-handoff disabled: "
+                        "stdin/stdout/stderr are not all TTYs")
+
+    def test_incompatible_args_stay_exec_only_when_headless(self):
+        # -p has no resumable session: supervise must never engage, flag or not
+        with mock.patch.object(registry, "auto_handoff", return_value=False):
+            code, supervised, execed = self._dispatch_non_tty(
+                ["claude", "--headroom-auto-handoff", "-p", "hello"])
+        self.assertEqual(code, 42)
+        supervised.assert_not_called()
+        execed.assert_called_once_with(
+            "claude", ["claude", "-p", "hello"],
+            launch_note="auto-handoff disabled: -p")
+
+    def test_config_default_alone_does_not_supervise_headless(self):
+        # a passive config default (no explicit flag, no env) must NOT silently
+        # start supervising every piped `headroom claude` — headless is opt-in
+        with mock.patch.object(registry, "auto_handoff", return_value=True):
+            code, supervised, execed = self._dispatch_non_tty(
+                ["claude", "--model", "sonnet"])
+        self.assertEqual(code, 42)
+        supervised.assert_not_called()
+        execed.assert_called_once_with(
+            "sonnet", ["claude", "--model", "sonnet"],
+            launch_note="auto-handoff disabled: "
+                        "stdin/stdout/stderr are not all TTYs")
+
+    def test_tty_run_is_unchanged_by_the_headless_path(self):
+        # the interactive TTY path still supervises with no env/flag gymnastics
+        tty = mock.Mock()
+        tty.isatty.return_value = True
+        with mock.patch.object(registry, "auto_handoff", return_value=True), \
+                mock.patch.object(__main__.sys, "stdin", tty), \
+                mock.patch.object(__main__.sys, "stdout", tty), \
+                mock.patch.object(__main__.sys, "stderr", tty), \
+                mock.patch("headroom.supervisor.cmd_claude",
+                           return_value=41) as supervised:
+            code = __main__._dispatch(["claude", "--model", "sonnet"])
+        self.assertEqual(code, 41)
+        supervised.assert_called_once_with("sonnet", ["--model", "sonnet"])
+
+
 # ==========================================================================
 # Round-2 red-team fixes
 # ==========================================================================
