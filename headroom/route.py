@@ -578,6 +578,13 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
         if reserve > 0 and scoped_pct > 100 - reserve:
             return (f"{fam} weekly cap below {reserve:g}% reserve "
                     f"({100 - scoped_pct:g}% left)")
+        # mirror the 5h/7d gate above: a scoped cap the provider has already
+        # flagged critical while the window is live is spent for routing — a
+        # sticky primary must overflow off it to a healthy seat, not cling on
+        # until it reads a hard 100% (by which point sessions have been
+        # spraying scoped-cap errors that never trip the 5h/7d handoff).
+        if scoped.get("severity") == "critical" and scoped.get("is_active"):
+            return f"{fam} weekly cap critical"
     for key in (f"{account['name']}:{fam}", f"{account['name']}:*"):
         if key not in cool:
             continue

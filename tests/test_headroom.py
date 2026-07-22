@@ -415,6 +415,45 @@ class BlockReasonFailClosed(unittest.TestCase):
         # but the opus family IS held
         self.assertIsNotNone(self.reason(row, fam="opus"))
 
+    def test_scoped_critical_active_cap_holds_the_model_family(self):
+        # a scoped weekly window the provider flagged critical while live is
+        # spent for routing (regression: sticky-primary clung to a Fable seat
+        # at 97% critical instead of overflowing, spraying scoped-cap errors
+        # that never tripped the 5h/7d handoff).
+        row = _claude_row()
+        row["windows"]["scoped:Fable"] = {"used_percent": 97.0,
+                                          "resets_at": self.now + 8 * 86400,
+                                          "window_minutes": 10080,
+                                          "severity": "critical",
+                                          "is_active": True}
+        reason = self.reason(row, fam="fable")
+        self.assertIsNotNone(reason)
+        self.assertIn("fable weekly cap critical", reason)
+        # generic claude is a different model and must stay unaffected
+        self.assertIsNone(self.reason(row, fam="claude"))
+
+    def test_scoped_critical_but_inactive_still_routes(self):
+        # critical severity on a window that is NOT the live one is not a
+        # current cap — do not over-block (mirrors the 5h/7d is_active gate).
+        row = _claude_row()
+        row["windows"]["scoped:Fable"] = {"used_percent": 88.0,
+                                          "resets_at": self.now + 8 * 86400,
+                                          "window_minutes": 10080,
+                                          "severity": "critical",
+                                          "is_active": False}
+        self.assertIsNone(self.reason(row, fam="fable"))
+
+    def test_scoped_normal_severity_routes(self):
+        # a healthy Fable seat (37%, normal) stays eligible — this is the seat
+        # the fixed overflow must land on.
+        row = _claude_row()
+        row["windows"]["scoped:Fable"] = {"used_percent": 37.0,
+                                          "resets_at": self.now + 8 * 86400,
+                                          "window_minutes": 10080,
+                                          "severity": "normal",
+                                          "is_active": True}
+        self.assertIsNone(self.reason(row, fam="fable"))
+
     def test_claude_missing_5h_holds(self):
         # the 5h window is optional ONLY for codex (OpenAI lifted it). A claude
         # seat missing its 5h is a failed read and must hold — fail-closed.
@@ -2103,16 +2142,16 @@ class RegistryCodexSeats(unittest.TestCase):
     def fleet(self):
         return {"schema_version": 1, "accounts": [
             {"name": "domanski-ai", "provider": "claude",
-             "home": "~/ai-accounts/homes/claude-domanski-ai",
-             "expected_email": "paul@domanski.ai"},
-            {"name": "codex-domanski-ai", "provider": "codex",
-             "home": "~/ai-accounts/homes/codex-domanski-ai",
-             "expected_email": "paul@domanski.ai",
-             "handoff_group": "domanski-server"},
-            {"name": "codex-gmail", "provider": "codex",
-             "home": "~/ai-accounts/homes/codex-gmail",
-             "expected_email": "domanskip.paul@gmail.com",
-             "handoff_group": "domanski-server",
+             "home": "~/ai-accounts/homes/claude-acct-a",
+             "expected_email": "a@example.com"},
+            {"name": "codex-acct-a", "provider": "codex",
+             "home": "~/ai-accounts/homes/codex-acct-a",
+             "expected_email": "a@example.com",
+             "handoff_group": "one-host"},
+            {"name": "codex-acct-b", "provider": "codex",
+             "home": "~/ai-accounts/homes/codex-acct-b",
+             "expected_email": "b@example.com",
+             "handoff_group": "one-host",
              "shared_desktop": True},
         ]}
 

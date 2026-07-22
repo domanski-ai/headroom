@@ -128,10 +128,10 @@ class CodexHandoffBase(unittest.TestCase):
         self.accounts = [
             {"name": "cxa", "provider": "codex", "home": self.source_home,
              "expected_email": "one@example.com",
-             "handoff_group": "domanski-server"},
+             "handoff_group": "one-host"},
             {"name": "cxb", "provider": "codex", "home": self.target_home,
              "expected_email": "two@example.com",
-             "handoff_group": "domanski-server"},
+             "handoff_group": "one-host"},
         ]
         self.rollout = self._rollout(self.source_home, SID)
         for home in (self.source_home, self.target_home):
@@ -326,7 +326,7 @@ class RolloutLocation(CodexHandoffBase):
             fh.write(_rollout_bytes(OTHER_SID))
         os.symlink(outside, os.path.join(home, "sessions"))
         accounts = [{"name": "cxc", "provider": "codex", "home": home,
-                     "handoff_group": "domanski-server"}]
+                     "handoff_group": "one-host"}]
         with self.assertRaisesRegex(handoff.HandoffError,
                                     "sessions directory is a symlink"):
             handoff_codex.resolve_codex_source(OTHER_SID, accounts)
@@ -803,7 +803,7 @@ class CodexCommit(CodexHandoffBase):
         self.assertTrue(required.issubset(record),
                         sorted(required - set(record)))
         self.assertEqual(record["provider"], "codex")
-        self.assertEqual(record["handoff_group"], "domanski-server")
+        self.assertEqual(record["handoff_group"], "one-host")
         self.assertEqual(record["old_session_id"], SID)
         self.assertEqual(record["actual_model_family"], "codex")
         self.assertEqual(record["transcript_sha256"],
