@@ -1726,10 +1726,11 @@ class CodexBlockReasonFailClosed(unittest.TestCase):
 
 
 class GreatestHeadroom(unittest.TestCase):
-    """Candidate order follows REGISTRY preference for every family
-    (operator 2026-07-18, reversing the 2026-07-14 Codex greatest-headroom
-    scoping): the registry lists accounts primary-first and overflow happens
-    only through eligibility, never emptiest-first hopping."""
+    """Candidate order: CODEX follows registry preference (sticky primary,
+    overflow only on a real block). CLAUDE ranks eligible seats by remaining
+    Fable headroom first (Paul 2026-07-22) so a session always lands where
+    Fable is still usable, even one running Opus; a seat with no readable Fable
+    reading falls back to registry order."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -1794,15 +1795,58 @@ class GreatestHeadroom(unittest.TestCase):
         self.assertIsNone(ranked[0][1])
         self.assertIsNotNone(ranked[1][1])
 
-    def test_claude_keeps_registry_order(self):
-        # Greatest-headroom ordering is Codex-only (Paul 2026-07-14); Claude
-        # keeps its established registry-order preference even when a later
-        # account has more room, so daily Claude routing is unchanged.
+    def _with_fable(self, row, used):
+        row["windows"]["scoped:Fable"] = {
+            "used_percent": used, "resets_at": self.now + 8 * 86400,
+            "window_minutes": 10080}
+        return row
+
+    @property
+    def now(self):
+        return time.time()
+
+    def test_claude_no_fable_reading_falls_back_to_registry_order(self):
+        # no scoped Fable window on either seat -> nothing to rank on, so the
+        # registry primary still wins (fail-closed fallback, not hopping).
         accounts = [_account("a"), _account("b")]
         rows = [_claude_row("a", used5h=80.0, used7d=10.0),
                 _claude_row("b", used5h=20.0, used7d=10.0)]
         ranked = self.ranked("sonnet", accounts, rows)
         self.assertEqual([r[0]["name"] for r in ranked], ["a", "b"])
+
+    def test_claude_prefers_most_fable_headroom_over_registry_primary(self):
+        # a is the registry primary but its Fable is nearly gone; b has plenty.
+        # Claude selection must land on b so Fable stays usable.
+        accounts = [_account("a"), _account("b")]
+        rows = [self._with_fable(_claude_row("a", used5h=10.0, used7d=10.0), 95.0),
+                self._with_fable(_claude_row("b", used5h=10.0, used7d=10.0), 20.0)]
+        ranked = self.ranked("sonnet", accounts, rows)
+        self.assertEqual([a["name"] for a, r in ranked if r is None], ["b", "a"])
+
+    def test_claude_fable_preference_applies_even_on_an_opus_route(self):
+        # the crux of Paul's ask: a session running Opus should still land on
+        # the seat with Fable left, so he can switch to Fable any time.
+        accounts = [_account("a"), _account("b")]
+        rows = [self._with_fable(_claude_row("a", used5h=10.0, used7d=10.0), 100.0),
+                self._with_fable(_claude_row("b", used5h=10.0, used7d=10.0), 30.0)]
+        ranked = self.ranked("opus", accounts, rows)
+        self.assertEqual(ranked[0][0]["name"], "b")
+
+    def test_claude_readable_fable_outranks_a_seat_with_no_reading(self):
+        # a has no Fable reading (unknown), b has one -> b (proven capacity)
+        # ranks first even though a is the registry primary.
+        accounts = [_account("a"), _account("b")]
+        rows = [_claude_row("a", used5h=10.0, used7d=10.0),
+                self._with_fable(_claude_row("b", used5h=10.0, used7d=10.0), 50.0)]
+        ranked = self.ranked("sonnet", accounts, rows)
+        self.assertEqual(ranked[0][0]["name"], "b")
+
+    def test_claude_fable_tie_breaks_on_registry_order(self):
+        accounts = [_account("a"), _account("b")]
+        rows = [self._with_fable(_claude_row("a", used5h=10.0, used7d=10.0), 40.0),
+                self._with_fable(_claude_row("b", used5h=10.0, used7d=10.0), 40.0)]
+        ranked = self.ranked("sonnet", accounts, rows)
+        self.assertEqual([a["name"] for a, r in ranked if r is None], ["a", "b"])
 
     def test_lifted_5h_seats_are_routable_and_scored_on_weekly(self):
         # both codex seats have their 5h lifted (absent). They must stay

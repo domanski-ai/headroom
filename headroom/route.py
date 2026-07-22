@@ -452,6 +452,32 @@ def scoped_window_for(fam, windows):
     return None
 
 
+def _fable_room(row):
+    """Remaining Fable weekly headroom (0-100, higher = more capacity), or None
+    when there is no readable Fable reading.
+
+    Paul 2026-07-22: Claude account selection PREFERS seats that still have
+    Fable capacity, so an interactive session can always switch to Fable —
+    even a session currently running Opus. This is a RANKING signal only;
+    eligibility is still decided by block_reason. A seat with no readable Fable
+    reading ranks after those with one (fail-closed ordering: never prefer an
+    unknown over a proven-capacity seat)."""
+    if not isinstance(row, dict):
+        return None
+    windows = row.get("windows")
+    if not isinstance(windows, dict):
+        return None
+    scoped = scoped_window_for("fable", windows)
+    if not isinstance(scoped, dict):
+        return None
+    if scoped.get("freshness") == "expired_observation":
+        return None
+    pct = scoped.get("used_percent")
+    if not _number(pct) or not 0 <= pct <= 100:
+        return None
+    return 100.0 - pct
+
+
 # Codex usage is now read live and identity-bound via the codex app-server
 # (account/rateLimits/read + account/read), so Codex is fully routed like
 # Claude. Set HEADROOM_CODEX_ROUTING=0 to force dashboard-only (e.g. an older
@@ -658,6 +684,14 @@ def candidates(fam, snapshot=_UNSET):
     cool = cooldowns()
     now = time.time()
     reserve = registry.reserve_percent()
+    # Claude selection ranks eligible seats by remaining FABLE headroom first
+    # (Paul 2026-07-22, superseding the 2026-07-18 pure registry-order sticky
+    # primary): a new session must land where Fable is still usable — even one
+    # running Opus — so the operator can always switch to Fable. Codex keeps
+    # registry order. This reorders only FRESH picks; a session that already
+    # exported its CLAUDE_CONFIG_DIR stays put via env_pinned_account, so live
+    # work is never hopped mid-flight.
+    prefer_fable = registry.family_provider(fam) == "claude"
     ranked = []
     for index, account in enumerate(registry.ordered_for(fam)):
         if snapshot is None:
@@ -665,17 +699,18 @@ def candidates(fam, snapshot=_UNSET):
         else:
             reason = block_reason(account, fam, rows.get(account["name"]),
                                   cool, now, reserve=reserve)
-        # Registry-order preference for EVERY family (operator 2026-07-18,
-        # reversing the 2026-07-14 Codex greatest-headroom scoping): the
-        # registry lists accounts primary-first, and overflow happens through
-        # eligibility, not through emptiest-first hopping — a sticky primary
-        # keeps sessions, caches, and mental models on one seat until it is
-        # actually blocked.
-        ranked.append((account, reason, index))
-    # Eligible before blocked; registry order decides among the eligible.
-    # Ordering never overrides eligibility — block_reason already decided that.
-    ranked.sort(key=lambda entry: (entry[1] is not None, entry[2]))
-    return [(account, reason) for account, reason, _ in ranked]
+        room = _fable_room(rows.get(account["name"])) \
+            if (reason is None and prefer_fable) else None
+        ranked.append((account, reason, index, room))
+    # Eligible before blocked; then (Claude) most Fable headroom first, a seat
+    # with no readable Fable reading last among the eligible; registry order
+    # breaks ties and orders every non-Fable case (Codex, or Claude lacking a
+    # Fable reading). Ordering never overrides eligibility — block_reason
+    # already decided that.
+    ranked.sort(key=lambda entry: (entry[1] is not None,
+                                    1.0 if entry[3] is None else -entry[3],
+                                    entry[2]))
+    return [(account, reason) for account, reason, _, _ in ranked]
 
 
 def pick(fam):
