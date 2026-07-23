@@ -453,6 +453,16 @@ class HookProof(unittest.TestCase):
         self.assertIn("weekly", supervisor.cap_message(direct, self.child))
         self.assertIn("session", supervisor.cap_message(self.record(), self.child))
 
+    def test_parser_accepts_scoped_model_out_of_credits_cap(self):
+        # a Fable-scoped weekly cap surfaces as "out of usage credits", not
+        # "hit your … limit"; it must still be recognised so the seat hands off
+        # (regression 2026-07-23: the sales seat capped on Fable and never
+        # rotated because this wording slipped past CAP_RE).
+        rec = self.record("You're out of usage credits. Run /usage-credits to "
+                          "keep using Fable 5 or /model to switch models.")
+        self.assertIn("out of usage credits",
+                      supervisor.cap_message(rec, self.child))
+
     def test_rejects_overload_429_wrong_nonce_generation_and_session(self):
         for record in (
             self.record("overloaded_error", payload={"error": "overloaded"}),

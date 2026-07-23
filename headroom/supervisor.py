@@ -38,9 +38,16 @@ LOOP_WINDOW = 10 * 60
 LOOP_MAX = 3
 MAX_HOOK_BYTES = 1024 * 1024
 
+# A subscription cap surfaces two ways: the classic "hit your … limit" wording,
+# and — for a scoped-model weekly cap (e.g. Fable) — "You're out of usage
+# credits. Run /usage-credits to keep using Fable 5". The second form never
+# matched, so a Fable cap slipped past the supervisor and never handed off
+# (observed 2026-07-23 on the sales seat). Both are genuine caps; transient
+# 429/overload deliberately stay out (they are retried, not rotated).
 CAP_RE = re.compile(
     r"\b(?:(?:you(?:'|’)ve\s+)?hit your "
-    r"(?:session|weekly|usage) limit|usage limit reached)\b", re.I)
+    r"(?:session|weekly|usage) limit|usage limit reached"
+    r"|out of usage credits)\b", re.I)
 
 HOOK_EVENTS = {"SessionStart", "StopFailure", "CwdChanged", "SessionEnd"}
 INCOMPATIBLE_FLAGS = {
