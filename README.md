@@ -109,7 +109,10 @@ in one long build writes nothing for an hour — so headroom uses the session's
 own records: an agent the transcript shows as launched (or re-messaged with
 `SendMessage`) with no later terminal `<task-notification>` is still running,
 and any sidechain transcript that ends in unanswered input or an unfinished
-tool call is still working. Both are bounded by the running child's own
+tool call is still working. Only the harness's own notification record can
+retire an agent — the same envelope quoted inside another tool's output (a
+command that prints a transcript, say) is an echo, and an echo bearing a live
+agent's id must never clear the way for its stop. Both are bounded by the running child's own
 lifetime, so agents that died with an earlier run of a resumed session never
 block. Anything unreadable refuses the rotation. No hook
 event may be pending, a session stopped mid-tool-call is never moved early,

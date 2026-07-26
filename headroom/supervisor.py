@@ -85,18 +85,33 @@ CAP_RE = re.compile(
     r"(?:session|weekly|usage) limit|usage limit reached"
     r"|out of usage credits)\b", re.I)
 
-# Background-agent lifecycle, as the parent transcript actually records it
-# (verified against live sessions — see _unfinished_background_agents):
-# the launch tool_result names the agent, and a <task-notification> with a
-# terminal status is written when it stops. Only these three statuses have
-# been observed; any unknown status is deliberately NOT terminal, so an
-# unrecognised outcome leaves the agent counted as live (fail closed).
+# Background-agent lifecycle, as the parent transcript actually records it.
+# Every discriminator below is pinned from live fleet data (50 sessions):
+#
+#   launch    a `user` record whose message content holds the Agent tool's own
+#             `tool_result` block, whose text carries "agent launched
+#             successfully … agentId: <id>"  (139 in the fleet)
+#   finish    a `user` record the HARNESS injects, marked
+#             origin={"kind": "task-notification"} (promptSource "system"),
+#             whose message content is the XML STRING itself  (659 in the
+#             fleet; no genuine notification has any other shape)
+#   statuses  completed / failed / killed / stopped — the complete observed
+#             vocabulary. "stopped" is terminal-but-resumable; a later
+#             SendMessage re-arms it. An UNKNOWN status is NEVER terminal.
+#
+# Shape decides, never text: the same XML also appears quoted inside other
+# tools' results (a Bash tool that cats a transcript — there is exactly such
+# a record in the fleet today), inside queue-operation and attachment
+# records, and in assistant prose. Retiring an agent on any of those would
+# let a copied envelope bearing a LIVE agent's id clear the way for its
+# SIGTERM, so only the authoritative record shape may mark an agent finished.
 BACKGROUND_LAUNCH_RE = re.compile(
     r"agent launched successfully.{0,400}?agentId:\s*([0-9A-Za-z_-]{4,})",
     re.I | re.S)
 TASK_ID_RE = re.compile(r"<task-id>\s*([0-9A-Za-z_-]{4,})\s*</task-id>")
-TASK_STATUS_RE = re.compile(r"<status>\s*([A-Za-z_]+)\s*</status>")
-TERMINAL_TASK_STATUS = {"completed", "failed", "killed"}
+TASK_STATUS_RE = re.compile(r"<status>\s*([A-Za-z_-]+)\s*</status>")
+TERMINAL_TASK_STATUS = {"completed", "failed", "killed", "stopped"}
+TASK_NOTIFICATION_ORIGIN = "task-notification"
 
 HOOK_EVENTS = {"SessionStart", "StopFailure", "CwdChanged", "SessionEnd"}
 INCOMPATIBLE_FLAGS = {
@@ -737,14 +752,21 @@ def _number(value):
 
 
 def _transcript_records(path, whole=False, limit=None):
-    """``(records, complete)`` parsed from the END of a transcript.
+    """``(records, complete, malformed)`` parsed from the END of a transcript.
 
     Everything the preemptive poll asks of a transcript — the model in use,
     whether the newest turn finished — lives at its end, so read a bounded
     tail rather than the whole session: a full parse every minute is
     O(session size) work on the one loop that also has to ingest hooks and
     prove caps. ``complete`` says whether the tail covered the whole file, so
-    a caller that found nothing can decide to pay for the full read."""
+    a caller that found nothing can decide to pay for the full read.
+
+    ``malformed`` reports a line that would not parse. The read starts at a
+    record BOUNDARY (the partial record at the seek point is discarded), so
+    anything unparseable after it is either real corruption or a record being
+    written this instant — never an artefact of the tail. Dropping such a line
+    silently would let a valid final assistant record followed by a broken
+    newest line read as a finished turn, so idleness callers refuse on it."""
     limit = TRANSCRIPT_TAIL_BYTES if limit is None else limit
     try:
         with open(path, "rb") as handle:
@@ -755,17 +777,19 @@ def _transcript_records(path, whole=False, limit=None):
                 handle.readline()  # drop the partial record at the boundary
             data = handle.read()
     except OSError:
-        return [], False
+        return [], False, False
     records = []
+    malformed = False
     for raw in data.splitlines():
         if not raw.strip():
             continue
         try:
             event = json.loads(raw.decode("utf-8"))
         except (UnicodeError, ValueError, json.JSONDecodeError):
+            malformed = True
             continue
         records.append(event)
-    return records, complete
+    return records, complete, malformed
 
 
 def _last_assistant_model(records):
@@ -784,7 +808,7 @@ def _transcript_model(path):
     reason — it reflects in-session ``/model`` switches, unlike the model
     named at SessionStart. Unreadable/absent yields "" and the caller falls
     back to the bound SessionStart model."""
-    records, complete = _transcript_records(path)
+    records, complete, _malformed = _transcript_records(path)
     model = _last_assistant_model(records)
     if model or complete:
         return model
@@ -806,7 +830,9 @@ def _turn_is_complete(path, records=None, complete=True):
     file-history-snapshot, summary) are skipped — Claude writes those after a
     turn ends, as the cap-evidence scanner already documents."""
     if records is None:
-        records, complete = _transcript_records(path)
+        records, complete, malformed = _transcript_records(path)
+        if malformed:
+            return "the transcript tail has an unreadable record"
     for event in reversed(records):
         if not isinstance(event, dict):
             continue
@@ -842,32 +868,72 @@ def _blocks(event):
     return content if isinstance(content, list) else []
 
 
-def _launched_background_agents(records):
-    """Agent ids this transcript shows as started and not yet reported back.
+def _launch_agent_ids(event):
+    """Ids from an AUTHORITATIVE background-launch record.
 
-    THE STRONGEST SIGNAL ON DISK, and the reason it is checked first: it is
-    the parent's own record of what it started, so it does not depend on the
-    agent having written — or being about to write — anything at all. Live
-    layout, verified against real sessions:
+    The Agent tool's own result: a `user` record carrying a `tool_result`
+    block whose text names the agent. Read from THAT block, never from the
+    record's flattened strings — an assistant merely writing "the agent
+    launched successfully" about a previous spawn must not enter the ledger.
+    (Erring loose here only over-reports work, which holds a rotation; the
+    dangerous direction is retiring an agent, and that is gated far harder.)"""
+    if not isinstance(event, dict) or event.get("type") != "user":
+        return []
+    ids = []
+    for block in _blocks(event):
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        ids.extend(BACKGROUND_LAUNCH_RE.findall(
+            "\n".join(_strings(block.get("content")))))
+    return ids
 
-      spawn   a `user` tool_result reading "Async agent launched
-              successfully … agentId: <id>" (the background Agent call
-              returns IMMEDIATELY, which is exactly why the main turn can
-              look finished while the agent works)
-      resume  an assistant `SendMessage` tool_use whose input `to` is <id>
-      finish  a `user` <task-notification> with <task-id><id></task-id> and a
-              terminal <status> (observed: completed / failed / killed)
 
-    So an id that was launched or messaged with no LATER terminal
-    notification is running right now, however quiet it or its transcript
-    happens to be. Truncating to a tail is sound here: notifications always
-    follow their launch, so a tail can only miss a launch (covered by the
-    per-sidechain shape check), never invent a live agent.
+def _terminal_notification(event):
+    """``(ids, status)`` of an AUTHORITATIVE terminal task-notification, else
+    None.
 
-    The caller still has to bound these ids by the CURRENT child's lifetime —
-    a resumed or forked session inherits its predecessor's records, and an
-    agent from a process that has exited is not running."""
-    live = {}
+    THE ONLY THING THAT MAY RETIRE AN AGENT, so it is the strictest check in
+    the file. Three conditions, all pinned from fleet data and all required:
+    a `user` record, marked by the harness with
+    ``origin={"kind": "task-notification"}``, whose message content is the
+    notification STRING itself. A quoted copy inside another tool's result,
+    an attachment, a queue-operation record or assistant prose satisfies none
+    of them — which is the point: such copies exist in real transcripts, and
+    one bearing a live agent's id would otherwise mark it finished and clear
+    the way for a SIGTERM. The status must be parsed from THAT record and be
+    in the observed terminal vocabulary; anything else leaves the agent
+    live."""
+    if not isinstance(event, dict) or event.get("type") != "user":
+        return None
+    origin = event.get("origin")
+    if not isinstance(origin, dict) \
+            or origin.get("kind") != TASK_NOTIFICATION_ORIGIN:
+        return None
+    message = event.get("message")
+    body = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(body, str) or "<task-notification>" not in body:
+        return None
+    status = TASK_STATUS_RE.search(body)
+    return TASK_ID_RE.findall(body), (status.group(1).lower() if status else "")
+
+
+def _agent_lifecycle(records):
+    """``(live ids, terminated ids)`` from the parent's own ledger.
+
+    THE STRONGEST SIGNAL ON DISK, and the reason it exists: it is the
+    parent's record of what it started, so it does not depend on the agent
+    having written — or being about to write — anything at all. A background
+    Agent call returns IMMEDIATELY, which is exactly why the main turn can
+    look finished while the agent works; `SendMessage` puts a stopped agent
+    back to work; only an authoritative terminal notification retires one.
+
+    Both sets come from ONE pass so they can never drift apart. Truncating to
+    a tail is sound: notifications always follow their launch, so a tail can
+    only miss a launch (covered by the per-sidechain shape check), never
+    invent a live agent. The caller must still bound these ids by the CURRENT
+    child's lifetime — a resumed or forked session inherits its predecessor's
+    records, and an agent from a process that has exited is not running."""
+    live, terminated = {}, set()
     for event in records:
         if not isinstance(event, dict):
             continue
@@ -877,18 +943,23 @@ def _launched_background_agents(records):
                 target = block.get("input")
                 target = target.get("to") if isinstance(target, dict) else None
                 if isinstance(target, str) and target.strip():
+                    # back to work: it is live again and no longer retired
                     live[target.strip()] = True
-        body = "\n".join(_strings(event.get("message")))
-        if not body:
-            continue
-        for agent_id in BACKGROUND_LAUNCH_RE.findall(body):
+                    terminated.discard(target.strip())
+        for agent_id in _launch_agent_ids(event):
             live[agent_id] = True
-        if "<task-notification>" in body:
-            status = TASK_STATUS_RE.search(body)
-            if status and status.group(1).lower() in TERMINAL_TASK_STATUS:
-                for agent_id in TASK_ID_RE.findall(body):
-                    live.pop(agent_id, None)
-    return set(live)
+            terminated.discard(agent_id)
+        notification = _terminal_notification(event)
+        if notification is not None and notification[1] in TERMINAL_TASK_STATUS:
+            for agent_id in notification[0]:
+                live.pop(agent_id, None)
+                terminated.add(agent_id)
+    return set(live), terminated
+
+
+def _launched_background_agents(records):
+    """Ids started and not yet authoritatively reported back."""
+    return _agent_lifecycle(records)[0]
 
 
 def _sidechain_busy(path):
@@ -902,7 +973,12 @@ def _sidechain_busy(path):
     value; a working one ends with input it has not answered yet, or with a
     tool_use whose result has not landed. Anything unreadable or shapeless
     refuses (fail closed)."""
-    records, _complete = _transcript_records(path, limit=SIDECHAIN_TAIL_BYTES)
+    records, _complete, malformed = _transcript_records(
+        path, limit=SIDECHAIN_TAIL_BYTES)
+    if malformed:
+        # a broken newest line past the boundary is corruption, or a record
+        # being written right now — either way this agent is not provably done
+        return "a subagent transcript has an unreadable record"
     if not records:
         return "a subagent transcript could not be read"
     unresolved = handoff.unresolved_tool_ids(records)
@@ -921,15 +997,13 @@ def _sidechain_busy(path):
 
 
 def _terminated_agents(records):
-    """Ids the parent transcript records as having stopped (any status)."""
-    finished = set()
-    for event in records:
-        if not isinstance(event, dict):
-            continue
-        body = "\n".join(_strings(event.get("message")))
-        if "<task-notification>" in body:
-            finished.update(TASK_ID_RE.findall(body))
-    return finished
+    """Ids the parent AUTHORITATIVELY records as having stopped.
+
+    Same single pass, same discriminators and same terminal vocabulary as the
+    live set — the two must never disagree about what "finished" means, and
+    this one only ever skips work (the sidechain shape check), so a looser
+    rule here would silently undo the harder one."""
+    return _agent_lifecycle(records)[1]
 
 
 def _subagent_activity(transcript_path, now, quiet_seconds, since=0.0,
@@ -999,12 +1073,17 @@ def _idle_refusal(transcript_path, now, quiet_seconds, since=0.0):
     started but has not seen finish, and the shape of every sidechain
     transcript this child could have written. None of them is "the file has
     not changed lately" — recency can prove work, never completion."""
-    records, complete = _transcript_records(transcript_path)
+    records, complete, malformed = _transcript_records(transcript_path)
+    if malformed:
+        # the tail starts at a record boundary, so a broken line after it is
+        # real corruption or a record being written right now — either way
+        # this transcript cannot prove the child is idle
+        return "the transcript tail has an unreadable record"
+    launched, finished = _agent_lifecycle(records)
     return (_turn_is_complete(transcript_path, records, complete)
             or _subagent_activity(
                 transcript_path, now, quiet_seconds, since=since,
-                launched=_launched_background_agents(records),
-                finished=_terminated_agents(records)))
+                launched=launched, finished=finished))
 
 
 def _capacity_reasons(family):
