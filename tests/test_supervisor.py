@@ -354,6 +354,25 @@ class TranscriptAndTransaction(unittest.TestCase):
         with self.assertRaisesRegex(handoff.HandoffError, "loop guard"):
             handoff.reserve_automatic(self.automatic_plan())
 
+    def test_edge_cancelled_stops_do_not_consume_the_loop_budget(self):
+        # a stop_sent row is durable BEFORE any signal, so a last-instant
+        # idleness cancellation leaves one behind having touched nothing
+        for _ in range(3):
+            handoff_id = str(__import__("uuid").uuid4())
+            handoff.append_action(handoff_id, "cap_confirmed", automatic=True,
+                                  source_slot="source", target_slot="old",
+                                  old_session_id=self.SID)
+            handoff.append_action(handoff_id, "stop_sent", automatic=True,
+                                  source_slot="source",
+                                  old_session_id=self.SID)
+            handoff.append_action(
+                handoff_id, "failure", automatic=True, source_slot="source",
+                target_slot="old", old_session_id=self.SID,
+                reason="preemptive_stop_cancelled_on_edge",
+                stop_cancelled=True)
+        record = handoff.reserve_automatic(self.automatic_plan())
+        self.assertEqual(record["action"], "cap_confirmed")
+
     def test_in_flight_admissions_still_count(self):
         for _ in range(3):
             handoff.append_action(

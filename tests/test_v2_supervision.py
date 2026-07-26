@@ -2148,6 +2148,105 @@ class TurnCompleteness(TempDirCase):
                           os.path.join(self.temp.name, "missing.jsonl")))
 
 
+class BackgroundSubagents(TempDirCase):
+    """Live layout: projects/<slug>/<session>.jsonl beside
+    projects/<slug>/<session>/subagents/agent-<id>.jsonl. A backgrounded Agent
+    hands its tool_result to the main thread at once and keeps working there,
+    so the main transcript reads "finished turn" while work is in flight."""
+
+    SID = "66666666-6666-4666-8666-666666666666"
+
+    def setUp(self):
+        super().setUp()
+        self.project = os.path.join(self.temp.name, "projects", "slug")
+        os.makedirs(self.project)
+        self.transcript = os.path.join(self.project, self.SID + ".jsonl")
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "go"}]}}) + "\n")
+            # the main turn genuinely ENDED: the Agent call was backgrounded
+            out.write(json.dumps({"type": "assistant", "message": {
+                "model": "claude-fable-5",
+                "content": [{"type": "text", "text": "started it"}]}}) + "\n")
+        old = time.time() - 3600
+        os.utime(self.transcript, (old, old))
+
+    def subagent(self, age, name="agent-a99d97898086ab524"):
+        directory = os.path.join(self.project, self.SID, "subagents")
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, name + ".jsonl")
+        with open(path, "w", encoding="utf-8") as out:
+            out.write(json.dumps({
+                "type": "assistant", "isSidechain": True,
+                "agentId": name[6:], "message": {
+                    "model": "claude-fable-5",
+                    "content": [{"type": "text", "text": "working"}]}}) + "\n")
+        with open(os.path.join(directory, name + ".meta.json"), "w",
+                  encoding="utf-8") as out:
+            json.dump({"agentType": "general-purpose", "description": "work",
+                       "toolUseId": "toolu_x", "spawnDepth": 1}, out)
+        when = time.time() - age
+        os.utime(path, (when, when))
+        return path
+
+    def test_main_transcript_alone_reads_idle(self):
+        # the exact trap: by the main transcript, this session looks finished
+        self.assertEqual(supervisor._turn_is_complete(self.transcript), "")
+
+    def test_a_live_background_subagent_is_not_idle(self):
+        self.subagent(age=2)
+        reason = supervisor._idle_refusal(self.transcript, time.time(), 60.0)
+        self.assertIn("background subagent", reason)
+
+    def test_a_finished_subagent_does_not_block_forever(self):
+        self.subagent(age=3600)
+        self.assertEqual(
+            supervisor._idle_refusal(self.transcript, time.time(), 60.0), "")
+
+    def test_the_newest_subagent_decides(self):
+        self.subagent(age=3600, name="agent-aold")
+        self.subagent(age=1, name="agent-anew")
+        self.assertIn("background subagent", supervisor._idle_refusal(
+            self.transcript, time.time(), 60.0))
+
+    def test_nested_worker_transcripts_are_seen(self):
+        directory = os.path.join(self.project, self.SID, "subagents",
+                                 "workflows", "w1")
+        os.makedirs(directory)
+        path = os.path.join(directory, "agent-nested.jsonl")
+        with open(path, "w", encoding="utf-8") as out:
+            out.write("{}\n")
+        self.assertIn("background subagent", supervisor._idle_refusal(
+            self.transcript, time.time(), 60.0))
+
+    def test_no_subagents_directory_is_idle(self):
+        self.assertEqual(
+            supervisor._idle_refusal(self.transcript, time.time(), 60.0), "")
+
+    def test_a_future_dated_write_counts_as_active(self):
+        path = self.subagent(age=0)
+        later = time.time() + 600
+        os.utime(path, (later, later))
+        self.assertIn("background subagent", supervisor._idle_refusal(
+            self.transcript, time.time(), 60.0))
+
+    def test_the_scan_is_bounded(self):
+        directory = os.path.join(self.project, self.SID, "subagents")
+        os.makedirs(directory, exist_ok=True)
+        old = time.time() - 3600
+        for index in range(12):
+            path = os.path.join(directory, f"agent-{index:03d}.jsonl")
+            with open(path, "w", encoding="utf-8"):
+                pass
+            os.utime(path, (old, old))
+        with mock.patch.object(supervisor, "MAX_SUBAGENT_SCAN", 5):
+            # refusing to rotate is the fail-closed answer when the session is
+            # too large to prove idle inside the poll
+            self.assertIn("too many subagent transcripts",
+                          supervisor._idle_refusal(self.transcript,
+                                                   time.time(), 60.0))
+
+
 class TranscriptTail(TempDirCase):
     """The poll must not re-parse a whole long session every minute."""
 
@@ -2428,10 +2527,115 @@ class PreemptiveRotation(TempDirCase):
         stop.assert_not_called()
         held = [event for event in self.events(emit)
                 if event["event"] == "preemptive_held"]
-        self.assertIn("mid-turn", held[0]["reason"])
+        self.assertIn("still working", held[0]["reason"])
         self.assertIn("awaiting its answer", held[0]["reason"])
         self.assertEqual(self.ledger(), [])
         self.assertTrue(self.child.automation)
+
+    def test_a_live_background_subagent_defers_the_rotation(self):
+        # the desk's normal mode: the main turn ended, but a backgrounded
+        # Agent is still writing its own sidechain transcript
+        directory = os.path.join(os.path.dirname(self.transcript), self.SID,
+                                 "subagents")
+        os.makedirs(directory)
+        with open(os.path.join(directory, "agent-a99d9789808.jsonl"), "w",
+                  encoding="utf-8") as out:
+            out.write(json.dumps({"type": "assistant", "isSidechain": True,
+                                  "agentId": "a99d9789808", "message": {
+                                      "model": "claude-fable-5",
+                                      "content": "still working"}}) + "\n")
+        runner = self.runner()
+        with mock.patch.object(runner, "_stop_and_commit") as stop, \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            self.assertIsNone(runner._preemptive_cycle(self.child))
+        stop.assert_not_called()
+        held = [event for event in self.events(emit)
+                if event["event"] == "preemptive_held"]
+        self.assertIn("background subagent", held[0]["reason"])
+        self.assertEqual(self.ledger(), [])
+        self.assertTrue(self.child.automation)
+
+    def test_target_relaunch_failure_recovers_the_source_supervised(self):
+        # the handoff COMMITTED (the conversation is staged on the target) and
+        # only then did the target spawn fail deterministically. An elective
+        # rotation must not turn that into a disarmed session.
+        runner = self.runner()
+        plan = mock.Mock(preemptive=True)
+        plan.target = self.target
+        plan.source.account = self.source
+        relaunch = supervisor.Relaunch(self.target, ["--resume", self.SID],
+                                       self.cwd, True, "hid", plan,
+                                       reason="preemptive")
+        spawns = []
+
+        def spawn(account, args, cwd, automatic, plan=None):
+            spawns.append((account["name"], automatic))
+            if len(spawns) == 2:
+                runner.spawn_ambiguous = False   # positively no child started
+                raise supervisor.SupervisorError(
+                    "`claude` not found on PATH; nothing was started")
+            child = mock.Mock()
+            child.account = account
+            child.generation = len(spawns)
+            return child
+
+        outcomes = iter([relaunch, 0])
+        with mock.patch.object(runner, "_spawn", side_effect=spawn), \
+                mock.patch.object(
+                    runner, "_monitor",
+                    side_effect=lambda child, pending="": next(outcomes)), \
+                mock.patch.object(runner, "_reconcile_leases"), \
+                mock.patch.object(runner, "_failure") as failure, \
+                mock.patch.object(handoff, "append_action"), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(runner.run(), 0)
+        self.assertEqual([name for name, _ in spawns],
+                         ["source", "target", "source"])
+        # the recovered source is SUPERVISED — the guarantee survives
+        self.assertTrue(spawns[2][1])
+        events = [event["event"] for event in self.events(emit)]
+        self.assertNotIn("supervision_lost", events)
+        self.assertIn("preemptive_held", events)
+        self.assertIn("target_relaunch_failed", failure.call_args.args[1])
+        self.assertEqual(runner.preemptive_hold_until,
+                         self.clock["t"] + supervisor.PREEMPT_BACKOFF_SECONDS)
+
+    def test_cap_origin_target_relaunch_failure_is_unchanged(self):
+        runner = self.runner()
+        plan = mock.Mock(preemptive=False)
+        plan.target = self.target
+        plan.source.account = self.source
+        relaunch = supervisor.Relaunch(self.target, ["--resume", self.SID],
+                                       self.cwd, True, "hid", plan)
+        spawns = []
+
+        def spawn(account, args, cwd, automatic, plan=None):
+            spawns.append((account["name"], automatic))
+            if len(spawns) == 2:
+                runner.spawn_ambiguous = False
+                raise supervisor.SupervisorError("nothing was started")
+            child = mock.Mock()
+            child.account = account
+            child.generation = len(spawns)
+            return child
+
+        outcomes = iter([relaunch, 0])
+        with mock.patch.object(runner, "_spawn", side_effect=spawn), \
+                mock.patch.object(
+                    runner, "_monitor",
+                    side_effect=lambda child, pending="": next(outcomes)), \
+                mock.patch.object(runner, "_reconcile_leases"), \
+                mock.patch.object(runner, "_failure"), \
+                mock.patch.object(handoff, "append_action"), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(runner.run(), 0)
+        self.assertFalse(spawns[2][1])          # still recovered unsupervised
+        self.assertIn("supervision_lost",
+                      [event["event"] for event in self.events(emit)])
+        self.assertEqual(runner.preemptive_hold_until, 0.0)
 
     def stopped_plan(self, runner):
         """A fully admitted preemptive plan, ready to stop the child."""
@@ -2469,6 +2673,12 @@ class PreemptiveRotation(TempDirCase):
         self.assertEqual(kills, [])          # the child was never signalled
         self.assertIn("edge of a preemptive stop", str(caught.exception))
         self.assertTrue(self.child.automation)
+        # the durable stop_sent row is marked cancelled, so the shared loop
+        # budget is not charged for a stop that never happened
+        rows = self.ledger()
+        self.assertEqual([row["action"] for row in rows],
+                         ["cap_confirmed", "stop_sent", "failure"])
+        self.assertIs(rows[-1]["stop_cancelled"], True)
 
     def test_stop_edge_refuses_a_transcript_that_became_mid_turn(self):
         runner = self.runner()
@@ -2480,7 +2690,7 @@ class PreemptiveRotation(TempDirCase):
         # the conversation is now mid-turn
         plan = mock.Mock(source_stat=handoff._transcript_stat(self.transcript))
         with self.assertRaisesRegex(supervisor.SupervisorError,
-                                    "became mid-turn"):
+                                    "became busy"):
             runner._preemptive_stop_edge(plan, proof)
 
     def test_aborted_rotation_recovers_the_source_with_supervision_on(self):

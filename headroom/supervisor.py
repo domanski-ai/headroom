@@ -67,6 +67,8 @@ PREEMPT_SNAPSHOT_MAX_AGE = max(30, paths.env_int(
 # how much of a transcript's END the poll parses (see _transcript_records)
 TRANSCRIPT_TAIL_BYTES = max(64 * 1024, paths.env_int(
     "HEADROOM_TRANSCRIPT_TAIL_BYTES", 256 * 1024))
+# bound on the sidechain scan that proves no background agent is working
+MAX_SUBAGENT_SCAN = max(64, paths.env_int("HEADROOM_MAX_SUBAGENT_SCAN", 512))
 
 # A subscription cap surfaces two ways: the classic "hit your … limit" wording,
 # and — for a scoped-model weekly cap (e.g. Fable) — "You're out of usage
@@ -804,6 +806,59 @@ def _turn_is_complete(path):
             else "no completed assistant turn in the transcript tail")
 
 
+def _subagents_dir(transcript_path):
+    """The sibling directory Claude writes BACKGROUND agent transcripts into.
+
+    Live layout: ``projects/<slug>/<session-id>.jsonl`` alongside
+    ``projects/<slug>/<session-id>/subagents/agent-<id>.jsonl`` (each with an
+    ``agent-<id>.meta.json``; nested worker directories occur too)."""
+    return os.path.join(
+        os.path.dirname(transcript_path),
+        os.path.splitext(os.path.basename(transcript_path))[0], "subagents")
+
+
+def _subagent_activity(transcript_path, now, quiet_seconds):
+    """"" when no background subagent has written recently; otherwise why the
+    session is still working.
+
+    A backgrounded Agent call hands its tool_result to the main thread
+    immediately and then keeps running in its OWN sidechain transcript, so the
+    main transcript can look like a cleanly finished turn while delegated work
+    is still in flight — and a preemptive stop would kill it. The sidechain
+    files carry no completion marker (their meta.json records what the agent
+    IS, not whether it finished), so recent mtime is the honest signal: the
+    same evidence, and the same window, the main transcript is judged by.
+    A future-dated mtime counts as active — clock skew must not read as idle."""
+    directory = _subagents_dir(transcript_path)
+    scanned = 0
+    try:
+        for root, _dirs, names in os.walk(directory):
+            for name in names:
+                if not name.endswith(".jsonl"):
+                    continue
+                scanned += 1
+                if scanned > MAX_SUBAGENT_SCAN:
+                    # a pathological session cannot be allowed to stall the
+                    # 250 ms loop; refuse the rotation instead of scanning on
+                    return ("too many subagent transcripts to prove idle "
+                            f"({MAX_SUBAGENT_SCAN}+)")
+                try:
+                    age = now - os.stat(os.path.join(root, name)).st_mtime
+                except OSError:
+                    continue
+                if age < quiet_seconds:
+                    return f"a background subagent wrote {max(age, 0):.0f}s ago"
+    except OSError:
+        return ""
+    return ""
+
+
+def _idle_refusal(transcript_path, now, quiet_seconds):
+    """"" when the child is genuinely idle; otherwise why it is still busy."""
+    return (_turn_is_complete(transcript_path)
+            or _subagent_activity(transcript_path, now, quiet_seconds))
+
+
 def _capacity_reasons(family):
     """Block reasons that mean 'this seat is spent', not 'this reading cannot
     be trusted'. A spent source is the whole point of a rotation; anything
@@ -1537,12 +1592,16 @@ class Supervisor:
         handoff.guard_source_stable(
             proof.transcript_path, now=self.now(),
             sleep=lambda _seconds: None, quiet_seconds=PREEMPT_IDLE_SECONDS)
-        # ...and quiescence is not idleness: the newest conversational record
-        # must be a FINISHED assistant turn, or a model thinking silently for
-        # longer than the quiet window would be killed mid-response.
-        turn = _turn_is_complete(proof.transcript_path)
-        if turn:
-            raise SupervisorError("child is mid-turn: " + turn)
+        # ...and quiescence is not idleness. The newest conversational record
+        # must be a FINISHED assistant turn (or a model thinking silently for
+        # longer than the quiet window would be killed mid-response), AND no
+        # background subagent may still be writing its own sidechain
+        # transcript (the main thread looks idle the moment it backgrounds a
+        # long-running agent).
+        busy = _idle_refusal(proof.transcript_path, self.now(),
+                             PREEMPT_IDLE_SECONDS)
+        if busy:
+            raise SupervisorError("child is still working: " + busy)
         if handoff._transcript_stat(proof.transcript_path) \
                 != proof.transcript_stat:
             raise SupervisorError(
@@ -1687,20 +1746,21 @@ class Supervisor:
         # elective: if it caught a turn after all, refuse to fork a broken
         # conversation and let the caller recover the source instead.
         inspected = handoff.inspect_transcript(
-            plan.source.transcript_path, allow_dangling=not plan.preemptive)
+            plan.source.transcript_path,
+            allow_dangling=plan.preemptive is not True)
         final_stat = handoff._transcript_stat(plan.source.transcript_path)
         if final_stat[:2] != plan.source_stat[:2] or final_stat != signature:
             raise SupervisorError("final transcript identity or stat changed")
         return replace(plan, inspected=inspected, source_stat=final_stat)
 
-    def _failure(self, plan, reason):
+    def _failure(self, plan, reason, **fields):
         try:
             handoff.append_action(
                 plan.handoff_id, "failure", automatic=True,
                 source_slot=plan.source.account["name"],
                 target_slot=plan.target["name"], reason=reason,
                 old_session_id=plan.source.session_id,
-                child_generation=plan.child_generation)
+                child_generation=plan.child_generation, **fields)
         except Exception:  # recovery must proceed even if the ledger is broken
             pass
 
@@ -1743,16 +1803,16 @@ class Supervisor:
         print(f"CLAUDE_CONFIG_DIR={shlex.quote(plan.source.account['home'])} "
               f"{source_argv}", file=sys.stderr)
 
-    @staticmethod
-    def _preemptive_stop_edge(plan, proof):
+    def _preemptive_stop_edge(self, plan, proof):
         """Last-instant idleness proof, immediately before SIGTERM."""
         if handoff._transcript_stat(proof.transcript_path) != plan.source_stat:
             raise SupervisorError(
                 "source transcript changed on the edge of a preemptive stop")
-        turn = _turn_is_complete(proof.transcript_path)
-        if turn:
+        busy = _idle_refusal(proof.transcript_path, self.now(),
+                             PREEMPT_IDLE_SECONDS)
+        if busy:
             raise SupervisorError(
-                "child became mid-turn before the preemptive stop: " + turn)
+                "child became busy before the preemptive stop: " + busy)
 
     @staticmethod
     def _commit_deadline(plan, proof):
@@ -1764,7 +1824,7 @@ class Supervisor:
         decision window holds — the observation is not a provider refusal, so
         it must not be allowed to go stale in the supervisor's hands. Both
         fail closed on a missing or invalid value."""
-        if getattr(proof, "preemptive", False):
+        if getattr(proof, "preemptive", False) is True:
             return getattr(proof, "deadline", None), "preemptive decision window"
         return plan.cooldown_scope.get("reset"), "cap reset"
 
@@ -1792,7 +1852,7 @@ class Supervisor:
             raise SupervisorError("source transcript changed before stop")
         if reset <= self.now():
             raise SupervisorError(f"{label} elapsed before stop")
-        if getattr(proof, "preemptive", False):
+        if getattr(proof, "preemptive", False) is True:
             print(f"[headroom] preemptive rotation ({proof.message}); "
                   f"{plan.source.account['name']} -> {plan.target['name']}",
                   file=sys.stderr)
@@ -1818,20 +1878,36 @@ class Supervisor:
                         "source transcript changed before stop")
                 if reset <= self.now():
                     raise SupervisorError(f"{label} elapsed before stop")
+                if plan.preemptive is True:
+                    # Cheap pre-filter: an already-busy child must not even
+                    # get a stop_sent row written for it.
+                    self._preemptive_stop_edge(plan, proof)
                 stop_sent_at = self.now()
                 handoff.append_action(
                     plan.handoff_id, "stop_sent", automatic=True,
                     source_slot=plan.source.account["name"],
                     old_session_id=plan.source.session_id,
                     child_generation=plan.child_generation)
-                if plan.preemptive:
+                if plan.preemptive is True:
                     # The durable stop_sent append above is a locked, fsync'd
                     # ledger write — milliseconds during which the child may
                     # start a turn. A cap stop has to proceed regardless (the
                     # session is refused anyway), but a preemptive stop is
                     # ELECTIVE, so re-prove idleness on the very edge of the
                     # kill, narrowing the window to a single stat syscall.
-                    self._preemptive_stop_edge(plan, proof)
+                    try:
+                        self._preemptive_stop_edge(plan, proof)
+                    except SupervisorError:
+                        # stop_sent is durable (it must be written BEFORE any
+                        # signal, so a crash can never hide a stop) but no
+                        # signal was ever sent. Mark the row cancelled so the
+                        # shared loop budget is not charged for a rotation
+                        # that never touched the session — otherwise repeated
+                        # near-misses would starve a genuine cap.
+                        self._failure(
+                            plan, "preemptive_stop_cancelled_on_edge",
+                            stop_cancelled=True)
+                        raise
                 os.kill(child.process.pid, signal.SIGTERM)
                 signal_sent = True
             returncode = self._wait_stopped(child, proof, stop_sent_at)
@@ -1873,7 +1949,7 @@ class Supervisor:
                             reason="preemptive" if plan.preemptive else "cap")
         except Exception as error:  # no post-stop failure may strand the user
             self._failure(plan, "post_stop_failed: " + str(error))
-            if plan.preemptive:
+            if plan.preemptive is True:
                 # An ELECTIVE rotation must never leave the user worse off
                 # than not rotating. The source is not capped, so recovering
                 # it with supervision OFF (the cap path's correct answer, since
@@ -2154,22 +2230,43 @@ class Supervisor:
                         failed_plan = pending_plan
                         self._failure(
                             failed_plan, "target_relaunch_failed: " + str(error))
-                        print(f"[headroom] target relaunch failed ({error}); "
-                              "relaunching the source with automation off",
-                              file=sys.stderr)
-                        # the recovered session is unsupervised — tell any
-                        # observer, since it saw the initial supervised launch
-                        # (P1-5)
-                        notify.emit({
-                            "event": "supervision_lost",
-                            "account": failed_plan.source.account["name"],
-                            "reason": f"target relaunch failed: {error}"})
+                        elective = getattr(failed_plan, "preemptive", False) is True
+                        if elective:
+                            # An ELECTIVE rotation whose target could not be
+                            # started must not cost the cap-reactive
+                            # guarantee: the source is not capped, so recover
+                            # it SUPERVISED (auto-handoff re-arms on the new
+                            # child's SessionStart) and hold the poll so it is
+                            # not immediately targeted again. Same reasoning as
+                            # the post-stop abort inside _stop_and_commit.
+                            print(f"[headroom] preemptive target relaunch "
+                                  f"failed ({error}); recovering the session "
+                                  f"on {failed_plan.source.account['name']} "
+                                  f"with auto-handoff still armed",
+                                  file=sys.stderr)
+                            self.preemptive_hold_until = \
+                                self.now() + PREEMPT_BACKOFF_SECONDS
+                            notify.emit({
+                                "event": "preemptive_held",
+                                "account": failed_plan.source.account["name"],
+                                "reason": f"target relaunch failed: {error}"})
+                        else:
+                            print(f"[headroom] target relaunch failed ({error}); "
+                                  "relaunching the source with automation off",
+                                  file=sys.stderr)
+                            # the recovered session is unsupervised — tell any
+                            # observer, since it saw the initial supervised
+                            # launch (P1-5)
+                            notify.emit({
+                                "event": "supervision_lost",
+                                "account": failed_plan.source.account["name"],
+                                "reason": f"target relaunch failed: {error}"})
                         # the target never started — release its unused lease
                         route.release_slot_lease(failed_plan.target["name"])
                         relaunch = self._source_relaunch(failed_plan)
                         account, args, cwd = (relaunch.account, relaunch.argv,
                                               relaunch.cwd)
-                        automatic = False
+                        automatic = elective
                         pending_handoff_id = ""
                         pending_plan = None
                         recovery_plan = failed_plan

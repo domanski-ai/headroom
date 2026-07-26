@@ -100,11 +100,16 @@ seat with proven headroom exists, *and* the child is idle.
 can think silently for minutes. So the transcript must have been quiet for a
 full minute **and** its newest conversational record must be a finished
 assistant turn: a prompt still awaiting its answer, an unanswered tool result,
-or a live subagent all mean a turn is in flight and the session stays put. No
-hook event may be pending, a session stopped mid-tool-call is never moved
-early, and idleness is re-proven on the very edge of the stop, after the
-durable ledger write, so a turn that starts in that window cancels the stop
-instead of being killed by it.
+or a live subagent all mean a turn is in flight and the session stays put.
+**Background agents count too**: a backgrounded `Agent` call returns its tool
+result immediately and keeps working in its own sidechain transcript
+(`projects/<slug>/<session>/subagents/`), so a session whose main thread looks
+finished is still busy — any recent write there holds the rotation. No hook
+event may be pending, a session stopped mid-tool-call is never moved early,
+and idleness is re-proven on the very edge of the stop, after the durable
+ledger write, so a turn that starts in that window cancels the stop instead of
+being killed by it (and that cancellation is not charged to the loop budget,
+because nothing was ever stopped).
 
 The rotation itself is the same pipeline as the cap path — staging, target
 identity verification, slot leases, ledger admission, the same

@@ -1148,10 +1148,19 @@ def reserve_automatic(plan, now=None, *, loop_window=600.0, loop_max=3):
             # budget — otherwise a few aborted (e.g. preemptive) attempts
             # exhaust the allowance and the next GENUINE cap is refused,
             # disabling supervision exactly when it is needed.
-            stopped = {row.get("handoff_id") for row in rows
-                       if row.get("action") == "stop_sent"}
+            #
+            # `stop_cancelled` is the one case where a durable stop_sent row
+            # exists but no signal was ever sent: the row must be written
+            # before any signal (so a crash can never hide a stop), and the
+            # caller then cancelled on a last-instant safety check. It never
+            # touched the session either.
+            cancelled = {row.get("handoff_id") for row in rows
+                         if row.get("action") == "failure"
+                         and row.get("stop_cancelled") is True}
+            touched = {row.get("handoff_id") for row in rows
+                       if row.get("action") == "stop_sent"} - cancelled
             effective = [row for row in confirmed
-                         if row.get("handoff_id") in stopped
+                         if row.get("handoff_id") in touched
                          or row.get("handoff_id") not in released]
             if len(effective) >= loop_max:
                 raise HandoffError(
