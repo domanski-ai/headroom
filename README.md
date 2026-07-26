@@ -104,7 +104,14 @@ or a live subagent all mean a turn is in flight and the session stays put.
 **Background agents count too**: a backgrounded `Agent` call returns its tool
 result immediately and keeps working in its own sidechain transcript
 (`projects/<slug>/<session>/subagents/`), so a session whose main thread looks
-finished is still busy — any recent write there holds the rotation. No hook
+finished is still busy. Recency is not enough there either — an agent blocked
+in one long build writes nothing for an hour — so headroom uses the session's
+own records: an agent the transcript shows as launched (or re-messaged with
+`SendMessage`) with no later terminal `<task-notification>` is still running,
+and any sidechain transcript that ends in unanswered input or an unfinished
+tool call is still working. Both are bounded by the running child's own
+lifetime, so agents that died with an earlier run of a resumed session never
+block. Anything unreadable refuses the rotation. No hook
 event may be pending, a session stopped mid-tool-call is never moved early,
 and idleness is re-proven on the very edge of the stop, after the durable
 ledger write, so a turn that starts in that window cancels the stop instead of

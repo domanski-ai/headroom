@@ -2171,16 +2171,30 @@ class BackgroundSubagents(TempDirCase):
         old = time.time() - 3600
         os.utime(self.transcript, (old, old))
 
-    def subagent(self, age, name="agent-a99d97898086ab524"):
+    # a finished agent's transcript ends with the assistant message that IS
+    # its return value; a live one ends with input it has not answered, or a
+    # tool_use whose result has not landed (real sidechain record shapes)
+    FINISHED = {"type": "assistant", "isSidechain": True,
+                "agentId": "a99d97898086ab524", "message": {
+                    "model": "claude-fable-5",
+                    "content": [{"type": "text", "text": "here is my report"}]}}
+    IN_TOOL = {"type": "assistant", "isSidechain": True,
+               "agentId": "a99d97898086ab524", "message": {
+                   "model": "claude-fable-5", "content": [
+                       {"type": "tool_use", "id": "toolu_slow", "name": "Bash",
+                        "input": {"command": "make -j8"}}]}}
+    AWAITING = {"type": "user", "isSidechain": True,
+                "agentId": "a99d97898086ab524", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_slow",
+                     "content": "build finished"}]}}
+
+    def subagent(self, age, name="agent-a99d97898086ab524", records=None):
         directory = os.path.join(self.project, self.SID, "subagents")
         os.makedirs(directory, exist_ok=True)
         path = os.path.join(directory, name + ".jsonl")
         with open(path, "w", encoding="utf-8") as out:
-            out.write(json.dumps({
-                "type": "assistant", "isSidechain": True,
-                "agentId": name[6:], "message": {
-                    "model": "claude-fable-5",
-                    "content": [{"type": "text", "text": "working"}]}}) + "\n")
+            for record in (records or [self.FINISHED]):
+                out.write(json.dumps(record) + "\n")
         with open(os.path.join(directory, name + ".meta.json"), "w",
                   encoding="utf-8") as out:
             json.dump({"agentType": "general-purpose", "description": "work",
@@ -2230,14 +2244,93 @@ class BackgroundSubagents(TempDirCase):
         self.assertIn("background subagent", supervisor._idle_refusal(
             self.transcript, time.time(), 60.0))
 
+    # --- liveness is SHAPE, never age -------------------------------------
+
+    def test_a_silently_thinking_subagent_is_live_however_old(self):
+        # blocked inside one long tool call for an hour: nothing written, so
+        # "old" says finished and only the shape says the truth
+        self.subagent(age=3600, records=[self.FINISHED, self.IN_TOOL])
+        reason = supervisor._idle_refusal(self.transcript, time.time(), 60.0)
+        self.assertIn("waiting on a tool call", reason)
+
+    def test_a_subagent_with_unanswered_input_is_live_however_old(self):
+        self.subagent(age=7200,
+                      records=[self.IN_TOOL, self.AWAITING])
+        reason = supervisor._idle_refusal(self.transcript, time.time(), 60.0)
+        self.assertIn("answering its latest input", reason)
+
+    def test_a_completed_return_value_does_not_block_however_old(self):
+        self.subagent(age=7200,
+                      records=[self.IN_TOOL, self.AWAITING, self.FINISHED])
+        self.assertEqual(
+            supervisor._idle_refusal(self.transcript, time.time(), 60.0), "")
+
+    def test_an_unreadable_or_shapeless_sidechain_refuses(self):
+        path = self.subagent(age=3600)
+        with open(path, "w", encoding="utf-8") as out:
+            out.write("not json at all\n")
+        old = time.time() - 3600
+        os.utime(path, (old, old))
+        self.assertIn("could not be read", supervisor._idle_refusal(
+            self.transcript, time.time(), 60.0))
+        with open(path, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "system", "subtype": "init"}) + "\n")
+        os.utime(path, (old, old))
+        self.assertIn("no conversational record", supervisor._idle_refusal(
+            self.transcript, time.time(), 60.0))
+
+    # --- bounded by THIS child's lifetime ---------------------------------
+
+    def main_with_launch(self, agent_id):
+        """A finished main turn that started a background agent."""
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "go"}]}}) + "\n")
+            out.write(json.dumps({"type": "user", "message": {"content": [{
+                "type": "tool_result", "tool_use_id": "toolu_x", "content": [{
+                    "type": "text",
+                    "text": ("Async agent launched successfully.\n"
+                             f"agentId: {agent_id} (internal ID)")}]}]}}) + "\n")
+            out.write(json.dumps({"type": "assistant", "message": {
+                "model": "claude-fable-5",
+                "content": [{"type": "text",
+                             "text": "started it"}]}}) + "\n")
+        old = time.time() - 3600
+        os.utime(self.transcript, (old, old))
+
+    def test_a_launched_agent_with_no_transcript_yet_is_live(self):
+        # the sidechain file may not exist at all in the instant after a spawn
+        self.main_with_launch("anewagent123")
+        now = time.time()
+        self.assertIn("have not reported back", supervisor._idle_refusal(
+            self.transcript, now, 60.0, since=now - 60))
+
+    def test_a_mid_turn_sidechain_from_a_previous_run_never_blocks(self):
+        self.subagent(age=7200, records=[self.IN_TOOL])
+        now = time.time()
+        # unbounded, it reads live — it really is mid-turn...
+        self.assertIn("waiting on a tool call",
+                      supervisor._idle_refusal(self.transcript, now, 60.0))
+        # ...but it stopped writing before this child started, so its agent
+        # died with the previous process and must not block forever
+        self.assertEqual(supervisor._idle_refusal(
+            self.transcript, now, 60.0, since=now - 60), "")
+
+    def test_a_launch_from_a_previous_run_does_not_block(self):
+        self.main_with_launch("aoldagent123")
+        self.subagent(age=7200, name="agent-aoldagent123")
+        now = time.time()
+        self.assertEqual(supervisor._idle_refusal(
+            self.transcript, now, 60.0, since=now - 60), "")
+
     def test_the_scan_is_bounded(self):
         directory = os.path.join(self.project, self.SID, "subagents")
         os.makedirs(directory, exist_ok=True)
         old = time.time() - 3600
         for index in range(12):
             path = os.path.join(directory, f"agent-{index:03d}.jsonl")
-            with open(path, "w", encoding="utf-8"):
-                pass
+            with open(path, "w", encoding="utf-8") as out:
+                out.write(json.dumps(self.FINISHED) + "\n")   # each one done
             os.utime(path, (old, old))
         with mock.patch.object(supervisor, "MAX_SUBAGENT_SCAN", 5):
             # refusing to rotate is the fail-closed answer when the session is
@@ -2245,6 +2338,85 @@ class BackgroundSubagents(TempDirCase):
             self.assertIn("too many subagent transcripts",
                           supervisor._idle_refusal(self.transcript,
                                                    time.time(), 60.0))
+
+
+class BackgroundAgentLedger(TempDirCase):
+    """The parent transcript's own record of what it started — the strongest
+    signal, because it does not depend on the agent writing anything. Record
+    shapes copied from live sessions."""
+
+    AGENT = "a0fdfb291e702a98b"
+
+    def launch(self, agent_id=None):
+        return {"type": "user", "message": {"content": [{
+            "type": "tool_result", "tool_use_id": "toolu_x", "content": [{
+                "type": "text",
+                "text": ("Async agent launched successfully. (This tool "
+                         "result is internal metadata — never quote it.)\n"
+                         f"agentId: {agent_id or self.AGENT} (internal ID - "
+                         "do not mention to user. Use SendMessage with to: "
+                         f"'{agent_id or self.AGENT}' to continue this "
+                         "agent.)\nThe agent is working in the background.")}]}]}}
+
+    def notification(self, status="completed", agent_id=None):
+        return {"type": "user", "message": {"content": (
+            "<task-notification>\n"
+            f"<task-id>{agent_id or self.AGENT}</task-id>\n"
+            "<tool-use-id>toolu_x</tool-use-id>\n"
+            f"<status>{status}</status>\n"
+            "<summary>Agent \"work\" finished</summary>\n"
+            "</task-notification>")}}
+
+    def send_message(self, agent_id=None):
+        return {"type": "assistant", "message": {"content": [{
+            "type": "tool_use", "id": "toolu_y", "name": "SendMessage",
+            "input": {"to": agent_id or self.AGENT, "summary": "more work",
+                      "message": "keep going"}}]}}
+
+    ANSWER = {"type": "assistant", "message": {
+        "model": "claude-fable-5",
+        "content": [{"type": "text", "text": "noted"}]}}
+
+    def test_a_launched_agent_with_no_notification_is_live(self):
+        self.assertEqual(supervisor._launched_background_agents(
+            [self.launch(), self.ANSWER]), {self.AGENT})
+
+    def test_a_terminal_notification_clears_it(self):
+        for status in ("completed", "failed", "killed"):
+            self.assertEqual(supervisor._launched_background_agents(
+                [self.launch(), self.notification(status), self.ANSWER]),
+                set(), status)
+
+    def test_an_unknown_status_is_not_terminal(self):
+        # fail closed: an outcome we do not recognise keeps the agent live
+        self.assertEqual(supervisor._launched_background_agents(
+            [self.launch(), self.notification("running"), self.ANSWER]),
+            {self.AGENT})
+
+    def test_a_resumed_agent_is_live_again(self):
+        records = [self.launch(), self.notification(), self.send_message(),
+                   self.ANSWER]
+        self.assertEqual(supervisor._launched_background_agents(records),
+                         {self.AGENT})
+        records.append(self.notification())
+        self.assertEqual(supervisor._launched_background_agents(records), set())
+
+    def test_several_agents_are_tracked_independently(self):
+        other = "abcdef1234567890a"
+        records = [self.launch(), self.launch(other),
+                   self.notification(agent_id=other)]
+        self.assertEqual(supervisor._launched_background_agents(records),
+                         {self.AGENT})
+
+    def test_a_notification_without_its_launch_never_invents_an_agent(self):
+        # a tail can truncate the launch; it must not create a live agent
+        self.assertEqual(supervisor._launched_background_agents(
+            [self.notification(), self.ANSWER]), set())
+
+    def test_terminated_ids_skip_the_shape_check(self):
+        self.assertEqual(
+            supervisor._terminated_agents([self.launch(), self.notification()]),
+            {self.AGENT})
 
 
 class TranscriptTail(TempDirCase):
@@ -2532,18 +2704,29 @@ class PreemptiveRotation(TempDirCase):
         self.assertEqual(self.ledger(), [])
         self.assertTrue(self.child.automation)
 
-    def test_a_live_background_subagent_defers_the_rotation(self):
-        # the desk's normal mode: the main turn ended, but a backgrounded
-        # Agent is still writing its own sidechain transcript
+    def sidechain(self, records, age):
         directory = os.path.join(os.path.dirname(self.transcript), self.SID,
                                  "subagents")
-        os.makedirs(directory)
-        with open(os.path.join(directory, "agent-a99d9789808.jsonl"), "w",
-                  encoding="utf-8") as out:
-            out.write(json.dumps({"type": "assistant", "isSidechain": True,
-                                  "agentId": "a99d9789808", "message": {
-                                      "model": "claude-fable-5",
-                                      "content": "still working"}}) + "\n")
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, "agent-a99d9789808.jsonl")
+        with open(path, "w", encoding="utf-8") as out:
+            for record in records:
+                out.write(json.dumps(record) + "\n")
+        when = time.time() - age
+        os.utime(path, (when, when))
+        return path
+
+    def test_a_live_background_subagent_defers_the_rotation(self):
+        # the desk's normal mode: the main turn ended, but a backgrounded
+        # Agent is still working — and it has been SILENT for far longer than
+        # the idle window, blocked in one long tool call. Only its shape says
+        # so; its mtime says "finished".
+        self.sidechain([{"type": "assistant", "isSidechain": True,
+                         "agentId": "a99d9789808", "message": {
+                             "model": "claude-fable-5", "content": [
+                                 {"type": "tool_use", "id": "toolu_slow",
+                                  "name": "Bash",
+                                  "input": {"command": "make"}}]}}], age=30)
         runner = self.runner()
         with mock.patch.object(runner, "_stop_and_commit") as stop, \
                 mock.patch.object(notify, "emit") as emit, \
@@ -2552,9 +2735,25 @@ class PreemptiveRotation(TempDirCase):
         stop.assert_not_called()
         held = [event for event in self.events(emit)
                 if event["event"] == "preemptive_held"]
-        self.assertIn("background subagent", held[0]["reason"])
+        self.assertIn("waiting on a tool call", held[0]["reason"])
         self.assertEqual(self.ledger(), [])
         self.assertTrue(self.child.automation)
+
+    def test_a_finished_background_subagent_does_not_block_the_rotation(self):
+        # same age, same silence — but its transcript ends with the assistant
+        # message that IS its return value, so the rotation proceeds
+        self.sidechain([{"type": "assistant", "isSidechain": True,
+                         "agentId": "a99d9789808", "message": {
+                             "model": "claude-fable-5", "content": [
+                                 {"type": "text",
+                                  "text": "report delivered"}]}}], age=30)
+        runner = self.runner()
+        with mock.patch.object(runner, "_stop_and_commit",
+                               return_value=None) as stop, \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            runner._preemptive_cycle(self.child)
+        stop.assert_called_once()
 
     def test_target_relaunch_failure_recovers_the_source_supervised(self):
         # the handoff COMMITTED (the conversation is staged on the target) and
@@ -2691,7 +2890,7 @@ class PreemptiveRotation(TempDirCase):
         plan = mock.Mock(source_stat=handoff._transcript_stat(self.transcript))
         with self.assertRaisesRegex(supervisor.SupervisorError,
                                     "became busy"):
-            runner._preemptive_stop_edge(plan, proof)
+            runner._preemptive_stop_edge(self.child, plan, proof)
 
     def test_aborted_rotation_recovers_the_source_with_supervision_on(self):
         runner = self.runner()

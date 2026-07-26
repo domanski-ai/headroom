@@ -111,6 +111,19 @@ def main():
     common = {"session_id": sid, "transcript_path": transcript,
               "cwd": os.getcwd(), "model": {"display_name": "Sonnet"},
               "version": "2.1.fake"}
+    terminated = {"value": False, "count": 0}
+
+    def on_term(_signum, _frame):
+        terminated["value"] = True
+        terminated["count"] += 1
+
+    # Install BEFORE announcing readiness. SessionStart is what arms the
+    # supervisor, and a preemptive rotation can decide to stop an idle child
+    # within a poll tick of it — if the handler were still uninstalled, the
+    # default disposition would kill this process instantly, with no
+    # sigterm_flush and no SessionEnd. A real CLI has its handlers up before
+    # it announces a session; the fake must too.
+    signal.signal(signal.SIGTERM, on_term)
     hook(settings, "SessionStart",
          dict(common, hook_event_name="SessionStart", source="startup"))
     changed_cwd = os.environ.get("FAKE_CHANGED_CWD")
@@ -169,14 +182,13 @@ def main():
             source="clear" if scenario == "clear" else "resume"))
         time.sleep(0.5)
         return 0
-    terminated = {"value": False, "count": 0}
-
-    def on_term(_signum, _frame):
-        terminated["value"] = True
-        terminated["count"] += 1
-
-    signal.signal(signal.SIGTERM, on_term)
-    deadline = time.time() + (3.0 if scenario == "loop" else 1.5)
+    # the preemptive path has to poll usage, prove idleness, admit through the
+    # ledger (fsync) and stop us — give it room on a loaded machine so the
+    # test measures behaviour, not scheduling luck
+    lifetime = 3.0 if scenario == "loop" else 1.5
+    if scenario in idle_scenarios:
+        lifetime = 3.0
+    deadline = time.time() + lifetime
     while time.time() < deadline:
         if terminated["value"]:
             with open(os.path.join(state, "sigterm-" + slot), "a",

@@ -69,6 +69,10 @@ TRANSCRIPT_TAIL_BYTES = max(64 * 1024, paths.env_int(
     "HEADROOM_TRANSCRIPT_TAIL_BYTES", 256 * 1024))
 # bound on the sidechain scan that proves no background agent is working
 MAX_SUBAGENT_SCAN = max(64, paths.env_int("HEADROOM_MAX_SUBAGENT_SCAN", 512))
+# a sidechain only has to be judged by its last few records, so its tail is
+# much smaller than the main transcript's — the scan may touch many files
+SIDECHAIN_TAIL_BYTES = max(8 * 1024, paths.env_int(
+    "HEADROOM_SIDECHAIN_TAIL_BYTES", 32 * 1024))
 
 # A subscription cap surfaces two ways: the classic "hit your … limit" wording,
 # and — for a scoped-model weekly cap (e.g. Fable) — "You're out of usage
@@ -80,6 +84,19 @@ CAP_RE = re.compile(
     r"\b(?:(?:you(?:'|’)ve\s+)?hit your "
     r"(?:session|weekly|usage) limit|usage limit reached"
     r"|out of usage credits)\b", re.I)
+
+# Background-agent lifecycle, as the parent transcript actually records it
+# (verified against live sessions — see _unfinished_background_agents):
+# the launch tool_result names the agent, and a <task-notification> with a
+# terminal status is written when it stops. Only these three statuses have
+# been observed; any unknown status is deliberately NOT terminal, so an
+# unrecognised outcome leaves the agent counted as live (fail closed).
+BACKGROUND_LAUNCH_RE = re.compile(
+    r"agent launched successfully.{0,400}?agentId:\s*([0-9A-Za-z_-]{4,})",
+    re.I | re.S)
+TASK_ID_RE = re.compile(r"<task-id>\s*([0-9A-Za-z_-]{4,})\s*</task-id>")
+TASK_STATUS_RE = re.compile(r"<status>\s*([A-Za-z_]+)\s*</status>")
+TERMINAL_TASK_STATUS = {"completed", "failed", "killed"}
 
 HOOK_EVENTS = {"SessionStart", "StopFailure", "CwdChanged", "SessionEnd"}
 INCOMPATIBLE_FLAGS = {
@@ -719,7 +736,7 @@ def _number(value):
             and math.isfinite(value))
 
 
-def _transcript_records(path, whole=False):
+def _transcript_records(path, whole=False, limit=None):
     """``(records, complete)`` parsed from the END of a transcript.
 
     Everything the preemptive poll asks of a transcript — the model in use,
@@ -728,12 +745,13 @@ def _transcript_records(path, whole=False):
     O(session size) work on the one loop that also has to ingest hooks and
     prove caps. ``complete`` says whether the tail covered the whole file, so
     a caller that found nothing can decide to pay for the full read."""
+    limit = TRANSCRIPT_TAIL_BYTES if limit is None else limit
     try:
         with open(path, "rb") as handle:
             size = os.fstat(handle.fileno()).st_size
-            complete = whole or size <= TRANSCRIPT_TAIL_BYTES
+            complete = whole or size <= limit
             if not complete:
-                handle.seek(size - TRANSCRIPT_TAIL_BYTES)
+                handle.seek(size - limit)
                 handle.readline()  # drop the partial record at the boundary
             data = handle.read()
     except OSError:
@@ -775,7 +793,7 @@ def _transcript_model(path):
     return _last_assistant_model(_transcript_records(path, whole=True)[0])
 
 
-def _turn_is_complete(path):
+def _turn_is_complete(path, records=None, complete=True):
     """"" when the transcript's newest conversational record is a FINISHED
     main-thread assistant turn; otherwise why the child may be MID-TURN.
 
@@ -787,7 +805,8 @@ def _turn_is_complete(path):
     record. Trailing bookkeeping records (system turn_duration, last-prompt,
     file-history-snapshot, summary) are skipped — Claude writes those after a
     turn ends, as the cap-evidence scanner already documents."""
-    records, complete = _transcript_records(path)
+    if records is None:
+        records, complete = _transcript_records(path)
     for event in reversed(records):
         if not isinstance(event, dict):
             continue
@@ -817,20 +836,123 @@ def _subagents_dir(transcript_path):
         os.path.splitext(os.path.basename(transcript_path))[0], "subagents")
 
 
-def _subagent_activity(transcript_path, now, quiet_seconds):
-    """"" when no background subagent has written recently; otherwise why the
-    session is still working.
+def _blocks(event):
+    message = event.get("message") if isinstance(event, dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    return content if isinstance(content, list) else []
 
-    A backgrounded Agent call hands its tool_result to the main thread
-    immediately and then keeps running in its OWN sidechain transcript, so the
-    main transcript can look like a cleanly finished turn while delegated work
-    is still in flight — and a preemptive stop would kill it. The sidechain
-    files carry no completion marker (their meta.json records what the agent
-    IS, not whether it finished), so recent mtime is the honest signal: the
-    same evidence, and the same window, the main transcript is judged by.
-    A future-dated mtime counts as active — clock skew must not read as idle."""
+
+def _launched_background_agents(records):
+    """Agent ids this transcript shows as started and not yet reported back.
+
+    THE STRONGEST SIGNAL ON DISK, and the reason it is checked first: it is
+    the parent's own record of what it started, so it does not depend on the
+    agent having written — or being about to write — anything at all. Live
+    layout, verified against real sessions:
+
+      spawn   a `user` tool_result reading "Async agent launched
+              successfully … agentId: <id>" (the background Agent call
+              returns IMMEDIATELY, which is exactly why the main turn can
+              look finished while the agent works)
+      resume  an assistant `SendMessage` tool_use whose input `to` is <id>
+      finish  a `user` <task-notification> with <task-id><id></task-id> and a
+              terminal <status> (observed: completed / failed / killed)
+
+    So an id that was launched or messaged with no LATER terminal
+    notification is running right now, however quiet it or its transcript
+    happens to be. Truncating to a tail is sound here: notifications always
+    follow their launch, so a tail can only miss a launch (covered by the
+    per-sidechain shape check), never invent a live agent.
+
+    The caller still has to bound these ids by the CURRENT child's lifetime —
+    a resumed or forked session inherits its predecessor's records, and an
+    agent from a process that has exited is not running."""
+    live = {}
+    for event in records:
+        if not isinstance(event, dict):
+            continue
+        for block in _blocks(event):
+            if isinstance(block, dict) and block.get("type") == "tool_use" \
+                    and block.get("name") == "SendMessage":
+                target = block.get("input")
+                target = target.get("to") if isinstance(target, dict) else None
+                if isinstance(target, str) and target.strip():
+                    live[target.strip()] = True
+        body = "\n".join(_strings(event.get("message")))
+        if not body:
+            continue
+        for agent_id in BACKGROUND_LAUNCH_RE.findall(body):
+            live[agent_id] = True
+        if "<task-notification>" in body:
+            status = TASK_STATUS_RE.search(body)
+            if status and status.group(1).lower() in TERMINAL_TASK_STATUS:
+                for agent_id in TASK_ID_RE.findall(body):
+                    live.pop(agent_id, None)
+    return set(live)
+
+
+def _sidechain_busy(path):
+    """Why one sidechain transcript looks LIVE, or "" when it is finished.
+
+    SHAPE, not age. An agent thinking silently, or blocked inside a single
+    long tool call (a build, a network wait), writes nothing for minutes — so
+    recency proves activity but never completion, and treating "old" as
+    "finished" is exactly how live delegated work gets killed. A finished
+    agent's transcript ends with the assistant message that IS its return
+    value; a working one ends with input it has not answered yet, or with a
+    tool_use whose result has not landed. Anything unreadable or shapeless
+    refuses (fail closed)."""
+    records, _complete = _transcript_records(path, limit=SIDECHAIN_TAIL_BYTES)
+    if not records:
+        return "a subagent transcript could not be read"
+    unresolved = handoff.unresolved_tool_ids(records)
+    for event in reversed(records):
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        if kind not in ("user", "assistant"):
+            continue
+        if kind == "user":
+            return "a background subagent is answering its latest input"
+        if unresolved:
+            return "a background subagent is waiting on a tool call"
+        return ""
+    return "a subagent transcript has no conversational record"
+
+
+def _terminated_agents(records):
+    """Ids the parent transcript records as having stopped (any status)."""
+    finished = set()
+    for event in records:
+        if not isinstance(event, dict):
+            continue
+        body = "\n".join(_strings(event.get("message")))
+        if "<task-notification>" in body:
+            finished.update(TASK_ID_RE.findall(body))
+    return finished
+
+
+def _subagent_activity(transcript_path, now, quiet_seconds, since=0.0,
+                       launched=(), finished=()):
+    """"" when no background subagent is still working.
+
+    One bounded walk of the sidechain directory, cheapest test first:
+
+      recent/future mtime   activity outright, no parse needed
+      mtime < `since`       written before THIS child started, so its agent
+                            died with the previous process — a resumed or
+                            forked session inherits the whole directory, and
+                            a dead agent must not block rotation forever
+      parent saw it stop    a terminal <task-notification> needs no more proof
+      otherwise             its transcript SHAPE decides (see _sidechain_busy)
+
+    Finally, an id the parent launched but that has no sidechain file of this
+    child's own is treated as live: an agent that was just spawned has not
+    necessarily written anything yet, and that is precisely the blind spot the
+    parent's record exists to cover."""
     directory = _subagents_dir(transcript_path)
     scanned = 0
+    seen = {}
     try:
         for root, _dirs, names in os.walk(directory):
             for name in names:
@@ -842,21 +964,47 @@ def _subagent_activity(transcript_path, now, quiet_seconds):
                     # 250 ms loop; refuse the rotation instead of scanning on
                     return ("too many subagent transcripts to prove idle "
                             f"({MAX_SUBAGENT_SCAN}+)")
+                path = os.path.join(root, name)
                 try:
-                    age = now - os.stat(os.path.join(root, name)).st_mtime
+                    mtime = os.stat(path).st_mtime
                 except OSError:
+                    return "a subagent transcript could not be inspected"
+                # agent-<id>.jsonl -> <id>
+                seen[os.path.splitext(name)[0].partition("-")[2]] = mtime
+                if now - mtime < quiet_seconds:
+                    return ("a background subagent wrote "
+                            f"{max(now - mtime, 0):.0f}s ago")
+                if mtime < since:
                     continue
-                if age < quiet_seconds:
-                    return f"a background subagent wrote {max(age, 0):.0f}s ago"
+                if os.path.splitext(name)[0].partition("-")[2] in finished:
+                    continue
+                busy = _sidechain_busy(path)
+                if busy:
+                    return busy
     except OSError:
         return ""
+    pending = [agent for agent in launched
+               if seen.get(agent, since) >= since]
+    if pending:
+        return (f"{len(pending)} background agent(s) started by this session "
+                "have not reported back")
     return ""
 
 
-def _idle_refusal(transcript_path, now, quiet_seconds):
-    """"" when the child is genuinely idle; otherwise why it is still busy."""
-    return (_turn_is_complete(transcript_path)
-            or _subagent_activity(transcript_path, now, quiet_seconds))
+def _idle_refusal(transcript_path, now, quiet_seconds, since=0.0):
+    """"" when the child is genuinely idle; otherwise why it is still busy.
+
+    Three independent proofs, each covering the others' blind spot: the main
+    thread's own turn shape, the parent's record of background agents it
+    started but has not seen finish, and the shape of every sidechain
+    transcript this child could have written. None of them is "the file has
+    not changed lately" — recency can prove work, never completion."""
+    records, complete = _transcript_records(transcript_path)
+    return (_turn_is_complete(transcript_path, records, complete)
+            or _subagent_activity(
+                transcript_path, now, quiet_seconds, since=since,
+                launched=_launched_background_agents(records),
+                finished=_terminated_agents(records)))
 
 
 def _capacity_reasons(family):
@@ -1599,7 +1747,7 @@ class Supervisor:
         # transcript (the main thread looks idle the moment it backgrounds a
         # long-running agent).
         busy = _idle_refusal(proof.transcript_path, self.now(),
-                             PREEMPT_IDLE_SECONDS)
+                             PREEMPT_IDLE_SECONDS, since=child.launched_at)
         if busy:
             raise SupervisorError("child is still working: " + busy)
         if handoff._transcript_stat(proof.transcript_path) \
@@ -1803,13 +1951,13 @@ class Supervisor:
         print(f"CLAUDE_CONFIG_DIR={shlex.quote(plan.source.account['home'])} "
               f"{source_argv}", file=sys.stderr)
 
-    def _preemptive_stop_edge(self, plan, proof):
+    def _preemptive_stop_edge(self, child, plan, proof):
         """Last-instant idleness proof, immediately before SIGTERM."""
         if handoff._transcript_stat(proof.transcript_path) != plan.source_stat:
             raise SupervisorError(
                 "source transcript changed on the edge of a preemptive stop")
         busy = _idle_refusal(proof.transcript_path, self.now(),
-                             PREEMPT_IDLE_SECONDS)
+                             PREEMPT_IDLE_SECONDS, since=child.launched_at)
         if busy:
             raise SupervisorError(
                 "child became busy before the preemptive stop: " + busy)
@@ -1881,7 +2029,7 @@ class Supervisor:
                 if plan.preemptive is True:
                     # Cheap pre-filter: an already-busy child must not even
                     # get a stop_sent row written for it.
-                    self._preemptive_stop_edge(plan, proof)
+                    self._preemptive_stop_edge(child, plan, proof)
                 stop_sent_at = self.now()
                 handoff.append_action(
                     plan.handoff_id, "stop_sent", automatic=True,
@@ -1896,7 +2044,7 @@ class Supervisor:
                     # ELECTIVE, so re-prove idleness on the very edge of the
                     # kill, narrowing the window to a single stat syscall.
                     try:
-                        self._preemptive_stop_edge(plan, proof)
+                        self._preemptive_stop_edge(child, plan, proof)
                     except SupervisorError:
                         # stop_sent is durable (it must be written BEFORE any
                         # signal, so a crash can never hide a stop) but no
