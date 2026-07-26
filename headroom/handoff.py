@@ -63,6 +63,11 @@ class HandoffPlan:
     automatic: bool = False
     child_generation: int = 0
     force: bool = False
+    # True for a supervisor rotation taken BEFORE the wall (a threshold
+    # crossing, not a proven cap). It only labels the ledger: a preemptive
+    # plan carries no cooldown_scope, so it cools nothing, and it is planned
+    # with allow_dangling off — a mid-tool-call session is never moved early.
+    preemptive: bool = False
     # provider adapter fields: "claude" plans behave exactly as before; a
     # "codex" plan publishes to relative_destination (a validated
     # slash-separated path under the target home) instead of projects/<slug>.
@@ -595,7 +600,7 @@ def _target_home_stat(target):
 def plan_handoff(source, family, target, snapshot, cap_proof, cwd, *,
                  cooldown_scope=None,
                  automatic=False, child_generation=0, force=False,
-                 require_executable=True):
+                 require_executable=True, preemptive=False):
     """Build a complete, non-mutating handoff plan."""
     family = resolve_model_family(source, family)
     if target.get("provider") != "claude":
@@ -623,7 +628,8 @@ def plan_handoff(source, family, target, snapshot, cap_proof, cwd, *,
         source_stat=_transcript_stat(source.transcript_path),
         target_identity=_target_snapshot_identity(snapshot, target),
         target_home_stat=_target_home_stat(target), automatic=bool(automatic),
-        child_generation=int(child_generation or 0), force=bool(force))
+        child_generation=int(child_generation or 0), force=bool(force),
+        preemptive=bool(preemptive))
 
 
 @contextlib.contextmanager
@@ -1253,7 +1259,8 @@ def commit_handoff(plan):
                 "child_generation": plan.child_generation,
                 "source_5h_used": ((source_row.get("windows") or {}).get("5h")
                                    or {}).get("used_percent"),
-                "reason": "capped" if scope else "manual",
+                "reason": ("preemptive" if plan.preemptive
+                           else "capped" if scope else "manual"),
             }
             if plan.provider == "codex":
                 from . import handoff_codex

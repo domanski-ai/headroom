@@ -8,6 +8,15 @@ transitions with a single JSON argument describing the event:
     {"event": "downgrade", "account": ..., "reason": ...}
     {"event": "supervision_lost", "account": ..., "reason": ...}
     {"event": "fallback", "reason": ...}
+    {"event": "preemptive_scheduled", "account": ..., "family": ...,
+     "window": ..., "used_percent": ...}
+    {"event": "preemptive_handoff", "account": ..., "target": ...,
+     "family": ..., "window": ..., "used_percent": ..., "handoff_id": ...}
+    {"event": "preemptive_held", "account": ..., "reason": ...}
+
+``supervision_lost`` fires for EVERY path that disarms a supervised child's
+automatic handoff, once per distinct reason — a dashboard should treat it as
+"this session is no longer protected".
 
 Delivery is best-effort and bounded: the command has a hard timeout (default
 10s, override with ``HEADROOM_NOTIFY_TIMEOUT``). Unix runs it in its own

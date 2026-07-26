@@ -32,7 +32,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from headroom import (  # noqa: E402
-    __main__, notify, paths, registry, route, supervisor,
+    __main__, collect, handoff, notify, paths, registry, route, supervisor,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -61,7 +61,7 @@ class TempDirCase(unittest.TestCase):
     CLEAR_VARS = ("HEADROOM_LAUNCH_MARKER", "HEADROOM_LAUNCH_FALLBACK",
                   "HEADROOM_SLOT_LEASE", "HEADROOM_NOTIFY_CMD",
                   "HEADROOM_NOTIFY_TIMEOUT", "CLAUDE_CONFIG_DIR",
-                  "CODEX_HOME")
+                  "CODEX_HOME", "HEADROOM_PREEMPTIVE")
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -1998,6 +1998,569 @@ class R4AmbiguousStopEmitsSupervisionLost(TempDirCase):
         self.assertEqual(len(lost), 1)
         self.assertEqual(lost[0]["account"], "acct-a")
         self.assertIn("unmonitored", lost[0]["reason"])
+
+
+# --------------------------------------------------------------------------
+# Preemptive rotation: leave BEFORE the wall (incident 2026-07-26 — a seat at
+# 97% with an idle session never rotated, because only a proven cap could
+# trigger a handoff)
+# --------------------------------------------------------------------------
+class PreemptiveConfig(TempDirCase):
+    BASE = {"schema_version": 1, "accounts": [
+        {"name": "a", "provider": "claude", "home": "/tmp/a"}]}
+
+    def test_defaults_on_with_93_and_95_thresholds(self):
+        self.assertTrue(registry.preemptive_handoff(self.BASE))
+        self.assertEqual(registry.preemptive_thresholds(self.BASE), (93.0, 95.0))
+        self.assertEqual(registry.preemptive_thresholds(
+            dict(self.BASE, routing="broken")), (93.0, 95.0))
+
+    def test_only_explicit_false_or_the_env_kill_switch_disables(self):
+        self.assertFalse(registry.preemptive_handoff(
+            dict(self.BASE, routing={"preemptive_handoff": False})))
+        for value in (True, "false", "true", 1, 0, None, [], {}):
+            config = dict(self.BASE, routing={"preemptive_handoff": value})
+            self.assertEqual(registry.preemptive_handoff(config),
+                             value is not False, value)
+        with mock.patch.dict(os.environ, {"HEADROOM_PREEMPTIVE": "0"}):
+            self.assertFalse(registry.preemptive_handoff(self.BASE))
+        with mock.patch.dict(os.environ, {"HEADROOM_PREEMPTIVE": "1"}):
+            self.assertTrue(registry.preemptive_handoff(self.BASE))
+
+    def test_configured_thresholds_are_used_and_nonsense_keeps_defaults(self):
+        config = dict(self.BASE, routing={"preemptive_scoped_percent": 80,
+                                          "preemptive_overall_percent": "88"})
+        self.assertEqual(registry.preemptive_thresholds(config), (80.0, 88.0))
+        for bad in ("x", None, [], 0, -1, 101, True):
+            config = dict(self.BASE, routing={"preemptive_scoped_percent": bad})
+            scoped, _ = registry.preemptive_thresholds(config)
+            # True coerces to 1.0, which is a legal (if silly) threshold; every
+            # other nonsense keeps the default rather than arming on garbage
+            self.assertEqual(scoped, 1.0 if bad is True else 93.0, bad)
+
+
+class PreemptiveThresholds(TempDirCase):
+    def runner(self, account=None):
+        return supervisor.Supervisor("fable", [], account or self.account())
+
+    def windows(self, seven=10.0, scoped=None, **over):
+        windows = {"5h": {"used_percent": 99.0},
+                   "7d": dict({"used_percent": seven}, **over)}
+        if scoped is not None:
+            windows["scoped:Fable"] = (scoped if isinstance(scoped, dict)
+                                       else {"used_percent": scoped})
+        return {"windows": windows}
+
+    def test_scoped_family_window_trips_first(self):
+        crossing = self.runner()._threshold_crossing(
+            "fable", self.windows(seven=10.0, scoped=93.0))
+        self.assertEqual(crossing, ("scoped:fable", 93.0))
+
+    def test_overall_seven_day_window_trips_at_its_own_threshold(self):
+        self.assertIsNone(self.runner()._threshold_crossing(
+            "fable", self.windows(seven=94.9, scoped=10.0)))
+        self.assertEqual(self.runner()._threshold_crossing(
+            "fable", self.windows(seven=95.0, scoped=10.0)), ("7d", 95.0))
+
+    def test_a_full_5h_window_is_never_a_preemptive_trigger(self):
+        # 5h heals within hours and the cap path already covers it
+        self.assertIsNone(self.runner()._threshold_crossing(
+            "fable", self.windows(seven=10.0, scoped=10.0)))
+
+    def test_absence_of_proof_is_never_a_crossing(self):
+        runner = self.runner()
+        for row in (None, {}, {"windows": None}, {"windows": {}},
+                    self.windows(seven="97"), self.windows(seven=101.0),
+                    self.windows(seven=float("nan")),
+                    self.windows(seven=97.0, freshness="expired_observation"),
+                    self.windows(scoped={"used_percent": 99.0,
+                                         "freshness": "expired_observation"})):
+            self.assertIsNone(runner._threshold_crossing("fable", row), row)
+
+    def test_thresholds_come_from_config(self):
+        registry.save({"schema_version": 1, "routing": {
+            "preemptive_scoped_percent": 70, "preemptive_overall_percent": 75},
+            "accounts": [self.account()]})
+        runner = self.runner()
+        self.assertEqual((runner.preemptive_scoped, runner.preemptive_overall),
+                         (70.0, 75.0))
+        self.assertEqual(runner._threshold_crossing(
+            "fable", self.windows(seven=10.0, scoped=71.0)),
+            ("scoped:fable", 71.0))
+
+
+class PreemptiveRotation(TempDirCase):
+    """The whole preemptive path against real transcripts, a real registry and
+    the real handoff ledger — only the child process and the stop are faked."""
+
+    SID = "33333333-3333-4333-8333-333333333333"
+
+    def setUp(self):
+        super().setUp()
+        self.clock = {"t": time.time()}
+        self.source = self.account("source")
+        self.target = self.account("target")
+        for account in (self.source, self.target):
+            os.makedirs(os.path.join(account["home"], "projects"),
+                        exist_ok=True)
+        registry.save({"schema_version": 1,
+                       "accounts": [self.source, self.target]})
+        directory = os.path.join(self.source["home"], "projects", "p")
+        os.makedirs(directory)
+        self.transcript = os.path.join(directory, self.SID + ".jsonl")
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "hi"}]}}) + "\n")
+            out.write(json.dumps({"type": "assistant", "message": {
+                "model": "claude-fable-5-20260701",
+                "content": [{"type": "text", "text": "done"}]}}) + "\n")
+        self.idle(seconds=600)
+        self.cwd = os.path.join(self.temp.name, "work")
+        os.makedirs(self.cwd)
+        binding = supervisor.Binding(self.SID, self.transcript, self.cwd,
+                                     "Fable", "2.1", self.source["home"],
+                                     epoch=1)
+        process = mock.Mock(pid=os.getpid())
+        process.poll.return_value = None
+        self.child = supervisor.Child(
+            process, self.source, 1,
+            os.path.join(self.temp.name, "no-such-events.jsonl"), "",
+            self.clock["t"] - 60, True, binding=binding, session_epoch=1)
+        patcher = mock.patch.object(collect, "local_binding",
+                                    return_value=("AAAA", "BBBB"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        which = mock.patch.object(handoff.shutil, "which",
+                                  side_effect=lambda name: "/usr/bin/" + name)
+        which.start()
+        self.addCleanup(which.stop)
+        for constant, value in (("PREEMPT_IDLE_SECONDS", 5.0),
+                                ("PREEMPT_POLL_SECONDS", 60.0),
+                                ("PREEMPT_BACKOFF_SECONDS", 300.0),
+                                ("PREEMPT_DECISION_TTL", 120.0)):
+            patch = mock.patch.object(supervisor, constant, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def idle(self, seconds=600):
+        """Age the transcript so it reads as an idle (no active turn) child."""
+        when = time.time() - seconds
+        os.utime(self.transcript, (when, when))
+
+    def usage(self, scoped=94.0, seven=20.0, target_ok=True):
+        captured = int(self.clock["t"])
+        source = usage_row("source", used7=seven, captured=captured)
+        source["windows"]["scoped:Fable"] = {
+            "used_percent": scoped, "resets_at": captured + 6 * 86400,
+            "window_minutes": 10080}
+        target = usage_row("target", captured=captured)
+        if not target_ok:
+            target["ok"] = False
+            target["error_code"] = "collect_failed"
+        return {"run_started": captured, "generated": captured,
+                "accounts": [source, target]}
+
+    def runner(self, snapshot=None):
+        snapshot = self.usage() if snapshot is None else snapshot
+        return supervisor.Supervisor(
+            "fable", [], self.source, collect_fn=lambda quiet=True: snapshot,
+            now=lambda: self.clock["t"], sleep=lambda seconds: None,
+            popen=mock.Mock())
+
+    def events(self, emit):
+        return [call.args[0] for call in emit.call_args_list]
+
+    def ledger(self):
+        path = os.path.join(paths.state_dir(), "handoffs.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as source:
+            return [json.loads(line) for line in source if line.strip()]
+
+    # -- the crossing itself ------------------------------------------------
+
+    def test_threshold_crossing_schedules_and_commits_a_handoff(self):
+        runner = self.runner()
+        captured = {}
+
+        def stop(child, plan, proof):
+            captured["plan"], captured["proof"] = plan, proof
+            return supervisor.Relaunch(plan.target, [], plan.cwd, True,
+                                       plan.handoff_id, plan,
+                                       reason="preemptive")
+
+        with mock.patch.object(runner, "_stop_and_commit", side_effect=stop), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            outcome = runner._preemptive_cycle(self.child)
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.account["name"], "target")
+        plan, proof = captured["plan"], captured["proof"]
+        self.assertTrue(plan.preemptive)
+        self.assertTrue(plan.automatic)
+        self.assertEqual(plan.family, "fable")
+        self.assertEqual(plan.target["name"], "target")
+        # a preemptive plan carries NO cap scope, so it cools nothing
+        self.assertEqual(plan.cooldown_scope, {})
+        self.assertEqual((proof.window, proof.used_percent),
+                         ("scoped:fable", 94.0))
+        # NOT an authenticated cap: a mid-tool-call transcript is refused
+        self.assertIs(plan.cap_proof["authenticated"], False)
+        self.assertIs(plan.cap_proof["preemptive"], True)
+        # the shared ledger admission ran: the target is reserved
+        reserved = [row for row in self.ledger()
+                    if row.get("action") == "cap_confirmed"]
+        self.assertEqual(len(reserved), 1)
+        self.assertEqual(reserved[0]["target_slot"], "target")
+        self.assertEqual([event["event"] for event in self.events(emit)],
+                         ["preemptive_scheduled", "preemptive_handoff"])
+        self.assertEqual(self.events(emit)[0]["used_percent"], 94.0)
+        self.assertTrue(self.child.automation)
+
+    def test_overall_weekly_crossing_also_rotates(self):
+        runner = self.runner(self.usage(scoped=10.0, seven=96.0))
+        with mock.patch.object(runner, "_stop_and_commit",
+                               return_value=None) as stop, \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            runner._preemptive_cycle(self.child)
+        self.assertEqual(stop.call_args.args[2].window, "7d")
+
+    def test_below_threshold_never_rotates_and_clears_the_announcement(self):
+        runner = self.runner(self.usage(scoped=10.0, seven=20.0))
+        self.child.preemptive_announced = True
+        with mock.patch.object(runner, "_stop_and_commit") as stop, \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            self.assertIsNone(runner._preemptive_cycle(self.child))
+        stop.assert_not_called()
+        emit.assert_not_called()
+        self.assertFalse(self.child.preemptive_announced)
+        self.assertTrue(self.child.automation)
+
+    # -- safe boundary ------------------------------------------------------
+
+    def test_mid_turn_child_defers_without_interrupting_or_disarming(self):
+        self.idle(seconds=0)          # transcript is being written right now
+        runner = self.runner()
+        with mock.patch.object(runner, "_stop_and_commit") as stop, \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            self.assertIsNone(runner._preemptive_cycle(self.child))
+        stop.assert_not_called()
+        self.assertTrue(self.child.automation)
+        self.assertFalse(self.child.supervision_loss_notified)
+        held = [event for event in self.events(emit)
+                if event["event"] == "preemptive_held"]
+        self.assertEqual(len(held), 1)
+        self.assertIn("changed recently", held[0]["reason"])
+        # a busy child is the common case: retry on the normal cadence, not
+        # the long backoff
+        self.assertEqual(self.child.preemptive_next_check,
+                         self.clock["t"] + supervisor.PREEMPT_POLL_SECONDS)
+        # nothing was staged or reserved
+        self.assertEqual(self.ledger(), [])
+
+    def test_mid_tool_call_transcript_is_never_moved_early(self):
+        with open(self.transcript, "a", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "assistant", "message": {
+                "model": "claude-fable-5-20260701",
+                "content": [{"type": "tool_use", "id": "t1",
+                             "name": "Bash", "input": {}}]}}) + "\n")
+        self.idle(seconds=600)
+        runner = self.runner()
+        with mock.patch.object(runner, "_stop_and_commit") as stop, \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            self.assertIsNone(runner._preemptive_cycle(self.child))
+        stop.assert_not_called()
+        held = [event for event in self.events(emit)
+                if event["event"] == "preemptive_held"]
+        self.assertIn("mid-tool-call", held[0]["reason"])
+        self.assertTrue(self.child.automation)
+
+    def test_unread_hook_event_defers_the_rotation(self):
+        runner = self.runner()
+        with open(self.child.event_path, "w", encoding="utf-8") as out:
+            out.write("{}\n")
+        with mock.patch.object(runner, "_stop_and_commit") as stop, \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            self.assertIsNone(runner._preemptive_cycle(self.child))
+        stop.assert_not_called()
+        self.assertTrue(self.child.automation)
+
+    # -- no target / guard refusal -----------------------------------------
+
+    def test_no_healthy_target_defers_with_backoff_and_does_not_thrash(self):
+        runner = self.runner(self.usage(target_ok=False))
+        with mock.patch.object(runner, "_stop_and_commit") as stop, \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            self.assertIsNone(runner._preemptive_cycle(self.child))
+            first = self.child.preemptive_next_check
+            self.assertIsNone(runner._preemptive_cycle(self.child))
+        stop.assert_not_called()
+        self.assertEqual(first, self.clock["t"]
+                         + supervisor.PREEMPT_BACKOFF_SECONDS)
+        held = [event for event in self.events(emit)
+                if event["event"] == "preemptive_held"]
+        self.assertEqual(len(held), 1)           # repeat holds do not re-notify
+        self.assertIn("no target with proven headroom", held[0]["reason"])
+        # nothing was announced: there was never an actionable rotation
+        self.assertEqual([event["event"] for event in self.events(emit)],
+                         ["preemptive_held"])
+        self.assertTrue(self.child.automation)
+
+    def test_target_that_is_itself_near_its_limit_is_never_moved_onto(self):
+        snapshot = self.usage()
+        target = snapshot["accounts"][1]
+        target["windows"]["7d"]["used_percent"] = 97.0
+        runner = self.runner(snapshot)
+        with mock.patch.object(runner, "_stop_and_commit") as stop, \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            self.assertIsNone(runner._preemptive_cycle(self.child))
+        stop.assert_not_called()
+        held = [event for event in self.events(emit)
+                if event["event"] == "preemptive_held"]
+        self.assertIn("itself near its limit", held[0]["reason"])
+        self.assertEqual(self.ledger(), [])
+        self.assertTrue(self.child.automation)
+
+    def test_guard_refusal_falls_back_cleanly_to_cap_reactive(self):
+        runner = self.runner()
+        with mock.patch.object(
+                handoff, "reserve_automatic",
+                side_effect=handoff.HandoffError(
+                    "automatic handoff loop guard: 3 handoffs in 10 minutes")), \
+                mock.patch.object(runner, "_stop_and_commit") as stop, \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            self.assertIsNone(runner._preemptive_cycle(self.child))
+        stop.assert_not_called()
+        # the cap-reactive guarantee is untouched: still armed, never disarmed
+        self.assertTrue(self.child.automation)
+        self.assertFalse(self.child.supervision_loss_notified)
+        held = [event for event in self.events(emit)
+                if event["event"] == "preemptive_held"]
+        self.assertIn("loop guard", held[0]["reason"])
+        self.assertEqual(self.child.preemptive_next_check,
+                         self.clock["t"] + supervisor.PREEMPT_BACKOFF_SECONDS)
+
+    def test_pre_stop_failure_releases_the_reservation_without_disarming(self):
+        runner = self.runner()
+        with mock.patch.object(
+                runner, "_stop_and_commit",
+                side_effect=supervisor.SupervisorError("target slot is leased")), \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            self.assertIsNone(runner._preemptive_cycle(self.child))
+        actions = [row.get("action") for row in self.ledger()]
+        self.assertEqual(actions, ["cap_confirmed", "failure"])
+        self.assertIn("preemptive_pre_stop_failed",
+                      self.ledger()[-1]["reason"])
+        self.assertTrue(self.child.automation)
+        self.assertFalse(self.child.supervision_loss_notified)
+
+    def test_unreadable_usage_holds_quietly_without_a_fleet_event(self):
+        def boom(quiet=True):
+            raise RuntimeError("provider unreachable")
+
+        runner = supervisor.Supervisor(
+            "fable", [], self.source, collect_fn=boom,
+            now=lambda: self.clock["t"], sleep=lambda seconds: None)
+        with mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            self.assertIsNone(runner._preemptive_cycle(self.child))
+        emit.assert_not_called()        # no crossing is known — not an event
+        self.assertTrue(self.child.automation)
+        self.assertEqual(self.child.preemptive_next_check,
+                         self.clock["t"] + supervisor.PREEMPT_BACKOFF_SECONDS)
+
+    # -- the monitor gate ---------------------------------------------------
+
+    def test_monitor_polls_only_when_due_and_returns_the_relaunch(self):
+        runner = self.runner()
+        relaunch = supervisor.Relaunch(self.target, [], self.cwd, True,
+                                       reason="preemptive")
+        self.child.preemptive_next_check = self.clock["t"] + 3600
+        self.assertFalse(runner._preemptive_due(self.child, None))
+        self.child.preemptive_next_check = self.clock["t"]
+        self.assertTrue(runner._preemptive_due(self.child, None))
+        polls = iter([None, 0])
+        self.child.process.poll.side_effect = lambda: next(polls)
+        with mock.patch.object(runner, "_handle_events", return_value=None), \
+                mock.patch.object(runner, "_preemptive_cycle",
+                                  return_value=relaunch) as cycle, \
+                redirect_stderr(io.StringIO()):
+            outcome = runner._monitor(self.child)
+        self.assertIs(outcome, relaunch)
+        cycle.assert_called_once()
+
+    def test_disabled_preemptive_never_polls(self):
+        registry.save({"schema_version": 1,
+                       "routing": {"preemptive_handoff": False},
+                       "accounts": [self.source, self.target]})
+        runner = self.runner()
+        self.assertFalse(runner.preemptive)
+        self.assertFalse(runner._preemptive_due(self.child, None))
+        polls = iter([None, 0])
+        self.child.process.poll.side_effect = lambda: next(polls)
+        with mock.patch.object(runner, "_handle_events", return_value=None), \
+                mock.patch.object(runner, "_preemptive_cycle") as cycle, \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(runner._monitor(self.child), 0)
+        cycle.assert_not_called()
+
+    def test_a_cap_proof_always_wins_over_a_preemptive_poll(self):
+        runner = self.runner()
+        self.assertTrue(runner._preemptive_due(self.child, None))
+        # a cap proof in flight, a pending cap, or an ended session all skip
+        self.assertFalse(runner._preemptive_due(self.child, object()))
+        self.child.pending_cap = supervisor.PendingCap(
+            {}, self.SID, self.transcript, 1, self.clock["t"], self.clock["t"])
+        self.assertFalse(runner._preemptive_due(self.child, None))
+        self.child.pending_cap = None
+        self.child.session_ended = True
+        self.assertFalse(runner._preemptive_due(self.child, None))
+
+    # -- the ledger label ---------------------------------------------------
+
+    def test_committed_preemptive_handoff_is_labelled_in_the_ledger(self):
+        runner = self.runner()
+        with mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            proof, snapshot = runner._preemptive_observation(self.child)
+            plan = runner._preemptive_preflight(self.child, proof, snapshot)
+            result = handoff.commit_handoff(plan)
+        self.assertEqual(result.record["reason"], "preemptive")
+        self.assertIsNone(result.record["cap_scope"])
+        self.assertTrue(os.path.exists(plan.destination))
+        # a preemptive rotation cools nothing — the seat is not capped
+        self.assertEqual(route.cooldowns(), {})
+
+
+# --------------------------------------------------------------------------
+# Loud disarms: every path that turns automatic handoff off for a child emits
+# a structured supervision_lost event, not just a stderr line
+# --------------------------------------------------------------------------
+class LoudDisarms(TempDirCase):
+    SUPERVISOR = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    SID = "44444444-4444-4444-8444-444444444444"
+
+    def setUp(self):
+        super().setUp()
+        self.home = self.account("source")["home"]
+        directory = os.path.join(self.home, "projects", "p")
+        os.makedirs(directory)
+        self.transcript = os.path.join(directory, self.SID + ".jsonl")
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "hi"}]}}) + "\n")
+        self.cwd = os.path.join(self.temp.name, "work")
+        os.makedirs(self.cwd)
+        self.account_row = {"name": "source", "provider": "claude",
+                            "home": self.home}
+        self.child = supervisor.Child(
+            mock.Mock(pid=os.getpid()), self.account_row, 1,
+            os.path.join(self.temp.name, self.SUPERVISOR + ".jsonl"), "",
+            1.0, True,
+            binding=supervisor.Binding(self.SID, self.transcript, self.cwd,
+                                       "Sonnet", "2.1", self.home, epoch=1),
+            session_epoch=1)
+        self.runner = supervisor.Supervisor(
+            "sonnet", [], self.account_row, popen=mock.Mock())
+
+    def record(self, **over):
+        payload = {"hook_event_name": "SessionEnd", "session_id": self.SID,
+                   "transcript_path": self.transcript, "cwd": self.cwd}
+        payload.update(over.pop("payload", {}))
+        record = {"schema": "headroom_hook_event@1",
+                  "supervisor_id": self.SUPERVISOR, "generation": 1,
+                  "source_slot": "source", "config_dir": self.home,
+                  "matcher": "", "received_at": time.time(),
+                  "payload": payload}
+        record.update(over)
+        return record
+
+    def disarm(self, records):
+        with mock.patch.object(supervisor, "_read_events",
+                               return_value=records), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as err:
+            self.runner._handle_events(self.child, "")
+        return [call.args[0] for call in emit.call_args_list], err.getvalue()
+
+    def test_malformed_hook_event_emits_supervision_lost(self):
+        events, err = self.disarm([self.record(source_slot="impostor")])
+        self.assertIn("automatic handoff disabled", err)
+        self.assertEqual([event["event"] for event in events],
+                         ["supervision_lost"])
+        self.assertIn("malformed hook event", events[0]["reason"])
+        self.assertFalse(self.child.automation)
+
+    def test_session_end_without_a_known_epoch_emits_supervision_lost(self):
+        other = "55555555-5555-4555-8555-555555555555"
+        path = os.path.join(os.path.dirname(self.transcript), other + ".jsonl")
+        with open(path, "w", encoding="utf-8") as out:
+            out.write("{}\n")
+        events, err = self.disarm([self.record(payload={
+            "session_id": other, "transcript_path": path})])
+        self.assertIn("SessionEnd has no known session epoch", err)
+        self.assertEqual([event["event"] for event in events],
+                         ["supervision_lost"])
+        self.assertIn("no known session epoch", events[0]["reason"])
+        self.assertFalse(self.child.automation)
+
+    def test_unreadable_hook_journal_emits_supervision_lost(self):
+        with mock.patch.object(
+                supervisor, "_read_events",
+                side_effect=supervisor.SupervisorError("journal is unreadable")), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as err:
+            self.runner._handle_events(self.child, "")
+        self.assertIn("automatic handoff disabled", err.getvalue())
+        events = [call.args[0] for call in emit.call_args_list]
+        self.assertIn("journal unreadable", events[0]["reason"])
+        self.assertFalse(self.child.automation)
+
+    def test_a_repeating_reason_notifies_once_a_new_one_is_never_silent(self):
+        with mock.patch.object(notify, "emit") as emit:
+            supervisor._lose_supervision(self.child, "same reason")
+            supervisor._lose_supervision(self.child, "same reason")
+            supervisor._lose_supervision(self.child, "a different failure")
+        reasons = [call.args[0]["reason"] for call in emit.call_args_list]
+        self.assertEqual(reasons, ["same reason", "a different failure"])
+
+    def test_shutdown_after_the_child_exited_is_not_a_silent_disarm(self):
+        # the child is already gone, so signal forwarding is moot: the disarm
+        # must still be reported rather than exiting quietly
+        class FakeGuard:
+            shutdown_signal = 15
+            forwarded = False
+
+            def __init__(self, process=None):
+                pass
+
+            def install(self):
+                pass
+
+            def restore(self):
+                pass
+
+            def poll(self, process):
+                pass
+
+        self.child.process.poll.return_value = 0
+        with mock.patch.object(supervisor, "_SignalGuard", FakeGuard), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(self.runner._monitor(self.child), 0)
+        lost = [call.args[0] for call in emit.call_args_list
+                if call.args[0]["event"] == "supervision_lost"]
+        self.assertEqual(len(lost), 1)
+        self.assertEqual(lost[0]["reason"], "shutdown signal received")
 
 
 if __name__ == "__main__":

@@ -330,6 +330,65 @@ def auto_handoff(config=None):
     return True
 
 
+PREEMPTIVE_SCOPED_PERCENT = 93.0
+PREEMPTIVE_OVERALL_PERCENT = 95.0
+
+
+def preemptive_handoff(config=None):
+    """Whether the supervisor may rotate BEFORE a seat hits the wall.
+
+    ON by default — the product promise is that the operator never has to
+    watch a percentage.  ``HEADROOM_PREEMPTIVE=0`` is the operator kill
+    switch (no config edit needed) and an explicit
+    ``routing.preemptive_handoff: false`` turns it off permanently.  Like
+    :func:`auto_handoff`, a wrong-typed value keeps the default rather than
+    guessing intent, and every guard downstream stays fail-closed: a
+    preemptive refusal only defers, it never disarms the cap-reactive path.
+    """
+    if os.environ.get("HEADROOM_PREEMPTIVE", "").strip() == "0":
+        return False
+    try:
+        config = load() if config is None else config
+    except RegistryError:
+        return True
+    routing = (config or {}).get("routing")
+    if isinstance(routing, dict) and routing.get("preemptive_handoff") is False:
+        return False
+    return True
+
+
+def _threshold(routing, key, default):
+    try:
+        value = float(routing.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    # a threshold outside (0, 100] can never describe a usable crossing —
+    # keep the default rather than arming (or disarming) on nonsense
+    return value if 0 < value <= 100 else default
+
+
+def preemptive_thresholds(config=None):
+    """``(scoped %, overall 7d %)`` at which a seat is rotated off early.
+
+    Defaults 93 / 95: the model-family-scoped weekly window (e.g. fable) is
+    the one that strands an interactive session first, so it trips earlier
+    than the all-model 7d window.  Read from
+    ``config['routing']['preemptive_scoped_percent']`` and
+    ``...['preemptive_overall_percent']``.  Never raises — an unreadable or
+    absent config yields the defaults."""
+    try:
+        config = load() if config is None else config
+    except RegistryError:
+        return PREEMPTIVE_SCOPED_PERCENT, PREEMPTIVE_OVERALL_PERCENT
+    routing = (config or {}).get("routing")
+    if not isinstance(routing, dict):
+        return PREEMPTIVE_SCOPED_PERCENT, PREEMPTIVE_OVERALL_PERCENT
+    return (_threshold(routing, "preemptive_scoped_percent",
+                       PREEMPTIVE_SCOPED_PERCENT),
+            _threshold(routing, "preemptive_overall_percent",
+                       PREEMPTIVE_OVERALL_PERCENT))
+
+
 def save(config):
     validate(config)
     paths.write_json_atomic(paths.config_path(), config, mode=0o600)

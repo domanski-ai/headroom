@@ -21,8 +21,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from headroom import (  # noqa: E402
-    __main__, collect, handoff, locks, paths, registry, route, statusline,
-    supervisor,
+    __main__, collect, handoff, locks, notify, paths, registry, route,
+    statusline, supervisor,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -1571,6 +1571,153 @@ class SupervisorIntegration(unittest.TestCase):
 
         exercise("ctrl-c")
         exercise("term")
+
+
+class PreemptiveIntegration(unittest.TestCase):
+    """End to end with a REAL child process: an idle session on a seat that
+    has crossed its threshold rotates before it ever hits the wall, through
+    the same staging/reservation/resume pipeline the cap path uses."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.temp.name, "headroom")
+        self.fake_state = os.path.join(self.temp.name, "fake-state")
+        self.bin_dir = os.path.join(self.temp.name, "bin")
+        os.makedirs(self.bin_dir)
+        fake = os.path.join(os.path.dirname(__file__), "fake_claude.py")
+        os.chmod(fake, 0o755)
+        os.symlink(fake, os.path.join(self.bin_dir, "claude"))
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.env = mock.patch.dict(os.environ, {
+            "HEADROOM_DIR": self.root,
+            "HEADROOM_EXECUTABLE": os.path.join(repo, "bin", "headroom"),
+            "PATH": self.bin_dir + os.pathsep + os.environ.get("PATH", ""),
+            "FAKE_CLAUDE_STATE": self.fake_state,
+            "FAKE_CLAUDE_SCENARIO": "idle",
+        })
+        self.env.start()
+        self.binding = mock.patch.object(
+            collect, "local_binding", return_value=("AAAA", "BBBB"))
+        self.binding.start()
+        # collapse the cadences: the real ones are minutes, the fake child
+        # lives for a second and a half
+        self.patched = [mock.patch.object(supervisor, name, value)
+                        for name, value in (("QUIET_SECONDS", 0.1),
+                                            ("PREEMPT_IDLE_SECONDS", 0.1),
+                                            ("PREEMPT_POLL_SECONDS", 0.05),
+                                            ("PREEMPT_BACKOFF_SECONDS", 0.2),
+                                            ("PREEMPT_DECISION_TTL", 60.0))]
+        for patch in self.patched:
+            patch.start()
+        self.cwd_before = os.getcwd()
+        self.cwd = os.path.join(self.temp.name, "work")
+        os.makedirs(self.cwd)
+        os.chdir(self.cwd)
+        self.accounts = []
+        for name in ("source", "target"):
+            home = os.path.join(self.temp.name, name)
+            os.makedirs(home, exist_ok=True)
+            self.accounts.append({"name": name, "provider": "claude",
+                                  "home": home})
+        registry.save({"schema_version": 1, "accounts": self.accounts,
+                       "routing": {"auto_handoff": True}})
+
+    def tearDown(self):
+        os.chdir(self.cwd_before)
+        for patch in reversed(self.patched):
+            patch.stop()
+        self.binding.stop()
+        self.env.stop()
+        self.temp.cleanup()
+
+    def usage(self, source7):
+        def snapshot(quiet=True):
+            del quiet
+            now = int(time.time())
+            return {"run_started": now, "generated": now, "accounts": [
+                usage_row("source", used5=10, used7=source7, captured=now),
+                usage_row("target", used5=10, used7=10, captured=now)]}
+        return snapshot
+
+    def ledger_rows(self):
+        path = handoff._ledger_path()
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as source:
+            return [json.loads(line) for line in source if line.strip()]
+
+    def source_session_id(self):
+        return str(__import__("uuid").uuid5(
+            __import__("uuid").NAMESPACE_DNS, "headroom-fake-source-1"))
+
+    def test_idle_child_over_threshold_rotates_before_the_wall(self):
+        runner = supervisor.Supervisor("sonnet", [], self.accounts[0],
+                                       collect_fn=self.usage(96.0))
+        with mock.patch.object(notify, "emit") as emit:
+            self.assertEqual(runner.run(), 0)
+        session = self.source_session_id()
+        destination = os.path.join(self.accounts[1]["home"], "projects",
+                                   "fake-project", session + ".jsonl")
+        self.assertTrue(os.path.exists(destination))
+        self.assertTrue(os.path.exists(
+            os.path.join(self.fake_state, "sigterm-source")))
+        rows = self.ledger_rows()
+        actions = [row.get("action") for row in rows]
+        for action in ("cap_confirmed", "stop_sent", "stopped", "staged",
+                       "resume_spawned", "resume_bound"):
+            self.assertIn(action, actions)
+        staged = next(row for row in rows if row.get("action") == "staged")
+        self.assertEqual(staged["reason"], "preemptive")
+        self.assertIsNone(staged["cap_scope"])
+        self.assertTrue(staged["automatic"])
+        # the seat was NOT capped, so nothing was cooled
+        self.assertEqual(route.cooldowns(), {})
+        with open(os.path.join(self.fake_state, "launches.jsonl"),
+                  encoding="utf-8") as source:
+            launches = [json.loads(line) for line in source]
+        self.assertEqual(launches[1]["args"],
+                         ["--resume", session, "--fork-session"])
+        self.assertEqual(launches[1]["config_dir"], self.accounts[1]["home"])
+        events = [call.args[0]["event"] for call in emit.call_args_list]
+        self.assertIn("preemptive_scheduled", events)
+        self.assertIn("preemptive_handoff", events)
+        self.assertNotIn("supervision_lost", events)
+
+    def test_seat_below_threshold_is_left_alone(self):
+        runner = supervisor.Supervisor("sonnet", [], self.accounts[0],
+                                       collect_fn=self.usage(50.0))
+        with mock.patch.object(notify, "emit") as emit:
+            self.assertEqual(runner.run(), 0)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.fake_state, "sigterm-source")))
+        self.assertEqual(self.ledger_rows(), [])
+        events = [call.args[0]["event"] for call in emit.call_args_list]
+        self.assertEqual(events, ["launch"])
+
+    def test_no_healthy_target_leaves_the_idle_child_running(self):
+        def snapshot(quiet=True):
+            del quiet
+            now = int(time.time())
+            target = usage_row("target", captured=now)
+            target["routable"] = False
+            target["trust_state"] = "unverified"
+            return {"run_started": now, "generated": now, "accounts": [
+                usage_row("source", used5=10, used7=96.0, captured=now),
+                target]}
+
+        runner = supervisor.Supervisor("sonnet", [], self.accounts[0],
+                                       collect_fn=snapshot)
+        with mock.patch.object(notify, "emit") as emit:
+            self.assertEqual(runner.run(), 0)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.fake_state, "sigterm-source")))
+        self.assertEqual(self.ledger_rows(), [])
+        held = [call.args[0] for call in emit.call_args_list
+                if call.args[0]["event"] == "preemptive_held"]
+        self.assertTrue(held)
+        self.assertIn("no target with proven headroom", held[0]["reason"])
+        # backoff, not a retry every tick: one hold notice for the whole run
+        self.assertEqual(len(held), 1)
 
 
 if __name__ == "__main__":

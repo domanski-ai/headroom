@@ -82,6 +82,48 @@ Turn it off in `headroom setup`, or explicitly in config:
 }
 ```
 
+### Preemptive rotation: leaving before the wall
+
+A cap-reactive handoff can only fire once the provider has already refused a
+turn. A seat that climbs to 97% while your session sits idle would otherwise
+strand you: you notice the percentage, `/exit`, and hand off by hand. So the
+supervisor also watches the usage feed it already collects and rotates
+**early** — when the account crosses **93%** of the model-family window it is
+running (e.g. fable) or **95%** of the all-model weekly window, *and* a target
+seat with proven headroom exists, *and* the child is idle.
+
+"Idle" means no active turn: the session transcript must have been quiet for a
+full minute, no hook event may be pending, and a session stopped mid-tool-call
+is never moved early. The rotation itself is the same pipeline as the cap
+path — staging, target identity verification, slot leases, ledger admission,
+the same three-per-ten-minutes loop guard, resume with `--fork-session`.
+Nothing is cooled, because the seat is not capped, and the handoff is recorded
+with `"reason": "preemptive"`.
+
+Preemptive rotation is strictly an optimisation on top of the cap-reactive
+guarantee: **any** refusal — no proven target, a busy child, a guard holding,
+a target that is itself near its limit — only defers (with a backoff, so a
+stranded session never thrashes) and leaves cap handoff fully armed. It is on
+by default; `HEADROOM_PREEMPTIVE=0` is the one-run kill switch, and the
+thresholds are config:
+
+```json
+{
+  "routing": {
+    "preemptive_handoff": true,
+    "preemptive_scoped_percent": 93,
+    "preemptive_overall_percent": 95
+  }
+}
+```
+
+Every path that disables automatic handoff for a running child — a malformed
+hook event, an unreadable hook journal, a lost session binding, a child that
+ignores `SIGTERM` — emits a `supervision_lost` event through
+`HEADROOM_NOTIFY_CMD` as well as printing to stderr, so a dashboard can show
+that a session is no longer protected. Preemptive activity emits
+`preemptive_scheduled`, `preemptive_handoff`, and `preemptive_held`.
+
 One-run overrides are `headroom claude --headroom-auto-handoff` and
 `--headroom-no-auto-handoff`. Supervision only activates when stdin, stdout,
 and stderr are TTYs and no hook-incompatible Claude flag is present; otherwise
@@ -433,7 +475,13 @@ Six affordances make headroom composable with launch wrappers:
   commits, `{"event": "downgrade", …}` when supervision was requested but the
   run is exec-only, `{"event": "supervision_lost", …}` when a supervised
   child's auto-handoff disarms after launch (e.g. the SessionStart hook never
-  bound), and `{"event": "fallback", …}` when the bare-CLI fallback fires.
+  bound, a malformed hook event, a child that ignores `SIGTERM`), and
+  `{"event": "fallback", …}` when the bare-CLI fallback fires. Preemptive
+  rotation adds `{"event": "preemptive_scheduled", "account", "family",
+  "window", "used_percent"}` when a seat crosses its threshold and a target
+  exists, `{"event": "preemptive_handoff", …, "target", "handoff_id"}` when
+  the session actually moves, and `{"event": "preemptive_held", "account",
+  "reason"}` when an early rotation is deferred.
   Delivery is bounded (10s hard timeout, override with
   `HEADROOM_NOTIFY_TIMEOUT`); on timeout the command's whole process group is
   killed, and a broken or hung command is swallowed with a stderr line and

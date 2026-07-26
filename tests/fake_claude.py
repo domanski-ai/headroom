@@ -58,14 +58,18 @@ def main():
         }) + "\n")
     if scenario == "foreground":
         ok = os.getpgrp() == os.tcgetpgrp(0)
-        print("PGRP_OK" if ok else "PGRP_BAD", flush=True)
         received = {"signal": ""}
 
         def foreground_signal(signum, _frame):
             received["signal"] = signal.Signals(signum).name
 
+        # Install BEFORE announcing readiness: the test sends ^C the instant
+        # it sees PGRP_OK, so printing first raced the handler installation
+        # and the child died of KeyboardInterrupt (an intermittent failure of
+        # this test that has nothing to do with what it asserts).
         signal.signal(signal.SIGINT, foreground_signal)
         signal.signal(signal.SIGTERM, foreground_signal)
+        print("PGRP_OK" if ok else "PGRP_BAD", flush=True)
         deadline = time.time() + 3
         while not received["signal"] and time.time() < deadline:
             time.sleep(0.02)
@@ -118,7 +122,7 @@ def main():
 
     cap_slots = set(filter(None, os.environ.get("FAKE_CAP_SLOTS", "source").split(",")))
     is_resume = "--resume" in args
-    if scenario in ("handoff", "delayed-flush") and is_resume:
+    if scenario in ("handoff", "delayed-flush", "idle") and is_resume:
         time.sleep(0.35)
         return 0
     if scenario == "missing-end" and is_resume:
@@ -128,14 +132,17 @@ def main():
         time.sleep(0.35)
         return 0
 
-    if scenario not in ("corrupt", "delayed-flush"):
+    # "idle": a bound, quiescent session that never caps — the child the
+    # preemptive path must be able to rotate at a safe boundary
+    if scenario not in ("corrupt", "delayed-flush", "idle"):
         append_event(transcript, cap_event)
 
     message = "rate limit: try again" if scenario == "transient" else \
         "You've hit your session limit · resets 12:20pm (UTC)"
-    hook(settings, "StopFailure", dict(
-        common, hook_event_name="StopFailure", error="rate_limit",
-        last_assistant_message=message))
+    if scenario != "idle":
+        hook(settings, "StopFailure", dict(
+            common, hook_event_name="StopFailure", error="rate_limit",
+            last_assistant_message=message))
     if scenario == "delayed-flush":
         time.sleep(0.4)
         append_event(transcript, cap_event)

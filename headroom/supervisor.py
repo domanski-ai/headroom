@@ -38,6 +38,33 @@ LOOP_WINDOW = 10 * 60
 LOOP_MAX = 3
 MAX_HOOK_BYTES = 1024 * 1024
 
+# --- preemptive rotation cadence -------------------------------------------
+# Cap-reactive handoff only fires once the provider has already refused a
+# turn. A seat that climbs to 97% while the session sits idle strands the
+# operator instead: they notice the percentage, /exit, and hand off by hand.
+# The preemptive poll closes that gap by rotating at a threshold, at a SAFE
+# BOUNDARY (an idle child), through the exact same handoff pipeline.
+#
+# Every number here is a cadence, not a safety bound — the safety bounds are
+# the unchanged handoff guards. Poll rarely (usage windows move in minutes,
+# not milliseconds), demand a long quiet period so an active turn is never
+# interrupted, and back off hard when a crossing cannot be acted on so a
+# stranded session does not retry (or notify) every tick.
+PREEMPT_POLL_SECONDS = max(5.0, float(
+    paths.env_int("HEADROOM_PREEMPTIVE_POLL_SECONDS", 60)))
+PREEMPT_BACKOFF_SECONDS = max(PREEMPT_POLL_SECONDS, float(
+    paths.env_int("HEADROOM_PREEMPTIVE_BACKOFF_SECONDS", 300)))
+PREEMPT_IDLE_SECONDS = max(QUIET_SECONDS, float(
+    paths.env_int("HEADROOM_PREEMPTIVE_IDLE_SECONDS", 60)))
+# how long an observed crossing stays actionable: the analogue of the cap
+# path's "the proven cap reset is still in the future" admission gate
+PREEMPT_DECISION_TTL = max(PREEMPT_IDLE_SECONDS + 10.0, float(
+    paths.env_int("HEADROOM_PREEMPTIVE_DECISION_TTL", 120)))
+# reuse the fleet's own usage feed when it is this fresh before paying for a
+# private collect (a running `headroom serve` refreshes it continuously)
+PREEMPT_SNAPSHOT_MAX_AGE = max(30, paths.env_int(
+    "HEADROOM_PREEMPTIVE_SNAPSHOT_MAX_AGE", 300))
+
 # A subscription cap surfaces two ways: the classic "hit your … limit" wording,
 # and — for a scoped-model weekly cap (e.g. Fable) — "You're out of usage
 # credits. Run /usage-credits to keep using Fable 5". The second form never
@@ -103,6 +130,30 @@ class CapProof:
     transcript_path: str
     epoch: int
     transcript_stat: tuple
+    preemptive: bool = False
+
+
+@dataclass(frozen=True)
+class PreemptiveProof:
+    """A threshold crossing on an idle child — deliberately shape-compatible
+    with :class:`CapProof` so every shared guard (`_proof_current`,
+    `_events_pending`, `_stop_and_commit`, `_consume_stop_events`) treats it
+    identically.  It proves far LESS than a CapProof (no provider refusal, no
+    cap-time model from an API-error event), which is exactly why acting on it
+    is gated on an idle transcript and why any refusal only defers."""
+    event: dict
+    message: str
+    family: str
+    session_id: str
+    transcript_path: str
+    epoch: int
+    transcript_stat: tuple
+    window: str = ""
+    used_percent: float = 0.0
+    # the instant this observation stops being actionable; the analogue of
+    # the cap path's proven reset, checked at every admission/stop edge
+    deadline: float = 0.0
+    preemptive: bool = True
 
 
 @dataclass(frozen=True)
@@ -135,7 +186,12 @@ class Child:
     session_epochs: dict = field(default_factory=dict)
     last_received_at: float = 0.0
     pending_cap: PendingCap = None
-    supervision_loss_notified: bool = False
+    # the last disarm reason already notified ("" / False = none yet)
+    supervision_loss_notified: object = False
+    # preemptive rotation state (never affects the cap-reactive path)
+    preemptive_next_check: float = 0.0
+    preemptive_announced: bool = False
+    preemptive_last_hold: str = ""
 
 
 @dataclass(frozen=True)
@@ -146,20 +202,29 @@ class Relaunch:
     automatic: bool
     handoff_id: str = ""
     plan: object = None
+    reason: str = "cap"
 
 
 def _lose_supervision(child, reason):
-    """Turn automation off for this child and (once per child) notify the
-    loss. Post-spawn supervision loss is exactly what an external dispatcher
-    cannot see on its own: the launch looked supervised, but auto-handoff
-    will silently not fire. The notify is a no-op unless HEADROOM_NOTIFY_CMD
-    is set; the stderr diagnostics at each call site are unchanged."""
+    """Turn automation off for this child and notify the loss.
+
+    Post-spawn supervision loss is exactly what an external dispatcher cannot
+    see on its own: the launch looked supervised, but auto-handoff will
+    silently not fire. Every stderr diagnostic at each call site is unchanged;
+    this adds the structured event, so a dashboard can surface an unprotected
+    session. The notify is a no-op unless HEADROOM_NOTIFY_CMD is set.
+
+    Dedupe is per REASON, not per child: a disarm that repeats on every 250 ms
+    poll (e.g. the bind timeout) notifies once, but a genuinely different
+    later disarm is never swallowed into silence by the first one."""
     child.automation = False
-    if not child.supervision_loss_notified:
-        child.supervision_loss_notified = True
-        notify.emit({"event": "supervision_lost",
-                     "account": child.account.get("name", ""),
-                     "reason": str(reason)})
+    reason = str(reason)
+    if child.supervision_loss_notified == reason:
+        return
+    child.supervision_loss_notified = reason
+    notify.emit({"event": "supervision_lost",
+                 "account": child.account.get("name", ""),
+                 "reason": reason})
 
 
 def _supervisors_dir():
@@ -638,6 +703,70 @@ def _event_stop_guard(child):
         handle.close()
 
 
+def _number(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+def _transcript_model(path):
+    """The model this session is CURRENTLY running: the last real assistant
+    model in the transcript.
+
+    Same authority the cap path trusts (``_active_model``) and for the same
+    reason — it reflects in-session ``/model`` switches, unlike the model
+    named at SessionStart. Unreadable/absent yields "" and the caller falls
+    back to the bound SessionStart model."""
+    try:
+        with open(path, "rb") as handle:
+            lines = [line for line in handle.read().splitlines() if line.strip()]
+    except OSError:
+        return ""
+    for raw in reversed(lines):
+        try:
+            event = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError, json.JSONDecodeError):
+            continue
+        model = _real_assistant_model(event)
+        if model:
+            return model
+    return ""
+
+
+def _capacity_reasons(family):
+    """Block reasons that mean 'this seat is spent', not 'this reading cannot
+    be trusted'. A spent source is the whole point of a rotation; anything
+    else means the source row is unusable and the rotation must hold."""
+    return {"5h at 100%", "7d at 100%", "5h critical", "7d critical",
+            f"{family} weekly cap at 100%", f"{family} weekly cap critical"}
+
+
+def _snapshot_row(snapshot, name):
+    rows = snapshot.get("accounts") if isinstance(snapshot, dict) else None
+    if not isinstance(rows, list):
+        return None
+    return next((row for row in rows if isinstance(row, dict)
+                 and row.get("name") == name), None)
+
+
+def _preemptive_row_bound(account, family, row, now):
+    """"" when ``row`` is a current, identity-bound reading for this account;
+    otherwise why an early rotation may not be based on it.
+
+    Deliberately the same shape of proof the cap path demands of its source
+    row — minus the "collected after the cap event" clause, which has no
+    meaning without an event. Capacity reasons pass (they are the trigger);
+    every trust/staleness reason holds."""
+    if not isinstance(row, dict):
+        return "source has no usage row in the snapshot"
+    reason = route.block_reason(account, family, row, {}, now, reserve=0)
+    if reason is not None and reason not in _capacity_reasons(family):
+        return reason
+    captured = row.get("captured_at")
+    if not _number(captured) or now - captured > route.OBSERVATION_MAX_AGE:
+        return "source observation is not current"
+    return ""
+
+
 def _source_row_is_bound(account, family, snapshot, collect_started):
     if not isinstance(snapshot, dict):
         return "collect returned no snapshot"
@@ -748,6 +877,13 @@ class Supervisor:
         self.now = time.time if now is None else now
         self.sleep = time.sleep if sleep is None else sleep
         self.supervisor_id = supervisor_id or str(uuid.uuid4())
+        # Preemptive rotation is resolved ONCE per supervised launch, so a
+        # config edit mid-session can never flip the policy under a live
+        # child. Reading it can't fail the launch (registry helpers swallow a
+        # broken config and return the default).
+        self.preemptive = registry.preemptive_handoff()
+        self.preemptive_scoped, self.preemptive_overall = \
+            registry.preemptive_thresholds()
         self.generation = 0
         self.settings_files = []
         # True once ANY child CLI process has been successfully spawned —
@@ -1091,6 +1227,265 @@ class Supervisor:
                 OSError, ValueError) as error:
             raise SupervisorError(str(error)) from error
 
+    # ---- preemptive rotation: leave BEFORE the wall ----------------------
+    #
+    # The cap-reactive path can only fire once the provider has already
+    # refused a turn. Preemptive rotation watches the same usage feed every
+    # other headroom surface uses and moves the conversation while the seat
+    # still has room — but ONLY at a safe boundary, and ONLY through the
+    # unchanged handoff pipeline (staging, target verification, leases,
+    # ledger admission, resume --fork-session). It is strictly an
+    # optimisation layered on top: every refusal defers and leaves the
+    # cap-reactive guarantee fully armed.
+
+    def _usage_snapshot(self):
+        """The freshest usage this supervisor can reach without new deps.
+
+        Prefer the private snapshot every other headroom surface already
+        maintains (the same reading the dashboard and the fleet usage feed are
+        built from), so a supervised session costs the provider nothing while
+        a collector is running; pay for a private collect only once that feed
+        has gone stale."""
+        snapshot = paths.load_json(paths.private_snapshot_path())
+        if route._snapshot_fresh(snapshot, self.now(), PREEMPT_SNAPSHOT_MAX_AGE):
+            return snapshot
+        try:
+            return self.collect_fn(quiet=True)
+        except TypeError:
+            return self.collect_fn()
+        except Exception as error:  # noqa: BLE001 — a failed poll never stops
+            raise SupervisorError(f"fresh usage collect failed: {error}") from error
+
+    def _child_family(self, child):
+        """The Claude family this child is actually running (raises when it
+        cannot be resolved — an unknown family can never be rotated)."""
+        binding = child.binding
+        model = _transcript_model(binding.transcript_path) or binding.model
+        return handoff.resolve_model_family(handoff.SourceSession(
+            binding.session_id, binding.transcript_path, child.account, model))
+
+    def _threshold_crossing(self, family, row):
+        """``(window key, used percent)`` when this row has crossed a
+        preemptive threshold, else None.
+
+        Absence of proof is never a crossing: a missing, malformed, expired,
+        or out-of-range reading returns None and the session stays put. The 5h
+        window is deliberately NOT a trigger — it heals within hours and the
+        cap-reactive path already covers it; moving a whole conversation for a
+        window that resets by itself would burn seats for nothing."""
+        windows = row.get("windows") if isinstance(row, dict) else None
+        if not isinstance(windows, dict):
+            return None
+        scoped = route.scoped_window_for(family, windows) if family in (
+            "opus", "sonnet", "haiku", "fable") else None
+        for window, key, threshold in (
+                (scoped, "scoped:" + family, self.preemptive_scoped),
+                (windows.get("7d"), "7d", self.preemptive_overall)):
+            if not isinstance(window, dict) \
+                    or window.get("freshness") == "expired_observation":
+                continue
+            used = window.get("used_percent")
+            if _number(used) and 0 <= used <= 100 and used >= threshold:
+                return key, float(used)
+        return None
+
+    def _preemptive_observation(self, child):
+        """``(proof, snapshot)`` for a live threshold crossing, else None."""
+        binding = child.binding
+        family = self._child_family(child)
+        snapshot = self._usage_snapshot()
+        crossing = self._threshold_crossing(
+            family, _snapshot_row(snapshot, child.account["name"]))
+        if crossing is None:
+            return None
+        window, used = crossing
+        observed_at = self.now()
+        proof = PreemptiveProof(
+            event={"received_at": observed_at},
+            message=f"{window} window at {used:g}%", family=family,
+            session_id=binding.session_id,
+            transcript_path=binding.transcript_path, epoch=binding.epoch,
+            transcript_stat=handoff._transcript_stat(binding.transcript_path),
+            window=window, used_percent=used,
+            deadline=observed_at + PREEMPT_DECISION_TTL)
+        return proof, snapshot
+
+    def _preemptive_due(self, child, proof):
+        """True when this tick may attempt a preemptive rotation.
+
+        A proven cap ALWAYS wins — a proof in flight (or a pending one) skips
+        the poll entirely — and the child must be enabled, bound, and live.
+        Ordered so a disqualifying condition short-circuits before the clock
+        is consulted."""
+        return (self.preemptive and proof is None and child.automation
+                and child.binding is not None and child.pending_cap is None
+                and not child.session_ended
+                and self.now() >= child.preemptive_next_check)
+
+    def _preemptive_defer(self, child, reason, *, backoff=True, announce=True):
+        """Hold this rotation without disarming anything.
+
+        Spaces out the retry so a stranded session cannot thrash the poll (or
+        an observer command), and reports each DISTINCT hold once. `announce`
+        is False for conditions observed before any crossing is known — those
+        are diagnostics, not fleet events."""
+        child.preemptive_next_check = self.now() + (
+            PREEMPT_BACKOFF_SECONDS if backoff else PREEMPT_POLL_SECONDS)
+        if child.preemptive_last_hold == reason:
+            return
+        child.preemptive_last_hold = reason
+        print(f"[headroom] preemptive handoff held: {reason}; child continues "
+              f"with cap handoff still armed", file=sys.stderr)
+        if announce:
+            notify.emit({"event": "preemptive_held",
+                         "account": child.account.get("name", ""),
+                         "reason": reason})
+
+    def _preemptive_cycle(self, child):
+        """One preemptive attempt. Returns a Relaunch when the session moved,
+        otherwise None.
+
+        Never disarms: preemptive rotation is an optimisation on top of the
+        cap-reactive guarantee, so no target, a busy child, or any guard
+        refusing simply defers with the child running and automation on.
+
+        The except clauses are deliberately broad (BLE001): an optimisation
+        must never take down a supervised session, so every failure degrades
+        to "no early rotation this tick"."""
+        child.preemptive_next_check = self.now() + PREEMPT_POLL_SECONDS
+        try:
+            observed = self._preemptive_observation(child)
+        except Exception as error:  # noqa: BLE001
+            # nothing is known about a crossing yet — hold quietly
+            self._preemptive_defer(child, f"usage unreadable: {error}",
+                                   announce=False)
+            return None
+        if observed is None:
+            child.preemptive_announced = False
+            child.preemptive_last_hold = ""
+            return None
+        proof, snapshot = observed
+        try:
+            # reuse the ranked route selection: no proven target, no rotation
+            handoff.select_target(child.account["name"], snapshot, proof.family)
+        except Exception as error:  # noqa: BLE001
+            self._preemptive_defer(
+                child, f"no target with proven headroom: {error}")
+            return None
+        if not child.preemptive_announced:
+            child.preemptive_announced = True
+            print(f"[headroom] {child.account['name']} {proof.message} — "
+                  f"scheduling a handoff at the next idle boundary",
+                  file=sys.stderr)
+            notify.emit({"event": "preemptive_scheduled",
+                         "account": child.account.get("name", ""),
+                         "family": proof.family, "window": proof.window,
+                         "used_percent": proof.used_percent})
+        try:
+            plan = self._preemptive_preflight(child, proof, snapshot)
+        except Exception as error:  # noqa: BLE001
+            # a child mid-turn is the expected, frequent case: retry on the
+            # normal cadence instead of the long backoff
+            busy = ("changed recently" in str(error)
+                    or "still changing" in str(error))
+            self._preemptive_defer(child, str(error), backoff=not busy)
+            return None
+        relaunch = None
+        try:
+            relaunch = self._stop_and_commit(child, plan, proof)
+        except Exception as error:  # noqa: BLE001 — a refusal must never disarm
+            # every raise out of _stop_and_commit happens BEFORE the SIGTERM,
+            # so the child is untouched and cap handoff stays armed
+            self._failure(plan, "preemptive_pre_stop_failed: " + str(error))
+            self._preemptive_defer(child, str(error))
+        # unless we are actually moving to the target, release the lease we
+        # took for it (the reservation is released by the failure row the
+        # stop path already wrote) so no other launcher is wrongly blocked
+        if not (relaunch is not None and relaunch.automatic):
+            route.release_slot_lease(plan.target["name"])
+        if relaunch is None:
+            child.preemptive_next_check = self.now() + PREEMPT_BACKOFF_SECONDS
+            return None
+        if relaunch.automatic:
+            notify.emit({"event": "preemptive_handoff",
+                         "account": child.account.get("name", ""),
+                         "target": plan.target.get("name", ""),
+                         "family": proof.family, "window": proof.window,
+                         "used_percent": proof.used_percent,
+                         "handoff_id": plan.handoff_id})
+        return relaunch
+
+    def _preemptive_preflight(self, child, proof, snapshot):
+        """The cap preflight's twin for a threshold crossing.
+
+        The same guards in the same order — proof still current, no unread
+        hook event, transcript quiet and unchanged, source row trustworthy,
+        target proven twice, atomic ledger admission — with two deliberate
+        differences. The quiet window is LONG, because an idle child is the
+        entire safety argument for moving without a provider refusal; and
+        there is no cap scope, so nothing is cooled and the admission deadline
+        is the observation's own short TTL instead of a proven cap reset."""
+        self._proof_current(child, proof)
+        self._events_pending(child)
+        # SAFE BOUNDARY: the transcript is the only in-band evidence of an
+        # active turn between hooks, and this is the same stability guard the
+        # manual handoff demands — just with a much longer quiet period.
+        handoff.guard_source_stable(
+            proof.transcript_path, now=self.now(),
+            sleep=lambda _seconds: None, quiet_seconds=PREEMPT_IDLE_SECONDS)
+        if handoff._transcript_stat(proof.transcript_path) \
+                != proof.transcript_stat:
+            raise SupervisorError(
+                "preemptive proof expired after the transcript changed")
+        reason = _preemptive_row_bound(
+            child.account, proof.family,
+            _snapshot_row(snapshot, child.account["name"]), self.now())
+        if reason:
+            raise SupervisorError(reason)
+        target = handoff.select_target(child.account["name"], snapshot,
+                                       proof.family)
+        # Never rotate ONTO a seat that has itself crossed the threshold: the
+        # next poll would move the session straight back off it. The ledger
+        # loop guard is a backstop against ping-pong, not a plan — and holding
+        # here simply leaves the cap-reactive path to do its job.
+        if self._threshold_crossing(
+                proof.family,
+                _snapshot_row(snapshot, target["name"])) is not None:
+            raise SupervisorError(
+                f"best target {target['name']} is itself near its limit")
+        binding = child.binding
+        source = handoff.SourceSession(
+            proof.session_id, proof.transcript_path, child.account,
+            proof.family, int(self.now()))
+        # cap_proof is NOT authenticated: plan_handoff therefore refuses a
+        # transcript that ends mid-tool-call, so an early rotation can never
+        # fork an unfinished turn the way an authenticated cap may.
+        plan = handoff.plan_handoff(
+            source, proof.family, target, snapshot,
+            {"authenticated": False, "preemptive": True,
+             "window": proof.window, "used_percent": proof.used_percent,
+             "observed_at": proof.event["received_at"]},
+            binding.cwd, cooldown_scope=None, automatic=True,
+            child_generation=child.generation, preemptive=True)
+        route.preflight_cooldowns()
+        handoff.select_target(child.account["name"], snapshot, proof.family,
+                              requested=target["name"])
+        self._proof_current(child, proof)
+        self._events_pending(child)
+        if handoff._transcript_stat(proof.transcript_path) != plan.source_stat:
+            raise SupervisorError("source transcript changed before admission")
+        if proof.deadline <= self.now():
+            raise SupervisorError(
+                "preemptive decision window elapsed before admission")
+        handoff.reserve_automatic(
+            plan, self.now(), loop_window=LOOP_WINDOW, loop_max=LOOP_MAX)
+        self._proof_current(child, proof)
+        self._events_pending(child)
+        if proof.deadline <= self.now():
+            raise SupervisorError(
+                "preemptive decision window elapsed before stop")
+        return plan
+
     @staticmethod
     def _save_terminal():
         if termios is None:
@@ -1227,6 +1622,20 @@ class Supervisor:
         print(f"CLAUDE_CONFIG_DIR={shlex.quote(plan.source.account['home'])} "
               f"{source_argv}", file=sys.stderr)
 
+    @staticmethod
+    def _commit_deadline(plan, proof):
+        """``(deadline, label)``: the instant after which this plan may no
+        longer be executed.
+
+        A cap plan may only proceed while its PROVEN cap reset is still in the
+        future (unchanged). A preemptive plan may only proceed while its short
+        decision window holds — the observation is not a provider refusal, so
+        it must not be allowed to go stale in the supervisor's hands. Both
+        fail closed on a missing or invalid value."""
+        if getattr(proof, "preemptive", False):
+            return getattr(proof, "deadline", None), "preemptive decision window"
+        return plan.cooldown_scope.get("reset"), "cap reset"
+
     def _stop_and_commit(self, child, plan, proof):
         self._proof_current(child, proof)
         self._events_pending(child)
@@ -1236,10 +1645,10 @@ class Supervisor:
             raise SupervisorError(str(error)) from error
         if source_stat != plan.source_stat:
             raise SupervisorError("source transcript changed before stop")
-        reset = plan.cooldown_scope.get("reset")
+        reset, label = self._commit_deadline(plan, proof)
         if (not isinstance(reset, (int, float)) or isinstance(reset, bool)
                 or not math.isfinite(reset) or reset <= self.now()):
-            raise SupervisorError("cap reset elapsed before stop")
+            raise SupervisorError(f"{label} elapsed before stop")
         try:
             handoff.verify_automatic_reservation(plan)
         except (handoff.HandoffError, registry.RegistryError, RuntimeError,
@@ -1250,9 +1659,14 @@ class Supervisor:
         if handoff._transcript_stat(proof.transcript_path) != plan.source_stat:
             raise SupervisorError("source transcript changed before stop")
         if reset <= self.now():
-            raise SupervisorError("cap reset elapsed before stop")
-        print(f"[headroom] cap confirmed; {plan.source.account['name']} -> "
-              f"{plan.target['name']}", file=sys.stderr)
+            raise SupervisorError(f"{label} elapsed before stop")
+        if getattr(proof, "preemptive", False):
+            print(f"[headroom] preemptive rotation ({proof.message}); "
+                  f"{plan.source.account['name']} -> {plan.target['name']}",
+                  file=sys.stderr)
+        else:
+            print(f"[headroom] cap confirmed; {plan.source.account['name']} -> "
+                  f"{plan.target['name']}", file=sys.stderr)
         # take the target lease before we stop the source (P0-2); on failure
         # this raises SupervisorError and the caller keeps the source running
         # and leased
@@ -1271,7 +1685,7 @@ class Supervisor:
                     raise SupervisorError(
                         "source transcript changed before stop")
                 if reset <= self.now():
-                    raise SupervisorError("cap reset elapsed before stop")
+                    raise SupervisorError(f"{label} elapsed before stop")
                 stop_sent_at = self.now()
                 handoff.append_action(
                     plan.handoff_id, "stop_sent", automatic=True,
@@ -1315,7 +1729,8 @@ class Supervisor:
                 print("[headroom] note: the interrupted tool call may re-run on "
                       "resume", file=sys.stderr)
             return Relaunch(plan.target, handoff.resume_argv(result)[1:],
-                            plan.cwd, True, plan.handoff_id, plan)
+                            plan.cwd, True, plan.handoff_id, plan,
+                            reason="preemptive" if plan.preemptive else "cap")
         except Exception as error:  # no post-stop failure may strand the user
             self._failure(plan, "post_stop_failed: " + str(error))
             print(f"[headroom] handoff failed after Claude exited ({error}); "
@@ -1460,6 +1875,10 @@ class Supervisor:
                     if not signals.forwarded:
                         returncode = child.process.poll()
                         if returncode is not None:
+                            # the child is already gone, so forwarding is moot
+                            # and the notifier can no longer delay it — record
+                            # the disarm rather than exiting silently
+                            _lose_supervision(child, "shutdown signal received")
                             return returncode
                         self.sleep(POLL_SECONDS)
                         continue
@@ -1480,6 +1899,13 @@ class Supervisor:
                     _lose_supervision(
                         child, "SessionStart hook never bound within "
                         f"{BIND_TIMEOUT:g}s — auto-handoff is not armed")
+                # Preemptive rotation runs only when no cap proof is in
+                # flight, and it never touches automation — the cap-reactive
+                # path below is unchanged whatever it decides.
+                if self._preemptive_due(child, proof):
+                    outcome = self._preemptive_cycle(child)
+                    if outcome is not None:
+                        return outcome
                 if proof is not None and child.automation:
                     try:
                         plan = self._preflight(child, proof)
@@ -1633,7 +2059,12 @@ class Supervisor:
                     # moment: this is the one place the user can actually see
                     # the handoff happen (anything printed earlier is hidden
                     # by Claude's alternate screen)
-                    if outcome.automatic:
+                    if outcome.automatic and outcome.reason == "preemptive":
+                        print(f"[headroom] {child.account['name']} is nearly "
+                              f"out of headroom, continuing this conversation "
+                              f"on {outcome.account['name']} before it caps",
+                              file=sys.stderr)
+                    elif outcome.automatic:
                         print(f"[headroom] {child.account['name']} hit its "
                               f"limit, continuing this conversation on "
                               f"{outcome.account['name']}",
