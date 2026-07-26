@@ -14,6 +14,7 @@ flock slot lease, caps probe) and the adversarial fixes:
   P1-9  requested leasing FAILS CLOSED on an infrastructure error
   P2-10 caps is command-scoped and honest about `run`
 """
+import dataclasses
 import io
 import json
 import os
@@ -2089,6 +2090,106 @@ class PreemptiveThresholds(TempDirCase):
             ("scoped:fable", 71.0))
 
 
+class TurnCompleteness(TempDirCase):
+    """Quiescence is not idleness: a turn can be silent for minutes while the
+    model thinks, so the newest conversational record decides."""
+
+    def write(self, *events):
+        path = os.path.join(self.temp.name, "t.jsonl")
+        with open(path, "w", encoding="utf-8") as out:
+            for event in events:
+                out.write(json.dumps(event) + "\n")
+        return path
+
+    ASSISTANT = {"type": "assistant", "message": {
+        "model": "claude-fable-5", "content": [{"type": "text", "text": "hi"}]}}
+    PROMPT = {"type": "user", "message": {
+        "content": [{"type": "text", "text": "do the thing"}]}}
+    TOOL_RESULT = {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}}
+
+    def test_finished_assistant_turn_is_complete(self):
+        self.assertEqual(
+            supervisor._turn_is_complete(self.write(self.PROMPT, self.ASSISTANT)),
+            "")
+
+    def test_trailing_bookkeeping_records_do_not_hide_the_turn(self):
+        path = self.write(self.PROMPT, self.ASSISTANT,
+                          {"type": "system", "subtype": "turn_duration"},
+                          {"type": "file-history-snapshot", "id": "x"},
+                          {"type": "summary", "summary": "s"})
+        self.assertEqual(supervisor._turn_is_complete(path), "")
+
+    def test_a_prompt_awaiting_its_answer_is_mid_turn(self):
+        # the reviewer's scenario: the model has been thinking for 70s and
+        # has written nothing, so the transcript is quiet AND mid-turn
+        path = self.write(self.ASSISTANT, self.PROMPT)
+        self.assertIn("awaiting its answer", supervisor._turn_is_complete(path))
+
+    def test_an_unanswered_tool_result_is_mid_turn(self):
+        path = self.write(self.PROMPT, self.ASSISTANT, self.TOOL_RESULT)
+        self.assertIn("awaiting its answer", supervisor._turn_is_complete(path))
+
+    def test_a_live_sidechain_is_mid_turn(self):
+        path = self.write(self.PROMPT, self.ASSISTANT,
+                          dict(self.ASSISTANT, isSidechain=True))
+        self.assertIn("subagent", supervisor._turn_is_complete(path))
+        path = self.write(self.PROMPT, self.ASSISTANT,
+                          {"type": "assistant", "message": dict(
+                              self.ASSISTANT["message"], isSidechain=True)})
+        self.assertIn("subagent", supervisor._turn_is_complete(path))
+
+    def test_no_conversational_record_is_never_complete(self):
+        self.assertIn("no completed assistant turn",
+                      supervisor._turn_is_complete(self.write(
+                          {"type": "system", "subtype": "init"})))
+        self.assertIn("no completed assistant turn",
+                      supervisor._turn_is_complete(
+                          os.path.join(self.temp.name, "missing.jsonl")))
+
+
+class TranscriptTail(TempDirCase):
+    """The poll must not re-parse a whole long session every minute."""
+
+    MODEL = "claude-fable-5-20260701"
+
+    def big(self, model_first=False):
+        path = os.path.join(self.temp.name, "big.jsonl")
+        assistant = json.dumps({"type": "assistant", "message": {
+            "model": self.MODEL, "content": [{"type": "text", "text": "x"}]}})
+        filler = json.dumps({"type": "user", "message": {"content": [
+            {"type": "text", "text": "f" * 200}]}})
+        with open(path, "w", encoding="utf-8") as out:
+            if model_first:
+                out.write(assistant + "\n")
+            for _ in range(400):
+                out.write(filler + "\n")
+            if not model_first:
+                out.write(assistant + "\n")
+        return path
+
+    def test_only_the_tail_is_read_and_parsed(self):
+        path = self.big()
+        with mock.patch.object(supervisor, "TRANSCRIPT_TAIL_BYTES", 4096):
+            records, complete = supervisor._transcript_records(path)
+            self.assertFalse(complete)
+            self.assertLess(len(records), 401)
+            # every parsed record is whole — the boundary record is dropped
+            self.assertTrue(all(isinstance(row, dict) for row in records))
+            self.assertEqual(supervisor._transcript_model(path), self.MODEL)
+
+    def test_whole_file_fallback_only_when_the_tail_proves_nothing(self):
+        path = self.big(model_first=True)
+        with mock.patch.object(supervisor, "TRANSCRIPT_TAIL_BYTES", 4096):
+            self.assertEqual(supervisor._transcript_model(path), self.MODEL)
+
+    def test_short_transcripts_are_read_whole(self):
+        path = self.big()
+        records, complete = supervisor._transcript_records(path)
+        self.assertTrue(complete)
+        self.assertEqual(len(records), 401)
+
+
 class PreemptiveRotation(TempDirCase):
     """The whole preemptive path against real transcripts, a real registry and
     the real handoff ledger — only the child process and the stop are faked."""
@@ -2312,6 +2413,174 @@ class PreemptiveRotation(TempDirCase):
                          ["preemptive_held"])
         self.assertTrue(self.child.automation)
 
+    def test_long_quiet_mid_turn_child_is_never_stopped(self):
+        # the transcript has been silent far longer than the idle window, but
+        # its newest record is an unanswered prompt: the model is thinking
+        with open(self.transcript, "a", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "think hard"}]}}) + "\n")
+        self.idle(seconds=3600)
+        runner = self.runner()
+        with mock.patch.object(runner, "_stop_and_commit") as stop, \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            self.assertIsNone(runner._preemptive_cycle(self.child))
+        stop.assert_not_called()
+        held = [event for event in self.events(emit)
+                if event["event"] == "preemptive_held"]
+        self.assertIn("mid-turn", held[0]["reason"])
+        self.assertIn("awaiting its answer", held[0]["reason"])
+        self.assertEqual(self.ledger(), [])
+        self.assertTrue(self.child.automation)
+
+    def stopped_plan(self, runner):
+        """A fully admitted preemptive plan, ready to stop the child."""
+        with mock.patch.object(notify, "emit"), redirect_stderr(io.StringIO()):
+            proof, snapshot = runner._preemptive_observation(self.child)
+            plan = runner._preemptive_preflight(self.child, proof, snapshot)
+        with open(self.child.event_path, "w", encoding="utf-8"):
+            pass          # the stop guard needs a real (empty) journal
+        return plan, proof
+
+    def test_a_turn_starting_during_the_stop_write_aborts_the_kill(self):
+        runner = self.runner()
+        plan, proof = self.stopped_plan(runner)
+        real_append = handoff.append_action
+
+        def append(handoff_id, action, **fields):
+            record = real_append(handoff_id, action, **fields)
+            if action == "stop_sent":
+                # the user hit enter while the durable stop_sent write was in
+                # flight — the exact TOCTOU window before SIGTERM
+                with open(self.transcript, "a", encoding="utf-8") as out:
+                    out.write(json.dumps({"type": "user", "message": {
+                        "content": [{"type": "text", "text": "one more"}]}})
+                        + "\n")
+            return record
+
+        kills = []
+        with mock.patch.object(handoff, "append_action", side_effect=append), \
+                mock.patch.object(supervisor.os, "kill",
+                                  side_effect=lambda pid, sig: kills.append(sig)), \
+                mock.patch.object(runner, "_wait_stopped", return_value=0), \
+                redirect_stderr(io.StringIO()):
+            with self.assertRaises(supervisor.SupervisorError) as caught:
+                runner._stop_and_commit(self.child, plan, proof)
+        self.assertEqual(kills, [])          # the child was never signalled
+        self.assertIn("edge of a preemptive stop", str(caught.exception))
+        self.assertTrue(self.child.automation)
+
+    def test_stop_edge_refuses_a_transcript_that_became_mid_turn(self):
+        runner = self.runner()
+        _, proof = self.stopped_plan(runner)
+        with open(self.transcript, "a", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "one more"}]}}) + "\n")
+        # stat matches (as it would if the record landed before the stat) but
+        # the conversation is now mid-turn
+        plan = mock.Mock(source_stat=handoff._transcript_stat(self.transcript))
+        with self.assertRaisesRegex(supervisor.SupervisorError,
+                                    "became mid-turn"):
+            runner._preemptive_stop_edge(plan, proof)
+
+    def test_aborted_rotation_recovers_the_source_with_supervision_on(self):
+        runner = self.runner()
+        plan, proof = self.stopped_plan(runner)
+
+        def wait(child, _proof, stop_sent_at):
+            child.session_ended = True
+            child.session_end_received_at = stop_sent_at + 0.1
+            return 0
+
+        with mock.patch.object(supervisor.os, "kill"), \
+                mock.patch.object(runner, "_wait_stopped", side_effect=wait), \
+                mock.patch.object(
+                    runner, "_post_stop_plan",
+                    side_effect=handoff.HandoffError(
+                        "session stopped mid-tool-call (unresolved: t1)")), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            outcome = runner._stop_and_commit(self.child, plan, proof)
+        self.assertEqual(outcome.account["name"], "source")
+        self.assertEqual(outcome.reason, "preemptive_aborted")
+        self.assertFalse(outcome.automatic)
+        self.assertTrue(outcome.supervised)     # recovered SUPERVISED
+        self.assertTrue(self.child.automation)
+        self.assertFalse(self.child.supervision_loss_notified)
+        self.assertNotIn("supervision_lost",
+                         [event["event"] for event in self.events(emit)])
+        # and the recovered child is not immediately re-targeted
+        self.assertEqual(runner.preemptive_hold_until,
+                         self.clock["t"] + supervisor.PREEMPT_BACKOFF_SECONDS)
+        self.assertFalse(runner._preemptive_due(self.child, None))
+
+    def test_post_stop_dangling_transcript_is_refused_only_when_preemptive(self):
+        runner = self.runner()
+        plan, _ = self.stopped_plan(runner)
+        # the stop caught a tool call after all
+        with open(self.transcript, "a", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "assistant", "message": {
+                "model": "claude-fable-5-20260701",
+                "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                             "input": {}}]}}) + "\n")
+        self.idle(seconds=600)
+        with self.assertRaisesRegex(handoff.HandoffError, "mid-tool-call"):
+            runner._post_stop_plan(plan)
+        # a CAP stop had no alternative, so it still publishes (with the
+        # "may re-run on resume" notice) — that behaviour is unchanged
+        cap_plan = dataclasses.replace(plan, preemptive=False)
+        self.assertEqual(
+            runner._post_stop_plan(cap_plan).inspected["unresolved_tool_ids"],
+            ("t1",))
+
+    def test_run_relaunches_an_aborted_rotation_supervised(self):
+        runner = self.runner()
+        spawned = []
+
+        def spawn(account, args, cwd, automatic, plan=None):
+            spawned.append(automatic)
+            child = mock.Mock()
+            child.account = account
+            child.generation = len(spawned)
+            return child
+
+        for supervised, expected in ((True, [True, True]),
+                                     (None, [True, False])):
+            spawned.clear()
+            outcomes = iter([supervisor.Relaunch(
+                self.source, ["--resume", self.SID], self.cwd, False,
+                reason="preemptive_aborted", supervised=supervised), 0])
+            with mock.patch.object(runner, "_spawn", side_effect=spawn), \
+                    mock.patch.object(
+                        runner, "_monitor",
+                        side_effect=lambda child, pending="": next(outcomes)), \
+                    redirect_stderr(io.StringIO()):
+                self.assertEqual(runner.run(), 0)
+            self.assertEqual(spawned, expected, supervised)
+
+    def test_cap_hook_during_the_stop_transition_is_absorbed(self):
+        runner = self.runner()
+        _, proof = self.stopped_plan(runner)
+        record = {"schema": "headroom_hook_event@1",
+                  "supervisor_id": os.path.splitext(
+                      os.path.basename(self.child.event_path))[0],
+                  "generation": 1, "source_slot": "source",
+                  "config_dir": self.source["home"], "matcher": "rate_limit",
+                  "received_at": self.clock["t"] + 1,
+                  "payload": {"hook_event_name": "StopFailure",
+                              "session_id": self.SID,
+                              "transcript_path": self.transcript,
+                              "cwd": self.cwd, "error": "rate_limit"}}
+        self.child.pending_cap = supervisor.PendingCap(
+            {}, self.SID, self.transcript, 1, self.clock["t"], self.clock["t"])
+        with mock.patch.object(supervisor, "_read_events",
+                               return_value=[record]), \
+                redirect_stderr(io.StringIO()):
+            # must NOT raise "cap proof expired during the stop transition"
+            runner._consume_stop_events(self.child, proof, self.clock["t"])
+        self.assertIsNone(self.child.pending_cap)
+        self.assertTrue(self.child.automation)
+
     def test_target_that_is_itself_near_its_limit_is_never_moved_onto(self):
         snapshot = self.usage()
         target = snapshot["accounts"][1]
@@ -2326,6 +2595,54 @@ class PreemptiveRotation(TempDirCase):
                 if event["event"] == "preemptive_held"]
         self.assertIn("itself near its limit", held[0]["reason"])
         self.assertEqual(self.ledger(), [])
+        self.assertTrue(self.child.automation)
+
+    def test_near_limit_top_candidate_is_skipped_for_a_healthy_lower_one(self):
+        # Claude ranking is Fable-headroom-primary, so the FIRST candidate can
+        # be the one over the 7d threshold while a healthy seat sits below it
+        # in the ranking. Walk the list instead of backing off on the leader.
+        seats = [self.source]
+        for name in ("target-a", "target-b"):
+            account = self.account(name)
+            os.makedirs(os.path.join(account["home"], "projects"),
+                        exist_ok=True)
+            seats.append(account)
+        registry.save({"schema_version": 1, "accounts": seats})
+        captured = int(self.clock["t"])
+        snapshot = self.usage()
+        snapshot["accounts"].pop()            # drop the fixture's "target"
+        for name, scoped, seven in (("target-a", 5.0, 97.0),
+                                    ("target-b", 60.0, 20.0)):
+            row = usage_row(name, used7=seven, captured=captured)
+            row["windows"]["scoped:Fable"] = {
+                "used_percent": scoped, "resets_at": captured + 6 * 86400,
+                "window_minutes": 10080}
+            snapshot["accounts"].append(row)
+        runner = self.runner(snapshot)
+        # the leader really is the near-limit seat
+        ranked = [account["name"] for account, reason
+                  in route.candidates("fable", snapshot) if reason is None]
+        self.assertEqual(ranked[0], "target-a")
+        self.assertIn("target-b", ranked)
+        with mock.patch.object(notify, "emit"), redirect_stderr(io.StringIO()):
+            proof, snap = runner._preemptive_observation(self.child)
+            plan = runner._preemptive_preflight(self.child, proof, snap)
+        self.assertEqual(plan.target["name"], "target-b")
+
+    def test_every_target_near_its_limit_backs_off_with_a_named_reason(self):
+        snapshot = self.usage()
+        snapshot["accounts"][1]["windows"]["7d"]["used_percent"] = 97.0
+        runner = self.runner(snapshot)
+        with mock.patch.object(runner, "_stop_and_commit") as stop, \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            self.assertIsNone(runner._preemptive_cycle(self.child))
+        stop.assert_not_called()
+        held = [event for event in self.events(emit)
+                if event["event"] == "preemptive_held"]
+        self.assertIn("itself near its limit: target", held[0]["reason"])
+        self.assertEqual(self.child.preemptive_next_check,
+                         self.clock["t"] + supervisor.PREEMPT_BACKOFF_SECONDS)
         self.assertTrue(self.child.automation)
 
     def test_guard_refusal_falls_back_cleanly_to_cap_reactive(self):

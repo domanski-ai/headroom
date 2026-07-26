@@ -122,7 +122,8 @@ def main():
 
     cap_slots = set(filter(None, os.environ.get("FAKE_CAP_SLOTS", "source").split(",")))
     is_resume = "--resume" in args
-    if scenario in ("handoff", "delayed-flush", "idle") and is_resume:
+    if scenario in ("handoff", "delayed-flush", "idle",
+                    "idle-cap-on-stop") and is_resume:
         time.sleep(0.35)
         return 0
     if scenario == "missing-end" and is_resume:
@@ -133,13 +134,16 @@ def main():
         return 0
 
     # "idle": a bound, quiescent session that never caps — the child the
-    # preemptive path must be able to rotate at a safe boundary
-    if scenario not in ("corrupt", "delayed-flush", "idle"):
+    # preemptive path must be able to rotate at a safe boundary.
+    # "idle-cap-on-stop": the same, but the seat caps while the preemptive
+    # stop is already in flight (StopFailure fired from the SIGTERM handler).
+    idle_scenarios = ("idle", "idle-cap-on-stop")
+    if scenario not in ("corrupt", "delayed-flush") + idle_scenarios:
         append_event(transcript, cap_event)
 
     message = "rate limit: try again" if scenario == "transient" else \
         "You've hit your session limit · resets 12:20pm (UTC)"
-    if scenario != "idle":
+    if scenario not in idle_scenarios:
         hook(settings, "StopFailure", dict(
             common, hook_event_name="StopFailure", error="rate_limit",
             last_assistant_message=message))
@@ -183,6 +187,12 @@ def main():
                 continue
             append_event(transcript, {"type": "system",
                                       "subtype": "sigterm_flush"})
+            if scenario == "idle-cap-on-stop":
+                # the seat caps while the rotation is already stopping us:
+                # the hook lands between SIGTERM and SessionEnd
+                hook(settings, "StopFailure", dict(
+                    common, hook_event_name="StopFailure", error="rate_limit",
+                    last_assistant_message="You've hit your session limit"))
             if scenario != "missing-end":
                 hook(settings, "SessionEnd",
                      dict(common, hook_event_name="SessionEnd", reason="other"))

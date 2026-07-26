@@ -322,6 +322,47 @@ class TranscriptAndTransaction(unittest.TestCase):
         self.assertIn("loop guard", next(
             outcome[1] for outcome in outcomes if outcome[0] == "error"))
 
+    def aborted_admission(self, target="old"):
+        """A reservation released by a failure that never stopped a child."""
+        handoff_id = str(__import__("uuid").uuid4())
+        handoff.append_action(handoff_id, "cap_confirmed", automatic=True,
+                              source_slot="source", target_slot=target,
+                              old_session_id=self.SID)
+        handoff.append_action(handoff_id, "failure", automatic=True,
+                              source_slot="source", target_slot=target,
+                              reason="preemptive_pre_stop_failed: raced",
+                              old_session_id=self.SID)
+        return handoff_id
+
+    def test_aborted_admissions_do_not_consume_the_loop_budget(self):
+        # the composition that matters: several preemptive attempts reserve a
+        # target and are released without ever stopping a child, then a REAL
+        # cap arrives inside the same ten minutes. It must still hand off —
+        # otherwise aborted optimisations disable supervision.
+        for _ in range(3):
+            self.aborted_admission()
+        record = handoff.reserve_automatic(self.automatic_plan())
+        self.assertEqual(record["action"], "cap_confirmed")
+
+    def test_admissions_that_stopped_a_child_still_trip_the_loop_guard(self):
+        for _ in range(3):
+            handoff_id = self.aborted_admission()
+            # this one really did stop a session before failing
+            handoff.append_action(handoff_id, "stop_sent", automatic=True,
+                                  source_slot="source",
+                                  old_session_id=self.SID)
+        with self.assertRaisesRegex(handoff.HandoffError, "loop guard"):
+            handoff.reserve_automatic(self.automatic_plan())
+
+    def test_in_flight_admissions_still_count(self):
+        for _ in range(3):
+            handoff.append_action(
+                str(__import__("uuid").uuid4()), "cap_confirmed",
+                automatic=True, source_slot="source", target_slot="old",
+                old_session_id=self.SID)
+        with self.assertRaisesRegex(handoff.HandoffError, "loop guard"):
+            handoff.reserve_automatic(self.automatic_plan())
+
     def test_malformed_automatic_ledger_row_holds_admission(self):
         handoff.append_ledger({
             "ts": "recent", "handoff_id": str(__import__("uuid").uuid4()),
@@ -1693,6 +1734,35 @@ class PreemptiveIntegration(unittest.TestCase):
         self.assertEqual(self.ledger_rows(), [])
         events = [call.args[0]["event"] for call in emit.call_args_list]
         self.assertEqual(events, ["launch"])
+
+    def test_cap_landing_during_the_preemptive_stop_is_absorbed(self):
+        # the race the rotation was trying to beat: the seat caps AFTER the
+        # SIGTERM and BEFORE SessionEnd. The in-flight handoff is already
+        # doing what the cap demands, so it must complete — never abort into
+        # an unsupervised source.
+        os.environ["FAKE_CLAUDE_SCENARIO"] = "idle-cap-on-stop"
+        runner = supervisor.Supervisor("sonnet", [], self.accounts[0],
+                                       collect_fn=self.usage(96.0))
+        with mock.patch.object(notify, "emit") as emit:
+            self.assertEqual(runner.run(), 0)
+        session = self.source_session_id()
+        self.assertTrue(os.path.exists(os.path.join(
+            self.accounts[1]["home"], "projects", "fake-project",
+            session + ".jsonl")))
+        actions = [row.get("action") for row in self.ledger_rows()]
+        self.assertIn("staged", actions)
+        self.assertIn("resume_bound", actions)
+        events = [call.args[0]["event"] for call in emit.call_args_list]
+        self.assertIn("preemptive_handoff", events)
+        self.assertNotIn("supervision_lost", events)
+        with open(os.path.join(self.fake_state, "launches.jsonl"),
+                  encoding="utf-8") as source:
+            launches = [json.loads(line) for line in source]
+        # the session resumed on the TARGET, supervised (a settings file is
+        # only passed to a supervised child)
+        self.assertEqual(launches[1]["config_dir"], self.accounts[1]["home"])
+        self.assertEqual(launches[1]["args"],
+                         ["--resume", session, "--fork-session"])
 
     def test_no_healthy_target_leaves_the_idle_child_running(self):
         def snapshot(quiet=True):

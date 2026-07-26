@@ -1138,11 +1138,24 @@ def reserve_automatic(plan, now=None, *, loop_window=600.0, loop_max=3):
                          if row.get("automatic") is True
                          and row.get("action") == "cap_confirmed"
                          and row["ts"] >= cutoff]
-            if len(confirmed) >= loop_max:
-                raise HandoffError(
-                    "automatic handoff loop guard: 3 handoffs in 10 minutes")
             released = {row.get("handoff_id") for row in rows
                         if row.get("action") in ("failure", "resume_bound")}
+            # The loop guard exists to stop a session being THRASHED between
+            # accounts, so it counts admissions that actually touched a
+            # session: one that reached `stop_sent`, or one still in flight.
+            # An admission that was released by a failure WITHOUT ever
+            # stopping the child moved nothing and must not consume the
+            # budget — otherwise a few aborted (e.g. preemptive) attempts
+            # exhaust the allowance and the next GENUINE cap is refused,
+            # disabling supervision exactly when it is needed.
+            stopped = {row.get("handoff_id") for row in rows
+                       if row.get("action") == "stop_sent"}
+            effective = [row for row in confirmed
+                         if row.get("handoff_id") in stopped
+                         or row.get("handoff_id") not in released]
+            if len(effective) >= loop_max:
+                raise HandoffError(
+                    "automatic handoff loop guard: 3 handoffs in 10 minutes")
             for row in confirmed:
                 until = row.get("reservation_until")
                 until = until if _number(until) else \

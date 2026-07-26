@@ -69,7 +69,11 @@ record without overwriting anything in the target account, and resumes with a
 forked session. The source transcript is never modified. If post-stop
 validation fails, the source session is relaunched
 with automation disabled. Three automatic handoffs in any rolling ten minutes
-trips the loop guard; the fourth child stays alive.
+trips the loop guard; the fourth child stays alive. The guard counts
+admissions that actually *touched* a session — one that reached its stop, or
+one still in flight — so an admission released without ever stopping a child
+(an aborted preemptive attempt, a lost target race) cannot spend the budget a
+genuine cap needs.
 
 Turn it off in `headroom setup`, or explicitly in config:
 
@@ -92,18 +96,29 @@ supervisor also watches the usage feed it already collects and rotates
 running (e.g. fable) or **95%** of the all-model weekly window, *and* a target
 seat with proven headroom exists, *and* the child is idle.
 
-"Idle" means no active turn: the session transcript must have been quiet for a
-full minute, no hook event may be pending, and a session stopped mid-tool-call
-is never moved early. The rotation itself is the same pipeline as the cap
-path — staging, target identity verification, slot leases, ledger admission,
-the same three-per-ten-minutes loop guard, resume with `--fork-session`.
-Nothing is cooled, because the seat is not capped, and the handoff is recorded
-with `"reason": "preemptive"`.
+"Idle" means no active turn, and quiet is not enough to prove that — a model
+can think silently for minutes. So the transcript must have been quiet for a
+full minute **and** its newest conversational record must be a finished
+assistant turn: a prompt still awaiting its answer, an unanswered tool result,
+or a live subagent all mean a turn is in flight and the session stays put. No
+hook event may be pending, a session stopped mid-tool-call is never moved
+early, and idleness is re-proven on the very edge of the stop, after the
+durable ledger write, so a turn that starts in that window cancels the stop
+instead of being killed by it.
+
+The rotation itself is the same pipeline as the cap path — staging, target
+identity verification, slot leases, ledger admission, the same
+three-per-ten-minutes loop guard, resume with `--fork-session`. Nothing is
+cooled, because the seat is not capped, and the handoff is recorded with
+`"reason": "preemptive"`.
 
 Preemptive rotation is strictly an optimisation on top of the cap-reactive
-guarantee: **any** refusal — no proven target, a busy child, a guard holding,
-a target that is itself near its limit — only defers (with a backoff, so a
-stranded session never thrashes) and leaves cap handoff fully armed. It is on
+guarantee: **any** refusal — no proven target (near-limit seats are skipped in
+favour of a healthy one further down the ranking), a busy child, a guard
+holding — only defers (with a backoff, so a stranded session never thrashes)
+and leaves cap handoff fully armed. If a rotation is aborted *after* the child
+has stopped, the session is recovered on its own seat with auto-handoff still
+armed — an elective rotation never costs you the guarantee. It is on
 by default; `HEADROOM_PREEMPTIVE=0` is the one-run kill switch, and the
 thresholds are config:
 

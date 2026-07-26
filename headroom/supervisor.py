@@ -64,6 +64,9 @@ PREEMPT_DECISION_TTL = max(PREEMPT_IDLE_SECONDS + 10.0, float(
 # private collect (a running `headroom serve` refreshes it continuously)
 PREEMPT_SNAPSHOT_MAX_AGE = max(30, paths.env_int(
     "HEADROOM_PREEMPTIVE_SNAPSHOT_MAX_AGE", 300))
+# how much of a transcript's END the poll parses (see _transcript_records)
+TRANSCRIPT_TAIL_BYTES = max(64 * 1024, paths.env_int(
+    "HEADROOM_TRANSCRIPT_TAIL_BYTES", 256 * 1024))
 
 # A subscription cap surfaces two ways: the classic "hit your … limit" wording,
 # and — for a scoped-model weekly cap (e.g. Fable) — "You're out of usage
@@ -203,6 +206,12 @@ class Relaunch:
     handoff_id: str = ""
     plan: object = None
     reason: str = "cap"
+    # Whether the relaunched child is supervised. None = "same as automatic",
+    # which is every pre-existing case: an automatic rotation is supervised
+    # and a cap recovery deliberately is not. Only an ABORTED preemptive
+    # rotation sets it independently — that source is not capped, so it is
+    # recovered with auto-handoff still armed.
+    supervised: object = None
 
 
 def _lose_supervision(child, reason):
@@ -708,6 +717,45 @@ def _number(value):
             and math.isfinite(value))
 
 
+def _transcript_records(path, whole=False):
+    """``(records, complete)`` parsed from the END of a transcript.
+
+    Everything the preemptive poll asks of a transcript — the model in use,
+    whether the newest turn finished — lives at its end, so read a bounded
+    tail rather than the whole session: a full parse every minute is
+    O(session size) work on the one loop that also has to ingest hooks and
+    prove caps. ``complete`` says whether the tail covered the whole file, so
+    a caller that found nothing can decide to pay for the full read."""
+    try:
+        with open(path, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            complete = whole or size <= TRANSCRIPT_TAIL_BYTES
+            if not complete:
+                handle.seek(size - TRANSCRIPT_TAIL_BYTES)
+                handle.readline()  # drop the partial record at the boundary
+            data = handle.read()
+    except OSError:
+        return [], False
+    records = []
+    for raw in data.splitlines():
+        if not raw.strip():
+            continue
+        try:
+            event = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError, json.JSONDecodeError):
+            continue
+        records.append(event)
+    return records, complete
+
+
+def _last_assistant_model(records):
+    for event in reversed(records):
+        model = _real_assistant_model(event)
+        if model:
+            return model
+    return ""
+
+
 def _transcript_model(path):
     """The model this session is CURRENTLY running: the last real assistant
     model in the transcript.
@@ -716,20 +764,44 @@ def _transcript_model(path):
     reason — it reflects in-session ``/model`` switches, unlike the model
     named at SessionStart. Unreadable/absent yields "" and the caller falls
     back to the bound SessionStart model."""
-    try:
-        with open(path, "rb") as handle:
-            lines = [line for line in handle.read().splitlines() if line.strip()]
-    except OSError:
-        return ""
-    for raw in reversed(lines):
-        try:
-            event = json.loads(raw.decode("utf-8"))
-        except (UnicodeError, ValueError, json.JSONDecodeError):
+    records, complete = _transcript_records(path)
+    model = _last_assistant_model(records)
+    if model or complete:
+        return model
+    # a tail full of tool traffic with no assistant record is possible on a
+    # huge session — only then pay for the whole file
+    return _last_assistant_model(_transcript_records(path, whole=True)[0])
+
+
+def _turn_is_complete(path):
+    """"" when the transcript's newest conversational record is a FINISHED
+    main-thread assistant turn; otherwise why the child may be MID-TURN.
+
+    Transcript quiescence alone is not proof of idleness: a turn can stay
+    silent for minutes while the model thinks or waits on a remote response,
+    and throughout that silence the newest conversational record is the
+    user's prompt (or a tool_result the model has not answered yet). So the
+    newest ``user``/``assistant`` record must be a main-thread assistant
+    record. Trailing bookkeeping records (system turn_duration, last-prompt,
+    file-history-snapshot, summary) are skipped — Claude writes those after a
+    turn ends, as the cap-evidence scanner already documents."""
+    records, complete = _transcript_records(path)
+    for event in reversed(records):
+        if not isinstance(event, dict):
             continue
-        model = _real_assistant_model(event)
-        if model:
-            return model
-    return ""
+        kind = event.get("type")
+        if kind not in ("user", "assistant"):
+            continue
+        message = event.get("message")
+        if event.get("isSidechain") is True or (
+                isinstance(message, dict)
+                and message.get("isSidechain") is True):
+            return "a subagent turn is still in flight"
+        if kind == "user":
+            return "a prompt is still awaiting its answer"
+        return ""
+    return ("no completed assistant turn in the transcript" if complete
+            else "no completed assistant turn in the transcript tail")
 
 
 def _capacity_reasons(family):
@@ -884,6 +956,9 @@ class Supervisor:
         self.preemptive = registry.preemptive_handoff()
         self.preemptive_scoped, self.preemptive_overall = \
             registry.preemptive_thresholds()
+        # a supervisor-wide hold that survives a child swap, so an aborted
+        # rotation cannot immediately re-target the recovered session
+        self.preemptive_hold_until = 0.0
         self.generation = 0
         self.settings_files = []
         # True once ANY child CLI process has been successfully spawned —
@@ -1310,6 +1385,35 @@ class Supervisor:
             deadline=observed_at + PREEMPT_DECISION_TTL)
         return proof, snapshot
 
+    def _preemptive_target(self, child, family, snapshot):
+        """The best seat that is BOTH routable and not itself near the
+        preemptive threshold.
+
+        Ranking is Fable-headroom-primary, so for an Opus/Sonnet or overall-7d
+        crossing the top-ranked candidate can easily be the one already over
+        the relevant threshold — rejecting only that one and backing off would
+        strand a session while a healthy seat sat two places down the list.
+        Walk the ranking instead, skipping near-limit seats (moving onto one
+        would just be undone by the next poll), and re-run the full
+        select_target gate on the winner so nothing bypasses it."""
+        source = child.account["name"]
+        skipped = []
+        for account, reason in route.candidates(family, snapshot):
+            if reason is not None or account.get("name") == source:
+                continue
+            if self._threshold_crossing(
+                    family,
+                    _snapshot_row(snapshot, account["name"])) is not None:
+                skipped.append(account["name"])
+                continue
+            return handoff.select_target(source, snapshot, family,
+                                         requested=account["name"])
+        detail = (f" (skipped, itself near its limit: {', '.join(skipped)})"
+                  if skipped else "")
+        raise SupervisorError(
+            f"no target with proven headroom for the {family} family"
+            f"{detail}")
+
     def _preemptive_due(self, child, proof):
         """True when this tick may attempt a preemptive rotation.
 
@@ -1320,7 +1424,8 @@ class Supervisor:
         return (self.preemptive and proof is None and child.automation
                 and child.binding is not None and child.pending_cap is None
                 and not child.session_ended
-                and self.now() >= child.preemptive_next_check)
+                and self.now() >= child.preemptive_next_check
+                and self.now() >= self.preemptive_hold_until)
 
     def _preemptive_defer(self, child, reason, *, backoff=True, announce=True):
         """Hold this rotation without disarming anything.
@@ -1367,10 +1472,9 @@ class Supervisor:
         proof, snapshot = observed
         try:
             # reuse the ranked route selection: no proven target, no rotation
-            handoff.select_target(child.account["name"], snapshot, proof.family)
+            self._preemptive_target(child, proof.family, snapshot)
         except Exception as error:  # noqa: BLE001
-            self._preemptive_defer(
-                child, f"no target with proven headroom: {error}")
+            self._preemptive_defer(child, str(error))
             return None
         if not child.preemptive_announced:
             child.preemptive_announced = True
@@ -1433,6 +1537,12 @@ class Supervisor:
         handoff.guard_source_stable(
             proof.transcript_path, now=self.now(),
             sleep=lambda _seconds: None, quiet_seconds=PREEMPT_IDLE_SECONDS)
+        # ...and quiescence is not idleness: the newest conversational record
+        # must be a FINISHED assistant turn, or a model thinking silently for
+        # longer than the quiet window would be killed mid-response.
+        turn = _turn_is_complete(proof.transcript_path)
+        if turn:
+            raise SupervisorError("child is mid-turn: " + turn)
         if handoff._transcript_stat(proof.transcript_path) \
                 != proof.transcript_stat:
             raise SupervisorError(
@@ -1442,17 +1552,7 @@ class Supervisor:
             _snapshot_row(snapshot, child.account["name"]), self.now())
         if reason:
             raise SupervisorError(reason)
-        target = handoff.select_target(child.account["name"], snapshot,
-                                       proof.family)
-        # Never rotate ONTO a seat that has itself crossed the threshold: the
-        # next poll would move the session straight back off it. The ledger
-        # loop guard is a backstop against ping-pong, not a plan — and holding
-        # here simply leaves the cap-reactive path to do its job.
-        if self._threshold_crossing(
-                proof.family,
-                _snapshot_row(snapshot, target["name"])) is not None:
-            raise SupervisorError(
-                f"best target {target['name']} is itself near its limit")
+        target = self._preemptive_target(child, proof.family, snapshot)
         binding = child.binding
         source = handoff.SourceSession(
             proof.session_id, proof.transcript_path, child.account,
@@ -1541,6 +1641,22 @@ class Supervisor:
                 binding = child.binding
                 child.binding = replace(binding, cwd=cwd)
                 continue
+            if hook_name == "StopFailure" \
+                    and source.session_id == proof.session_id \
+                    and source.transcript_path == proof.transcript_path \
+                    and epoch == proof.epoch:
+                # A cap landing on THIS session while we are already stopping
+                # it is corroboration, not contradiction: the handoff in
+                # flight is doing exactly what the cap demands, and its target
+                # was proven and reserved moments ago. Absorb it. Treating it
+                # as an unexpected event aborted a committed stop and left the
+                # recovered child unsupervised — losing the cap-reactive
+                # guarantee at the one moment it is needed. Most valuable for
+                # a preemptive stop (the seat capping mid-rotation is exactly
+                # the race the rotation was trying to beat), but the cap path
+                # gets the same protection from a repeated StopFailure.
+                child.pending_cap = None
+                continue
             if hook_name != "SessionEnd":
                 raise SupervisorError(
                     "cap proof expired during the stop transition")
@@ -1565,8 +1681,13 @@ class Supervisor:
             if self.now() >= deadline:
                 raise SupervisorError("final transcript did not become quiet")
             self.sleep(min(POLL_SECONDS, max(0.0, QUIET_SECONDS - age)))
+        # A cap stop may only ever produce a dangling transcript (the session
+        # was refused mid-turn and there was no alternative), so it is allowed
+        # through with the "may re-run on resume" notice. A PREEMPTIVE stop was
+        # elective: if it caught a turn after all, refuse to fork a broken
+        # conversation and let the caller recover the source instead.
         inspected = handoff.inspect_transcript(
-            plan.source.transcript_path, allow_dangling=True)
+            plan.source.transcript_path, allow_dangling=not plan.preemptive)
         final_stat = handoff._transcript_stat(plan.source.transcript_path)
         if final_stat[:2] != plan.source_stat[:2] or final_stat != signature:
             raise SupervisorError("final transcript identity or stat changed")
@@ -1621,6 +1742,17 @@ class Supervisor:
             ["claude", "--resume", plan.source.session_id])
         print(f"CLAUDE_CONFIG_DIR={shlex.quote(plan.source.account['home'])} "
               f"{source_argv}", file=sys.stderr)
+
+    @staticmethod
+    def _preemptive_stop_edge(plan, proof):
+        """Last-instant idleness proof, immediately before SIGTERM."""
+        if handoff._transcript_stat(proof.transcript_path) != plan.source_stat:
+            raise SupervisorError(
+                "source transcript changed on the edge of a preemptive stop")
+        turn = _turn_is_complete(proof.transcript_path)
+        if turn:
+            raise SupervisorError(
+                "child became mid-turn before the preemptive stop: " + turn)
 
     @staticmethod
     def _commit_deadline(plan, proof):
@@ -1692,6 +1824,14 @@ class Supervisor:
                     source_slot=plan.source.account["name"],
                     old_session_id=plan.source.session_id,
                     child_generation=plan.child_generation)
+                if plan.preemptive:
+                    # The durable stop_sent append above is a locked, fsync'd
+                    # ledger write — milliseconds during which the child may
+                    # start a turn. A cap stop has to proceed regardless (the
+                    # session is refused anyway), but a preemptive stop is
+                    # ELECTIVE, so re-prove idleness on the very edge of the
+                    # kill, narrowing the window to a single stat syscall.
+                    self._preemptive_stop_edge(plan, proof)
                 os.kill(child.process.pid, signal.SIGTERM)
                 signal_sent = True
             returncode = self._wait_stopped(child, proof, stop_sent_at)
@@ -1733,6 +1873,20 @@ class Supervisor:
                             reason="preemptive" if plan.preemptive else "cap")
         except Exception as error:  # no post-stop failure may strand the user
             self._failure(plan, "post_stop_failed: " + str(error))
+            if plan.preemptive:
+                # An ELECTIVE rotation must never leave the user worse off
+                # than not rotating. The source is not capped, so recovering
+                # it with supervision OFF (the cap path's correct answer, since
+                # a capped source would just try to hand off again) would trade
+                # a saved wall for a lost guarantee. Recover it SUPERVISED and
+                # hold the poll so the recovered child is not targeted again.
+                print(f"[headroom] preemptive handoff aborted after Claude "
+                      f"exited ({error}); recovering the session on "
+                      f"{plan.source.account['name']} with auto-handoff still "
+                      f"armed", file=sys.stderr)
+                self.preemptive_hold_until = self.now() + PREEMPT_BACKOFF_SECONDS
+                return replace(self._source_relaunch(plan),
+                               reason="preemptive_aborted", supervised=True)
             print(f"[headroom] handoff failed after Claude exited ({error}); "
                   "relaunching the source with automation off", file=sys.stderr)
             # the source will be relaunched UNsupervised — notify the loss once
@@ -2073,7 +2227,8 @@ class Supervisor:
                         print(f"[headroom] recovering your session on "
                               f"{outcome.account['name']}", file=sys.stderr)
                     account, args, cwd = outcome.account, outcome.argv, outcome.cwd
-                    automatic = outcome.automatic
+                    automatic = (outcome.automatic if outcome.supervised is None
+                                 else bool(outcome.supervised))
                     pending_handoff_id = outcome.handoff_id
                     pending_plan = outcome.plan if outcome.automatic else None
                     continue
