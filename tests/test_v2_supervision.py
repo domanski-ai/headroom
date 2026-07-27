@@ -1601,6 +1601,33 @@ class UserSettingsAreMergedNotObeyed(TempDirCase):
         self.assertNotIn("sk-super-secret", errors.getvalue())
         self.assertIn("<inline JSON>", errors.getvalue())
 
+    def test_the_equals_form_is_redacted_on_the_supervised_surface(self):
+        # `--settings={…}` is ONE token beginning with a dash: the whole
+        # document rode into the rendered command behind the `=`
+        inline = '{"env": {"MY_API_KEY": "sk-super-secret"}}'
+        errors = self._refused_fallback(
+            ["--settings=" + inline],
+            account=mock.patch.object(supervisor, "_initial_account",
+                                      return_value=None))
+        self.assertNotIn("sk-super-secret", errors)
+        self.assertNotIn("MY_API_KEY", errors)
+        self.assertIn("<inline JSON>", errors)
+
+    def test_the_equals_form_is_redacted_on_the_pre_import_surface(self):
+        inline = '{"env": {"MY_API_KEY": "sk-super-secret"}}'
+        with mock.patch.object(__main__, "_prepare_launch",
+                               side_effect=RuntimeError("import blew up")), \
+                mock.patch.object(__main__, "_bare_cli_fallback") as bare, \
+                redirect_stderr(io.StringIO()) as errors:
+            code = __main__._dispatch(
+                ["claude", "--headroom-launch-fallback",
+                 "--settings=" + inline])
+        self.assertEqual(code, 2)
+        bare.assert_not_called()
+        self.assertNotIn("sk-super-secret", errors.getvalue())
+        self.assertNotIn("MY_API_KEY", errors.getvalue())
+        self.assertIn("<inline JSON>", errors.getvalue())
+
     def test_managed_settings_refuses_the_launch(self):
         # policy settings sit above the merged document and can turn the
         # injected hooks off; there is nothing to merge
@@ -2113,6 +2140,16 @@ class R3CrudeBareArgvValueAware(TempDirCase):
                     __main__._takes_value(flag, following),
                     supervisor.takes_value(flag, following),
                     (flag, following))
+
+    def test_local_redaction_mirrors_supervisor(self):
+        # the same duplication, and the same obligation: a token the canonical
+        # redactor elides must not be printed verbatim by the pre-import copy
+        secret = '{"env": {"MY_API_KEY": "sk-super-secret"}}'
+        for token in (secret, "--settings=" + secret, "--settings=/tmp/u.json",
+                      "--agents=" + secret, "--model=sonnet", "--fork-session",
+                      "/tmp/u.json", "", "-"):
+            self.assertEqual(__main__._redacted(token),
+                             supervisor.redacted_argument(token), token)
 
     def test_import_failure_preserves_option_value_that_looks_like_a_flag(self):
         # end-to-end: env-based fallback + import failure + a prompt value that

@@ -1202,6 +1202,47 @@ class CliWiring(unittest.TestCase):
         self.assertIn("<inline JSON>", rendered)
         self.assertIn("--model sonnet", rendered)
 
+    def test_the_equals_form_hides_the_document_behind_a_dash(self):
+        # a first-character test only ever sees `--settings {…}`, never
+        # `--settings={…}` — which is how the equals form kept leaking
+        secret = '{"env": {"MY_API_KEY": "sk-super-secret"}}'
+        self.assertEqual(supervisor.redacted_argument("--settings=" + secret),
+                         "--settings=<inline JSON>")
+        for token, expected in (
+                ("--agents=" + secret, "--agents=<inline JSON>"),
+                ("--json-schema=" + secret, "--json-schema=<inline JSON>"),
+                ("--managed-settings=" + secret,
+                 "--managed-settings=<inline JSON>"),
+                (secret, "<inline JSON>"),
+                ("--settings=/tmp/user.json", "--settings=/tmp/user.json"),
+                ("--model=sonnet", "--model=sonnet"),
+                ("--fork-session", "--fork-session"),
+                ("/tmp/user.json", "/tmp/user.json")):
+            self.assertEqual(supervisor.redacted_argument(token), expected)
+        rendered = supervisor.redacted_command(
+            ["claude", "--settings=" + secret, "--model", "sonnet"])
+        self.assertNotIn("sk-super-secret", rendered)
+        self.assertNotIn("MY_API_KEY", rendered)
+        self.assertIn("<inline JSON>", rendered)
+
+    def test_every_argv_headroom_prints_goes_through_the_redactor(self):
+        # the property is per-renderer, not per-call-site: a resume argv
+        # carries no document today, and still cannot start reproducing one
+        secret = '{"env": {"MY_API_KEY": "sk-super-secret"}}'
+        recovery = supervisor.Recovery(
+            {"name": "seat", "home": "/tmp/home"},
+            ["--resume", "SID", "--fork-session", "--settings=" + secret],
+            "/tmp/work", "SID")
+        self.assertNotIn("sk-super-secret", recovery.command())
+        self.assertIn("<inline JSON>", recovery.command())
+        # …and an ordinary resume command is rendered exactly as before
+        plain = supervisor.Recovery(
+            {"name": "seat", "home": "/tmp/home"},
+            ["--resume", "SID", "--fork-session"], "/tmp/work", "SID")
+        self.assertEqual(
+            plain.command(),
+            "CLAUDE_CONFIG_DIR=/tmp/home claude --resume SID --fork-session")
+
     def test_a_hook_restricting_key_that_is_off_still_merges(self):
         merged = supervisor.merge_user_settings({"disableAllHooks": False},
                                                 "/tmp/user.json")

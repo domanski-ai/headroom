@@ -448,9 +448,14 @@ class Recovery:
 
         Built from the stored argv itself, never re-derived: the argv already
         encodes both things a reconstruction gets wrong — the model a large
-        transcript must be resumed on, and whether forking is safe."""
+        transcript must be resumed on, and whether forking is safe.
+
+        A resume argv is `--resume`/`--fork-session`/`--model` and carries no
+        user document today, so the redaction is a no-op here — it is applied
+        anyway so that "an argv headroom prints never reproduces a document"
+        is a property of every renderer rather than an argument about one."""
         return (f"CLAUDE_CONFIG_DIR={shlex.quote(self.account['home'])} "
-                + shlex.join(["claude"] + list(self.argv)))
+                + redacted_command(["claude"] + list(self.argv)))
 
 
 @dataclass(frozen=True)
@@ -3767,6 +3772,11 @@ def _initial_account(family):
     return account if reason is None else None
 
 
+def _is_inline_document(value):
+    """Whether this string IS a settings document rather than naming one."""
+    return (value or "").strip().startswith(("{", "["))
+
+
 def redacted_settings_value(value):
     """A `--settings` value that is safe to print.
 
@@ -3774,13 +3784,32 @@ def redacted_settings_value(value):
     one legitimately carries credentials (apiKeyHelper, an `env` block). The
     refusal diagnostics below go to stderr, which is captured by launchers and
     logs, so the inline form is named and never reproduced."""
-    return ("<inline JSON>" if (value or "").strip().startswith(("{", "["))
-            else value)
+    return "<inline JSON>" if _is_inline_document(value) else value
+
+
+def redacted_argument(arg):
+    """One argv TOKEN, safe to print.
+
+    Two shapes carry a document, and only one of them starts with a brace:
+    the shell split `--settings {…}` into its own token, but `--settings={…}`
+    hides the document behind an `=` and begins with a dash. Testing the first
+    character of the token only ever catches the first shape — which is how
+    the equals form kept leaking a credential after the space-separated form
+    was fixed. Any `--option=<document>` is elided, not just settings: the
+    CLI takes JSON on `--agents`, `--json-schema` and `--managed-settings`
+    too."""
+    if _is_inline_document(arg):
+        return "<inline JSON>"
+    if arg.startswith("-") and "=" in arg:
+        flag, _, value = arg.partition("=")
+        if _is_inline_document(value):
+            return flag + "=<inline JSON>"
+    return arg
 
 
 def redacted_command(argv):
     """A shell-safe rendering of an argv with every inline document elided."""
-    return shlex.join([redacted_settings_value(arg) for arg in argv])
+    return shlex.join([redacted_argument(arg) for arg in argv])
 
 
 def _refuse_settings_launch(error):

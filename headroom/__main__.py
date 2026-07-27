@@ -145,11 +145,18 @@ def _takes_value(arg, following):
 
 
 def _redacted(value):
-    """supervisor.redacted_settings_value, mirrored for the same reason: an
-    inline settings document can carry credentials and must never be echoed
-    into stderr, and this path cannot import supervisor."""
-    return ("<inline JSON>" if (value or "").strip().startswith(("{", "["))
-            else value)
+    """supervisor.redacted_argument, mirrored for the same reason: an inline
+    settings document can carry credentials and must never be echoed into
+    stderr, and this path cannot import supervisor. Handles a bare value and
+    the `--option=<document>` token alike — the equals form hides the document
+    behind a dash, where a first-character test never sees it."""
+    if (value or "").strip().startswith(("{", "[")):
+        return "<inline JSON>"
+    if value and value.startswith("-") and "=" in value:
+        flag, _, inner = value.partition("=")
+        if inner.strip().startswith(("{", "[")):
+            return flag + "=<inline JSON>"
+    return value
 
 
 def _settings_in(args):

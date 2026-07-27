@@ -235,7 +235,8 @@ that recovers a session whose rotation target could not start, which carries
 your settings without the hooks. A document it cannot merge — missing, empty,
 unparseable, absurdly nested, setting `disableAllHooks`/
 `allowManagedHooksOnly`, or setting a `CLAUDE_*`/`HEADROOM_*` variable (or
-`HOME`) in `env` — **refuses the launch** and names the file and the key.
+`HOME`/`USERPROFILE`) in `env` — **refuses the launch** and names the file
+and the key.
 Those two namespaces are refused wholesale rather than by a list of known-bad
 names: they are the CLI's and headroom's own control surfaces (which shell
 runs a hook, whether it runs at all, which state tree it writes into), and a
