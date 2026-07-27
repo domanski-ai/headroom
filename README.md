@@ -230,11 +230,19 @@ obeyed instead of supervision. Claude honours one `--settings` and a second
 replaces the first, so the supervisor lifts the flag off the child's argv,
 merges your document underneath its own, and launches the child with the one
 file it owns: your keys pass through, its hook groups run first, and the
-merged document rides every rotation. A document it cannot merge — missing,
-unparseable, or setting `disableAllHooks`/`allowManagedHooksOnly` or a
-headroom-owned variable in `env` — **refuses the launch** and names the file
-and the key. It never degrades to an unsupervised child, because a session
-that looks launched but rotates on nothing is the failure this replaced.
+merged document rides every rotation — including the unsupervised relaunch
+that recovers a session whose rotation target could not start, which carries
+your settings without the hooks. A document it cannot merge — missing, empty,
+unparseable, absurdly nested, or setting `disableAllHooks`/
+`allowManagedHooksOnly` or a headroom-owned variable in `env` (including
+`CLAUDE_CODE_SIMPLE`/`CLAUDE_CODE_SAFE_MODE`, which are what `--bare` and
+`--safe-mode` set) — **refuses the launch** and names the file and the key.
+
+It never degrades to an unsupervised child, because a session that looks
+launched but rotates on nothing is the failure this replaced. That includes
+the opt-in `--headroom-launch-fallback`: a bare CLI cannot be supervised, so
+when the argv carries `--settings` the fallback refuses and prints the exact
+bare command instead of running it for you.
 
 What carries is the conversation, model-family routing, and latest session cwd.
 Background tasks, live MCP connections, pending MCP/permission approvals,

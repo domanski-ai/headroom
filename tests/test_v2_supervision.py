@@ -14,6 +14,7 @@ flock slot lease, caps probe) and the adversarial fixes:
   P1-9  requested leasing FAILS CLOSED on an infrastructure error
   P2-10 caps is command-scoped and honest about `run`
 """
+import contextlib
 import dataclasses
 import io
 import json
@@ -1385,6 +1386,239 @@ class UserSettingsAreMergedNotObeyed(TempDirCase):
                 document = json.load(handle)
             self.assertTrue(document["ultracode"])
             self.assertIn("StopFailure", document["hooks"])
+
+    def test_a_boolean_or_optional_flag_never_hides_the_settings(self):
+        # `--ide` (boolean) and `--resume` (optional value) used to consume
+        # the next token, so `--settings` stayed on the child's argv beside
+        # the supervisor's own and Claude honoured the LATER one
+        path = self.user_settings({"ultracode": True})
+        for prefix in (["--ide"], ["--resume"], ["-r"], ["--fork-session"]):
+            spawned = []
+            runner = supervisor.Supervisor(
+                "sonnet", prefix + ["--settings", path], self.account(),
+                popen=lambda argv, **kw: spawned.append(argv) or mock.Mock())
+            child = runner._spawn(self.account(), runner.initial_args,
+                                  self.temp.name, True)
+            argv = spawned[0]
+            self.assertEqual(argv.count("--settings"), 1, prefix)
+            self.assertNotIn(path, argv)
+            self.assertEqual(argv, ["claude", "--settings",
+                                    child.settings_path] + prefix)
+            with open(child.settings_path, encoding="utf-8") as handle:
+                self.assertTrue(json.load(handle)["ultracode"])
+
+    def test_an_unsupervised_recovery_still_carries_the_user_settings(self):
+        # a rotation that could not start its target relaunches the source
+        # with automation OFF; losing the rotation must not also lose the
+        # settings the operator launched with
+        path = self.user_settings({"ultracode": True})
+        spawned = []
+        runner = supervisor.Supervisor(
+            "sonnet", ["--settings", path], self.account(),
+            popen=lambda argv, **kw: spawned.append(argv) or mock.Mock())
+        child = runner._spawn(self.account(), ["--resume", "SID"],
+                              self.temp.name, False)
+        argv = spawned[0]
+        self.assertEqual(argv, ["claude", "--settings", child.settings_path,
+                                "--resume", "SID"])
+        with open(child.settings_path, encoding="utf-8") as handle:
+            document = json.load(handle)
+        self.assertTrue(document["ultracode"])
+        # …but NOT the hooks: this child carries no supervisor identity, so
+        # every injected hook would be refused and printed at the operator
+        self.assertNotIn("hooks", document)
+
+    def test_an_unsupervised_child_without_user_settings_is_unchanged(self):
+        spawned = []
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.account(),
+            popen=lambda argv, **kw: spawned.append(argv) or mock.Mock())
+        runner._spawn(self.account(), ["--resume", "SID"], self.temp.name,
+                      False)
+        self.assertEqual(spawned[0], ["claude", "--resume", "SID"])
+        self.assertEqual(runner.settings_files, [])
+
+    def test_the_recovery_branch_in_run_reaches_that_spawn(self):
+        # the same thing through run(): source -> failed target -> source
+        # recovered unsupervised, with the user's document still on the argv
+        path = self.user_settings({"ultracode": True})
+        source, target = self.account("source"), self.account("target")
+        spawned = []
+
+        def popen(argv, **kw):
+            # read the document exactly when the child would: run() deletes
+            # its settings files on a clean exit
+            document = None
+            if "--settings" in argv:
+                with open(argv[argv.index("--settings") + 1],
+                          encoding="utf-8") as handle:
+                    document = json.load(handle)
+            spawned.append((argv, document))
+            return mock.Mock()
+
+        runner = supervisor.Supervisor(
+            "sonnet", ["--settings", path], source, popen=popen)
+        plan = mock.Mock(preemptive=False)
+        plan.target, plan.source.account = target, source
+        relaunch = supervisor.Relaunch(target, ["--resume", "SID"],
+                                       self.temp.name, True, "hid", plan)
+        recovery = supervisor.Relaunch(source, ["--resume", "SID"],
+                                       self.temp.name, False)
+        outcomes = iter([relaunch, 0])
+        with mock.patch.object(
+                handoff, "verify_target_binding",     # the TARGET spawn only
+                side_effect=handoff.HandoffError("target changed")), \
+                mock.patch.object(runner, "_monitor",
+                                  side_effect=lambda child, pending="":
+                                  next(outcomes)), \
+                mock.patch.object(runner, "_source_relaunch",
+                                  return_value=recovery), \
+                mock.patch.object(runner, "_reconcile_leases"), \
+                mock.patch.object(runner, "_failure"), \
+                mock.patch.object(route, "release_slot_lease"), \
+                mock.patch.object(handoff, "append_action"), \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(runner.run(), 0)
+        self.assertEqual(len(spawned), 2)     # the target never started
+        recovered, document = spawned[1]
+        self.assertEqual(recovered[:2], ["claude", "--settings"])
+        self.assertEqual(recovered[3:], ["--resume", "SID"])
+        self.assertTrue(document["ultracode"])
+        self.assertNotIn("hooks", document)
+        # the first (supervised) child had both
+        self.assertTrue(spawned[0][1]["ultracode"])
+        self.assertIn("SessionStart", spawned[0][1]["hooks"])
+
+    def _refused_fallback(self, argv, **patches):
+        """cmd_claude with the fallback armed and a VALID settings file: the
+        launch fails for a routing reason, and the bare argv still carries
+        --settings, so the fallback must refuse rather than exec."""
+        with mock.patch.object(route, "bare_fallback_exec") as bare, \
+                mock.patch.object(route.os, "execvpe") as execute, \
+                mock.patch.object(route.os, "execvp") as execute_p, \
+                redirect_stderr(io.StringIO()) as errors:
+            with contextlib.ExitStack() as stack:
+                for target, patch in patches.items():
+                    stack.enter_context(patch)
+                code = supervisor.cmd_claude(
+                    "sonnet", argv, fallback_argv=["claude"] + argv)
+        self.assertEqual(code, 2)
+        bare.assert_not_called()
+        execute.assert_not_called()
+        execute_p.assert_not_called()
+        self.assertIn("refusing the bare fallback", errors.getvalue())
+        return errors.getvalue()
+
+    def test_no_account_refuses_rather_than_bare_execing_settings(self):
+        path = self.user_settings({"ultracode": True})
+        errors = self._refused_fallback(
+            ["--settings", path],
+            account=mock.patch.object(supervisor, "_initial_account",
+                                      return_value=None))
+        self.assertIn(path, errors)
+        self.assertIn("proven headroom", errors)
+
+    def test_a_lease_failure_refuses_rather_than_bare_execing_settings(self):
+        path = self.user_settings({"ultracode": True})
+        errors = self._refused_fallback(
+            ["--settings", path],
+            account=mock.patch.object(supervisor, "_initial_account",
+                                      return_value=self.account()),
+            lease=mock.patch.object(route, "acquire_slot_lease",
+                                    side_effect=route.LeaseError("no lock")))
+        self.assertIn("slot lease unavailable", errors)
+
+    def test_a_preparation_failure_refuses_rather_than_bare_execing(self):
+        path = self.user_settings({"ultracode": True})
+        errors = self._refused_fallback(
+            ["--settings", path],
+            account=mock.patch.object(
+                supervisor, "_initial_account",
+                side_effect=registry.RegistryError("no config")))
+        self.assertIn("launch preparation failed", errors)
+
+    def test_a_first_spawn_failure_refuses_rather_than_bare_execing(self):
+        path = self.user_settings({"ultracode": True})
+
+        class Stub:
+            def __init__(self, family, args, account):
+                self.spawned_any = False
+                self.spawn_ambiguous = False
+
+            def run(self):
+                return 127        # never spawned a child
+
+        errors = self._refused_fallback(
+            ["--settings", path],
+            account=mock.patch.object(supervisor, "_initial_account",
+                                      return_value=self.account()),
+            runner=mock.patch.object(supervisor, "Supervisor", Stub))
+        self.assertIn("Claude never started", errors)
+
+    def test_a_fallback_without_settings_is_completely_unchanged(self):
+        # the opt-in fallback still exists — only a --settings argv disarms it
+        with mock.patch.object(supervisor, "_initial_account",
+                               return_value=None), \
+                mock.patch.object(route, "bare_fallback_exec",
+                                  return_value=0) as bare, \
+                redirect_stderr(io.StringIO()):
+            code = supervisor.cmd_claude("sonnet", ["--model", "sonnet"],
+                                         fallback_argv=["claude", "--model",
+                                                        "sonnet"])
+        self.assertEqual(code, 0)
+        bare.assert_called_once()
+
+    def test_preprocessing_failure_with_settings_never_bare_execs(self):
+        # the PRE-IMPORT boundary: supervisor may not even be importable, so
+        # this guard is duplicated there — and it must refuse the same way
+        path = self.user_settings({"ultracode": True})
+        with mock.patch.object(__main__, "_prepare_launch",
+                               side_effect=RuntimeError("import blew up")), \
+                mock.patch.object(__main__, "_bare_cli_fallback") as bare, \
+                mock.patch.object(__main__.os, "execvp") as execute, \
+                redirect_stderr(io.StringIO()) as errors:
+            code = __main__._dispatch(
+                ["claude", "--headroom-launch-fallback", "--settings", path])
+        self.assertEqual(code, 2)
+        bare.assert_not_called()
+        execute.assert_not_called()
+        self.assertIn(path, errors.getvalue())
+        self.assertIn("refusing the bare fallback", errors.getvalue())
+
+    def test_preprocessing_failure_without_settings_still_bare_execs(self):
+        with mock.patch.object(__main__, "_prepare_launch",
+                               side_effect=RuntimeError("import blew up")), \
+                mock.patch.object(__main__, "_bare_cli_fallback",
+                                  return_value=0) as bare, \
+                redirect_stderr(io.StringIO()):
+            code = __main__._dispatch(
+                ["claude", "--headroom-launch-fallback", "--model", "sonnet"])
+        self.assertEqual(code, 0)
+        bare.assert_called_once()
+
+    def test_an_empty_settings_value_refuses_the_launch(self):
+        for argv in (["claude", "--settings="], ["claude", "--settings", ""]):
+            code, supervised, execed, bare, raw, errors = self._dispatch(argv)
+            self.assertEqual(code, 2, argv)
+            supervised.assert_not_called()
+            execed.assert_not_called()
+            bare.assert_not_called()
+            for call in raw:
+                call.assert_not_called()
+            self.assertIn("empty value", errors.getvalue())
+
+    def test_a_document_too_deep_to_read_refuses_the_launch(self):
+        deep = "{\"a\":" * 1400 + "1" + "}" * 1400
+        code, supervised, execed, bare, raw, errors = self._dispatch(
+            ["claude", "--headroom-launch-fallback", "--settings", deep])
+        self.assertEqual(code, 2)
+        supervised.assert_not_called()
+        execed.assert_not_called()
+        bare.assert_not_called()
+        for call in raw:
+            call.assert_not_called()
+        self.assertIn("too deeply", errors.getvalue())
 
     def test_a_settings_edit_mid_run_cannot_change_a_live_child(self):
         path = self.user_settings({"ultracode": True})

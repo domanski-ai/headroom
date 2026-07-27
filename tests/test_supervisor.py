@@ -1023,16 +1023,63 @@ class CliWiring(unittest.TestCase):
         self.assertEqual(
             supervisor.split_user_settings(
                 ["--model", "--settings", "--", "--settings=after.json"]),
-            (["--model", "--settings", "--", "--settings=after.json"], ""))
+            (["--model", "--settings", "--", "--settings=after.json"], None))
         # and after `--` it is prompt text, never an option
         self.assertEqual(
             supervisor.split_user_settings(
                 ["--brief", "--", "--settings=prompt-text"]),
-            (["--brief", "--", "--settings=prompt-text"], ""))
+            (["--brief", "--", "--settings=prompt-text"], None))
 
     def test_settings_with_no_value_refuses_instead_of_guessing(self):
         with self.assertRaises(supervisor.UserSettingsError):
             supervisor.split_user_settings(["--brief", "--settings"])
+
+    def test_option_classes_match_the_cli_and_never_swallow_settings(self):
+        # `--ide` is BOOLEAN and `--resume`/`-r` take an OPTIONAL value; both
+        # sat in the required table, so these argv shapes walked straight past
+        # the user's settings and left it on the child's argv
+        for prefix in (["--ide"], ["--resume"], ["-r"], ["--fork-session"],
+                       ["--brief"], ["--tmux"], ["--worktree"], ["-d"]):
+            self.assertEqual(
+                supervisor.split_user_settings(
+                    prefix + ["--settings", "u.json"]),
+                (prefix, "u.json"), prefix)
+            self.assertEqual(
+                supervisor.split_user_settings(prefix + ["--settings=u.json"]),
+                (prefix, "u.json"), prefix)
+        # an optional value that is NOT option-shaped is still consumed
+        self.assertEqual(
+            supervisor.split_user_settings(
+                ["--resume", "abc123", "--settings", "u.json"]),
+            (["--resume", "abc123"], "u.json"))
+        # and the opposite misparse: a REQUIRED option's value stays its value
+        for required in ("--agent", "--effort", "--name", "-n",
+                         "--managed-settings", "--setting-sources"):
+            self.assertEqual(
+                supervisor.split_user_settings([required, "--settings"]),
+                ([required, "--settings"], None), required)
+
+    def test_takes_value_is_the_one_grammar_every_walker_shares(self):
+        self.assertTrue(supervisor.takes_value("--model", "sonnet"))
+        self.assertTrue(supervisor.takes_value("--agent", "--settings"))
+        self.assertFalse(supervisor.takes_value("--ide", "--settings"))
+        self.assertFalse(supervisor.takes_value("--brief", "anything"))
+        # commander's optional-value rule, both directions
+        self.assertTrue(supervisor.takes_value("--resume", "abc123"))
+        self.assertFalse(supervisor.takes_value("--resume", "--settings"))
+        self.assertFalse(supervisor.takes_value("--resume", None))
+        self.assertTrue(supervisor.takes_value("--resume", "-"))   # not option
+
+    def test_the_grammar_fix_reaches_the_other_walkers_too(self):
+        # `--ide` used to eat the next token, so a -p run looked supervisable
+        self.assertEqual(supervisor.incompatible_args(["--ide", "-p"]), "-p")
+        self.assertEqual(
+            supervisor.incompatible_args(["--resume", "--print"]), "--print")
+        # and it used to eat a headroom override instead of stripping it
+        cleaned, _auto, no_auto = supervisor.strip_headroom_overrides(
+            ["--resume", "--headroom-no-auto-handoff"])
+        self.assertEqual(cleaned, ["--resume"])
+        self.assertTrue(no_auto)
 
     def test_settings_merge_keeps_supervision_and_the_user_document(self):
         merged = supervisor.merge_user_settings({
@@ -1079,6 +1126,9 @@ class CliWiring(unittest.TestCase):
                  "HEADROOM_SUPERVISOR_ID"),
                 ({"env": {"CLAUDE_CODE_SAFE_MODE": "1"}},
                  "CLAUDE_CODE_SAFE_MODE"),
+                # what --bare sets; 2.1.220's own help: "skip hooks … Sets
+                # CLAUDE_CODE_SIMPLE=1"
+                ({"env": {"CLAUDE_CODE_SIMPLE": "1"}}, "CLAUDE_CODE_SIMPLE"),
                 ({"env": ["nope"]}, "env"),
                 ({"hooks": ["nope"]}, "hooks"),
                 ({"hooks": {"SessionStart": "mine"}}, "hooks.SessionStart")):
@@ -1148,6 +1198,52 @@ class CliWiring(unittest.TestCase):
         with self.assertRaises(supervisor.UserSettingsError) as caught:
             supervisor.load_user_settings('{"ultracode": ')
         self.assertIn("inline --settings JSON", str(caught.exception))
+
+    def test_an_empty_settings_value_is_given_not_absent(self):
+        # `--settings=` and `--settings ""` used to collapse into the same
+        # "no settings" sentinel and were silently discarded
+        self.assertEqual(supervisor.split_user_settings(["--settings="]),
+                         ([], ""))
+        self.assertEqual(supervisor.split_user_settings(["--settings", ""]),
+                         ([], ""))
+        for argv in (["--settings="], ["--settings", ""],
+                     ["--settings", "   "]):
+            with self.assertRaises(supervisor.UserSettingsError) as caught:
+                supervisor.validate_user_settings(argv)
+            self.assertIn("empty value", str(caught.exception))
+
+    def test_a_document_too_deep_to_read_is_refused_not_crashed(self):
+        # RecursionError is a RuntimeError, and the launch guard bare-execs on
+        # broad exceptions — but whether the interpreter raises AT ALL depends
+        # on how deep the stack already was (this exact 1,400-level object
+        # parses fine from a shallow stack), so the refusal is by measured
+        # depth, not by catching the crash
+        deep = "{\"a\":" * 1400 + "1" + "}" * 1400
+        with self.assertRaises(supervisor.UserSettingsError) as caught:
+            supervisor.load_user_settings(deep)
+        self.assertIn("too deeply", str(caught.exception))
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "deep.json")
+            with open(path, "w") as handle:
+                handle.write(deep)
+            with self.assertRaises(supervisor.UserSettingsError) as caught:
+                supervisor.load_user_settings(path)
+            self.assertIn("too deeply", str(caught.exception))
+        # the merge refuses on its own account too — it is public and runs
+        # once per generation, so it may not trust its caller
+        document = inner = {}
+        for _ in range(supervisor.MAX_SETTINGS_DEPTH + 5):
+            inner["a"] = {}
+            inner = inner["a"]
+        with self.assertRaises(supervisor.UserSettingsError) as caught:
+            supervisor.merge_user_settings(document, "/tmp/user.json")
+        self.assertIn("too deeply", str(caught.exception))
+        # and an ordinary settings document is nowhere near the limit
+        self.assertFalse(supervisor._nested_too_deeply(
+            supervisor.merge_user_settings({
+                "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                    {"type": "command", "command": "x"}]}]},
+                "permissions": {"allow": ["Bash(git *)"]}})))
 
     def test_validate_user_settings_is_the_pre_launch_gate(self):
         self.assertEqual(supervisor.validate_user_settings(["--model", "x"]),

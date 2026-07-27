@@ -128,7 +128,10 @@ A user-supplied `--settings` is merged under that fragment rather than passed
 through beside it (Claude accepts one, and the second replaces the first), so
 the supervisor refuses to launch a document that would suppress its hooks:
 `disableAllHooks`, `allowManagedHooksOnly`, or an `env` block rebinding
-`CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_SAFE_MODE` or a `HEADROOM_*` variable. The
+`CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_SAFE_MODE`, `CLAUDE_CODE_SIMPLE` or a
+`HEADROOM_*` variable. It also refuses the opt-in bare-CLI launch fallback
+for that run: the fallback argv still carries `--settings` and a bare CLI is
+unsupervised, so headroom prints the command rather than running it. The
 merge only covers what headroom can see in that one document — managed and
 policy settings still sit above it, which is the limit this section opened
 with. The user document is read ONCE, at launch: editing the file mid-session

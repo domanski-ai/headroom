@@ -99,19 +99,68 @@ _OWNED_LAUNCH_FLAGS = frozenset({
     "--headroom-launch-fallback", "--headroom-auto-handoff",
     "--headroom-no-auto-handoff"})
 
-# Claude value-taking options — a LOCAL mirror of supervisor.CLAUDE_VALUE_FLAGS
-# kept here so the pre-import fallback can be value-aware WITHOUT importing
-# supervisor (the very import that may have failed). Keep in sync with
-# supervisor.CLAUDE_VALUE_FLAGS. Used only to avoid mistaking an option VALUE
-# that happens to look like a headroom flag for the flag itself (P2-3).
+# Claude option grammar — a LOCAL mirror of supervisor.CLAUDE_VALUE_FLAGS /
+# CLAUDE_OPTIONAL_VALUE_FLAGS kept here so the pre-import fallback can be
+# value-aware WITHOUT importing supervisor (the very import that may have
+# failed). Keep in sync with supervisor's tables, which are audited against
+# the CLI's own option chain. Used to avoid mistaking an option VALUE that
+# happens to look like a headroom flag for the flag itself (P2-3), and to
+# find a user `--settings` that no bare fallback may carry.
 _CLAUDE_VALUE_FLAGS = frozenset({
-    "--model", "--settings", "--system-prompt", "--append-system-prompt",
-    "--agents", "--allowedTools", "--disallowedTools", "--permission-mode",
-    "--permission-prompt-tool", "--mcp-config", "--add-dir", "--ide",
-    "--fallback-model", "--json-schema", "--max-budget-usd",
-    "--input-format", "--output-format", "--debug-file", "--betas",
-    "--plugin-dir", "--session-id", "--resume", "-r",
+    "--add-dir", "--advisor", "--agent", "--agent-color", "--agent-id",
+    "--agent-name", "--agent-type", "--agents", "--allowed-tools",
+    "--allowedTools", "--append-subagent-system-prompt",
+    "--append-system-prompt", "--append-system-prompt-file", "--betas",
+    "--channels", "--dangerously-load-development-channels",
+    "--debug-file", "--deep-link-cwd-b64", "--deep-link-last-fetch",
+    "--deep-link-repo", "--disallowed-tools", "--disallowedTools",
+    "--effort", "--fallback-model", "--file", "--input-format",
+    "--json-schema", "--managed-settings", "--max-budget-usd",
+    "--max-thinking-tokens", "--max-turns", "--mcp-config", "--model",
+    "-n", "--name", "--output-format", "--parent-session-id",
+    "--permission-mode", "--permission-prompt-tool",
+    "--plan-mode-instructions", "--plugin-dir", "--plugin-dir-no-mcp",
+    "--plugin-url", "--prefill", "--prefill-b64",
+    "--remote-control-session-name-prefix", "--resume-session-at",
+    "--rewind-files", "--sdk-url", "--session-id", "--setting-sources",
+    "--settings", "--system-prompt", "--system-prompt-file", "--task-budget",
+    "--team-name", "--teammate-mode", "--thinking", "--thinking-display",
+    "--tools", "--workload",
 })
+_CLAUDE_OPTIONAL_VALUE_FLAGS = frozenset({
+    "--cloud", "-d", "--debug", "--from-pr", "--prompt-suggestions", "--rc",
+    "--remote", "--remote-control", "-r", "--resume", "--teleport",
+    "-w", "--worktree",
+})
+
+
+def _takes_value(arg, following):
+    """supervisor.takes_value, mirrored for the pre-import boundary."""
+    if arg in _CLAUDE_VALUE_FLAGS:
+        return True
+    if arg in _CLAUDE_OPTIONAL_VALUE_FLAGS:
+        return following is not None and not (
+            len(following) > 1 and following.startswith("-"))
+    return False
+
+
+def _settings_in(args):
+    """The user `--settings` value in a claude option segment, else None.
+
+    Deliberately duplicated rather than imported: this runs on the path where
+    importing supervisor is exactly what failed."""
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            return None
+        if arg == "--settings":
+            return args[index + 1] if index + 1 < len(args) else ""
+        if arg.startswith("--settings="):
+            return arg.split("=", 1)[1]
+        following = args[index + 1] if index + 1 < len(args) else None
+        index += 2 if _takes_value(arg, following) else 1
+    return None
 
 
 def _fallback_intent(args):
@@ -131,18 +180,22 @@ def _crude_bare_argv(command, args):
     flag (P2-3). The normal path uses supervisor.split_headroom_flags; this is
     the reduced parser used only when supervisor could not be imported."""
     separator = args.index("--") if "--" in args else len(args)
+    option_args = args[:separator]
     head = []
-    value_expected = False
-    for arg in args[:separator]:
-        if value_expected:
-            head.append(arg)  # an option value — never a headroom flag
-            value_expected = False
-            continue
+    index = 0
+    while index < len(option_args):
+        arg = option_args[index]
         if arg in _OWNED_LAUNCH_FLAGS:
+            index += 1
             continue
         head.append(arg)
-        if arg in _CLAUDE_VALUE_FLAGS:
-            value_expected = True
+        following = (option_args[index + 1]
+                     if index + 1 < len(option_args) else None)
+        if _takes_value(arg, following):
+            head.append(following)  # an option value — never a headroom flag
+            index += 2
+        else:
+            index += 1
     return [command] + head + args[separator:]
 
 
@@ -183,9 +236,25 @@ def _launch(command, args):
         prepared = _prepare_launch(command, args)
     except Exception as error:  # noqa: BLE001 — pre-boundary: bare-exec if asked
         if intent:
+            bare_argv = _crude_bare_argv(command, args)
+            # A bare CLI is unsupervised by definition. If preprocessing died
+            # with a user `--settings` on the argv, headroom cannot tell
+            # whether the document was even readable — and a claude that
+            # starts here starts unsupervised WITH it, the exact silent loss
+            # the merge removed. Refuse loudly and hand over the command.
+            settings = (_settings_in(args[:args.index("--")] if "--" in args
+                                     else args) if command == "claude"
+                        else None)
+            if settings is not None:
+                print(f"headroom: refusing the bare fallback: launch "
+                      f"preprocessing failed: {error}", file=sys.stderr)
+                print(f"[headroom] --settings {settings} was given, and a "
+                      f"bare CLI cannot be supervised. Run it yourself if "
+                      f"that is what you want:", file=sys.stderr)
+                print("  " + " ".join(bare_argv), file=sys.stderr)
+                return 2
             return _bare_cli_fallback(
-                _crude_bare_argv(command, args),
-                f"launch preprocessing failed: {error}")
+                bare_argv, f"launch preprocessing failed: {error}")
         raise
     if isinstance(prepared, int):
         return prepared  # a usage refusal (exit code), not a launch plan
@@ -271,12 +340,7 @@ def _prepare_launch(command, args):
                 try:
                     supervisor.validate_user_settings(args)
                 except supervisor.UserSettingsError as error:
-                    print(f"headroom: refusing to launch: {error}",
-                          file=sys.stderr)
-                    print("[headroom] headroom never runs an unsupervised "
-                          "child to work around a settings file",
-                          file=sys.stderr)
-                    return 2
+                    return supervisor._refuse_settings_launch(error)
                 use_supervisor = True
             else:
                 why = incompatible or "stdin/stdout/stderr are not all TTYs"

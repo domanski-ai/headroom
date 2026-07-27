@@ -179,17 +179,56 @@ INCOMPATIBLE_FLAGS = {
     "--bare", "--safe-mode", "--disable-all-hooks", "--print", "-p",
     "--output-format", "--input-format", "--no-session-persistence",
 }
+# --- Claude's own option grammar -------------------------------------------
+# Audited option-by-option against the top-level `claude` command table in
+# Claude Code 2.1.220 (its whole `.option(...)` chain, hidden entries
+# included). Every headroom argv walker has to see the argv Claude will see,
+# and commander parses THREE classes differently:
+#
+#   `<value>` / `<values...>`  required — ALWAYS consumes the next token
+#   `[value]`                  optional — consumes the next token only when it
+#                              does not itself look like an option
+#   everything else            boolean  — consumes nothing
+#
+# Getting a class wrong is not cosmetic. `--ide` sat in the required list and
+# is boolean, and `--resume`/`-r` sat there and are optional, so
+# `--ide --settings user.json` and `--resume --settings user.json` walked
+# straight PAST the user's settings: the flag stayed on the child's argv
+# beside the supervisor's own, and Claude honours the last one. The opposite
+# error is just as real — a required option missing from the table (`--agent`
+# was) lets its VALUE be read as an option.
 CLAUDE_VALUE_FLAGS = {
-    "--model", "--settings", "--system-prompt", "--append-system-prompt",
-    "--agents", "--allowedTools", "--disallowedTools", "--permission-mode",
-    "--permission-prompt-tool", "--mcp-config", "--add-dir", "--ide",
-    "--fallback-model", "--json-schema", "--max-budget-usd",
-    "--input-format", "--output-format", "--debug-file", "--betas",
-    "--plugin-dir", "--session-id", "--resume", "-r",
+    "--add-dir", "--advisor", "--agent", "--agent-color", "--agent-id",
+    "--agent-name", "--agent-type", "--agents", "--allowed-tools",
+    "--allowedTools", "--append-subagent-system-prompt",
+    "--append-system-prompt", "--append-system-prompt-file", "--betas",
+    "--channels", "--dangerously-load-development-channels",
+    "--debug-file", "--deep-link-cwd-b64", "--deep-link-last-fetch",
+    "--deep-link-repo", "--disallowed-tools", "--disallowedTools",
+    "--effort", "--fallback-model", "--file", "--input-format",
+    "--json-schema", "--managed-settings", "--max-budget-usd",
+    "--max-thinking-tokens", "--max-turns", "--mcp-config", "--model",
+    "-n", "--name", "--output-format", "--parent-session-id",
+    "--permission-mode", "--permission-prompt-tool",
+    "--plan-mode-instructions", "--plugin-dir", "--plugin-dir-no-mcp",
+    "--plugin-url", "--prefill", "--prefill-b64",
+    "--remote-control-session-name-prefix", "--resume-session-at",
+    "--rewind-files", "--sdk-url", "--session-id", "--setting-sources",
+    "--settings", "--system-prompt", "--system-prompt-file", "--task-budget",
+    "--team-name", "--teammate-mode", "--thinking", "--thinking-display",
+    "--tools", "--workload",
 }
-# Every other maintained Claude flag (including current flags such as --brief)
-# is the boolean complement.  Unknown flags are boolean too; only this known
-# value-taking list may consume the following argument.
+# `[value]` options. Commander's own rule: the following token is the value
+# only when it is not option-shaped, which is exactly why `--resume
+# --settings x` leaves `--settings x` to be parsed as settings.
+CLAUDE_OPTIONAL_VALUE_FLAGS = {
+    "--cloud", "-d", "--debug", "--from-pr", "--prompt-suggestions", "--rc",
+    "--remote", "--remote-control", "-r", "--resume", "--teleport",
+    "-w", "--worktree",
+}
+# Every other maintained Claude flag (--ide, --brief, --fork-session, --tmux,
+# --chrome, …) is the boolean complement.  Unknown flags are boolean too; only
+# the two tables above may consume the following argument.
 HEADROOM_OVERRIDE_FLAGS = {
     "--headroom-auto-handoff", "--headroom-no-auto-handoff",
     "--headroom-launch-fallback"}
@@ -211,9 +250,26 @@ HOOK_RESTRICTING_KEYS = ("disableAllHooks", "allowManagedHooksOnly")
 # A settings `env` block that rebinds any of them would point the handshake at
 # another supervisor (or another home) while this one waits for a hook that
 # can never arrive, so it is a refusal, not a merge.
+#
+# CLAUDE_CODE_SAFE_MODE and CLAUDE_CODE_SIMPLE are here for a second reason:
+# they are what `--safe-mode` and `--bare` set, and both of those disable
+# hooks (2.1.220's own help for --bare: "skip hooks … Sets
+# CLAUDE_CODE_SIMPLE=1"). They are already refused as FLAGS by
+# INCOMPATIBLE_FLAGS; a settings `env` block is the same switch by another
+# name, and an injected hook that never runs is not a merge that won.
 RESERVED_SETTINGS_ENV = (
     "CLAUDE_CONFIG_DIR", "HEADROOM_SUPERVISOR_ID", "HEADROOM_CHILD_GENERATION",
-    "HEADROOM_SOURCE_SLOT", "HEADROOM_HOOK_MATCHER", "CLAUDE_CODE_SAFE_MODE")
+    "HEADROOM_SOURCE_SLOT", "HEADROOM_HOOK_MATCHER", "CLAUDE_CODE_SAFE_MODE",
+    "CLAUDE_CODE_SIMPLE")
+# How deep a settings document may nest. Every step of the merge recurses
+# (parse, deep copy, serialize), and a RecursionError raised anywhere in there
+# is a bare RuntimeError that the launch guard would answer by bare-execing —
+# unsupervised, with the very document it could not read. Whether the
+# interpreter raises at all depends on how deep the stack already was, so the
+# refusal cannot be left to it: the depth is measured ITERATIVELY and refused
+# by policy, with the RecursionError catches kept only as a backstop. Real
+# settings are five or six levels deep; this is an order of magnitude of room.
+MAX_SETTINGS_DEPTH = 64
 
 
 class SupervisorError(RuntimeError):
@@ -528,24 +584,40 @@ def write_hook_event(stream=None, environ=None, now=None):
         return 2
 
 
+def _option_shaped(arg):
+    """Commander's own test for "this token cannot be my optional value"."""
+    return len(arg) > 1 and arg.startswith("-")
+
+
+def takes_value(arg, following):
+    """Whether Claude's parser will consume `following` as `arg`'s value.
+
+    `following` is None at the end of the argv. This is the one place the
+    three option classes are resolved, so every headroom walker splits an
+    argv the same way Claude does."""
+    if arg in CLAUDE_VALUE_FLAGS:
+        return True
+    if arg in CLAUDE_OPTIONAL_VALUE_FLAGS:
+        return following is not None and not _option_shaped(following)
+    return False
+
+
 def incompatible_args(args):
     # NOTE: `--settings` is deliberately NOT here. It used to return
     # "user-supplied --settings" and disarm supervision for the whole run —
     # silently, since the run still started. It is now merged instead; see
     # split_user_settings/merge_user_settings.
-    value_expected = False
-    for arg in args:
-        if value_expected:
-            value_expected = False
-            continue
+    index = 0
+    while index < len(args):
+        arg = args[index]
         if arg == "--":
             break
         if arg in INCOMPATIBLE_FLAGS or any(
                 arg.startswith(flag + "=")
                 for flag in ("--output-format", "--input-format")):
             return arg
-        if arg in CLAUDE_VALUE_FLAGS:
-            value_expected = True
+        following = args[index + 1] if index + 1 < len(args) else None
+        index += 2 if takes_value(arg, following) else 1
     return ""
 
 
@@ -557,26 +629,23 @@ def split_headroom_flags(args):
     original override stripping."""
     cleaned = []
     found = set()
-    value_expected = False
-    after_separator = False
-    for arg in args:
-        if after_separator:
-            cleaned.append(arg)
-            continue
-        if value_expected:
-            cleaned.append(arg)
-            value_expected = False
-            continue
+    index = 0
+    while index < len(args):
+        arg = args[index]
         if arg == "--":
-            cleaned.append(arg)
-            after_separator = True
-            continue
+            cleaned.extend(args[index:])
+            break
         if arg in HEADROOM_OVERRIDE_FLAGS:
             found.add(arg)
+            index += 1
             continue
         cleaned.append(arg)
-        if arg in CLAUDE_VALUE_FLAGS:
-            value_expected = True
+        following = args[index + 1] if index + 1 < len(args) else None
+        if takes_value(arg, following):
+            cleaned.append(following)
+            index += 2
+        else:
+            index += 1
     return cleaned, found
 
 
@@ -590,48 +659,65 @@ def strip_headroom_overrides(args):
 def split_user_settings(args):
     """`(cleaned_args, raw_value)` — lift the user's `--settings` off the argv.
 
-    Value-aware exactly like `split_headroom_flags`: an argument that is the
-    VALUE of another option (`--model --settings`) is that option's value, and
-    everything after `--` is the prompt, not options. Claude honours one
-    `--settings` and a later one replaces an earlier one, so when several are
-    given the LAST wins here too — the supervisor merges what Claude would
-    have loaded, never more."""
+    Value-aware exactly like `split_headroom_flags` — same `takes_value`
+    grammar, so an argument that is another option's VALUE (`--model
+    --settings`, `--agent --settings`) stays that option's value, a boolean
+    (`--ide`) or an optional-value option facing an option-shaped token
+    (`--resume --settings`) consumes nothing, and everything after `--` is
+    prompt text. Claude honours one `--settings` and a later one replaces an
+    earlier one, so when several are given the LAST wins here too — the
+    supervisor merges what Claude would have loaded, never more.
+
+    `raw` is None when no `--settings` was given at all. An EMPTY value
+    (`--settings=` or `--settings ""`) is not the same thing and must not
+    collapse into it: it is a value headroom cannot read, so it is returned
+    as the empty string and refused downstream."""
     cleaned = []
-    raw = ""
-    value_expected = False
-    after_separator = False
-    pending_settings = False
-    for arg in args:
-        if after_separator:
-            cleaned.append(arg)
-            continue
-        if pending_settings:            # this argument is --settings' value
-            raw = arg
-            pending_settings = False
-            value_expected = False
-            continue
-        if value_expected:
-            cleaned.append(arg)
-            value_expected = False
-            continue
+    raw = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
         if arg == "--":
-            cleaned.append(arg)
-            after_separator = True
-            continue
+            cleaned.extend(args[index:])
+            break
         if arg == "--settings":
-            pending_settings = True
+            if index + 1 >= len(args):
+                # Claude would refuse the option outright, and a supervisor
+                # that silently dropped it would be guessing
+                raise UserSettingsError("--settings was given no value")
+            raw = args[index + 1]
+            index += 2
             continue
         if arg.startswith("--settings="):
             raw = arg.split("=", 1)[1]
+            index += 1
             continue
         cleaned.append(arg)
-        if arg in CLAUDE_VALUE_FLAGS:
-            value_expected = True
-    if pending_settings:
-        # `--settings` with nothing after it: Claude would refuse the option,
-        # and a supervisor that silently dropped it would be guessing
-        raise UserSettingsError("--settings was given no value")
+        following = args[index + 1] if index + 1 < len(args) else None
+        if takes_value(arg, following):
+            cleaned.append(following)
+            index += 2
+        else:
+            index += 1
     return cleaned, raw
+
+
+def _nested_too_deeply(document, limit=MAX_SETTINGS_DEPTH):
+    """Whether a parsed document nests past `limit`.
+
+    Deliberately ITERATIVE: a recursive probe would be the exact crash it
+    exists to prevent, and would inherit the same stack-depth dependence that
+    makes RecursionError an unreliable gate."""
+    stack = [(document, 1)]
+    while stack:
+        value, depth = stack.pop()
+        if depth > limit:
+            return True
+        if isinstance(value, dict):
+            stack.extend((child, depth + 1) for child in value.values())
+        elif isinstance(value, list):
+            stack.extend((child, depth + 1) for child in value)
+    return False
 
 
 def load_user_settings(raw):
@@ -639,10 +725,15 @@ def load_user_settings(raw):
     does: a JSON object literal is inline settings, anything else is a path.
 
     Every failure is loud and names what was read. A settings document that
-    cannot be read is never a reason to run the child unsupervised."""
+    cannot be read is never a reason to run the child unsupervised — which is
+    why RecursionError is caught at every recursive step (parse, round-trip,
+    and the deep copy in the merge): a deeply nested document would otherwise
+    escape as a bare RuntimeError, and the launch guard above catches broad
+    exceptions to bare-exec them."""
     value = (raw or "").strip()
     if not value:
-        raise UserSettingsError("--settings was given an empty value")
+        raise UserSettingsError(
+            "--settings was given an empty value")
     if value[0] in "{[":            # a path never starts with a JSON opener
         source = "the inline --settings JSON"
         try:
@@ -650,6 +741,9 @@ def load_user_settings(raw):
         except ValueError as error:
             raise UserSettingsError(
                 f"{source} is not valid JSON: {error}") from error
+        except RecursionError as error:
+            raise UserSettingsError(
+                f"{source} is nested too deeply to read") from error
     else:
         source = os.path.abspath(os.path.expanduser(value))
         try:
@@ -666,10 +760,18 @@ def load_user_settings(raw):
             raise UserSettingsError(
                 f"--settings file {source} is not valid JSON: "
                 f"{error}") from error
+        except RecursionError as error:
+            raise UserSettingsError(
+                f"--settings file {source} is nested too deeply "
+                f"to read") from error
     if not isinstance(document, dict):
         raise UserSettingsError(
             f"{source} must be a JSON object, not "
             f"{type(document).__name__}")
+    if _nested_too_deeply(document):
+        raise UserSettingsError(
+            f"{source} is nested too deeply to merge safely (more than "
+            f"{MAX_SETTINGS_DEPTH} levels)")
     try:
         # the merged document is written back out with allow_nan=False; a NaN
         # or Infinity accepted here would only fail at spawn time, after the
@@ -679,6 +781,9 @@ def load_user_settings(raw):
         raise UserSettingsError(
             f"{source} holds a value that is not portable JSON: "
             f"{error}") from error
+    except RecursionError as error:
+        raise UserSettingsError(
+            f"{source} is nested too deeply to write back out") from error
     return document, source
 
 
@@ -697,6 +802,12 @@ def merge_user_settings(document=None, source=""):
     unmerged launch is byte-identical to the one before merging existed."""
     document = {} if document is None else document
     where = source or "the --settings document"
+    if _nested_too_deeply(document):
+        # checked here too: this is called per generation and is public, so it
+        # may not rely on load_user_settings having been the way in
+        raise UserSettingsError(
+            f"{where} is nested too deeply to merge safely (more than "
+            f"{MAX_SETTINGS_DEPTH} levels)")
     offenders = [key for key in HOOK_RESTRICTING_KEYS if document.get(key)]
     if offenders:
         raise UserSettingsError(
@@ -714,7 +825,11 @@ def merge_user_settings(document=None, source=""):
     hooks = document.get("hooks")
     if hooks is not None and not isinstance(hooks, dict):
         raise UserSettingsError(f"{where} has a non-object \"hooks\"")
-    merged = copy.deepcopy(document)
+    try:
+        merged = copy.deepcopy(document)
+    except RecursionError as error:
+        raise UserSettingsError(
+            f"{where} is nested too deeply to merge") from error
     # an explicit null `hooks` normalises to an empty block: the injected
     # hooks still have to land somewhere
     supervised = merged["hooks"] = dict(merged.get("hooks") or {})
@@ -733,9 +848,11 @@ def validate_user_settings(args):
 
     Raises :class:`UserSettingsError` — never returns a "supervision off"
     answer, because there is no such answer: the launch either runs supervised
-    with the merged document or it does not run."""
+    with the merged document or it does not run. `raw is None` (no flag) is
+    the only case that passes without reading anything; an EMPTY value is a
+    given flag headroom cannot honour, so it refuses like any other."""
     _cleaned, raw = split_user_settings(args)
-    if not raw:
+    if raw is None:
         return {}
     document, source = load_user_settings(raw)
     return merge_user_settings(document, source)
@@ -1731,7 +1848,7 @@ class Supervisor:
         self.initial_args, raw_settings = split_user_settings(list(args))
         self.user_settings = {}
         self.user_settings_source = ""
-        if raw_settings:
+        if raw_settings is not None:    # an EMPTY value is given, and refused
             self.user_settings, self.user_settings_source = \
                 load_user_settings(raw_settings)
             merge_user_settings(self.user_settings, self.user_settings_source)
@@ -1785,14 +1902,23 @@ class Supervisor:
         # child exists is ever unguarded (P1, r7)
         self._signals = None
 
-    def _settings_file(self, generation):
+    def _settings_file(self, generation, automatic=True):
         directory = paths.ensure_private(_supervisors_dir())
         filename = f"{self.supervisor_id}-{generation}.settings.json"
         destination = os.path.join(directory, filename)
-        # one file, supervisor keys on top; identical to hook_settings() when
-        # the user gave none
-        document = merge_user_settings(self.user_settings,
-                                       self.user_settings_source)
+        if automatic:
+            # one file, supervisor keys on top; identical to hook_settings()
+            # when the user gave none
+            document = merge_user_settings(self.user_settings,
+                                           self.user_settings_source)
+        else:
+            # An UNSUPERVISED child (post-rotation source recovery) still gets
+            # the user's document — losing a rotation must not also lose their
+            # settings — but NOT the hooks. This child deliberately carries no
+            # supervisor identity in its environment, so every injected hook
+            # would be refused by the adapter and print to the operator's
+            # terminal: automation off has to mean off, not noisy.
+            document = copy.deepcopy(self.user_settings)
         paths.write_json_atomic(destination, document, mode=0o600)
         self.settings_files.append(destination)
         return destination
@@ -1823,7 +1949,12 @@ class Supervisor:
 
     def _spawn(self, account, args, cwd, automatic, plan=None):
         self.generation += 1
-        settings = self._settings_file(self.generation) if automatic else ""
+        # a settings file is written whenever there is anything to say: the
+        # supervisor's hooks, the user's document, or both. With neither
+        # (an unsupervised child and no user settings) the argv is unchanged.
+        settings = ""
+        if automatic or self.user_settings:
+            settings = self._settings_file(self.generation, automatic)
         argv = ["claude"]
         if settings:
             argv.extend(["--settings", settings])
@@ -3577,6 +3708,16 @@ def _initial_account(family):
     return account if reason is None else None
 
 
+def _refuse_settings_launch(error):
+    """The single refusal voice for an unusable `--settings`, exit code and
+    all. Used by every surface that can reach one, so no caller has to invent
+    its own — and none of them may answer with an unsupervised launch."""
+    print(f"headroom: refusing to launch: {error}", file=sys.stderr)
+    print("[headroom] headroom never runs an unsupervised child to work "
+          "around a settings file", file=sys.stderr)
+    return 2
+
+
 def cmd_claude(family, args, fallback_argv=None):
     """Supervised launch. `fallback_argv` (opt-in, from
     --headroom-launch-fallback / HEADROOM_LAUNCH_FALLBACK=1) is the bare CLI
@@ -3585,7 +3726,15 @@ def cmd_claude(family, args, fallback_argv=None):
     (Supervisor.spawned_any) — or while the spawn outcome is even AMBIGUOUS
     (Supervisor.spawn_ambiguous, P0-3) — a later exit or crash is a normal
     supervision/exit path and NEVER triggers the fallback, so a live child is
-    never duplicated by a bare relaunch."""
+    never duplicated by a bare relaunch.
+
+    A user `--settings` disarms the fallback itself. Every fallback argv is
+    the ORIGINAL argv, `--settings` and all, and a bare CLI is by definition
+    unsupervised — so bare-execing one would start precisely the child the
+    merge exists to prevent, on the routing failures (no headroom, lease
+    unavailable, preparation error) that have nothing to do with the settings
+    at all. Those refuse instead, and print the exact command to run by
+    hand."""
     # EVERYTHING after the fallback intent is established runs inside the
     # pre-spawn guard — account selection, lease commit, the diagnostic, and
     # Supervisor construction — so any pre-spawn failure (including a
@@ -3593,6 +3742,25 @@ def cmd_claude(family, args, fallback_argv=None):
     # (P1-4). The guard is only for BEFORE the first spawn; runner.run() owns
     # the after-spawn boundary via spawned_any/spawn_ambiguous.
     runner = None
+    try:
+        _cleaned, raw_settings = split_user_settings(args)
+    except UserSettingsError as error:
+        return _refuse_settings_launch(error)
+
+    def _fall_back(reason):
+        """Take the opt-in bare fallback, or refuse it when the argv carries
+        a user `--settings` that only a supervised launch can honour."""
+        if raw_settings is None:
+            return route.bare_fallback_exec(fallback_argv, reason)
+        print(f"headroom: refusing the bare fallback: {reason}",
+              file=sys.stderr)
+        print(f"[headroom] --settings {raw_settings} was given, and a bare "
+              f"CLI cannot be supervised — headroom will not start an "
+              f"unsupervised child carrying it. Run it yourself if that is "
+              f"what you want:", file=sys.stderr)
+        print("  " + shlex.join(fallback_argv), file=sys.stderr)
+        return 2
+
     try:
         account = _initial_account(family)
         # commit: take the slot flock (no-op unless HEADROOM_SLOT_LEASE=1);
@@ -3620,29 +3788,24 @@ def cmd_claude(family, args, fallback_argv=None):
         # still carries the user's `--settings`, so falling back here would
         # start exactly the unsupervised child the merge exists to prevent —
         # and silently, since the session would look launched.
-        print(f"headroom: refusing to launch: {error}", file=sys.stderr)
-        print("[headroom] headroom never runs an unsupervised child to work "
-              "around a settings file", file=sys.stderr)
-        return 2
+        return _refuse_settings_launch(error)
     except route.LeaseError as error:
         # HEADROOM_SLOT_LEASE=1 fails closed: refuse the routed launch. With
         # the explicit fallback opt-in, still degrade to a bare CLI (the
-        # caller asked to always run something).
+        # caller asked to always run something) — unless that argv carries a
+        # user --settings, which no bare CLI can run supervised.
         print(f"[headroom] slot lease unavailable ({error}); refusing to "
               f"launch — HEADROOM_SLOT_LEASE=1 fails closed", file=sys.stderr)
         if fallback_argv is not None:
-            return route.bare_fallback_exec(
-                fallback_argv, f"slot lease unavailable: {error}")
+            return _fall_back(f"slot lease unavailable: {error}")
         return 2
     except Exception as error:  # noqa: BLE001 — opt-in: pre-spawn failures fall back
         if fallback_argv is not None:
-            return route.bare_fallback_exec(
-                fallback_argv, f"launch preparation failed: {error}")
+            return _fall_back(f"launch preparation failed: {error}")
         raise
     if account is None:
         if fallback_argv is not None:
-            return route.bare_fallback_exec(
-                fallback_argv,
+            return _fall_back(
                 f"no account for '{family}' has proven headroom")
         print(f"[headroom] no account for '{family}' has proven headroom; "
               f"try `headroom status {family}`", file=sys.stderr)
@@ -3658,12 +3821,10 @@ def cmd_claude(family, args, fallback_argv=None):
         result = runner.run()
     except Exception as error:  # noqa: BLE001 — opt-in: pre-spawn failures fall back
         if _may_fall_back():
-            return route.bare_fallback_exec(
-                fallback_argv, f"failed before Claude started: {error}")
+            return _fall_back(f"failed before Claude started: {error}")
         raise
     if _may_fall_back():
         # run() returned without ever spawning a child (e.g. the very first
         # spawn failed) — strictly before-first-spawn, so fall back
-        return route.bare_fallback_exec(
-            fallback_argv, "Claude never started (details on stderr)")
+        return _fall_back("Claude never started (details on stderr)")
     return result
