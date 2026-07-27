@@ -325,6 +325,23 @@ class Child:
 
 
 @dataclass(frozen=True)
+class Recovery:
+    """How to bring a session back when its REPLACEMENT could not be spawned.
+
+    The account-to-account paths carry a `HandoffPlan` for this, and run()
+    recovers the source from it. A same-seat context rotation has no plan (it
+    reserves nothing and moves nothing), so it carries this instead: without
+    it an unambiguous spawn failure after an ELECTIVE stop exits 127 on a
+    session that was already stopped — the exact "strand the user" outcome the
+    rotation exists to prevent."""
+    account: dict
+    argv: list
+    cwd: str
+    session_id: str
+    reason: str = "context_backstop"
+
+
+@dataclass(frozen=True)
 class Relaunch:
     account: dict
     argv: list
@@ -339,6 +356,10 @@ class Relaunch:
     # rotation sets it independently — that source is not capped, so it is
     # recovered with auto-handoff still armed.
     supervised: object = None
+    # What to fall back to if THIS relaunch cannot be spawned (see Recovery).
+    # Only the planless same-seat rotation needs it; every other path recovers
+    # from its plan.
+    recovery: object = None
 
 
 def _lose_supervision(child, reason):
@@ -919,7 +940,11 @@ def _assistant_usage(event):
 
     Sidechains are excluded because a subagent runs in its own window; adding
     its usage to the parent's would report a context pressure the parent does
-    not have. Nested per-`iterations` usage is ignored for the mirror-image
+    not have. BOTH sidechain markers are honoured — the record's own and the
+    nested `message.isSidechain` — exactly as `_turn_is_complete` does: a
+    subagent turn carrying only the nested marker would otherwise be read as
+    the parent's own occupancy and could force a rotation the parent never
+    needed. Nested per-`iterations` usage is ignored for the mirror-image
     reason: those are the same tokens as the record's own totals, and summing
     both would double-count a multi-iteration turn straight past the ceiling.
     Only the record's top-level counters count.
@@ -931,6 +956,8 @@ def _assistant_usage(event):
             or event.get("isSidechain"):
         return 0
     message = event.get("message")
+    if isinstance(message, dict) and message.get("isSidechain") is True:
+        return 0
     usage = message.get("usage") if isinstance(message, dict) else None
     if not isinstance(usage, dict):
         return 0
@@ -1530,6 +1557,11 @@ class Supervisor:
         # could not change the window would repeat forever
         self.context_hold_until = 0.0
         self.context_rotations = []
+        # The model the most recently STOPPED child was running. Recovery
+        # happens after that child is gone — in _stop_and_commit, and in run()
+        # where the Child handle no longer exists — but what it was running
+        # still decides what window its conversation may be resumed into.
+        self.stopped_child_model = ""
         self.generation = 0
         self.settings_files = []
         # True once ANY child CLI process has been successfully spawned —
@@ -2299,6 +2331,7 @@ class Supervisor:
             raise SupervisorError("context decision window elapsed before stop")
         print(f"[headroom] {proof.message}; forcing a lossless rotation of "
               f"this session on {child.account['name']}", file=sys.stderr)
+        self.stopped_child_model = _model_flag(child.spawn_args)
         saved = self._save_terminal()
         stop_error = None
         stop_sent_at = 0.0
@@ -2319,7 +2352,13 @@ class Supervisor:
             if not signal_sent:
                 raise SupervisorError(str(error)) from error
             stop_error = error
-            returncode = child.process.poll()
+            # The signal WAS sent, so this child is on its way out and the
+            # session has to come back whatever went wrong. Give it the full
+            # exit budget instead of sampling poll() once: a racing hook event
+            # (a cap landing between SIGTERM and exit, say) would otherwise
+            # read as "ignored SIGTERM", disarm supervision and return no
+            # relaunch — leaving a stopped session with nothing to replace it.
+            returncode = self._await_exit(child)
         finally:
             self._restore_terminal(saved)
         if returncode is None:
@@ -2370,11 +2409,22 @@ class Supervisor:
         if forced:
             print(f"[headroom] resuming this conversation on {forced} so its "
                   f"{proof.used:,} tokens have room", file=sys.stderr)
+        # What to do if THIS relaunch cannot even be spawned: the plain
+        # resume, on the same seat, fitted only where the transcript genuinely
+        # demands it. It is deliberately the SIMPLER command — dropping the
+        # fork and any model this rotation added — because the added flags are
+        # exactly what a spawn failure might be about, and a stopped session
+        # with nothing running is the worst outcome this feature can produce.
+        fallback, _fitted = _window_fit_argv(
+            ["--resume", proof.session_id], proof.transcript_path,
+            used=proof.used, model=self.stopped_child_model)
+        recovery = (None if fallback == argv else Recovery(
+            child.account, fallback, child.binding.cwd, proof.session_id))
         # supervised either way: an elective stop must never cost the
         # cap-reactive guarantee, and this seat is not capped
         return Relaunch(child.account, argv, child.binding.cwd,
                         reason == "context_backstop", reason=reason,
-                        supervised=True)
+                        supervised=True, recovery=recovery)
 
     def _context_backstop_cycle(self, child):
         """One backstop attempt. Returns a Relaunch when the session was
@@ -2474,6 +2524,18 @@ class Supervisor:
         self._consume_stop_events(child, proof, stop_sent_at)
         return returncode
 
+    def _await_exit(self, child):
+        """Wait out the exit budget WITHOUT consuming hook events.
+
+        `_wait_stopped` doubles as the stop-transition event reader, so it
+        cannot be re-entered once one of those events has raised. This is the
+        plain half: the signal is already delivered, and all that is left to
+        establish is whether the process is gone."""
+        deadline = self.now() + TERM_TIMEOUT
+        while child.process.poll() is None and self.now() < deadline:
+            self.sleep(POLL_SECONDS)
+        return child.process.poll()
+
     def _consume_stop_events(self, child, proof, stop_sent_at):
         _remember_binding(child)
         for record in _read_events(child):
@@ -2514,6 +2576,22 @@ class Supervisor:
                 # a preemptive stop (the seat capping mid-rotation is exactly
                 # the race the rotation was trying to beat), but the cap path
                 # gets the same protection from a repeated StopFailure.
+                #
+                # NONE of that holds for a context backstop stop: it has no
+                # target, and it comes back on the SAME seat. Absorbing the
+                # cap there would resume the conversation on a seat that has
+                # just been refused — the one outcome a cap must never lead
+                # to. So it is never swallowed: it aborts the elective fork
+                # (see _context_backstop_stop, which degrades to an in-place
+                # SUPERVISED resume) and the cap-reactive path takes the
+                # session off this seat on its next refusal, through the
+                # pipeline that can actually stage it. Re-driving that
+                # pipeline here is not possible: this session is already in
+                # `dead_sessions`, so every cap proof against it is expired by
+                # construction (`_proof_current`).
+                if getattr(proof, "backstop", False) is True:
+                    raise SupervisorError(
+                        "a subscription cap landed during the context stop")
                 child.pending_cap = None
                 continue
             if hook_name != "SessionEnd":
@@ -2588,13 +2666,18 @@ class Supervisor:
                 route.release_slot_lease(name)
 
     @staticmethod
-    def _source_relaunch(plan):
-        # even a RECOVERY resume has to fit the window it resumes into: the
+    def _source_relaunch(plan, model=""):
+        # Even a RECOVERY resume has to fit the window it resumes into: the
         # session being recovered is the same one whose transcript may already
-        # have outgrown the standard window
+        # have outgrown the standard window. `model` is what the stopped child
+        # was RUNNING, and it must be threaded in here too — recovering a
+        # `sonnet[1m]` session without it shrinks the conversation back into a
+        # 200k window (a large one lands there already in crisis) or swaps its
+        # family for the default fit model when it did not need to change at
+        # all.
         argv, _forced = _window_fit_argv(
             ["--resume", plan.source.session_id],
-            plan.source.transcript_path)
+            plan.source.transcript_path, model=model)
         return Relaunch(plan.source.account, argv, plan.cwd, False)
 
     @staticmethod
@@ -2676,6 +2759,10 @@ class Supervisor:
         # this raises SupervisorError and the caller keeps the source running
         # and leased
         self._lease_target(plan)
+        # what this child is RUNNING, remembered before it dies: every
+        # recovery below (and run()'s, which has no Child handle at all) needs
+        # it to decide what window the conversation may be resumed into
+        self.stopped_child_model = _model_flag(child.spawn_args)
         saved = self._save_terminal()
         stop_error = None
         stop_sent_at = 0.0
@@ -2789,15 +2876,16 @@ class Supervisor:
                       f"{plan.source.account['name']} with auto-handoff still "
                       f"armed", file=sys.stderr)
                 self.preemptive_hold_until = self.now() + PREEMPT_BACKOFF_SECONDS
-                return replace(self._source_relaunch(plan),
-                               reason="preemptive_aborted", supervised=True)
+                return replace(
+                    self._source_relaunch(plan, model=self.stopped_child_model),
+                    reason="preemptive_aborted", supervised=True)
             print(f"[headroom] handoff failed after Claude exited ({error}); "
                   "relaunching the source with automation off", file=sys.stderr)
             # the source will be relaunched UNsupervised — notify the loss once
             # so an observer that saw the initial supervised launch knows (P1-5)
             _lose_supervision(
                 child, f"handoff failed after Claude exited: {error}")
-            return self._source_relaunch(plan)
+            return self._source_relaunch(plan, model=self.stopped_child_model)
 
     def _handle_events(self, child, pending_handoff_id, proof=None):
         try:
@@ -3027,6 +3115,11 @@ class Supervisor:
         pending_handoff_id = ""
         pending_plan = None
         recovery_plan = None
+        # the planless equivalent of `pending_plan`: how to bring the session
+        # back if the replacement for a same-seat context rotation cannot be
+        # spawned (see Recovery)
+        pending_recovery = None
+        manual_resume = ""
         last_exit = 0
         clean_exit = False
         try:
@@ -3100,7 +3193,11 @@ class Supervisor:
                                 "reason": f"target relaunch failed: {error}"})
                         # the target never started — release its unused lease
                         route.release_slot_lease(failed_plan.target["name"])
-                        relaunch = self._source_relaunch(failed_plan)
+                        # the child that was stopped for this plan is gone,
+                        # but the model it was running still decides what its
+                        # conversation may be resumed into
+                        relaunch = self._source_relaunch(
+                            failed_plan, model=self.stopped_child_model)
                         account, args, cwd = (relaunch.account, relaunch.argv,
                                               relaunch.cwd)
                         automatic = elective
@@ -3108,9 +3205,45 @@ class Supervisor:
                         pending_plan = None
                         recovery_plan = failed_plan
                         continue
+                    if pending_recovery is not None:
+                        # A same-seat context rotation reserves nothing, so it
+                        # carries no plan and the branch above cannot see it —
+                        # but its child was ALREADY STOPPED, so exiting here
+                        # would strand exactly the session the rotation exists
+                        # to save. Bring it back on its own seat, SUPERVISED
+                        # (the seat is not capped; an elective rotation must
+                        # never cost the cap-reactive guarantee), and hold the
+                        # backstop so the recovered child is not immediately
+                        # targeted again.
+                        failed = pending_recovery
+                        print(f"[headroom] context rotation could not start its "
+                              f"replacement ({error}); recovering the session "
+                              f"on {failed.account['name']} with auto-handoff "
+                              f"still armed", file=sys.stderr)
+                        notify.emit({
+                            "event": "context_backstop_held",
+                            "account": failed.account["name"],
+                            "reason": f"replacement spawn failed: {error}"})
+                        self.context_hold_until = \
+                            self.now() + PREEMPT_BACKOFF_SECONDS
+                        account, args, cwd = (failed.account, failed.argv,
+                                              failed.cwd)
+                        automatic = True
+                        pending_handoff_id = ""
+                        pending_plan = None
+                        pending_recovery = None
+                        manual_resume = handoff.resume_command(
+                            failed.account["home"], failed.session_id)
+                        continue
                     print(f"headroom: {error}", file=sys.stderr)
                     if recovery_plan is not None:
                         self._print_manual_recovery(recovery_plan)
+                    elif manual_resume:
+                        # the recovery above could not start either: leave the
+                        # user the one command that gets their conversation back
+                        print("headroom: automatic recovery could not start "
+                              "Claude; run:", file=sys.stderr)
+                        print(manual_resume, file=sys.stderr)
                     clean_exit = True
                     return 127
                 # run() has now safely RECEIVED the child and taken ownership:
@@ -3122,6 +3255,8 @@ class Supervisor:
                 self.spawn_ambiguous = False
                 pending_plan = None
                 recovery_plan = None
+                pending_recovery = None
+                manual_resume = ""
                 # the active child now exists on `child.account`: hold exactly
                 # its lease. After a rotation this releases the OLD source
                 # lease (kept until the target spawned, per _lease_target);
@@ -3170,6 +3305,7 @@ class Supervisor:
                                  else bool(outcome.supervised))
                     pending_handoff_id = outcome.handoff_id
                     pending_plan = outcome.plan if outcome.automatic else None
+                    pending_recovery = outcome.recovery
                     continue
                 last_exit = int(outcome)
                 clean_exit = True

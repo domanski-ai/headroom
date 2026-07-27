@@ -175,7 +175,15 @@ actually has room. Nothing is cleared — the fork carries the whole
 conversation — the pre-rotation session id stays on disk, no account moves,
 nothing is cooled, and no target is reserved. If the stop cannot be proven
 clean (no `SessionEnd`, a transcript ending mid-tool-call) the session is
-resumed in place instead of forked, but it always comes back.
+resumed in place instead of forked, but it always comes back — including when
+the replacement itself cannot be spawned, which falls back to the plain resume
+on the same seat, supervised, and prints the manual resume command if even
+that refuses to start. A subscription cap landing *during* a context stop is
+never absorbed the way it is for a seat rotation: there is no reserved target
+here and the session would come back on a seat that has just been refused, so
+the fork is abandoned, the session resumes in place with auto-handoff armed,
+and the cap-reactive path moves it off the seat through the pipeline that can
+actually stage it.
 
 It is bounded on purpose: a fork inherits its parent's usage records, so
 rotations are capped (two per ten minutes per supervisor, separate from the

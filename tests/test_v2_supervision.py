@@ -3546,6 +3546,15 @@ class ContextMeasurement(TempDirCase):
         ])
         self.assertEqual(supervisor._context_used(path), 180_000)
 
+    def test_a_nested_sidechain_marker_is_honoured_too(self):
+        # some records carry the marker on the message, not the record — the
+        # idleness machinery already reads both, and so must this
+        nested = usage_record(950_000)
+        nested["message"]["isSidechain"] = True
+        path = self.transcript([usage_record(180_000), nested])
+        self.assertEqual(supervisor._context_used(path), 180_000)
+        self.assertEqual(supervisor._assistant_usage(nested), 0)
+
     def test_records_without_usage_never_read_as_an_empty_window(self):
         path = self.transcript([
             usage_record(180_000),
@@ -3707,6 +3716,31 @@ class WindowFitOnResume(TempDirCase):
         self.assertEqual(supervisor.Supervisor._source_relaunch(plan).argv,
                          ["--resume", "sid"])
 
+    def test_source_recovery_keeps_the_stopped_childs_own_1m_model(self):
+        # recovering a sonnet[1m] session without its model shrinks it into a
+        # 200k window (at 190k that is a 5%-remaining crisis on arrival) or
+        # swaps its family for the default fit model for no reason at all
+        plan = mock.Mock(cwd="/work")
+        plan.source.session_id = "sid"
+        plan.source.account = {"name": "source"}
+        for total in (190_000, 500_000):
+            plan.source.transcript_path = self.transcript(total)
+            relaunch = supervisor.Supervisor._source_relaunch(
+                plan, model="claude-sonnet-5[1m]")
+            self.assertEqual(
+                relaunch.argv,
+                ["--resume", "sid", "--model", "claude-sonnet-5[1m]"], total)
+
+    def test_source_recovery_of_a_small_session_still_routes_normally(self):
+        plan = mock.Mock(cwd="/work")
+        plan.source.session_id = "sid"
+        plan.source.account = {"name": "source"}
+        plan.source.transcript_path = self.transcript(50_000)
+        self.assertEqual(
+            supervisor.Supervisor._source_relaunch(
+                plan, model="claude-sonnet-5[1m]").argv,
+            ["--resume", "sid"])
+
 
 class ContextBackstop(TempDirCase):
     """The fail-safe under the cooperative baton handoff: a real transcript, a
@@ -3800,6 +3834,14 @@ class ContextBackstop(TempDirCase):
         self.assertEqual(outcome.cwd, self.cwd)
         self.assertTrue(outcome.automatic)
         self.assertTrue(outcome.supervised)
+        # it carries its OWN recovery: there is no handoff plan behind a
+        # same-seat rotation, so this is all run() has if the replacement
+        # cannot be spawned onto an already-stopped session
+        self.assertIsNotNone(outcome.recovery)
+        self.assertEqual(outcome.recovery.argv, ["--resume", self.SID])
+        self.assertEqual(outcome.recovery.account["name"], "source")
+        self.assertEqual(outcome.recovery.session_id, self.SID)
+        self.assertEqual(outcome.recovery.cwd, self.cwd)
         self.assertEqual([event["event"] for event in events],
                          ["context_backstop_scheduled",
                           "context_backstop_rotation"])
@@ -4086,6 +4128,168 @@ class ContextBackstop(TempDirCase):
         killed.assert_not_called()
         self.assertIn("newer hook event",
                       [event.get("reason", "") for event in events][-1])
+
+    # -- the session must survive the rotation itself -----------------------
+
+    def relaunched(self, runner, relaunch, fail_on=2):
+        """Drive run() so the `fail_on`-th spawn fails unambiguously."""
+        spawns = []
+
+        def spawn(account, args, cwd, automatic, plan=None):
+            spawns.append((account["name"], list(args), automatic))
+            if len(spawns) == fail_on:
+                runner.spawn_ambiguous = False   # positively no child started
+                raise supervisor.SupervisorError(
+                    "`claude` not found on PATH; nothing was started")
+            child = mock.Mock()
+            child.account = account
+            child.generation = len(spawns)
+            return child
+
+        outcomes = iter([relaunch, 0])
+        with mock.patch.object(runner, "_spawn", side_effect=spawn), \
+                mock.patch.object(
+                    runner, "_monitor",
+                    side_effect=lambda child, pending="": next(outcomes)), \
+                mock.patch.object(runner, "_reconcile_leases"), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as err:
+            exit_code = runner.run()
+        return exit_code, spawns, self.events(emit), err.getvalue()
+
+    def rotation(self, recovery=True):
+        """The Relaunch a successful backstop rotation hands back."""
+        return supervisor.Relaunch(
+            self.source,
+            ["--resume", self.SID, "--fork-session", "--model", "opus[1m]"],
+            self.cwd, True, reason="context_backstop", supervised=True,
+            recovery=supervisor.Recovery(
+                self.source, ["--resume", self.SID], self.cwd, self.SID)
+            if recovery else None)
+
+    def test_a_replacement_that_cannot_be_spawned_never_strands_the_session(self):
+        # the child was ALREADY STOPPED by an elective rotation: exiting here
+        # kills exactly the conversation the rotation exists to save. End to
+        # end from the REAL rotation, so the recovery it carries is the one
+        # under test, not a hand-built stand-in.
+        runner = self.runner()
+        outcome, _killed, _events = self.cycle(runner)
+        exit_code, spawns, events, _err = self.relaunched(runner, outcome)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual([name for name, _a, _s in spawns],
+                         ["source", "source", "source"])
+        # recovered on its own seat with the SIMPLER command, and SUPERVISED
+        self.assertEqual(spawns[2][1], ["--resume", self.SID])
+        self.assertTrue(spawns[2][2])
+        self.assertNotIn("supervision_lost",
+                         [event["event"] for event in events])
+        held = [event for event in events
+                if event["event"] == "context_backstop_held"]
+        self.assertEqual(len(held), 1)
+        self.assertIn("replacement spawn failed", held[0]["reason"])
+        # and the recovered child is not immediately targeted again
+        self.assertEqual(runner.context_hold_until,
+                         self.clock["t"] + supervisor.PREEMPT_BACKOFF_SECONDS)
+
+    def test_a_recovery_that_also_fails_leaves_a_usable_resume_command(self):
+        # both the replacement AND its recovery refuse to start: the user gets
+        # the one command that brings the conversation back by hand
+        runner = self.runner()
+        spawns = []
+
+        def spawn(account, args, cwd, automatic, plan=None):
+            spawns.append(list(args))
+            runner.spawn_ambiguous = False
+            if len(spawns) == 1:
+                child = mock.Mock()
+                child.account = account
+                child.generation = 1
+                return child
+            raise supervisor.SupervisorError("nothing was started")
+
+        with mock.patch.object(runner, "_spawn", side_effect=spawn), \
+                mock.patch.object(
+                    runner, "_monitor",
+                    side_effect=lambda child, pending="": self.rotation()), \
+                mock.patch.object(runner, "_reconcile_leases"), \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(runner.run(), 127)
+        self.assertEqual(len(spawns), 3)
+        self.assertIn("--resume " + self.SID, err.getvalue())
+        self.assertIn(self.source["home"], err.getvalue())
+
+    def stop_failure(self):
+        """A valid StopFailure hook row bound to this child's session."""
+        return {"schema": "headroom_hook_event@1",
+                "supervisor_id": os.path.splitext(
+                    os.path.basename(self.child.event_path))[0],
+                "generation": 1, "source_slot": "source",
+                "config_dir": self.source["home"], "matcher": "rate_limit",
+                "received_at": self.clock["t"] + 1,
+                "payload": {"hook_event_name": "StopFailure",
+                            "session_id": self.SID,
+                            "transcript_path": self.transcript,
+                            "cwd": self.cwd, "error": "rate_limit"}}
+
+    def test_a_child_that_exits_a_moment_after_the_race_still_comes_back(self):
+        # the racing event lands while the child is still dying. Sampling
+        # poll() once would read that as "ignored SIGTERM", disarm, and hand
+        # back NO relaunch — stranding a session that was already stopped.
+        runner = self.runner()
+        proof = runner._context_observation(self.child)
+        alive = iter([None, None])
+        self.child.process.poll.side_effect = lambda: next(alive, 0)
+        with mock.patch.object(supervisor, "_read_events",
+                               return_value=[self.stop_failure()]), \
+                mock.patch.object(supervisor.os, "kill"), \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            outcome = runner._context_backstop_stop(self.child, proof)
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.reason, "context_backstop_recovered")
+        self.assertTrue(self.child.automation)
+        self.assertFalse(self.child.supervision_loss_notified)
+
+    def test_a_cap_landing_during_the_context_stop_is_never_swallowed(self):
+        # absorbing it would resume the conversation on a seat that has just
+        # been refused; the fork is abandoned and the cap path takes over
+        runner = self.runner()
+        proof = runner._context_observation(self.child)
+        record = self.stop_failure()
+        self.child.process.poll.return_value = 0
+        with mock.patch.object(supervisor, "_read_events",
+                               return_value=[record]), \
+                mock.patch.object(supervisor.os, "kill"), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            outcome = runner._context_backstop_stop(self.child, proof)
+        self.assertIsNotNone(outcome)          # the session still comes back
+        self.assertNotIn("--fork-session", outcome.argv)
+        self.assertEqual(outcome.reason, "context_backstop_recovered")
+        self.assertTrue(outcome.supervised)    # cap handoff stays armed
+        self.assertTrue(self.child.automation)
+        reasons = [event.get("reason", "") for event in self.events(emit)]
+        self.assertIn("a subscription cap landed during the context stop",
+                      reasons[-1])
+
+    def test_the_same_race_is_still_absorbed_for_a_seat_rotation(self):
+        # the preemptive/cap contract is unchanged: those stops DO have a
+        # reserved target on another seat, so a racing cap is corroboration
+        runner = self.runner()
+        proof = runner._context_observation(self.child)
+        seat_proof = supervisor.PreemptiveProof(
+            event={"received_at": self.clock["t"]}, message="7d at 96%",
+            family="fable", session_id=proof.session_id,
+            transcript_path=proof.transcript_path, epoch=proof.epoch,
+            transcript_stat=proof.transcript_stat, window="7d",
+            used_percent=96.0, deadline=self.clock["t"] + 120)
+        with mock.patch.object(supervisor, "_read_events",
+                               return_value=[self.stop_failure()]), \
+                redirect_stderr(io.StringIO()):
+            runner._consume_stop_events(self.child, seat_proof,
+                                        self.clock["t"])
+        self.assertTrue(self.child.automation)
 
     def test_the_monitor_loop_returns_the_forced_rotation(self):
         runner = self.runner()
