@@ -144,6 +144,14 @@ def _takes_value(arg, following):
     return False
 
 
+def _redacted(value):
+    """supervisor.redacted_settings_value, mirrored for the same reason: an
+    inline settings document can carry credentials and must never be echoed
+    into stderr, and this path cannot import supervisor."""
+    return ("<inline JSON>" if (value or "").strip().startswith(("{", "["))
+            else value)
+
+
 def _settings_in(args):
     """The user `--settings` value in a claude option segment, else None.
 
@@ -248,10 +256,11 @@ def _launch(command, args):
             if settings is not None:
                 print(f"headroom: refusing the bare fallback: launch "
                       f"preprocessing failed: {error}", file=sys.stderr)
-                print(f"[headroom] --settings {settings} was given, and a "
-                      f"bare CLI cannot be supervised. Run it yourself if "
-                      f"that is what you want:", file=sys.stderr)
-                print("  " + " ".join(bare_argv), file=sys.stderr)
+                print(f"[headroom] --settings {_redacted(settings)} was "
+                      f"given, and a bare CLI cannot be supervised. Run it "
+                      f"yourself if that is what you want:", file=sys.stderr)
+                print("  " + " ".join(_redacted(arg) for arg in bare_argv),
+                      file=sys.stderr)
                 return 2
             return _bare_cli_fallback(
                 bare_argv, f"launch preprocessing failed: {error}")

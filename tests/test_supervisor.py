@@ -8,7 +8,9 @@ import os
 if os.name != "nt":
     import pty
 import select
+import shlex
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -1137,6 +1139,69 @@ class CliWiring(unittest.TestCase):
             self.assertIn(offender, str(caught.exception))
             self.assertIn("/tmp/user.json", str(caught.exception))
 
+    def test_managed_settings_cannot_be_merged_and_is_refused_by_name(self):
+        # policy settings sit ABOVE the merged document: an
+        # allowManagedHooksOnly / strictPluginOnlyCustomization in there turns
+        # the injected hooks off and no merge can answer for it
+        for argv in (["--managed-settings", "policy.json"],
+                     ["--managed-settings=policy.json"],
+                     ["--model", "sonnet", "--managed-settings", "p.json"]):
+            with self.assertRaises(supervisor.UserSettingsError) as caught:
+                supervisor.validate_user_settings(argv)
+            self.assertIn("--managed-settings", str(caught.exception))
+        # …but only when it IS an option: as another option's value, or as
+        # prompt text, it is not one
+        self.assertEqual(supervisor.hook_suppressing_flag(
+            ["--model", "--managed-settings"]), "")
+        self.assertEqual(
+            supervisor.hook_suppressing_flag(["--", "--managed-settings"]), "")
+
+    def test_the_reserved_env_rule_is_a_namespace_not_a_list(self):
+        # round 1 enumerated names and missed two; the rule is now the two
+        # control surfaces themselves, so a knob added by a later CLI release
+        # is covered before it exists
+        for key in ("CLAUDE_CODE_SHELL_PREFIX",     # replaces the command
+                    "CLAUDE_CODE_SHELL",            # replaces the shell
+                    "CLAUDE_CODE_PROCESS_WRAPPER",  # wraps the process
+                    "CLAUDE_CODE_FORCE_SANDBOX",
+                    "CLAUDE_CODE_SIMPLE", "CLAUDE_CODE_SAFE_MODE",
+                    "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_A_KNOB_FROM_2027",
+                    "HEADROOM_DIR",                 # moves the state tree
+                    "HEADROOM_SUPERVISOR_ID", "HEADROOM_ANYTHING",
+                    "HOME", "USERPROFILE"):         # relocate ~/.headroom
+            with self.assertRaises(supervisor.UserSettingsError) as caught:
+                supervisor.merge_user_settings({"env": {key: "1"}},
+                                               "/tmp/user.json")
+            self.assertIn(key, str(caught.exception), key)
+        # the operator's own variables are exactly what merging is for
+        merged = supervisor.merge_user_settings(
+            {"env": {"ANTHROPIC_API_KEY": "sk-x", "AWS_PROFILE": "work",
+                     "NODE_ENV": "test", "MY_CLAUDE_TOKEN": "t"}},
+            "/tmp/user.json")
+        self.assertEqual(merged["env"]["AWS_PROFILE"], "work")
+        self.assertEqual(merged["env"]["MY_CLAUDE_TOKEN"], "t")
+
+    def test_the_injected_hook_command_pins_the_state_tree(self):
+        # the event path may not depend on the env check being complete
+        expected = "HEADROOM_DIR=" + shlex.quote(paths.base_dir())
+        for groups in supervisor.hook_settings()["hooks"].values():
+            for group in groups:
+                for entry in group["hooks"]:
+                    self.assertTrue(entry["command"].startswith(expected),
+                                    entry["command"])
+
+    def test_an_inline_settings_document_is_never_echoed(self):
+        secret = '{"env": {"MY_API_KEY": "sk-super-secret"}}'
+        self.assertEqual(supervisor.redacted_settings_value(secret),
+                         "<inline JSON>")
+        self.assertEqual(supervisor.redacted_settings_value("/tmp/user.json"),
+                         "/tmp/user.json")
+        rendered = supervisor.redacted_command(
+            ["claude", "--settings", secret, "--model", "sonnet"])
+        self.assertNotIn("sk-super-secret", rendered)
+        self.assertIn("<inline JSON>", rendered)
+        self.assertIn("--model sonnet", rendered)
+
     def test_a_hook_restricting_key_that_is_off_still_merges(self):
         merged = supervisor.merge_user_settings({"disableAllHooks": False},
                                                 "/tmp/user.json")
@@ -1347,6 +1412,132 @@ class CliWiring(unittest.TestCase):
                 redirect_stdout(output):
             self.assertEqual(statusline.main(), 0)
         self.assertIn("auto-handoff armed", output.getvalue())
+
+
+class InjectedHooksActuallyRun(unittest.TestCase):
+    """Round-2 P2: every settings test so far asserted on the REFUSAL path,
+    and that is how three hook bypasses survived a whole round. These run the
+    injected hook command for real — the same string, through the same shell,
+    that `tests/fake_claude.py` (and Claude) executes — and look at where the
+    event landed."""
+
+    SUP = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.tree = os.path.join(self.temp.name, "headroom")     # the real one
+        self.elsewhere = os.path.join(self.temp.name, "elsewhere")
+        environ = dict(os.environ)
+        environ.update({
+            "HEADROOM_DIR": self.tree,
+            # hermetic: never fire an installed headroom that is not this tree
+            "HEADROOM_EXECUTABLE": os.path.join(self.REPO, "bin", "headroom"),
+        })
+        patcher = mock.patch.dict(os.environ, environ, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def child_env(self, **adversarial):
+        """The environment Claude hands a hook: the supervisor's own
+        variables, plus whatever a settings `env` block put there."""
+        environ = dict(os.environ)
+        environ.update({
+            "HEADROOM_SUPERVISOR_ID": self.SUP,
+            "HEADROOM_CHILD_GENERATION": "1",
+            "HEADROOM_SOURCE_SLOT": "seat",
+            "CLAUDE_CONFIG_DIR": os.path.join(self.temp.name, "home"),
+        })
+        environ.update(adversarial)
+        return environ
+
+    @staticmethod
+    def fire(command, environ):
+        payload = {"hook_event_name": "SessionStart",
+                   "session_id": "11111111-1111-4111-8111-111111111111",
+                   "transcript_path": "/tmp/t.jsonl", "cwd": "/tmp"}
+        return subprocess.run(command, shell=True, env=environ, text=True,
+                              input=json.dumps(payload), capture_output=True)
+
+    @staticmethod
+    def events(tree, supervisor_id):
+        path = os.path.join(tree, "state", "supervisors",
+                            supervisor_id + ".jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+
+    def session_start_command(self, document=None):
+        """Exactly what fake_claude executes: the FIRST group's command."""
+        settings = supervisor.merge_user_settings(document, "/tmp/user.json")
+        return settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+
+    def test_the_handshake_lands_even_when_the_child_env_redirects_it(self):
+        # the bypass shape: a settings `env` that moved HEADROOM_DIR (or HOME,
+        # where the default tree lives) so hooks run perfectly into a state
+        # tree the supervisor is not reading
+        command = self.session_start_command()
+        result = self.fire(command, self.child_env(
+            HEADROOM_DIR=self.elsewhere, HOME=self.elsewhere))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        landed = self.events(self.tree, self.SUP)
+        self.assertEqual(len(landed), 1, result.stderr)
+        self.assertEqual(landed[0]["supervisor_id"], self.SUP)
+        self.assertEqual(landed[0]["payload"]["hook_event_name"],
+                         "SessionStart")
+        self.assertEqual(self.events(self.elsewhere, self.SUP), [])
+
+    def test_without_the_pin_the_same_env_captures_the_event(self):
+        # the control that proves the bypass was real: drop the pinned
+        # assignment and the identical hook writes into the other tree
+        command = self.session_start_command()
+        unpinned = command.split(" ", 1)[1]
+        self.assertTrue(command.startswith("HEADROOM_DIR="))
+        result = self.fire(unpinned, self.child_env(
+            HEADROOM_DIR=self.elsewhere, HOME=self.elsewhere))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.events(self.tree, self.SUP), [])
+        self.assertEqual(len(self.events(self.elsewhere, self.SUP)), 1)
+
+    def test_a_merged_document_still_fires_both_hooks(self):
+        # the supervisor's group runs FIRST and the operator's own SessionStart
+        # hook still runs — proven by running both, not by reading the JSON
+        witness = os.path.join(self.temp.name, "user-hook-ran")
+        merged = supervisor.merge_user_settings({
+            "env": {"MY_TOKEN": "t"},
+            "hooks": {"SessionStart": [{"hooks": [{
+                "type": "command",
+                "command": "touch " + shlex.quote(witness)}]}]},
+        }, "/tmp/user.json")
+        groups = merged["hooks"]["SessionStart"]
+        self.assertEqual(len(groups), 2)
+        environ = self.child_env()
+        for group in groups:
+            result = self.fire(group["hooks"][0]["command"], environ)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.events(self.tree, self.SUP)), 1)
+        self.assertTrue(os.path.exists(witness))
+
+    def test_a_hook_that_cannot_run_at_all_fails_closed(self):
+        # the residual class headroom cannot defend against inside the child
+        # (a shell prefix, a broken interpreter): the adapter never writes, so
+        # the supervisor's handshake simply never arrives — which is the
+        # 30-second loud disarm, never a silent unsupervised session
+        command = self.session_start_command()
+        result = self.fire("/bin/true " + shlex.quote(command),
+                           self.child_env())
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.events(self.tree, self.SUP), [])
+
+    def test_a_forged_supervisor_id_is_refused_by_the_adapter(self):
+        command = self.session_start_command()
+        result = self.fire(command,
+                           self.child_env(HEADROOM_SUPERVISOR_ID="not-a-uuid"))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("refused", result.stderr)
+        self.assertEqual(self.events(self.tree, self.SUP), [])
 
 
 class SupervisorIntegration(unittest.TestCase):

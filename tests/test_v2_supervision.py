@@ -1556,6 +1556,99 @@ class UserSettingsAreMergedNotObeyed(TempDirCase):
             runner=mock.patch.object(supervisor, "Supervisor", Stub))
         self.assertIn("Claude never started", errors)
 
+    def test_a_run_that_raises_before_the_first_spawn_also_refuses(self):
+        # the other side of the boundary: run() RAISING before any child
+        # exists, not returning — a separate fallback call site
+        path = self.user_settings({"ultracode": True})
+
+        class Stub:
+            def __init__(self, family, args, account):
+                self.spawned_any = False
+                self.spawn_ambiguous = False
+
+            def run(self):
+                raise supervisor.SupervisorError("nothing was started")
+
+        errors = self._refused_fallback(
+            ["--settings", path],
+            account=mock.patch.object(supervisor, "_initial_account",
+                                      return_value=self.account()),
+            runner=mock.patch.object(supervisor, "Supervisor", Stub))
+        self.assertIn("failed before Claude started", errors)
+
+    def test_the_refusal_never_echoes_an_inline_settings_document(self):
+        # inline settings legitimately carry credentials, and this diagnostic
+        # goes to stderr — which is exactly what a launcher captures
+        inline = '{"env": {"MY_API_KEY": "sk-super-secret"}}'
+        errors = self._refused_fallback(
+            ["--settings", inline],
+            account=mock.patch.object(supervisor, "_initial_account",
+                                      return_value=None))
+        self.assertNotIn("sk-super-secret", errors)
+        self.assertNotIn("MY_API_KEY", errors)
+        self.assertIn("<inline JSON>", errors)
+
+    def test_the_pre_import_refusal_never_echoes_one_either(self):
+        inline = '{"env": {"MY_API_KEY": "sk-super-secret"}}'
+        with mock.patch.object(__main__, "_prepare_launch",
+                               side_effect=RuntimeError("import blew up")), \
+                mock.patch.object(__main__, "_bare_cli_fallback") as bare, \
+                redirect_stderr(io.StringIO()) as errors:
+            code = __main__._dispatch(
+                ["claude", "--headroom-launch-fallback", "--settings", inline])
+        self.assertEqual(code, 2)
+        bare.assert_not_called()
+        self.assertNotIn("sk-super-secret", errors.getvalue())
+        self.assertIn("<inline JSON>", errors.getvalue())
+
+    def test_managed_settings_refuses_the_launch(self):
+        # policy settings sit above the merged document and can turn the
+        # injected hooks off; there is nothing to merge
+        for argv in (["claude", "--managed-settings", "/tmp/policy.json"],
+                     ["claude", "--managed-settings=/tmp/policy.json"],
+                     ["claude", "--managed-settings", "/tmp/p.json",
+                      "--settings", "/tmp/user.json"]):
+            code, supervised, execed, bare, raw, errors = self._dispatch(argv)
+            self.assertEqual(code, 2, argv)
+            supervised.assert_not_called()
+            execed.assert_not_called()
+            bare.assert_not_called()
+            for call in raw:
+                call.assert_not_called()
+            self.assertIn("--managed-settings", errors.getvalue())
+
+    def test_every_hook_bypassing_env_shape_refuses_the_launch(self):
+        for key in ("CLAUDE_CODE_SHELL_PREFIX", "CLAUDE_CODE_SHELL",
+                    "CLAUDE_CODE_PROCESS_WRAPPER", "CLAUDE_CODE_SIMPLE",
+                    "HEADROOM_DIR", "HOME", "USERPROFILE",
+                    "CLAUDE_CODE_A_KNOB_FROM_2027"):
+            path = self.user_settings({"env": {key: "/bin/true"}},
+                                      name=key + ".json")
+            code, supervised, execed, bare, raw, errors = self._dispatch(
+                ["claude", "--settings", path])
+            self.assertEqual(code, 2, key)
+            supervised.assert_not_called()
+            execed.assert_not_called()
+            bare.assert_not_called()
+            for call in raw:
+                call.assert_not_called()
+            self.assertIn(key, errors.getvalue())
+
+    def test_an_ordinary_env_block_still_reaches_the_child(self):
+        path = self.user_settings(
+            {"env": {"MY_TOKEN": "t", "AWS_PROFILE": "work"}})
+        spawned = []
+        runner = supervisor.Supervisor(
+            "sonnet", ["--settings", path], self.account(),
+            popen=lambda argv, **kw: spawned.append(argv) or mock.Mock())
+        child = runner._spawn(self.account(), runner.initial_args,
+                              self.temp.name, True)
+        with open(child.settings_path, encoding="utf-8") as handle:
+            document = json.load(handle)
+        self.assertEqual(document["env"],
+                         {"MY_TOKEN": "t", "AWS_PROFILE": "work"})
+        self.assertIn("SessionStart", document["hooks"])
+
     def test_a_fallback_without_settings_is_completely_unchanged(self):
         # the opt-in fallback still exists — only a --settings argv disarms it
         with mock.patch.object(supervisor, "_initial_account",
@@ -2004,9 +2097,22 @@ class R3CrudeBareArgvValueAware(TempDirCase):
         self.assertEqual(argv, ["claude", "--model=sonnet"])
 
     def test_local_value_flags_mirror_supervisor(self):
-        # keep the pre-import copy honest against the canonical list
+        # keep the pre-import copy honest against the canonical lists — BOTH
+        # of them: an optional-value flag mirrored as required is exactly the
+        # misparse that let `--resume --settings x` past the merge
         self.assertEqual(set(__main__._CLAUDE_VALUE_FLAGS),
                          set(supervisor.CLAUDE_VALUE_FLAGS))
+        self.assertEqual(set(__main__._CLAUDE_OPTIONAL_VALUE_FLAGS),
+                         set(supervisor.CLAUDE_OPTIONAL_VALUE_FLAGS))
+        # and the grammar itself agrees on every flag in both tables
+        for flag in (supervisor.CLAUDE_VALUE_FLAGS
+                     | supervisor.CLAUDE_OPTIONAL_VALUE_FLAGS
+                     | {"--ide", "--brief", "--unknown-future"}):
+            for following in ("value", "--settings", None):
+                self.assertEqual(
+                    __main__._takes_value(flag, following),
+                    supervisor.takes_value(flag, following),
+                    (flag, following))
 
     def test_import_failure_preserves_option_value_that_looks_like_a_flag(self):
         # end-to-end: env-based fallback + import failure + a prompt value that

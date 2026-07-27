@@ -233,10 +233,15 @@ file it owns: your keys pass through, its hook groups run first, and the
 merged document rides every rotation — including the unsupervised relaunch
 that recovers a session whose rotation target could not start, which carries
 your settings without the hooks. A document it cannot merge — missing, empty,
-unparseable, absurdly nested, or setting `disableAllHooks`/
-`allowManagedHooksOnly` or a headroom-owned variable in `env` (including
-`CLAUDE_CODE_SIMPLE`/`CLAUDE_CODE_SAFE_MODE`, which are what `--bare` and
-`--safe-mode` set) — **refuses the launch** and names the file and the key.
+unparseable, absurdly nested, setting `disableAllHooks`/
+`allowManagedHooksOnly`, or setting a `CLAUDE_*`/`HEADROOM_*` variable (or
+`HOME`) in `env` — **refuses the launch** and names the file and the key.
+Those two namespaces are refused wholesale rather than by a list of known-bad
+names: they are the CLI's and headroom's own control surfaces (which shell
+runs a hook, whether it runs at all, which state tree it writes into), and a
+document being read by a surface may not reconfigure it. Your own variables
+pass through untouched. `--managed-settings` is refused for the same reason
+and cannot be merged at all: policy settings sit above the merged document.
 
 It never degrades to an unsupervised child, because a session that looks
 launched but rotates on nothing is the failure this replaced. That includes

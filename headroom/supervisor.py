@@ -245,22 +245,39 @@ HEADROOM_OVERRIDE_FLAGS = {
 # Two settings keys can suppress hooks outright. There is no merge that keeps
 # supervision armed once either is set, so either one is a refusal.
 HOOK_RESTRICTING_KEYS = ("disableAllHooks", "allowManagedHooksOnly")
-# Environment the supervisor OWNS: the hook adapter authenticates every event
-# against these, and CLAUDE_CONFIG_DIR decides WHICH account the child is on.
-# A settings `env` block that rebinds any of them would point the handshake at
-# another supervisor (or another home) while this one waits for a hook that
-# can never arrive, so it is a refusal, not a merge.
+# Environment a settings `env` block may NOT set, by NAMESPACE rather than by
+# name. The hook process inherits the child's environment, so this list is
+# the CLI's whole execution-control surface plus headroom's own — and an
+# enumeration of it is unprovable: naming CLAUDE_CODE_SAFE_MODE and
+# CLAUDE_CODE_SIMPLE missed CLAUDE_CODE_SHELL_PREFIX (which REPLACES the
+# command that gets spawned), CLAUDE_CODE_SHELL, CLAUDE_CODE_PROCESS_WRAPPER,
+# the sandbox switches, and HEADROOM_DIR (which moves the whole state tree
+# the adapter writes into). Any release can add another.
 #
-# CLAUDE_CODE_SAFE_MODE and CLAUDE_CODE_SIMPLE are here for a second reason:
-# they are what `--safe-mode` and `--bare` set, and both of those disable
-# hooks (2.1.220's own help for --bare: "skip hooks … Sets
-# CLAUDE_CODE_SIMPLE=1"). They are already refused as FLAGS by
-# INCOMPATIBLE_FLAGS; a settings `env` block is the same switch by another
-# name, and an injected hook that never runs is not a merge that won.
-RESERVED_SETTINGS_ENV = (
-    "CLAUDE_CONFIG_DIR", "HEADROOM_SUPERVISOR_ID", "HEADROOM_CHILD_GENERATION",
-    "HEADROOM_SOURCE_SLOT", "HEADROOM_HOOK_MATCHER", "CLAUDE_CODE_SAFE_MODE",
-    "CLAUDE_CODE_SIMPLE")
+# So the rule is the namespace, not the name: neither surface may be
+# reconfigured by the document the surface is reading. `CLAUDE_*` covers
+# CLAUDE_CONFIG_DIR and every CLAUDE_CODE_* execution knob, present and
+# future; `HEADROOM_*` covers every variable the hook adapter authenticates
+# against. HOME/USERPROFILE are named explicitly because they sit in no
+# namespace and relocate `~/.headroom` — the same redirection by another
+# route.
+#
+# An ALLOWLIST was considered and rejected: passing the operator's own
+# variables through is the whole point of merging an `env` block, and there
+# is no finite set of "safe" names to enumerate. See also `_hook_command`,
+# which pins the event path INTO the command so a redirection cannot depend
+# on this check being complete, and the 30-second handshake timeout, which is
+# what actually makes an unrunnable hook fail closed and loudly.
+RESERVED_SETTINGS_ENV = ("HOME", "USERPROFILE")
+RESERVED_SETTINGS_ENV_PREFIXES = ("CLAUDE_", "HEADROOM_")
+# CLI flags that suppress the injected hooks no matter what the merged
+# document says, and so cannot be merged at all. `--managed-settings` loads a
+# POLICY document, and policy sits ABOVE flag settings: an
+# `allowManagedHooksOnly` or `strictPluginOnlyCustomization` in there turns
+# the injected hooks off and nothing in the merged document can answer for it
+# (the standing managed-policy caveat in docs/KNOWN-LIMITS.md). There is
+# nothing to merge, so it is refused by name like an unmergeable key.
+HOOK_SUPPRESSING_FLAGS = ("--managed-settings",)
 # How deep a settings document may nest. Every step of the merge recurses
 # (parse, deep copy, serialize), and a RecursionError raised anywhere in there
 # is a bare RuntimeError that the launch guard would answer by bare-execing —
@@ -512,7 +529,15 @@ def _hook_command(matcher=""):
     command = shlex.quote(_hook_executable()) + " _hook-event"
     if matcher:
         command = "HEADROOM_HOOK_MATCHER=" + shlex.quote(matcher) + " " + command
-    return command
+    # Pin the state tree INTO the command. The hook process inherits the
+    # child's environment, so a settings `env` (or anything else) that moved
+    # HEADROOM_DIR — or HOME, where the default `~/.headroom` lives — would
+    # send every event into a different tree: hooks that run perfectly while
+    # the supervisor waits deaf and disarms at the 30-second timeout. A shell
+    # assignment on the command line beats any inherited value, so the event
+    # path is fixed here, at launch, and does not depend on the reserved-env
+    # check catching every name that could point it elsewhere.
+    return ("HEADROOM_DIR=" + shlex.quote(paths.base_dir()) + " " + command)
 
 
 def hook_settings():
@@ -720,6 +745,34 @@ def _nested_too_deeply(document, limit=MAX_SETTINGS_DEPTH):
     return False
 
 
+def hook_suppressing_flag(args):
+    """The first argv option that would suppress the injected hooks, or "".
+
+    Walks with the same grammar as every other splitter, so an occurrence
+    that is another option's VALUE — or prompt text after `--` — is not one."""
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        for flag in HOOK_SUPPRESSING_FLAGS:
+            if arg == flag or arg.startswith(flag + "="):
+                return flag
+        following = args[index + 1] if index + 1 < len(args) else None
+        index += 2 if takes_value(arg, following) else 1
+    return ""
+
+
+def refuse_hook_suppressing_flags(args):
+    """Fail closed on an argv option that supervision cannot merge with."""
+    flag = hook_suppressing_flag(args)
+    if flag:
+        raise UserSettingsError(
+            f"{flag} loads settings that sit ABOVE the document headroom "
+            f"merges, so it can turn the supervisor's own hooks off and no "
+            f"merge can answer for it — drop it, or launch without headroom")
+
+
 def load_user_settings(raw):
     """`(document, source)` — read a user `--settings` value the way Claude
     does: a JSON object literal is inline settings, anything else is a path.
@@ -816,12 +869,16 @@ def merge_user_settings(document=None, source=""):
     environment = document.get("env")
     if environment is not None and not isinstance(environment, dict):
         raise UserSettingsError(f"{where} has a non-object \"env\"")
-    reserved = [key for key in RESERVED_SETTINGS_ENV
-                if key in (environment or {})]
+    reserved = sorted(
+        key for key in (environment or {})
+        if key in RESERVED_SETTINGS_ENV
+        or key.startswith(RESERVED_SETTINGS_ENV_PREFIXES))
     if reserved:
         raise UserSettingsError(
-            f"{where} sets {', '.join(reserved)} in \"env\", which headroom "
-            f"owns for this child — remove it, or launch without headroom")
+            f"{where} sets {', '.join(reserved)} in \"env\" — headroom and "
+            f"Claude Code own those names for this child (they decide where "
+            f"the hook writes and whether it runs at all). Remove them, or "
+            f"launch without headroom")
     hooks = document.get("hooks")
     if hooks is not None and not isinstance(hooks, dict):
         raise UserSettingsError(f"{where} has a non-object \"hooks\"")
@@ -851,6 +908,7 @@ def validate_user_settings(args):
     with the merged document or it does not run. `raw is None` (no flag) is
     the only case that passes without reading anything; an EMPTY value is a
     given flag headroom cannot honour, so it refuses like any other."""
+    refuse_hook_suppressing_flags(args)
     _cleaned, raw = split_user_settings(args)
     if raw is None:
         return {}
@@ -1845,6 +1903,7 @@ class Supervisor:
         # the rotation policy), and merged under the injected document for
         # every generation. Anything unmergeable raises out of the
         # constructor: no child is spawned at all.
+        refuse_hook_suppressing_flags(list(args))
         self.initial_args, raw_settings = split_user_settings(list(args))
         self.user_settings = {}
         self.user_settings_source = ""
@@ -3708,6 +3767,22 @@ def _initial_account(family):
     return account if reason is None else None
 
 
+def redacted_settings_value(value):
+    """A `--settings` value that is safe to print.
+
+    A PATH names a document; an INLINE document IS the document, and a real
+    one legitimately carries credentials (apiKeyHelper, an `env` block). The
+    refusal diagnostics below go to stderr, which is captured by launchers and
+    logs, so the inline form is named and never reproduced."""
+    return ("<inline JSON>" if (value or "").strip().startswith(("{", "["))
+            else value)
+
+
+def redacted_command(argv):
+    """A shell-safe rendering of an argv with every inline document elided."""
+    return shlex.join([redacted_settings_value(arg) for arg in argv])
+
+
 def _refuse_settings_launch(error):
     """The single refusal voice for an unusable `--settings`, exit code and
     all. Used by every surface that can reach one, so no caller has to invent
@@ -3754,11 +3829,12 @@ def cmd_claude(family, args, fallback_argv=None):
             return route.bare_fallback_exec(fallback_argv, reason)
         print(f"headroom: refusing the bare fallback: {reason}",
               file=sys.stderr)
-        print(f"[headroom] --settings {raw_settings} was given, and a bare "
+        print(f"[headroom] --settings "
+              f"{redacted_settings_value(raw_settings)} was given, and a bare "
               f"CLI cannot be supervised — headroom will not start an "
               f"unsupervised child carrying it. Run it yourself if that is "
               f"what you want:", file=sys.stderr)
-        print("  " + shlex.join(fallback_argv), file=sys.stderr)
+        print("  " + redacted_command(fallback_argv), file=sys.stderr)
         return 2
 
     try:

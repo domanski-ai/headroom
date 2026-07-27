@@ -127,11 +127,29 @@ headroom disables automation for that child and leaves the child running.
 A user-supplied `--settings` is merged under that fragment rather than passed
 through beside it (Claude accepts one, and the second replaces the first), so
 the supervisor refuses to launch a document that would suppress its hooks:
-`disableAllHooks`, `allowManagedHooksOnly`, or an `env` block rebinding
-`CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_SAFE_MODE`, `CLAUDE_CODE_SIMPLE` or a
-`HEADROOM_*` variable. It also refuses the opt-in bare-CLI launch fallback
-for that run: the fallback argv still carries `--settings` and a bare CLI is
-unsupervised, so headroom prints the command rather than running it. The
+`disableAllHooks`, `allowManagedHooksOnly`, or an `env` block setting any
+`CLAUDE_*` or `HEADROOM_*` variable (or `HOME`/`USERPROFILE`). The namespaces
+are refused wholesale, not a list of known-bad names — `CLAUDE_CODE_SHELL`,
+`CLAUDE_CODE_SHELL_PREFIX` and `CLAUDE_CODE_PROCESS_WRAPPER` decide what
+actually gets executed, `HEADROOM_DIR` and `HOME` decide where the event is
+written, and any release can add another. `--managed-settings` is refused
+outright: policy settings sit above the merged document, so nothing in the
+merge can answer for an `allowManagedHooksOnly` there.
+
+Redirection of the event path does not depend on that check being complete:
+the injected hook command pins `HEADROOM_DIR` into the command line itself,
+which beats any inherited value. What remains is SUPPRESSION — an environment
+that stops the hook running at all (a shell prefix, a broken interpreter, a
+sandbox). Headroom cannot prevent that from inside the child, and does not
+need to: no handshake arrives, and the 30-second timeout above disables
+automation loudly and leaves the child running. A hook that cannot run is a
+visible disarm, never a session that looks supervised and is not.
+
+It also refuses the opt-in bare-CLI launch fallback for that run: the
+fallback argv still carries `--settings` and a bare CLI is unsupervised, so
+headroom prints the command (with any inline document elided — an inline
+`--settings` can carry credentials and is never echoed) rather than running
+it. The
 merge only covers what headroom can see in that one document — managed and
 policy settings still sit above it, which is the limit this section opened
 with. The user document is read ONCE, at launch: editing the file mid-session
