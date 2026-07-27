@@ -41,6 +41,9 @@ usage:
   headroom widget-feed --swiftbar  render the last snapshot (never collects)
   headroom statusline               Claude Code status line output
   headroom accounts                 list connected accounts
+  headroom ops-status [--json]      read-only JSON snapshot of every supervised
+                                    session (turn, subagents, context, tmux
+                                    container) plus per-seat batteries
   headroom doctor                   environment + config health check
 
 Try it with no accounts:  headroom serve --demo   (bundled sample data)
@@ -509,6 +512,9 @@ def _dispatch(argv):
     if command == "statusline":
         from . import statusline
         return statusline.main()
+    if command == "ops-status":
+        from . import ops_status
+        return ops_status.cmd_ops_status(args)
     if command == "doctor":
         import platform
         import shutil
