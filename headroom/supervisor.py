@@ -340,6 +340,15 @@ class Recovery:
     session_id: str
     reason: str = "context_backstop"
 
+    def command(self):
+        """This recovery as a command a human can paste.
+
+        Built from the stored argv itself, never re-derived: the argv already
+        encodes both things a reconstruction gets wrong — the model a large
+        transcript must be resumed on, and whether forking is safe."""
+        return (f"CLAUDE_CONFIG_DIR={shlex.quote(self.account['home'])} "
+                + shlex.join(["claude"] + list(self.argv)))
+
 
 @dataclass(frozen=True)
 class Relaunch:
@@ -2415,11 +2424,20 @@ class Supervisor:
         # fork and any model this rotation added — because the added flags are
         # exactly what a spawn failure might be about, and a stopped session
         # with nothing running is the worst outcome this feature can produce.
+        #
+        # ALWAYS attached, even when it comes out identical to the argv that
+        # just failed. Skipping it then looked like a harmless optimisation
+        # and was the bug: spawn failures are not always about the argv (a
+        # transient fork/exec failure, a momentarily missing binary), so a
+        # plain retry is still a recovery — and "identical" is exactly the
+        # case for a degraded stop of a transcript that must keep its model,
+        # i.e. a session that has ALREADY been stopped and has nothing else
+        # left to bring it back.
         fallback, _fitted = _window_fit_argv(
             ["--resume", proof.session_id], proof.transcript_path,
             used=proof.used, model=self.stopped_child_model)
-        recovery = (None if fallback == argv else Recovery(
-            child.account, fallback, child.binding.cwd, proof.session_id))
+        recovery = Recovery(child.account, fallback, child.binding.cwd,
+                            proof.session_id)
         # supervised either way: an elective stop must never cost the
         # cap-reactive guarantee, and this seat is not capped
         return Relaunch(child.account, argv, child.binding.cwd,
@@ -3232,8 +3250,12 @@ class Supervisor:
                         pending_handoff_id = ""
                         pending_plan = None
                         pending_recovery = None
-                        manual_resume = handoff.resume_command(
-                            failed.account["home"], failed.session_id)
+                        # the human's last resort must be EXACTLY what the
+                        # machine would have run — reconstructing a resume
+                        # command instead drops a model the transcript
+                        # requires and re-adds a fork that a degraded stop
+                        # already ruled unsafe
+                        manual_resume = failed.command()
                         continue
                     print(f"headroom: {error}", file=sys.stderr)
                     if recovery_plan is not None:

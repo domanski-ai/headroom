@@ -4191,10 +4191,8 @@ class ContextBackstop(TempDirCase):
         self.assertEqual(runner.context_hold_until,
                          self.clock["t"] + supervisor.PREEMPT_BACKOFF_SECONDS)
 
-    def test_a_recovery_that_also_fails_leaves_a_usable_resume_command(self):
-        # both the replacement AND its recovery refuse to start: the user gets
-        # the one command that brings the conversation back by hand
-        runner = self.runner()
+    def everything_fails(self, runner, relaunch):
+        """run() where the replacement AND its recovery both refuse to start."""
         spawns = []
 
         def spawn(account, args, cwd, automatic, plan=None):
@@ -4210,14 +4208,85 @@ class ContextBackstop(TempDirCase):
         with mock.patch.object(runner, "_spawn", side_effect=spawn), \
                 mock.patch.object(
                     runner, "_monitor",
-                    side_effect=lambda child, pending="": self.rotation()), \
+                    side_effect=lambda child, pending="": relaunch), \
                 mock.patch.object(runner, "_reconcile_leases"), \
                 mock.patch.object(notify, "emit"), \
                 redirect_stderr(io.StringIO()) as err:
-            self.assertEqual(runner.run(), 127)
+            exit_code = runner.run()
+        return exit_code, spawns, err.getvalue()
+
+    def degraded_rotation(self, runner):
+        """A rotation whose stop could not be proven clean (no SessionEnd)."""
+        with mock.patch.object(supervisor.os, "kill"), \
+                mock.patch.object(runner, "_wait_stopped", return_value=0), \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            return runner._context_backstop_cycle(self.child)
+
+    def test_a_recovery_identical_to_the_replacement_is_still_attached(self):
+        # HEADROOM_CTX_WINDOW=500000 + a 480k transcript + a degraded stop:
+        # the fallback command comes out IDENTICAL to the one that just
+        # failed, and skipping it there left an already-stopped session with
+        # no recovery at all and an exit 127
+        with mock.patch.dict(os.environ, {"HEADROOM_CTX_WINDOW": "500000"}):
+            self.write(480_000)
+            runner = self.runner()
+            outcome = self.degraded_rotation(runner)
+            self.assertEqual(outcome.reason, "context_backstop_recovered")
+            self.assertIsNotNone(outcome.recovery)
+            self.assertEqual(outcome.recovery.argv, outcome.argv)
+            self.assertIn("--model", outcome.recovery.argv)
+            exit_code, spawns, events, _err = self.relaunched(runner, outcome)
+        # a plain retry of the same command IS a recovery — spawn failures are
+        # not always about the argv
+        self.assertEqual(exit_code, 0)
         self.assertEqual(len(spawns), 3)
-        self.assertIn("--resume " + self.SID, err.getvalue())
-        self.assertIn(self.source["home"], err.getvalue())
+        self.assertEqual(spawns[2][1], outcome.recovery.argv)
+        self.assertTrue(spawns[2][2])          # SUPERVISED
+        self.assertNotIn("supervision_lost",
+                         [event["event"] for event in events])
+
+    def test_every_rotation_shape_carries_a_recovery(self):
+        for degraded in (False, True):
+            self.write(190_000)
+            runner = self.runner()
+            outcome = (self.degraded_rotation(runner) if degraded
+                       else self.cycle(runner)[0])
+            self.assertIsNotNone(outcome.recovery, degraded)
+            self.assertEqual(outcome.recovery.session_id, self.SID)
+            self.assertEqual(outcome.recovery.account["name"], "source")
+
+    def test_a_recovery_that_also_fails_leaves_a_usable_resume_command(self):
+        # both the replacement AND its recovery refuse to start: the user gets
+        # the one command that brings the conversation back by hand
+        runner = self.runner()
+        exit_code, spawns, err = self.everything_fails(runner, self.rotation())
+        self.assertEqual(exit_code, 127)
+        self.assertEqual(len(spawns), 3)
+        self.assertIn("--resume " + self.SID, err)
+        self.assertIn(self.source["home"], err)
+
+    def test_the_manual_command_is_the_stored_argv_not_a_reconstruction(self):
+        # a rebuilt resume command drops the model a large transcript REQUIRES
+        # and re-adds a fork that a degraded stop already ruled unsafe
+        runner = self.runner()
+        recovery = supervisor.Recovery(
+            self.source,
+            ["--resume", self.SID, "--model", "claude-sonnet-5[1m]"],
+            self.cwd, self.SID)
+        relaunch = supervisor.Relaunch(
+            self.source, list(recovery.argv), self.cwd, False,
+            reason="context_backstop_recovered", supervised=True,
+            recovery=recovery)
+        _exit, _spawns, err = self.everything_fails(runner, relaunch)
+        printed = [line for line in err.splitlines()
+                   if line.startswith("CLAUDE_CONFIG_DIR=")]
+        self.assertEqual(len(printed), 1)
+        self.assertEqual(
+            printed[0],
+            f"CLAUDE_CONFIG_DIR={self.source['home']} claude --resume "
+            f"{self.SID} --model 'claude-sonnet-5[1m]'")
+        self.assertNotIn("--fork-session", printed[0])
 
     def stop_failure(self):
         """A valid StopFailure hook row bound to this child's session."""
