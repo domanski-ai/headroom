@@ -389,6 +389,49 @@ def preemptive_thresholds(config=None):
                        PREEMPTIVE_OVERALL_PERCENT))
 
 
+CONTEXT_BACKSTOP_PERCENT = 10.0
+
+
+def context_backstop(config=None):
+    """Whether the supervisor may force a lossless rotation on a session that
+    is nearly out of CONTEXT (not usage).
+
+    ON by default, and independent of :func:`preemptive_handoff` — the two
+    answer different questions (is this seat spent? is this conversation
+    full?).  ``HEADROOM_CONTEXT_BACKSTOP=0`` is the operator kill switch and
+    ``routing.context_backstop: false`` turns it off permanently.  Every guard
+    downstream stays fail-closed and a refusal only defers."""
+    if os.environ.get("HEADROOM_CONTEXT_BACKSTOP", "").strip() == "0":
+        return False
+    try:
+        config = load() if config is None else config
+    except RegistryError:
+        return True
+    routing = (config or {}).get("routing")
+    if isinstance(routing, dict) and routing.get("context_backstop") is False:
+        return False
+    return True
+
+
+def context_backstop_percent(config=None):
+    """Remaining-context percent at which the backstop fires (default 10).
+
+    Deliberately far below the cooperative handoff threshold: a session is
+    expected to notice its own context and write a baton long before this, and
+    a backstop that fired first would replace a considered handoff with a
+    mechanical one.  Read from ``config['routing']['context_backstop_percent']``
+    and never raises."""
+    try:
+        config = load() if config is None else config
+    except RegistryError:
+        return CONTEXT_BACKSTOP_PERCENT
+    routing = (config or {}).get("routing")
+    if not isinstance(routing, dict):
+        return CONTEXT_BACKSTOP_PERCENT
+    return _threshold(routing, "context_backstop_percent",
+                      CONTEXT_BACKSTOP_PERCENT)
+
+
 def save(config):
     validate(config)
     paths.write_json_atomic(paths.config_path(), config, mode=0o600)

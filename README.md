@@ -147,12 +147,70 @@ thresholds are config:
 }
 ```
 
+### Context backstop: never lose a session to its own window
+
+Usage caps are not the only wall. A long session fills its **context window**,
+and at 0% remaining the conversation is over — with whatever it had not
+written down. The intended answer is cooperative and lives in your own hooks:
+warn the session early, let it write a handoff note, let it restart itself.
+That produces a far better handoff than any mechanical one, so headroom stays
+out of the way for as long as it can.
+
+Underneath it, for a session that ignores the warning — wedged in a loop, or
+spending its last context inside one long turn — the supervisor keeps its own
+measurement. It reads the transcript's own usage records (the newest
+main-thread assistant record's input + cache-read + cache-creation tokens;
+sidechains and per-iteration copies are excluded so a subagent or a
+multi-iteration turn cannot inflate the number) and infers the window the way
+the transcript allows: a child launched with an explicit `--model …[1m]` is
+known to be on the 1M window; otherwise usage above ~205k tokens can only have
+been served by that window, and anything below assumes the standard 200k.
+`HEADROOM_CTX_WINDOW` overrides both.
+
+At **10% remaining**, and only with the child provably idle by the same
+three-proof machinery preemptive rotation uses, headroom forces one **lossless**
+rotation: stop, then `--resume … --fork-session` on the **same seat**, with the
+resumed session re-modelled onto the 1M-window model so the conversation
+actually has room. Nothing is cleared — the fork carries the whole
+conversation — the pre-rotation session id stays on disk, no account moves,
+nothing is cooled, and no target is reserved. If the stop cannot be proven
+clean (no `SessionEnd`, a transcript ending mid-tool-call) the session is
+resumed in place instead of forked, but it always comes back.
+
+It is bounded on purpose: a fork inherits its parent's usage records, so
+rotations are capped (two per ten minutes per supervisor, separate from the
+handoff ledger's own loop guard, which a genuine cap needs) and held for a
+backoff afterwards. A session already on the largest window is **not**
+restarted — there is no bigger window to move it to, so headroom says so once
+(loudly, via notify) and leaves it running rather than spending its last
+minutes on a pointless restart; `HEADROOM_CONTEXT_BACKSTOP_ALWAYS=1` forces it
+anyway. On by default, `HEADROOM_CONTEXT_BACKSTOP=0` is the kill switch, and:
+
+```json
+{
+  "routing": {
+    "context_backstop": true,
+    "context_backstop_percent": 10
+  }
+}
+```
+
+The same window-fit rule applies to **every** automatic resume, not just this
+one: a transcript that has outgrown the standard window is resumed on
+`opus[1m]` whether it is moving for a cap, moving preemptively, being
+recovered on its own seat, or being forked by the backstop. Without it a large
+conversation resumed under a 200k window dies on its first prompt ("Prompt is
+too long") and is stranded on a seat nobody is watching.
+
 Every path that disables automatic handoff for a running child — a malformed
 hook event, an unreadable hook journal, a lost session binding, a child that
 ignores `SIGTERM` — emits a `supervision_lost` event through
 `HEADROOM_NOTIFY_CMD` as well as printing to stderr, so a dashboard can show
 that a session is no longer protected. Preemptive activity emits
-`preemptive_scheduled`, `preemptive_handoff`, and `preemptive_held`.
+`preemptive_scheduled`, `preemptive_handoff`, and `preemptive_held`; the
+context backstop emits `context_backstop_scheduled`,
+`context_backstop_rotation`, and `context_backstop_held`, plus
+`context_window_fit` when a handoff resume is re-modelled to fit its window.
 
 One-run overrides are `headroom claude --headroom-auto-handoff` and
 `--headroom-no-auto-handoff`. Supervision only activates when stdin, stdout,
@@ -511,7 +569,14 @@ Six affordances make headroom composable with launch wrappers:
   "window", "used_percent"}` when a seat crosses its threshold and a target
   exists, `{"event": "preemptive_handoff", …, "target", "handoff_id"}` when
   the session actually moves, and `{"event": "preemptive_held", "account",
-  "reason"}` when an early rotation is deferred.
+  "reason"}` when an early rotation is deferred. The context backstop adds
+  `{"event": "context_backstop_scheduled", "account", "used", "window",
+  "remaining_percent"}`, `{"event": "context_backstop_rotation", …, "model",
+  "forked"}` when a session is forcibly continued, `{"event":
+  "context_backstop_held", "account", "reason"}` when it is deferred (including
+  the "already on the largest context window" case, which only an operator can
+  resolve), and `{"event": "context_window_fit", "account", "model",
+  "handoff_id"}` when a handoff resume is re-modelled to fit its window.
   Delivery is bounded (10s hard timeout, override with
   `HEADROOM_NOTIFY_TIMEOUT`); on timeout the command's whole process group is
   killed, and a broken or hung command is swallowed with a stderr line and

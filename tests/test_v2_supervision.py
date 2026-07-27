@@ -56,13 +56,45 @@ def usage_row(name, used5=10.0, used7=10.0, captured=None):
             }}
 
 
+def usage_record(total, iterations=2, sidechain=False,
+                 model="claude-fable-5-20260701"):
+    """An assistant record shaped like the real thing.
+
+    `total` is split across the three input-side counters, and the nested
+    `iterations` carry the SAME tokens again — a summer that walked them would
+    report a multiple of the truth."""
+    read = max(total - 1001, 0)
+    usage = {
+        "input_tokens": 1, "cache_creation_input_tokens": total - read - 1,
+        "cache_read_input_tokens": read, "output_tokens": 405,
+        "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
+        "service_tier": "standard",
+        "cache_creation": {"ephemeral_1h_input_tokens": total - read - 1,
+                           "ephemeral_5m_input_tokens": 0},
+        "inference_geo": "not_available", "speed": "standard",
+    }
+    if iterations:
+        usage["iterations"] = [
+            {"input_tokens": 1, "output_tokens": 405,
+             "cache_read_input_tokens": read, "type": "message",
+             "cache_creation_input_tokens": total - read - 1}
+            for _ in range(iterations)]
+    record = {"type": "assistant", "sessionId": "s", "message": {
+        "model": model, "usage": usage,
+        "content": [{"type": "text", "text": "done"}]}}
+    if sidechain:
+        record["isSidechain"] = True
+    return record
+
+
 class TempDirCase(unittest.TestCase):
     """A fresh HEADROOM_DIR per test, with no launch/lease env leakage."""
 
     CLEAR_VARS = ("HEADROOM_LAUNCH_MARKER", "HEADROOM_LAUNCH_FALLBACK",
                   "HEADROOM_SLOT_LEASE", "HEADROOM_NOTIFY_CMD",
                   "HEADROOM_NOTIFY_TIMEOUT", "CLAUDE_CONFIG_DIR",
-                  "CODEX_HOME", "HEADROOM_PREEMPTIVE")
+                  "CODEX_HOME", "HEADROOM_PREEMPTIVE", "HEADROOM_CTX_WINDOW",
+                  "HEADROOM_CONTEXT_BACKSTOP")
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -3037,6 +3069,52 @@ class PreemptiveRotation(TempDirCase):
                                     "became busy"):
             runner._preemptive_stop_edge(self.child, plan, proof)
 
+    def test_a_committed_rotation_fits_the_window_it_resumes_into(self):
+        # the whole real pipeline — admission, stop, staging, commit — for a
+        # conversation that has outgrown the standard context window
+        with open(self.transcript, "a", encoding="utf-8") as out:
+            out.write(json.dumps(usage_record(500_000)) + "\n")
+        self.idle(seconds=600)
+        runner = self.runner()
+        plan, proof = self.stopped_plan(runner)
+
+        def wait(child, _proof, stop_sent_at):
+            child.session_ended = True
+            child.session_end_received_at = stop_sent_at + 0.1
+            return 0
+
+        with mock.patch.object(supervisor.os, "kill"), \
+                mock.patch.object(runner, "_wait_stopped", side_effect=wait), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            outcome = runner._stop_and_commit(self.child, plan, proof)
+        self.assertEqual(outcome.account["name"], "target")
+        self.assertEqual(outcome.argv, ["--resume", self.SID, "--fork-session",
+                                        "--model", "opus[1m]"])
+        fit = [event for event in self.events(emit)
+               if event["event"] == "context_window_fit"]
+        self.assertEqual(len(fit), 1)
+        self.assertEqual(fit[0]["model"], "opus[1m]")
+        self.assertEqual(fit[0]["account"], "target")
+
+    def test_a_normal_rotation_resumes_exactly_as_before(self):
+        runner = self.runner()
+        plan, proof = self.stopped_plan(runner)
+
+        def wait(child, _proof, stop_sent_at):
+            child.session_ended = True
+            child.session_end_received_at = stop_sent_at + 0.1
+            return 0
+
+        with mock.patch.object(supervisor.os, "kill"), \
+                mock.patch.object(runner, "_wait_stopped", side_effect=wait), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            outcome = runner._stop_and_commit(self.child, plan, proof)
+        self.assertEqual(outcome.argv, ["--resume", self.SID, "--fork-session"])
+        self.assertNotIn("context_window_fit",
+                         [event["event"] for event in self.events(emit)])
+
     def test_aborted_rotation_recovers_the_source_with_supervision_on(self):
         runner = self.runner()
         plan, proof = self.stopped_plan(runner)
@@ -3432,6 +3510,596 @@ class LoudDisarms(TempDirCase):
                 if call.args[0]["event"] == "supervision_lost"]
         self.assertEqual(len(lost), 1)
         self.assertEqual(lost[0]["reason"], "shutdown signal received")
+
+
+# --------------------------------------------------------------------------
+# Context backstop: measurement, window fit, and the forced rotation
+# --------------------------------------------------------------------------
+class ContextMeasurement(TempDirCase):
+    """What the supervisor believes about a session's remaining context.
+
+    The cooperative hook and this backstop must agree exactly — a disagreement
+    means one of them fires at the wrong moment."""
+
+    def transcript(self, records, name="c.jsonl"):
+        path = os.path.join(self.temp.name, name)
+        with open(path, "w", encoding="utf-8") as out:
+            for record in records:
+                out.write(json.dumps(record) + "\n")
+        return path
+
+    def test_the_newest_main_loop_record_decides_and_iterations_never_double(self):
+        path = self.transcript([
+            {"type": "user", "message": {"content": "hi"}},
+            usage_record(120_000),
+            {"type": "user", "message": {"content": "again"}},
+            usage_record(180_000),
+        ])
+        # each request carries the whole conversation, so the newest record IS
+        # the occupancy: not a sum of turns, and not multiplied by iterations
+        self.assertEqual(supervisor._context_used(path), 180_000)
+
+    def test_a_sidechain_never_counts_as_the_parents_context(self):
+        path = self.transcript([
+            usage_record(180_000),
+            usage_record(950_000, sidechain=True),
+        ])
+        self.assertEqual(supervisor._context_used(path), 180_000)
+
+    def test_records_without_usage_never_read_as_an_empty_window(self):
+        path = self.transcript([
+            usage_record(180_000),
+            {"type": "assistant", "message": {
+                "model": "<synthetic>",
+                "content": [{"type": "text", "text": "interrupted"}]}},
+            {"type": "system", "subtype": "turn_duration", "durationMs": 12},
+            {"type": "user", "message": {"content": "next"}},
+        ])
+        self.assertEqual(supervisor._context_used(path), 180_000)
+
+    def test_an_unmeasurable_transcript_is_unknown_not_zero(self):
+        self.assertIsNone(supervisor._context_used(
+            os.path.join(self.temp.name, "missing.jsonl")))
+        self.assertIsNone(supervisor._context_used(self.temp.name))
+        self.assertIsNone(supervisor._context_used(mock.Mock()))
+        self.assertIsNone(supervisor._context_used(self.transcript([
+            {"type": "user", "message": {"content": "hi"}}])))
+        broken = os.path.join(self.temp.name, "broken.jsonl")
+        with open(broken, "w", encoding="utf-8") as out:
+            out.write("{not json\n")
+        self.assertIsNone(supervisor._context_used(broken))
+
+    def test_usage_counters_that_are_not_numbers_are_ignored(self):
+        record = usage_record(180_000)
+        record["message"]["usage"]["input_tokens"] = True   # bool is not a count
+        record["message"]["usage"]["cache_creation_input_tokens"] = "1000"
+        path = self.transcript([record])
+        self.assertEqual(supervisor._context_used(path),
+                         record["message"]["usage"]["cache_read_input_tokens"])
+
+    def test_window_inference_boundaries(self):
+        # a transcript can only be over the ceiling if the 1M window served it
+        self.assertEqual(supervisor._context_window(190_000), 200_000)
+        self.assertEqual(supervisor._context_window(205_000), 200_000)
+        self.assertEqual(supervisor._context_window(205_001), 1_000_000)
+        self.assertEqual(supervisor._context_window(210_000), 1_000_000)
+
+    def test_an_explicit_1m_model_is_knowledge_that_beats_inference(self):
+        for args in (["--model", "opus[1m]", "--resume", "x"],
+                     ["--model=claude-opus-5[1m]"],
+                     ["--resume", "x", "--model", "OPUS[1M]"]):
+            self.assertEqual(
+                supervisor._context_window(1_000,
+                                           supervisor._model_flag(args)),
+                1_000_000, args)
+        # ...and a normal model infers exactly as before
+        self.assertEqual(
+            supervisor._context_window(
+                1_000, supervisor._model_flag(["--model", "fable"])), 200_000)
+
+    def test_the_hooks_env_override_wins(self):
+        with mock.patch.dict(os.environ, {"HEADROOM_CTX_WINDOW": "500000"}):
+            self.assertEqual(supervisor._context_window(190_000), 500_000)
+        for bad in ("", "abc", "0", "-5"):
+            with mock.patch.dict(os.environ, {"HEADROOM_CTX_WINDOW": bad}):
+                self.assertEqual(supervisor._context_window(190_000), 200_000)
+
+    def test_remaining_percent_is_fail_closed(self):
+        self.assertEqual(supervisor._context_remaining(180_000, 200_000), 10.0)
+        self.assertEqual(supervisor._context_remaining(190_000, 200_000), 5.0)
+        self.assertEqual(supervisor._context_remaining(190_000, 1_000_000), 81.0)
+        self.assertEqual(supervisor._context_remaining(250_000, 200_000), 0.0)
+        for used, window in ((None, 200_000), (100, 0), (100, None),
+                             (-1, 200_000), (float("nan"), 200_000)):
+            self.assertIsNone(supervisor._context_remaining(used, window))
+
+    def test_model_flags_respect_the_argument_separator(self):
+        self.assertEqual(
+            supervisor._model_flag(["--resume", "x", "--", "--model", "no"]),
+            "")
+        self.assertEqual(
+            supervisor._with_model(["--resume", "x", "--", "payload"], "m"),
+            ["--resume", "x", "--model", "m", "--", "payload"])
+        for args in (["--model", "fable", "--resume", "x"],
+                     ["--model=fable", "--resume", "x"],
+                     ["--resume", "x"]):
+            self.assertEqual(supervisor._with_model(args, "opus[1m]"),
+                             ["--resume", "x", "--model", "opus[1m]"])
+
+
+class WindowFitOnResume(TempDirCase):
+    """Every automatic resume must fit the window it resumes into (production
+    lesson, 2026-07-27: a 500k-token transcript resumed under a 200k window
+    died on its first prompt, twice)."""
+
+    def transcript(self, total):
+        path = os.path.join(self.temp.name, "t.jsonl")
+        with open(path, "w", encoding="utf-8") as out:
+            out.write(json.dumps(usage_record(total)) + "\n")
+        return path
+
+    def test_a_transcript_past_the_limit_forces_the_1m_model(self):
+        path = self.transcript(500_000)
+        argv, forced = supervisor._window_fit_argv(
+            ["--resume", "sid", "--fork-session"], path)
+        self.assertEqual(argv, ["--resume", "sid", "--fork-session",
+                                "--model", "opus[1m]"])
+        self.assertEqual(forced, "opus[1m]")
+
+    def test_a_fitting_transcript_is_resumed_exactly_as_before(self):
+        for total in (1_000, 190_000, 205_000):
+            argv, forced = supervisor._window_fit_argv(
+                ["--resume", "sid"], self.transcript(total))
+            self.assertEqual((argv, forced), (["--resume", "sid"], ""))
+
+    def test_a_wrong_model_on_an_over_limit_resume_is_replaced(self):
+        argv, _ = supervisor._window_fit_argv(
+            ["--resume", "sid", "--model", "fable"], self.transcript(500_000))
+        self.assertEqual(argv, ["--resume", "sid", "--model", "opus[1m]"])
+        # already fitted: nothing to say and nothing to change
+        self.assertEqual(supervisor._window_fit_argv(
+            argv, self.transcript(500_000)), (argv, ""))
+
+    def test_a_large_conversation_keeps_the_1m_model_it_was_running(self):
+        # a resume argv names only --resume/--fork-session, so without this a
+        # rotation would silently shrink a 1M session back to 200k
+        argv, forced = supervisor._window_fit_argv(
+            ["--resume", "sid", "--fork-session"], self.transcript(150_000),
+            model="opus[1m]")
+        self.assertEqual(argv, ["--resume", "sid", "--fork-session",
+                                "--model", "opus[1m]"])
+        self.assertEqual(forced, "opus[1m]")
+        # the child's OWN 1M model is kept, not swapped for the default one
+        argv, forced = supervisor._window_fit_argv(
+            ["--resume", "sid"], self.transcript(500_000),
+            model="claude-sonnet-5[1m]")
+        self.assertEqual(forced, "claude-sonnet-5[1m]")
+        self.assertEqual(argv[-1], "claude-sonnet-5[1m]")
+
+    def test_a_small_conversation_on_a_big_model_still_routes_normally(self):
+        for total in (1_000, 100_000, 139_000):
+            self.assertEqual(
+                supervisor._window_fit_argv(["--resume", "sid"],
+                                            self.transcript(total),
+                                            model="opus[1m]"),
+                (["--resume", "sid"], ""))
+
+    def test_an_unmeasurable_transcript_changes_nothing(self):
+        for path in (mock.Mock(), os.path.join(self.temp.name, "gone.jsonl")):
+            self.assertEqual(
+                supervisor._window_fit_argv(["--resume", "sid"], path),
+                (["--resume", "sid"], ""))
+
+    def test_source_recovery_is_fitted_too(self):
+        plan = mock.Mock(cwd="/work")
+        plan.source.session_id = "sid"
+        plan.source.transcript_path = self.transcript(500_000)
+        plan.source.account = {"name": "source"}
+        relaunch = supervisor.Supervisor._source_relaunch(plan)
+        self.assertEqual(relaunch.argv,
+                         ["--resume", "sid", "--model", "opus[1m]"])
+        self.assertFalse(relaunch.automatic)
+
+    def test_source_recovery_of_an_unmeasurable_plan_is_unchanged(self):
+        plan = mock.Mock(cwd="/work")
+        plan.source.session_id = "sid"
+        plan.source.account = {"name": "source"}
+        self.assertEqual(supervisor.Supervisor._source_relaunch(plan).argv,
+                         ["--resume", "sid"])
+
+
+class ContextBackstop(TempDirCase):
+    """The fail-safe under the cooperative baton handoff: a real transcript, a
+    real registry, the real idleness machinery; only the child process and the
+    signal are faked."""
+
+    SID = "44444444-4444-4444-8444-444444444444"
+
+    def setUp(self):
+        super().setUp()
+        self.clock = {"t": time.time()}
+        self.source = self.account("source")
+        os.makedirs(os.path.join(self.source["home"], "projects"))
+        registry.save({"schema_version": 1, "accounts": [self.source]})
+        directory = os.path.join(self.source["home"], "projects", "p")
+        os.makedirs(directory)
+        self.transcript = os.path.join(directory, self.SID + ".jsonl")
+        self.write(190_000)
+        self.cwd = os.path.join(self.temp.name, "work")
+        os.makedirs(self.cwd)
+        self.events_path = os.path.join(self.temp.name, "events.jsonl")
+        with open(self.events_path, "w", encoding="utf-8"):
+            pass
+        binding = supervisor.Binding(self.SID, self.transcript, self.cwd,
+                                     "Fable", "2.1", self.source["home"],
+                                     epoch=1)
+        process = mock.Mock(pid=os.getpid())
+        process.poll.return_value = None
+        self.child = supervisor.Child(
+            process, self.source, 1, self.events_path, "",
+            self.clock["t"] - 600, True, binding=binding, session_epoch=1)
+        for constant, value in (("PREEMPT_IDLE_SECONDS", 5.0),
+                                ("PREEMPT_POLL_SECONDS", 60.0),
+                                ("PREEMPT_BACKOFF_SECONDS", 300.0),
+                                ("PREEMPT_DECISION_TTL", 120.0)):
+            patch = mock.patch.object(supervisor, constant, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def write(self, used, trailing=None, idle=600):
+        """A transcript whose newest turn is finished at `used` tokens."""
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "hi"}]}}) + "\n")
+            out.write(json.dumps(usage_record(used)) + "\n")
+            for record in trailing or ():
+                out.write(json.dumps(record) + "\n")
+        when = time.time() - idle
+        os.utime(self.transcript, (when, when))
+
+    def runner(self):
+        return supervisor.Supervisor(
+            "fable", [], self.source, collect_fn=lambda quiet=True: {},
+            now=lambda: self.clock["t"], sleep=lambda seconds: None,
+            popen=mock.Mock())
+
+    def events(self, emit):
+        return [call.args[0] for call in emit.call_args_list]
+
+    def stopping(self, runner, exits=True):
+        """Patch the kill + wait so a rotation completes without a real child."""
+        def wait(child, _proof, stop_sent_at):
+            if not exits:
+                return None
+            child.session_ended = True
+            child.session_end_received_at = stop_sent_at + 0.1
+            return 0
+        return (mock.patch.object(supervisor.os, "kill"),
+                mock.patch.object(runner, "_wait_stopped", side_effect=wait))
+
+    def cycle(self, runner):
+        kill, wait = self.stopping(runner)
+        with kill as killed, wait, mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            outcome = runner._context_backstop_cycle(self.child)
+        return outcome, killed, self.events(emit)
+
+    # -- the crossing -------------------------------------------------------
+
+    def test_a_nearly_full_idle_session_is_forked_onto_a_bigger_window(self):
+        runner = self.runner()
+        outcome, killed, events = self.cycle(runner)
+        self.assertIsNotNone(outcome)
+        killed.assert_called_once()
+        self.assertEqual(killed.call_args.args[1], signal.SIGTERM)
+        # the SAME seat, the SAME conversation, a window it fits in
+        self.assertEqual(outcome.account["name"], "source")
+        self.assertEqual(outcome.argv, ["--resume", self.SID, "--fork-session",
+                                        "--model", "opus[1m]"])
+        self.assertEqual(outcome.reason, "context_backstop")
+        self.assertEqual(outcome.cwd, self.cwd)
+        self.assertTrue(outcome.automatic)
+        self.assertTrue(outcome.supervised)
+        self.assertEqual([event["event"] for event in events],
+                         ["context_backstop_scheduled",
+                          "context_backstop_rotation"])
+        self.assertEqual(events[1]["used"], 190_000)
+        self.assertEqual(events[1]["window"], 200_000)
+        self.assertEqual(events[1]["model"], "opus[1m]")
+        self.assertIs(events[1]["forked"], True)
+        # nothing was disarmed and nothing was reserved or cooled
+        self.assertTrue(self.child.automation)
+        self.assertFalse(self.child.supervision_loss_notified)
+        self.assertFalse(os.path.exists(
+            os.path.join(paths.state_dir(), "handoffs.jsonl")))
+        # the successor is not immediately rotated again
+        self.assertEqual(runner.context_hold_until,
+                         self.clock["t"] + supervisor.PREEMPT_BACKOFF_SECONDS)
+        self.assertFalse(runner._context_backstop_due(self.child, None))
+
+    def test_the_cooperative_zone_is_never_preempted(self):
+        # 30% -> 10% belongs to the session's own baton handoff
+        runner = self.runner()
+        for used in (100_000, 140_000, 179_000, 179_999):
+            self.write(used)
+            self.assertIsNone(runner._context_observation(self.child), used)
+            outcome, killed, events = self.cycle(runner)
+            self.assertIsNone(outcome, used)
+            killed.assert_not_called()
+            self.assertEqual(events, [])
+        self.assertTrue(self.child.automation)
+
+    def test_the_threshold_itself_fires(self):
+        runner = self.runner()
+        self.write(180_000)                       # exactly 10% remaining
+        proof = runner._context_observation(self.child)
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof.remaining_percent, 10.0)
+        self.assertIn("context at 10% remaining", proof.message)
+
+    def test_the_threshold_is_configurable(self):
+        registry.save({"schema_version": 1, "accounts": [self.source],
+                       "routing": {"context_backstop_percent": 25}})
+        runner = self.runner()
+        self.write(160_000)                       # 20% remaining
+        self.assertIsNotNone(runner._context_observation(self.child))
+
+    def test_an_unmeasurable_transcript_never_rotates(self):
+        runner = self.runner()
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user",
+                                  "message": {"content": "hi"}}) + "\n")
+        outcome, killed, events = self.cycle(runner)
+        self.assertIsNone(outcome)
+        killed.assert_not_called()
+        self.assertEqual(events, [])
+
+    # -- the safe boundary --------------------------------------------------
+
+    def test_a_child_mid_turn_is_never_interrupted(self):
+        runner = self.runner()
+        self.write(190_000, trailing=[{"type": "user", "message": {
+            "content": [{"type": "text", "text": "one more"}]}}])
+        outcome, killed, events = self.cycle(runner)
+        self.assertIsNone(outcome)
+        killed.assert_not_called()
+        held = [event for event in events
+                if event["event"] == "context_backstop_held"]
+        self.assertEqual(len(held), 1)
+        # refused by the PREFLIGHT, long before the stop edge that backs it up
+        self.assertEqual(held[0]["reason"],
+                         "child is still working: a prompt is still awaiting "
+                         "its answer")
+        self.assertTrue(self.child.automation)
+        self.assertFalse(self.child.supervision_loss_notified)
+
+    def test_the_preflight_itself_refuses_a_busy_child(self):
+        runner = self.runner()
+        proof = runner._context_observation(self.child)
+        self.write(190_000, trailing=[{"type": "user", "message": {
+            "content": [{"type": "text", "text": "one more"}]}}])
+        with self.assertRaisesRegex(supervisor.SupervisorError,
+                                    "child is still working: a prompt is "
+                                    "still awaiting its answer"):
+            runner._context_backstop_preflight(self.child, proof)
+
+    def test_a_transcript_still_being_written_defers_on_the_short_cadence(self):
+        runner = self.runner()
+        self.write(190_000, idle=0)
+        outcome, killed, events = self.cycle(runner)
+        self.assertIsNone(outcome)
+        killed.assert_not_called()
+        self.assertIn("changed recently",
+                      [event.get("reason", "") for event in events][-1])
+        self.assertEqual(self.child.context_next_check,
+                         self.clock["t"] + supervisor.PREEMPT_POLL_SECONDS)
+
+    def test_a_live_background_subagent_holds_the_rotation(self):
+        runner = self.runner()
+        directory = os.path.join(os.path.dirname(self.transcript), self.SID,
+                                 "subagents")
+        os.makedirs(directory)
+        path = os.path.join(directory, "agent-a99d9789808.jsonl")
+        with open(path, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "isSidechain": True,
+                                  "message": {"content": "go"}}) + "\n")
+        when = time.time() - 600
+        os.utime(path, (when, when))
+        outcome, killed, events = self.cycle(runner)
+        self.assertIsNone(outcome)
+        killed.assert_not_called()
+        self.assertEqual(
+            events[-1]["reason"],
+            "child is still working: a background subagent is answering its "
+            "latest input")
+        # and the preflight is the layer that says so
+        proof = runner._context_observation(self.child)
+        with self.assertRaisesRegex(supervisor.SupervisorError,
+                                    "child is still working: a background "
+                                    "subagent"):
+            runner._context_backstop_preflight(self.child, proof)
+
+    def test_a_cap_proof_in_flight_always_wins(self):
+        runner = self.runner()
+        self.assertTrue(runner._context_backstop_due(self.child, None))
+        self.assertFalse(runner._context_backstop_due(self.child, object()))
+        self.child.pending_cap = mock.Mock()
+        self.assertFalse(runner._context_backstop_due(self.child, None))
+
+    def test_the_operator_can_turn_it_off(self):
+        with mock.patch.dict(os.environ, {"HEADROOM_CONTEXT_BACKSTOP": "0"}):
+            runner = self.runner()
+        self.assertFalse(runner._context_backstop_due(self.child, None))
+        registry.save({"schema_version": 1, "accounts": [self.source],
+                       "routing": {"context_backstop": False}})
+        self.assertFalse(self.runner()._context_backstop_due(self.child, None))
+
+    def test_a_disarmed_or_unbound_child_is_left_alone(self):
+        runner = self.runner()
+        self.child.automation = False
+        self.assertFalse(runner._context_backstop_due(self.child, None))
+        self.child.automation = True
+        self.child.binding = None
+        self.assertFalse(runner._context_backstop_due(self.child, None))
+
+    # -- the limits of a same-seat rotation ---------------------------------
+
+    def test_a_session_on_the_largest_window_is_not_restarted_for_nothing(self):
+        self.child.spawn_args = ("--model", "opus[1m]", "--resume", self.SID)
+        self.write(950_000)
+        runner = self.runner()
+        outcome, killed, events = self.cycle(runner)
+        self.assertIsNone(outcome)
+        killed.assert_not_called()
+        self.assertEqual([event["event"] for event in events],
+                         ["context_backstop_held"])
+        self.assertIn("already on the largest context window",
+                      events[0]["reason"])
+        # ...unless the operator insists
+        with mock.patch.object(supervisor, "CONTEXT_BACKSTOP_ALWAYS", True):
+            outcome, killed, _events = self.cycle(runner)
+        self.assertIsNotNone(outcome)
+        # the fork gains no headroom, but the resume still has to NAME the
+        # only window that can hold 950k tokens
+        self.assertEqual(outcome.argv, ["--resume", self.SID, "--fork-session",
+                                        "--model", "opus[1m]"])
+
+    def test_the_budget_bounds_forced_rotations(self):
+        runner = self.runner()
+        runner.context_rotations = [self.clock["t"] - 60] \
+            * supervisor.CONTEXT_BACKSTOP_MAX
+        outcome, killed, events = self.cycle(runner)
+        self.assertIsNone(outcome)
+        killed.assert_not_called()
+        self.assertIn("budget spent", events[0]["reason"])
+        # an old rotation falls out of the window and the budget returns
+        runner.context_rotations = [self.clock["t"] - supervisor.LOOP_WINDOW - 1] \
+            * supervisor.CONTEXT_BACKSTOP_MAX
+        self.child.context_last_hold = ""
+        outcome, _killed, _events = self.cycle(runner)
+        self.assertIsNotNone(outcome)
+
+    # -- the stop itself ----------------------------------------------------
+
+    def test_a_child_that_ignores_sigterm_disarms_instead_of_forking(self):
+        runner = self.runner()
+        kill, wait = self.stopping(runner, exits=False)
+        with kill, wait, mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            outcome = runner._context_backstop_cycle(self.child)
+        self.assertIsNone(outcome)
+        self.assertFalse(self.child.automation)
+        self.assertIn("supervision_lost",
+                      [event["event"] for event in self.events(emit)])
+        self.assertEqual(self.child.context_next_check,
+                         self.clock["t"] + supervisor.PREEMPT_BACKOFF_SECONDS)
+
+    def test_a_conversation_that_cannot_be_proven_clean_is_resumed_in_place(self):
+        runner = self.runner()
+        kill, wait = self.stopping(runner)
+        with kill, wait, mock.patch.object(
+                handoff, "inspect_transcript",
+                side_effect=handoff.HandoffError(
+                    "session stopped mid-tool-call (unresolved: t1)")), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            outcome = runner._context_backstop_cycle(self.child)
+        self.assertIsNotNone(outcome)
+        # no fork of a conversation we could not prove finished — but the
+        # session still comes back, and still on a window it fits
+        self.assertEqual(outcome.argv,
+                         ["--resume", self.SID, "--model", "opus[1m]"])
+        self.assertEqual(outcome.reason, "context_backstop_recovered")
+        self.assertFalse(outcome.automatic)
+        self.assertTrue(outcome.supervised)
+        self.assertIn("forked resume degraded",
+                      [event.get("reason", "")
+                       for event in self.events(emit)][-2])
+
+    def test_a_missing_session_end_degrades_the_resume_but_never_drops_it(self):
+        runner = self.runner()
+        with mock.patch.object(supervisor.os, "kill"), \
+                mock.patch.object(runner, "_wait_stopped", return_value=0), \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            outcome = runner._context_backstop_cycle(self.child)
+        self.assertEqual(outcome.reason, "context_backstop_recovered")
+        self.assertEqual(outcome.argv,
+                         ["--resume", self.SID, "--model", "opus[1m]"])
+
+    def test_a_turn_starting_on_the_edge_cancels_the_kill(self):
+        runner = self.runner()
+        proof = runner._context_observation(self.child)
+        with open(self.transcript, "a", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "one more"}]}}) + "\n")
+        stat = handoff._transcript_stat(self.transcript)
+        with self.assertRaisesRegex(supervisor.SupervisorError,
+                                    "became busy before the context backstop"):
+            runner._idle_stop_edge(self.child, proof, stat,
+                                   label="context backstop")
+        with self.assertRaisesRegex(
+                supervisor.SupervisorError,
+                "edge of a context backstop stop"):
+            runner._idle_stop_edge(self.child, proof, proof.transcript_stat,
+                                   label="context backstop")
+
+    def test_a_turn_that_lands_between_the_proof_and_the_kill_is_spared(self):
+        # the user hit enter after the preflight passed. The stat check cannot
+        # see it (it landed before the stat was taken, as the identical
+        # preemptive race shows), so ONLY the last-instant edge stands between
+        # a live turn and a SIGTERM.
+        runner = self.runner()
+        proof = runner._context_observation(self.child)
+        with open(self.transcript, "a", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "one more"}]}}) + "\n")
+        with mock.patch.object(handoff, "_transcript_stat",
+                               return_value=proof.transcript_stat), \
+                mock.patch.object(supervisor.os, "kill") as killed, \
+                mock.patch.object(runner, "_wait_stopped", return_value=0), \
+                redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(
+                    supervisor.SupervisorError,
+                    "became busy before the context backstop stop"):
+                runner._context_backstop_stop(self.child, proof)
+        killed.assert_not_called()
+        self.assertTrue(self.child.automation)
+
+    def test_an_expired_decision_window_never_reaches_the_signal(self):
+        runner = self.runner()
+        proof = runner._context_observation(self.child)
+        self.clock["t"] += supervisor.PREEMPT_DECISION_TTL + 1
+        with mock.patch.object(supervisor.os, "kill") as killed, \
+                redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(supervisor.SupervisorError,
+                                        "decision window elapsed"):
+                runner._context_backstop_stop(self.child, proof)
+        killed.assert_not_called()
+
+    def test_an_unread_hook_event_holds_the_rotation(self):
+        runner = self.runner()
+        with open(self.events_path, "a", encoding="utf-8") as out:
+            out.write("{}\n")
+        outcome, killed, events = self.cycle(runner)
+        self.assertIsNone(outcome)
+        killed.assert_not_called()
+        self.assertIn("newer hook event",
+                      [event.get("reason", "") for event in events][-1])
+
+    def test_the_monitor_loop_returns_the_forced_rotation(self):
+        runner = self.runner()
+        relaunch = supervisor.Relaunch(self.source, ["--resume", self.SID],
+                                       self.cwd, True,
+                                       reason="context_backstop")
+        with mock.patch.object(runner, "_handle_events", return_value=None), \
+                mock.patch.object(runner, "_preemptive_cycle",
+                                  return_value=None), \
+                mock.patch.object(runner, "_context_backstop_cycle",
+                                  return_value=relaunch) as cycle, \
+                redirect_stderr(io.StringIO()):
+            self.assertIs(runner._monitor(self.child), relaunch)
+        cycle.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -74,6 +74,66 @@ MAX_SUBAGENT_SCAN = max(64, paths.env_int("HEADROOM_MAX_SUBAGENT_SCAN", 512))
 SIDECHAIN_TAIL_BYTES = max(8 * 1024, paths.env_int(
     "HEADROOM_SIDECHAIN_TAIL_BYTES", 32 * 1024))
 
+# --- context: the OTHER wall -----------------------------------------------
+# Usage caps are not the only way a session dies. A long parent session fills
+# its context window, and at 0% remaining the conversation is simply over —
+# with whatever was not written down lost with it.
+#
+# The intended answer is COOPERATIVE and lives outside this process: a
+# UserPromptSubmit hook measures the same numbers below and, from 30%
+# remaining, instructs the session every turn to write a baton and refresh
+# itself. That path produces a considered handoff and must be allowed to win.
+#
+# This is the fail-safe UNDER it, for a session that ignores the nudge — one
+# wedged in a loop, or spending its last context in a single long turn. At a
+# far later threshold (10% remaining) the supervisor forces ONE lossless
+# rotation of its own: the same stop + `--resume --fork-session` pipeline,
+# on the SAME seat. Nothing is cleared — the fork carries the whole
+# conversation — and the window-fit rule below puts it on a model whose
+# context window can actually hold it.
+#
+# Transcripts do not record the context window, so it is inferred exactly the
+# way the hook infers it, from the usage the provider charged:
+CONTEXT_WINDOW_STANDARD = 200_000
+CONTEXT_WINDOW_LARGE = 1_000_000
+# Usage above this ceiling can only have been served by the 1M-token window: a
+# standard-window session would have been REFUSED ("Prompt is too long")
+# instead of being charged for it. So this one number does two jobs — it
+# infers the window, and it decides whether a transcript may be resumed under
+# the standard window at all (see _window_fit_argv; a resume that ignores it
+# dies on its first prompt, observed twice in production 2026-07-27).
+CONTEXT_WINDOW_FIT_LIMIT = max(1, paths.env_int(
+    "HEADROOM_CONTEXT_FIT_LIMIT", 205_000))
+# The model an over-limit transcript must be resumed with. It is a MODEL
+# choice, not a family choice: only the 1M-window variants can hold such a
+# transcript, so a session that outgrew the standard window continues on this
+# one whatever it was running before.
+CONTEXT_FIT_MODEL = (os.environ.get("HEADROOM_CONTEXT_FIT_MODEL", "").strip()
+                     or "opus[1m]")
+# A resume argv names only `--resume`/`--fork-session`, so a child KNOWN to be
+# on the 1M window would silently come back on the standard one. Below this
+# much free space in a standard window, that shrink is not acceptable — the
+# successor would be born inside the warning zone the cooperative handoff
+# exists for, and would have to rotate again immediately. Above it, shrinking
+# is harmless and family routing wins.
+CONTEXT_KEEP_LARGE_PERCENT = 30.0
+# How many forced context rotations this supervisor may perform in one
+# LOOP_WINDOW. The analogue of the handoff ledger's loop guard, kept local
+# because a same-seat rotation reserves nothing: it moves no account, cools
+# nothing, and must never spend the ledger budget a genuine cap needs. The
+# bound matters because a fork INHERITS its parent's usage records, so a
+# rotation that cannot change the window (already on 1M) would otherwise
+# observe the same crossing again on the next poll, forever.
+CONTEXT_BACKSTOP_MAX = max(1, paths.env_int("HEADROOM_CONTEXT_BACKSTOP_MAX", 2))
+# A forced rotation is only worth its restart if the successor gets a window
+# the conversation actually fits in. A session already on the 1M window has
+# nowhere bigger to go: forking it would carry the same tokens into the same
+# ceiling, cost the user a restart, and change nothing. By default the
+# backstop refuses that (loudly — the operator is the only one who can save
+# such a session); HEADROOM_CONTEXT_BACKSTOP_ALWAYS=1 forces it anyway.
+CONTEXT_BACKSTOP_ALWAYS = (
+    os.environ.get("HEADROOM_CONTEXT_BACKSTOP_ALWAYS", "").strip() == "1")
+
 # A subscription cap surfaces two ways: the classic "hit your … limit" wording,
 # and — for a scoped-model weekly cap (e.g. Fable) — "You're out of usage
 # credits. Run /usage-credits to keep using Fable 5". The second form never
@@ -194,6 +254,32 @@ class PreemptiveProof:
 
 
 @dataclass(frozen=True)
+class ContextProof:
+    """A measured context crossing on an idle child.
+
+    Shape-compatible with :class:`CapProof` / :class:`PreemptiveProof` for the
+    same reason they are compatible with each other: every shared guard
+    (`_proof_current`, `_events_pending`, `_event_stop_guard`, `_wait_stopped`,
+    `_consume_stop_events`) must treat it identically. It proves nothing about
+    usage — only that this session is close to the end of its context window —
+    so it may never rotate a seat; it only forks the conversation in place."""
+    event: dict
+    message: str
+    session_id: str
+    transcript_path: str
+    epoch: int
+    transcript_stat: tuple
+    used: int = 0
+    window: int = 0
+    remaining_percent: float = 0.0
+    deadline: float = 0.0
+    # this is NOT a usage-threshold rotation: it must never reach the cap
+    # path's commit deadline or the preemptive notify/ledger vocabulary
+    preemptive: bool = False
+    backstop: bool = True
+
+
+@dataclass(frozen=True)
 class PendingCap:
     event: dict
     session_id: str
@@ -229,6 +315,13 @@ class Child:
     preemptive_next_check: float = 0.0
     preemptive_announced: bool = False
     preemptive_last_hold: str = ""
+    # the argv this child was spawned with: an explicit `--model …[1m]` is
+    # KNOWLEDGE about its context window, better than any inference
+    spawn_args: tuple = ()
+    # context backstop state (independent of both paths above)
+    context_next_check: float = 0.0
+    context_announced: bool = False
+    context_last_hold: str = ""
 
 
 @dataclass(frozen=True)
@@ -817,6 +910,191 @@ def _transcript_model(path):
     return _last_assistant_model(_transcript_records(path, whole=True)[0])
 
 
+def _assistant_usage(event):
+    """Context tokens ONE main-loop assistant record was charged for.
+
+    The three input-side counters are the whole prompt the provider saw:
+    fresh input, cache reads and cache writes. Output tokens are deliberately
+    excluded — they are already inside the NEXT request's input.
+
+    Sidechains are excluded because a subagent runs in its own window; adding
+    its usage to the parent's would report a context pressure the parent does
+    not have. Nested per-`iterations` usage is ignored for the mirror-image
+    reason: those are the same tokens as the record's own totals, and summing
+    both would double-count a multi-iteration turn straight past the ceiling.
+    Only the record's top-level counters count.
+
+    Same rule the UserPromptSubmit context-guard hook applies, deliberately:
+    the cooperative nudge and this backstop must never disagree about how much
+    context a session has left."""
+    if not isinstance(event, dict) or event.get("type") != "assistant" \
+            or event.get("isSidechain"):
+        return 0
+    message = event.get("message")
+    usage = message.get("usage") if isinstance(message, dict) else None
+    if not isinstance(usage, dict):
+        return 0
+    total = 0
+    for key in ("input_tokens", "cache_read_input_tokens",
+                "cache_creation_input_tokens"):
+        value = usage.get(key)
+        if _number(value) and value >= 0:
+            total += int(value)
+    return total
+
+
+def _context_used(path, records=None):
+    """Context tokens the NEWEST main-loop assistant record was charged for,
+    or None when the transcript cannot say.
+
+    The newest record, not the largest and not a sum: each request carries the
+    whole conversation, so the last one IS the current occupancy. Records with
+    no usage at all (synthetic notices, tool bookkeeping) are skipped rather
+    than read as zero — a zero would look like an empty window.
+
+    None means UNKNOWN, and every caller treats unknown as "change nothing":
+    never rotate, never rewrite a resume's model."""
+    try:
+        if records is None:
+            records, complete, _malformed = _transcript_records(path)
+            if not any(_assistant_usage(event) for event in records) \
+                    and not complete:
+                # a tail full of one enormous tool result can hold no assistant
+                # record at all — only then pay for the whole file (the same
+                # trade _transcript_model makes)
+                records = _transcript_records(path, whole=True)[0]
+        used = None
+        for event in records:
+            total = _assistant_usage(event)
+            if total:
+                used = total
+        return used
+    except Exception:  # noqa: BLE001 — a measurement never breaks supervision
+        return None
+
+
+def _context_window(used, model="", environ=None):
+    """The context window a session with this usage is running in.
+
+    KNOWLEDGE FIRST: a child spawned with an explicit `--model …[1m]` is on the
+    1M window and there is nothing to infer. Otherwise infer from the usage
+    itself — anything past the fit limit could not have been served by the
+    standard window. `HEADROOM_CTX_WINDOW` overrides both (the same knob, with
+    the same precedence, as the cooperative hook)."""
+    if "[1m]" in str(model or "").lower():
+        window = CONTEXT_WINDOW_LARGE
+    elif _number(used) and used > CONTEXT_WINDOW_FIT_LIMIT:
+        window = CONTEXT_WINDOW_LARGE
+    else:
+        window = CONTEXT_WINDOW_STANDARD
+    environ = os.environ if environ is None else environ
+    override = str(environ.get("HEADROOM_CTX_WINDOW", "")).strip()
+    if override:
+        try:
+            forced = int(override)
+        except (TypeError, ValueError):
+            return window
+        if forced > 0:
+            return forced
+    return window
+
+
+def _context_remaining(used, window):
+    """Percent of the window still free (0-100), fail-closed on nonsense."""
+    if not (_number(used) and _number(window)) or window <= 0 or used < 0:
+        return None
+    # (window - used) / window, not 1 - used/window: the second form makes the
+    # exact threshold land a float epsilon off (180000/200000 -> 9.999…%), and
+    # a boundary this code compares against must be exact
+    return max(0.0, min(100.0, 100.0 * (window - used) / window))
+
+
+def _model_flag(args):
+    """The value of the last `--model` in a Claude argv ("" when absent).
+
+    Everything after `--` is the child's own payload, never an option."""
+    value = ""
+    expected = False
+    for arg in args or ():
+        if not isinstance(arg, str):
+            continue
+        if expected:
+            value, expected = arg, False
+            continue
+        if arg == "--":
+            break
+        if arg == "--model":
+            expected = True
+        elif arg.startswith("--model="):
+            value = arg.split("=", 1)[1]
+    return value
+
+
+def _with_model(args, model):
+    """`args` carrying exactly one `--model`, set to `model`."""
+    cleaned, tail = [], []
+    expected = False
+    after_separator = False
+    for arg in args:
+        if after_separator:
+            tail.append(arg)
+            continue
+        if expected:
+            expected = False
+            continue
+        if arg == "--":
+            after_separator = True
+            tail.append(arg)
+            continue
+        if arg == "--model":
+            expected = True
+            continue
+        if isinstance(arg, str) and arg.startswith("--model="):
+            continue
+        cleaned.append(arg)
+    return cleaned + ["--model", model] + tail
+
+
+def _window_fit_argv(args, transcript_path, used=None, model=""):
+    """``(argv, forced model)`` — make a resume argv FIT the transcript it
+    resumes.
+
+    A transcript past the fit limit cannot be replayed into the standard
+    window: the resumed session dies on its first prompt with "Prompt is too
+    long" and the conversation is stranded on a seat nobody is watching
+    (production, 2026-07-27, twice in one day). So every automatic resume this
+    supervisor performs — cap rotation, preemptive rotation, source recovery,
+    context backstop — is re-modelled onto the 1M window when, and only when,
+    the transcript proves it needs one.
+
+    `model` is what the stopped child was RUNNING. When that is already a 1M
+    variant the conversation keeps it rather than being shrunk back into the
+    standard window — but only once it is big enough for the shrink to matter
+    (CONTEXT_KEEP_LARGE_PERCENT), so a small session on a big model still
+    follows normal family routing.
+
+    Unknown usage changes nothing: an unmeasurable transcript resumes exactly
+    as it would have before."""
+    args = list(args)
+    if used is None:
+        used = _context_used(transcript_path)
+    if used is None:
+        return args, ""
+    large = "[1m]" in str(model or "").lower()
+    needed = used > CONTEXT_WINDOW_FIT_LIMIT
+    if not needed and large:
+        standard = _context_remaining(used, CONTEXT_WINDOW_STANDARD)
+        needed = standard is not None and standard <= CONTEXT_KEEP_LARGE_PERCENT
+    if not needed:
+        return args, ""
+    # keep the child's own 1M model where it has one; only a session with no
+    # such model of its own is moved onto the default fit model
+    fit = model if large else CONTEXT_FIT_MODEL
+    if _model_flag(args) == fit:
+        return args, ""
+    return _with_model(args, fit), fit
+
+
 def _turn_is_complete(path, records=None, complete=True):
     """"" when the transcript's newest conversational record is a FINISHED
     main-thread assistant turn; otherwise why the child may be MID-TURN.
@@ -1241,6 +1519,17 @@ class Supervisor:
         # a supervisor-wide hold that survives a child swap, so an aborted
         # rotation cannot immediately re-target the recovered session
         self.preemptive_hold_until = 0.0
+        # Context backstop policy, resolved once per launch for the same
+        # reason: no config edit may flip it under a live child. It is
+        # deliberately INDEPENDENT of preemptive rotation — one is about the
+        # seat's usage, the other about the conversation's own window.
+        self.context_backstop = registry.context_backstop()
+        self.context_backstop_percent = registry.context_backstop_percent()
+        # the same hold/budget shape the preemptive path uses: a forked child
+        # inherits its parent's usage records, so without them a rotation that
+        # could not change the window would repeat forever
+        self.context_hold_until = 0.0
+        self.context_rotations = []
         self.generation = 0
         self.settings_files = []
         # True once ANY child CLI process has been successfully spawned —
@@ -1405,7 +1694,7 @@ class Supervisor:
                          "model": self.family, "note": ""})
         return Child(process, account, self.generation,
                      event_path(self.supervisor_id), settings, launched_at,
-                     automatic)
+                     automatic, spawn_args=tuple(args))
 
     def _fresh_collect(self, event_time):
         # Provider snapshots use whole-second timestamps.  Crossing the next
@@ -1872,6 +2161,290 @@ class Supervisor:
                 "preemptive decision window elapsed before stop")
         return plan
 
+    # ---- context backstop: never lose a session to its own window ---------
+    #
+    # The cooperative path owns everything above the backstop threshold: from
+    # 30% remaining the session is told, every turn, to write a baton and
+    # refresh itself. That is the intended flow and it produces a far better
+    # handoff than any mechanical one, so this code does nothing at all until
+    # a session has demonstrably NOT taken it.
+    #
+    # What it then does is the least destructive thing that can save the
+    # conversation: stop the child at a proven-idle boundary and resume the
+    # SAME session with `--fork-session` on the SAME seat, re-modelled onto a
+    # window that can hold it. No account moves, nothing is cooled, no target
+    # is reserved, the source transcript is untouched, and the pre-rotation
+    # session id remains on disk. Every refusal only defers — a backstop is
+    # worth nothing if it can take a session down.
+
+    def _context_state(self, child):
+        """``(used, window, remaining %)`` for this child, or None when its
+        context cannot be measured.
+
+        Absence of proof is never a crossing: an unreadable transcript, a tail
+        with no usage record, a nonsensical window — all return None and the
+        child is left alone."""
+        binding = child.binding
+        if binding is None:
+            return None
+        used = _context_used(binding.transcript_path)
+        if used is None:
+            return None
+        window = _context_window(used, _model_flag(child.spawn_args))
+        remaining = _context_remaining(used, window)
+        if remaining is None:
+            return None
+        return used, window, remaining
+
+    def _context_backstop_due(self, child, proof):
+        """True when this tick may consider a forced context rotation.
+
+        Same admission shape as the preemptive poll — a cap proof in flight
+        always wins, the child must be enabled, bound and live — plus the
+        backstop's own clock and hold. Automation being ON is required for a
+        second reason here: the stop below wants this child's SessionEnd, and
+        only a supervised child emits one."""
+        return (self.context_backstop and proof is None and child.automation
+                and child.binding is not None and child.pending_cap is None
+                and not child.session_ended
+                and self.now() >= child.context_next_check
+                and self.now() >= self.context_hold_until)
+
+    def _context_defer(self, child, reason, *, backoff=True, announce=True):
+        """Hold the backstop without disarming anything (see
+        `_preemptive_defer`: same contract, separate clock and dedupe)."""
+        child.context_next_check = self.now() + (
+            PREEMPT_BACKOFF_SECONDS if backoff else PREEMPT_POLL_SECONDS)
+        if child.context_last_hold == reason:
+            return
+        child.context_last_hold = reason
+        print(f"[headroom] context backstop held: {reason}; child continues "
+              f"with cap handoff still armed", file=sys.stderr)
+        if announce:
+            notify.emit({"event": "context_backstop_held",
+                         "account": child.account.get("name", ""),
+                         "reason": reason})
+
+    def _context_budget_spent(self):
+        """True once this supervisor has forced its allowance of rotations in
+        the current window (the local analogue of the ledger's loop guard)."""
+        cutoff = self.now() - LOOP_WINDOW
+        self.context_rotations = [when for when in self.context_rotations
+                                  if when >= cutoff]
+        return len(self.context_rotations) >= CONTEXT_BACKSTOP_MAX
+
+    def _context_observation(self, child):
+        """A :class:`ContextProof` for a live crossing, else None."""
+        state = self._context_state(child)
+        if state is None:
+            return None
+        used, window, remaining = state
+        if remaining > self.context_backstop_percent:
+            return None
+        binding = child.binding
+        observed_at = self.now()
+        return ContextProof(
+            event={"received_at": observed_at},
+            message=(f"context at {remaining:.0f}% remaining "
+                     f"({used:,} of {window:,} tokens)"),
+            session_id=binding.session_id,
+            transcript_path=binding.transcript_path, epoch=binding.epoch,
+            transcript_stat=handoff._transcript_stat(binding.transcript_path),
+            used=used, window=window, remaining_percent=remaining,
+            deadline=observed_at + PREEMPT_DECISION_TTL)
+
+    def _context_backstop_preflight(self, child, proof):
+        """Prove the child is at a SAFE BOUNDARY before forcing anything.
+
+        The preemptive preflight's guards, minus everything that only a
+        seat-to-seat move needs (usage row, target selection, cooldowns,
+        ledger admission): proof still current, no unread hook event, the
+        transcript quiet AND idle by the full three-proof machinery (finished
+        main-thread turn, no live background agent, no busy sidechain), the
+        transcript unchanged since the observation, and the decision still
+        inside its short TTL."""
+        self._proof_current(child, proof)
+        self._events_pending(child)
+        handoff.guard_source_stable(
+            proof.transcript_path, now=self.now(),
+            sleep=lambda _seconds: None, quiet_seconds=PREEMPT_IDLE_SECONDS)
+        busy = _idle_refusal(proof.transcript_path, self.now(),
+                             PREEMPT_IDLE_SECONDS, since=child.launched_at)
+        if busy:
+            raise SupervisorError("child is still working: " + busy)
+        if handoff._transcript_stat(proof.transcript_path) \
+                != proof.transcript_stat:
+            raise SupervisorError(
+                "context proof expired after the transcript changed")
+        if proof.deadline <= self.now():
+            raise SupervisorError(
+                "context decision window elapsed before stop")
+
+    def _context_backstop_stop(self, child, proof):
+        """Stop the child and hand back the resume that continues it.
+
+        Returns a :class:`Relaunch` (the child is gone and MUST be replaced),
+        or None when the child ignored SIGTERM and is still running.
+
+        After the signal there is no "refuse" left — the session must come
+        back — so a post-stop problem degrades the resume instead of
+        abandoning it: a plain `--resume` of the very same session id rather
+        than a fork of a conversation we could not prove clean."""
+        self._proof_current(child, proof)
+        self._events_pending(child)
+        if handoff._transcript_stat(proof.transcript_path) \
+                != proof.transcript_stat:
+            raise SupervisorError("source transcript changed before stop")
+        if proof.deadline <= self.now():
+            raise SupervisorError("context decision window elapsed before stop")
+        print(f"[headroom] {proof.message}; forcing a lossless rotation of "
+              f"this session on {child.account['name']}", file=sys.stderr)
+        saved = self._save_terminal()
+        stop_error = None
+        stop_sent_at = 0.0
+        signal_sent = False
+        child.session_ended = False
+        child.session_end_received_at = 0.0
+        try:
+            with _event_stop_guard(child):
+                self._proof_current(child, proof)
+                # last-instant idleness, one stat syscall before the kill
+                self._idle_stop_edge(child, proof, proof.transcript_stat,
+                                     label="context backstop")
+                stop_sent_at = self.now()
+                os.kill(child.process.pid, signal.SIGTERM)
+                signal_sent = True
+            returncode = self._wait_stopped(child, proof, stop_sent_at)
+        except Exception as error:  # post-signal failures still recover
+            if not signal_sent:
+                raise SupervisorError(str(error)) from error
+            stop_error = error
+            returncode = child.process.poll()
+        finally:
+            self._restore_terminal(saved)
+        if returncode is None:
+            print("[headroom] Claude did not exit after one SIGTERM; automatic "
+                  "handoff disabled for this child", file=sys.stderr)
+            _lose_supervision(child, "Claude did not exit after one SIGTERM")
+            return None
+        degraded = ""
+        if stop_error is not None:
+            degraded = f"the stop transition was not clean: {stop_error}"
+        elif not child.session_ended \
+                or child.session_end_received_at < stop_sent_at:
+            degraded = "SessionEnd proof is missing"
+        else:
+            try:
+                handoff.inspect_transcript(proof.transcript_path,
+                                           allow_dangling=False)
+            except (handoff.HandoffError, OSError, ValueError) as error:
+                degraded = str(error)
+        if degraded:
+            # never fork a conversation we cannot prove finished — resume the
+            # session itself instead, and say so
+            print(f"[headroom] context rotation could not fork cleanly "
+                  f"({degraded}); resuming the session in place",
+                  file=sys.stderr)
+            notify.emit({"event": "context_backstop_held",
+                         "account": child.account.get("name", ""),
+                         "reason": f"forked resume degraded: {degraded}"})
+            argv = ["--resume", proof.session_id]
+            reason = "context_backstop_recovered"
+        else:
+            argv = ["--resume", proof.session_id, "--fork-session"]
+            reason = "context_backstop"
+        # THE POINT OF THE ROTATION: the successor must get a window this
+        # conversation fits in. Below the fit limit `_window_fit_argv` would
+        # (correctly, for every other resume path) leave the model alone — but
+        # a session at 5% of a 200k window is under that limit and would come
+        # straight back at 5%, so a backstop resume off the standard window
+        # always re-models. A session already on the largest window never gets
+        # here (the cycle refuses it) unless the operator forced it.
+        if proof.window < CONTEXT_WINDOW_LARGE:
+            forced = CONTEXT_FIT_MODEL
+            argv = _with_model(argv, forced)
+        else:
+            argv, forced = _window_fit_argv(
+                argv, proof.transcript_path, used=proof.used,
+                model=_model_flag(child.spawn_args))
+        if forced:
+            print(f"[headroom] resuming this conversation on {forced} so its "
+                  f"{proof.used:,} tokens have room", file=sys.stderr)
+        # supervised either way: an elective stop must never cost the
+        # cap-reactive guarantee, and this seat is not capped
+        return Relaunch(child.account, argv, child.binding.cwd,
+                        reason == "context_backstop", reason=reason,
+                        supervised=True)
+
+    def _context_backstop_cycle(self, child):
+        """One backstop attempt. Returns a Relaunch when the session was
+        forcibly continued, otherwise None.
+
+        Never disarms: like preemptive rotation this is layered ON TOP of the
+        cap-reactive guarantee, so every failure degrades to "no forced
+        rotation this tick"."""
+        child.context_next_check = self.now() + PREEMPT_POLL_SECONDS
+        try:
+            proof = self._context_observation(child)
+        except Exception as error:  # noqa: BLE001
+            self._context_defer(child, f"context unreadable: {error}",
+                                announce=False)
+            return None
+        if proof is None:
+            child.context_announced = False
+            child.context_last_hold = ""
+            return None
+        if proof.window >= CONTEXT_WINDOW_LARGE and not CONTEXT_BACKSTOP_ALWAYS:
+            # nothing automatic can save this session: say so ONCE (the defer
+            # dedupes by reason) and leave it running rather than spending its
+            # last minutes on a restart that changes nothing
+            self._context_defer(
+                child, f"{proof.message} and it is already on the largest "
+                f"context window — only the operator can save this session")
+            return None
+        if self._context_budget_spent():
+            self._context_defer(
+                child, f"context backstop budget spent "
+                f"({CONTEXT_BACKSTOP_MAX} in {LOOP_WINDOW / 60:.0f} minutes)")
+            return None
+        if not child.context_announced:
+            child.context_announced = True
+            print(f"[headroom] {child.account['name']} {proof.message} — "
+                  f"forcing a handoff at the next idle boundary",
+                  file=sys.stderr)
+            notify.emit({"event": "context_backstop_scheduled",
+                         "account": child.account.get("name", ""),
+                         "used": proof.used, "window": proof.window,
+                         "remaining_percent": proof.remaining_percent})
+        try:
+            self._context_backstop_preflight(child, proof)
+        except Exception as error:  # noqa: BLE001
+            busy = ("changed recently" in str(error)
+                    or "still changing" in str(error))
+            self._context_defer(child, str(error), backoff=not busy)
+            return None
+        try:
+            relaunch = self._context_backstop_stop(child, proof)
+        except Exception as error:  # noqa: BLE001 — a refusal must never disarm
+            # every raise before the SIGTERM leaves the child untouched
+            self._context_defer(child, str(error))
+            return None
+        if relaunch is None:
+            child.context_next_check = self.now() + PREEMPT_BACKOFF_SECONDS
+            return None
+        # charge the budget and hold: the forked child INHERITS these usage
+        # records, so it will read as the same crossing until it either moved
+        # onto a bigger window or wrote a turn of its own
+        self.context_rotations.append(self.now())
+        self.context_hold_until = self.now() + PREEMPT_BACKOFF_SECONDS
+        notify.emit({"event": "context_backstop_rotation",
+                     "account": child.account.get("name", ""),
+                     "used": proof.used, "window": proof.window,
+                     "remaining_percent": proof.remaining_percent,
+                     "model": _model_flag(relaunch.argv),
+                     "forked": relaunch.reason == "context_backstop"})
+        return relaunch
+
     @staticmethod
     def _save_terminal():
         if termios is None:
@@ -2016,8 +2589,13 @@ class Supervisor:
 
     @staticmethod
     def _source_relaunch(plan):
-        return Relaunch(plan.source.account,
-                        ["--resume", plan.source.session_id], plan.cwd, False)
+        # even a RECOVERY resume has to fit the window it resumes into: the
+        # session being recovered is the same one whose transcript may already
+        # have outgrown the standard window
+        argv, _forced = _window_fit_argv(
+            ["--resume", plan.source.session_id],
+            plan.source.transcript_path)
+        return Relaunch(plan.source.account, argv, plan.cwd, False)
 
     @staticmethod
     def _print_manual_recovery(plan):
@@ -2030,16 +2608,24 @@ class Supervisor:
         print(f"CLAUDE_CONFIG_DIR={shlex.quote(plan.source.account['home'])} "
               f"{source_argv}", file=sys.stderr)
 
-    def _preemptive_stop_edge(self, child, plan, proof):
-        """Last-instant idleness proof, immediately before SIGTERM."""
-        if handoff._transcript_stat(proof.transcript_path) != plan.source_stat:
+    def _idle_stop_edge(self, child, proof, expected_stat, label="preemptive"):
+        """Last-instant idleness proof, immediately before SIGTERM.
+
+        Shared by every ELECTIVE stop (preemptive rotation, context backstop):
+        a cap stop has to proceed regardless because the session is refused
+        anyway, but an elective one must not catch a turn that started while
+        the decision was being written down."""
+        if handoff._transcript_stat(proof.transcript_path) != expected_stat:
             raise SupervisorError(
-                "source transcript changed on the edge of a preemptive stop")
+                f"source transcript changed on the edge of a {label} stop")
         busy = _idle_refusal(proof.transcript_path, self.now(),
                              PREEMPT_IDLE_SECONDS, since=child.launched_at)
         if busy:
             raise SupervisorError(
-                "child became busy before the preemptive stop: " + busy)
+                f"child became busy before the {label} stop: " + busy)
+
+    def _preemptive_stop_edge(self, child, plan, proof):
+        self._idle_stop_edge(child, proof, plan.source_stat)
 
     @staticmethod
     def _commit_deadline(plan, proof):
@@ -2171,7 +2757,22 @@ class Supervisor:
             if plan.inspected["unresolved_tool_ids"]:
                 print("[headroom] note: the interrupted tool call may re-run on "
                       "resume", file=sys.stderr)
-            return Relaunch(plan.target, handoff.resume_argv(result)[1:],
+            # The conversation only survives if the target can actually LOAD
+            # it: a transcript past the fit limit resumed under the standard
+            # window dies on its first prompt. Measure the staged conversation
+            # itself, not the seat it came from.
+            argv, forced = _window_fit_argv(
+                handoff.resume_argv(result)[1:], plan.source.transcript_path,
+                model=_model_flag(child.spawn_args))
+            if forced:
+                print(f"[headroom] this transcript no longer fits a "
+                      f"{CONTEXT_WINDOW_STANDARD:,}-token window — resuming it "
+                      f"on {forced}", file=sys.stderr)
+                notify.emit({"event": "context_window_fit",
+                             "account": plan.target.get("name", ""),
+                             "model": forced,
+                             "handoff_id": plan.handoff_id})
+            return Relaunch(plan.target, argv,
                             plan.cwd, True, plan.handoff_id, plan,
                             reason="preemptive" if plan.preemptive else "cap")
         except Exception as error:  # no post-stop failure may strand the user
@@ -2363,6 +2964,15 @@ class Supervisor:
                     outcome = self._preemptive_cycle(child)
                     if outcome is not None:
                         return outcome
+                # The context backstop runs LAST and lowest: a seat rotation
+                # is preferable (it also gives the conversation a fresh
+                # process) and the cooperative baton handoff, which owns
+                # everything above 10% remaining, is preferable to both. This
+                # only ever fires for a session that took neither.
+                if self._context_backstop_due(child, proof):
+                    outcome = self._context_backstop_cycle(child)
+                    if outcome is not None:
+                        return outcome
                 if proof is not None and child.automation:
                     try:
                         plan = self._preflight(child, proof)
@@ -2537,7 +3147,12 @@ class Supervisor:
                     # moment: this is the one place the user can actually see
                     # the handoff happen (anything printed earlier is hidden
                     # by Claude's alternate screen)
-                    if outcome.automatic and outcome.reason == "preemptive":
+                    if outcome.reason.startswith("context_backstop"):
+                        print(f"[headroom] this session was nearly out of "
+                              f"context, continuing it on "
+                              f"{outcome.account['name']} without losing the "
+                              f"conversation", file=sys.stderr)
+                    elif outcome.automatic and outcome.reason == "preemptive":
                         print(f"[headroom] {child.account['name']} is nearly "
                               f"out of headroom, continuing this conversation "
                               f"on {outcome.account['name']} before it caps",
