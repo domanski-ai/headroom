@@ -43,7 +43,9 @@ usage:
   headroom accounts                 list connected accounts
   headroom ops-status [--json]      read-only JSON snapshot of every supervised
                                     session (turn, subagents, context, tmux
-                                    container) plus per-seat batteries
+                                    container) plus per-seat batteries; a list
+                                    that could not be read is null, with the
+                                    reason in "errors"
   headroom doctor                   environment + config health check
 
 Try it with no accounts:  headroom serve --demo   (bundled sample data)

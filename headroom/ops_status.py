@@ -15,10 +15,28 @@ implementation of "is this session busy" would drift from the first, and the
 two would disagree exactly when it matters — the moment something is about to
 restart a session that is still working.
 
-Contract: read-only, no writes anywhere, no network, no LLM, sub-second, and
-it degrades per session. One unreadable transcript costs that session's
-fields, never the command. Exit 0 with valid JSON on stdout whenever ANY
-source could be read; exit 1 only when none could.
+Contract: read-only, no writes anywhere, no network, no LLM, and it degrades
+per session — one unreadable transcript costs that session's fields, never
+the command. Exit 0 with valid JSON on stdout whenever ANY source could be
+read; exit 1 only when none could.
+
+An empty census and a FAILED census are never confused. `sessions` and
+`seats` are lists when they were read — possibly empty — and null when they
+could not be, with the reason named in the top-level `errors` array. The
+same rule runs all the way down: "" for a container is the positive claim
+"tmux answered and this session is outside it", and only a walk that reached
+the process-tree root may make it.
+
+Runtime is bounded by construction, not by hope. Per report: one /proc
+sweep, one tmux call (TMUX_TIMEOUT, degrading every container to null on
+timeout). Per session: a bounded journal tail (JOURNAL_TAIL_BYTES), ONE
+bounded transcript tail (supervisor.TRANSCRIPT_TAIL_BYTES) that serves the
+turn shape, the agent ledger AND the context fallback, a bounded sidechain
+walk (supervisor.MAX_SUBAGENT_SCAN), and an ancestry walk of at most
+MAX_ANCESTRY hops. Nothing here reads a whole transcript: the context
+fallback is handed the tail this report already parsed, so a session with no
+usage record in its tail yields null rather than a full-history parse.
+Measured on a live 4-session host: ~0.2-0.3 s.
 """
 import json
 import os
@@ -36,8 +54,10 @@ PROC_ROOT = "/proc"
 CTX_MAX_AGE = 15 * 60
 # last few non-CwdChanged hook events, oldest first
 RECENT_EVENTS = 5
-# a status command may not hang on a wedged tmux server
-TMUX_TIMEOUT = 2.0
+# a status command may not hang on a wedged tmux server, and this is the
+# single largest term in its worst case — a timeout costs every container in
+# the report (all null), so keep it short enough to stay sub-second overall
+TMUX_TIMEOUT = 1.0
 # the journal is append-only and small; bound the read anyway (same discipline
 # as _transcript_records — a status command's cost must not track history)
 JOURNAL_TAIL_BYTES = 256 * 1024
@@ -142,12 +162,14 @@ def _clock_ticks():
 
 
 def _pids(proc_root):
-    """Every numeric entry under /proc, or None when /proc is unreadable."""
+    """`(pids, reason)` — pids is None when /proc could not be listed, and
+    `reason` then says why, so the report can SIGNAL a failed census instead
+    of publishing an empty one."""
     try:
         return sorted(int(name) for name in os.listdir(proc_root)
-                      if name.isdigit())
-    except OSError:
-        return None
+                      if name.isdigit()), ""
+    except OSError as error:
+        return None, f"{proc_root} is unreadable ({error.strerror or error})"
 
 
 def _is_supervised_child(argv, supervisor_id):
@@ -181,36 +203,61 @@ def _is_supervised_child(argv, supervisor_id):
     return False
 
 
-def _parent_holds_same_supervisor(proc_root, ppid, supervisor_id):
-    """Whether this process is INSIDE a supervised session rather than being
-    one.
+def _is_supervisor_process(argv):
+    """Whether this argv is a headroom launcher — i.e. could be a supervisor.
 
-    The supervisor injects HEADROOM_SUPERVISOR_ID *for the child it spawns*,
-    so the supervised CLI is the unique process whose parent does not already
-    carry that id. Everything a session then runs — a shell, a tool, and
-    critically a headless `claude -p …` one-shot the session itself launched
-    — inherits both the variable and, for that last one, the program name.
-    Observed live on this fleet: four `claude -p` workers of the sales
-    session, each reporting the SAME session id as their parent, which is
-    precisely the duplicate-session shape an ops layer must never see.
+    Deliberately INCLUSIVE (any headroom-looking argument counts), because
+    the launcher's shape varies: `bin/headroom` execs `python3 -c "…from
+    headroom.__main__ import main…"`, `python3 -m headroom` and an installed
+    console script all look different. A false positive here cannot invent a
+    session on its own — the caller also requires the parent NOT to carry the
+    child's supervisor id — whereas a false negative would hide a real
+    one."""
+    return any(isinstance(arg, str)
+               and ("headroom" in os.path.basename(arg) or "headroom" in arg)
+               for arg in argv or ())
 
-    A NESTED supervisor is still reported: it generates a fresh id, so its
-    child's parent carries a DIFFERENT one and the comparison passes."""
+
+def _parent_is_supervisor(proc_root, ppid, supervisor_id):
+    """Whether this process is a SUPERVISOR'S OWN CHILD.
+
+    The defining property of a supervised session is not that it carries
+    HEADROOM_SUPERVISOR_ID — everything a session spawns inherits that — but
+    that its PARENT IS THE SUPERVISOR that generated the id. Two conditions,
+    both required:
+
+      the parent is a headroom launcher process, and
+      the parent does not already carry this same supervisor id
+
+    The second alone was the first attempt and it is not enough: a headless
+    `claude -p …` worker a session launched in the background is REPARENTED
+    TO INIT when its shell exits, keeps the inherited variable, and then has
+    a parent (pid 1) that carries no id at all — so it passed, and stood
+    beside the real session wearing the same supervisor UUID (Codex review,
+    reproduced). Anchoring on the supervisor closes that: init is not a
+    launcher, and a reparented worker is definitionally not a supervisor's
+    child any more.
+
+    A NESTED supervisor still reports: it is a launcher, and it generates a
+    fresh id, so it carries the OUTER one and the comparison passes."""
     if ppid is None or ppid <= 1:
         return False
-    parent = _proc_environ(proc_root, ppid)
-    return parent.get("HEADROOM_SUPERVISOR_ID", "") == supervisor_id
+    if _proc_environ(proc_root, ppid).get(
+            "HEADROOM_SUPERVISOR_ID", "") == supervisor_id:
+        return False
+    return _is_supervisor_process(_proc_cmdline(proc_root, ppid))
 
 
 def supervised_children(proc_root=None):
-    """Every live supervised Claude CLI process on this host.
+    """`(children, reason)` — every live supervised Claude CLI on this host.
 
-    Returns None when the process table itself could not be read — the caller
-    reports that as "nothing could be read", not as "no sessions"."""
+    `children` is None when the process table itself could not be read. That
+    is NOT an empty estate and the caller must never publish it as one: an
+    ops layer reading `sessions: []` believes it has seen the whole host."""
     proc_root = PROC_ROOT if proc_root is None else proc_root
-    pids = _pids(proc_root)
+    pids, reason = _pids(proc_root)
     if pids is None:
-        return None
+        return None, reason
     boot = _boot_time(proc_root)
     ticks = _clock_ticks()
     found = []
@@ -223,7 +270,7 @@ def supervised_children(proc_root=None):
         if not _is_supervised_child(argv, supervisor_id):
             continue
         ppid, starttime = _proc_stat_fields(proc_root, pid)
-        if _parent_holds_same_supervisor(proc_root, ppid, supervisor_id):
+        if not _parent_is_supervisor(proc_root, ppid, supervisor_id):
             continue
         generation = environ.get("HEADROOM_CHILD_GENERATION", "")
         config_dir = environ.get("CLAUDE_CONFIG_DIR", "")
@@ -246,7 +293,7 @@ def supervised_children(proc_root=None):
                            if boot is not None and starttime is not None
                            else None),
         })
-    return found
+    return found, ""
 
 
 # --- tmux -------------------------------------------------------------------
@@ -280,7 +327,13 @@ def _container(proc_root, pid, panes):
 
     A pane's pid is whatever the pane runs, which is rarely the CLI itself —
     a supervisor, or a wrapper waiting on a predecessor, sits between them.
-    So walk the ancestry rather than matching the pid directly."""
+    So walk the ancestry rather than matching the pid directly.
+
+    "" is a POSITIVE claim — tmux answered and this session is genuinely
+    outside it — and only ONE exit may make it: a walk that reached the
+    process-tree root having met no pane. A cycle, the hop limit and an
+    ancestor that vanished mid-walk all prove nothing except that the
+    ancestry is unknown, and each returns null."""
     if panes is None or pid is None:
         return None
     seen = set()
@@ -288,14 +341,16 @@ def _container(proc_root, pid, panes):
     for _step in range(MAX_ANCESTRY):
         if current in panes:
             return panes[current]
-        if current in seen or current <= 1:
-            break
+        if current <= 1:
+            return ""  # the root, with no tmux anywhere above: genuinely bare
+        if current in seen:
+            return None  # a cycle in /proc cannot prove anything
         seen.add(current)
         parent, _starttime = _proc_stat_fields(proc_root, current)
         if parent is None:
             return None
         current = parent
-    return ""
+    return None  # hop limit: the walk never reached the root
 
 
 # --- supervisor journal -----------------------------------------------------
@@ -349,7 +404,19 @@ def _session_binding(records, generation):
 
     The journal, not the child's argv: a `--resume X --fork-session` launch
     runs as a NEW session id, so the argv names the conversation's ancestor
-    and only the harness's own SessionStart names what is live."""
+    and only the harness's own SessionStart names what is live.
+
+    STRICTLY per-generation, with no fallback to an earlier one. A handoff
+    respawns the child as generation n+1 and its SessionStart hook lands a
+    moment later; during that gap the newest record still belongs to
+    generation n. Borrowing it would dress the live session in the retired
+    one's UUID, transcript, turn state and context — a phantom old session
+    reported while the new one goes missing (Codex review). The honest
+    answer in that window is "not bound yet": session_id None, which every
+    downstream field then reads as unknown.
+
+    A child with no generation at all (the env var missing) cannot be
+    filtered, so it takes the newest record — the same read as before."""
     for record in reversed(records):
         if generation is not None and record.get("generation") != generation:
             continue
@@ -425,19 +492,26 @@ def _window_is_certain(used, model, environ=None):
                 and used > supervisor.CONTEXT_WINDOW_FIT_LIMIT)
 
 
-def _context_remaining(session_id, transcript_path, model, now, environ=None):
+def _context_remaining(session_id, transcript_path, model, now, records=None,
+                       environ=None):
     """Percent of context still free, or None.
 
     Primary source is the ctx file. Only when that is absent or stale does
     this fall back to the supervisor's OWN measurement of the transcript —
     and then only when the window it would be measured against is certain,
-    so an unknown stays null instead of becoming a guess."""
+    so an unknown stays null instead of becoming a guess.
+
+    `records` is the tail this report ALREADY parsed, and passing it is what
+    keeps the fallback bounded: `_context_used` given no records is entitled
+    to re-read the whole file when the tail holds no usage record, which on a
+    large session makes a status command's cost scale with conversation
+    history. Handed the tail, it either answers from it or says None."""
     remaining = _ctx_remaining(session_id, now)
     if remaining is not None:
         return remaining
-    if not transcript_path:
+    if not transcript_path or records is None:
         return None
-    used = supervisor._context_used(transcript_path)
+    used = supervisor._context_used(transcript_path, records)
     if used is None or not _window_is_certain(used, model, environ):
         return None
     window = supervisor._context_window(used, model, environ)
@@ -457,24 +531,27 @@ def _turn_state(reason):
 
 
 def _activity(transcript_path, now, since):
-    """`(turn, subagents, last_write_epoch)` for one session.
+    """`(turn, subagents, last_write_epoch, records)` for one session.
 
     Every judgement here is the supervisor's own, called directly: the turn
     shape it trusts before a rotation, the parent ledger of background agents
     it started, and the bounded sidechain walk that proves none is working.
     Nothing about idleness is decided from mtime — recency can prove work,
-    never completion."""
+    never completion.
+
+    The parsed tail comes back with the answers so the context fallback can
+    reuse it instead of paying for the file a second time."""
     if not transcript_path:
-        return "unknown", "unknown", None
+        return "unknown", "unknown", None, None
     try:
         mtime = os.stat(transcript_path).st_mtime
     except OSError:
-        return "unknown", "unknown", None
+        return "unknown", "unknown", None, None
     try:
         records, complete, malformed = supervisor._transcript_records(
             transcript_path)
         if malformed:
-            return "unknown", "unknown", mtime
+            return "unknown", "unknown", mtime, None
         turn = _turn_state(
             supervisor._turn_is_complete(transcript_path, records, complete))
         launched, finished = supervisor._agent_lifecycle(records)
@@ -482,8 +559,8 @@ def _activity(transcript_path, now, since):
             transcript_path, now, supervisor.PREEMPT_IDLE_SECONDS,
             since=since or 0.0, launched=launched, finished=finished)
     except Exception:  # noqa: BLE001 — one session never breaks the report
-        return "unknown", "unknown", mtime
-    return turn, ("active" if busy else "idle"), mtime
+        return "unknown", "unknown", mtime, None
+    return turn, ("active" if busy else "idle"), mtime, records
 
 
 # --- seats ------------------------------------------------------------------
@@ -597,14 +674,12 @@ def _session_report(child, proc_root, panes, now, by_home=None, environ=None):
         records = journal_records(supervisor_id)
     except Exception:  # noqa: BLE001
         records = []
+    # strictly this generation — an unbound new child reports unknown rather
+    # than wearing the retired generation's identity (see _session_binding)
     session_id, transcript_path = _session_binding(records, generation)
-    if session_id is None and generation is not None:
-        # the child's generation left no record yet (a session that has only
-        # just started): fall back to whatever this supervisor last bound
-        session_id, transcript_path = _session_binding(records, None)
     seat = _seat_of(child["config_dir"], by_home or {})
     model = supervisor._model_flag(child["argv"][1:])
-    turn, subagents, mtime = _activity(
+    turn, subagents, mtime, tail = _activity(
         transcript_path, now, child.get("started_at"))
     return {
         "container": _container(proc_root, child["pid"], panes),
@@ -615,7 +690,7 @@ def _session_report(child, proc_root, panes, now, by_home=None, environ=None):
         "turn": turn,
         "subagents": subagents,
         "context_remaining_percentage": _context_remaining(
-            session_id, transcript_path, model, now, environ),
+            session_id, transcript_path, model, now, tail, environ),
         "last_transcript_write": _iso(mtime),
         "generation": generation,
         "recent_events": _recent_events(records),
@@ -626,6 +701,12 @@ def snapshot(now=None, proc_root=None, panes=None,
              fallback_path=None, environ=None):
     """`(report, read_something)`.
 
+    An EMPTY census and a FAILED census are different facts and the report
+    keeps them apart: `sessions`/`seats` are lists when they were read (even
+    empty ones) and null when they could not be, with the reason named in
+    `errors`. An ops layer handed `sessions: []` believes it has seen the
+    whole host; handed null, it knows it has seen nothing.
+
     `panes` may be pre-supplied (tests, or a caller that already asked tmux);
     None means consult tmux once for the whole report. The path defaults are
     resolved HERE rather than bound as argument defaults, so the module-level
@@ -634,12 +715,18 @@ def snapshot(now=None, proc_root=None, panes=None,
     proc_root = PROC_ROOT if proc_root is None else proc_root
     fallback_path = (FALLBACK_USAGE_PATH if fallback_path is None
                      else fallback_path)
-    children = supervised_children(proc_root)
+    errors = []
+    children, reason = supervised_children(proc_root)
+    if children is None:
+        errors.append("session_discovery_failed: " + (reason or "unknown"))
     if panes is None:
         panes = tmux_panes()
     battery = seats(fallback_path)
+    if battery is None:
+        errors.append("seat_snapshot_unreadable: no usage snapshot could be "
+                      "read")
     by_home = _seat_index()[1]
-    sessions = []
+    sessions = None if children is None else []
     for child in (children or []):
         try:
             sessions.append(_session_report(
@@ -653,13 +740,15 @@ def snapshot(now=None, proc_root=None, panes=None,
                 "last_transcript_write": None, "generation": None,
                 "recent_events": [],
             })
-    sessions.sort(key=lambda row: (row["container"] or "",
-                                   row["supervisor_id"] or ""))
+    if sessions is not None:
+        sessions.sort(key=lambda row: (row["container"] or "",
+                                       row["supervisor_id"] or ""))
     report = {
         "schema": SCHEMA,
         "generated_at": _iso(now),
         "sessions": sessions,
-        "seats": battery or [],
+        "seats": battery,
+        "errors": errors,
     }
     return report, (children is not None or battery is not None)
 

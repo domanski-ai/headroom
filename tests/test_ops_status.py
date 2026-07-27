@@ -41,6 +41,14 @@ SUP_B = "66666666-7777-8888-9999-aaaaaaaaaaaa"
 SID_A = "aaaaaaaa-1111-2222-3333-444444444444"
 SID_B = "bbbbbbbb-1111-2222-3333-444444444444"
 
+# what the repo launcher really execs (bin/headroom -> python3 -c "…"), and
+# what a supervised child's parent must therefore look like
+SUPERVISOR_ARGV = [
+    "python3", "-c",
+    'import os, sys\nsys.path.insert(0, os.environ["HEADROOM_REPO"])\n'
+    'from headroom.__main__ import main\nraise SystemExit(main())',
+    "claude", "--model", "fable"]
+
 SESSION_KEYS = {
     "container", "supervisor_id", "session_id", "seat", "pid", "turn",
     "subagents", "context_remaining_percentage", "last_transcript_write",
@@ -111,6 +119,17 @@ class OpsStatusCase(unittest.TestCase):
             handle.write(f"{pid} (cl (aude) " + " ".join(tail) + "\n")
         return pid
 
+    def supervised(self, pid, argv=("claude",), environ=None, sup_pid=None,
+                   started=None, sup_argv=None):
+        """A supervisor process and the claude child it owns — the only
+        shape discovery accepts."""
+        sup_pid = pid - 1 if sup_pid is None else sup_pid
+        self.write_proc(sup_pid, sup_argv or SUPERVISOR_ARGV, {}, ppid=1,
+                        started=started)
+        self.write_proc(pid, list(argv), environ or self.child_env(),
+                        ppid=sup_pid, started=started)
+        return pid
+
     def child_env(self, supervisor_id=SUP_A, generation=1, home=None):
         return {"HEADROOM_SUPERVISOR_ID": supervisor_id,
                 "HEADROOM_CHILD_GENERATION": str(generation),
@@ -165,8 +184,8 @@ class OpsStatusCase(unittest.TestCase):
         self.journal(SUP_A, [
             (self.now - 900, 1, "SessionStart", session_id, transcript),
             (self.now - 500, 1, "CwdChanged", session_id, transcript)])
-        self.write_proc(4000, ["python3", "-c", "...", "claude"], {},
-                        ppid=1, started=self.now - 1000)
+        self.write_proc(4000, SUPERVISOR_ARGV, {}, ppid=1,
+                        started=self.now - 1000)
         self.write_proc(4001, ["claude", "--settings", "/x.settings.json"],
                         self.child_env(), ppid=4000, started=self.now - 1000)
         return transcript
@@ -190,7 +209,8 @@ class ReportShape(OpsStatusCase):
         report, ok = self.snapshot(panes={4000: "sales"})
         self.assertTrue(ok)
         self.assertEqual(set(report), {"schema", "generated_at", "sessions",
-                                       "seats"})
+                                       "seats", "errors"})
+        self.assertEqual(report["errors"], [])
         self.assertEqual(report["schema"], "headroom_ops_status@1")
         self.assertEqual(report["generated_at"],
                          time.strftime("%Y-%m-%dT%H:%M:%SZ",
@@ -232,7 +252,7 @@ class ReportShape(OpsStatusCase):
                  "CwdChanged" if index % 2 else "SessionStart",
                  SID_A, transcript) for index in range(20)]
         self.journal(SUP_A, rows)
-        self.write_proc(4001, ["claude"], self.child_env(), ppid=1)
+        self.supervised(4001)
         report, _ok = self.snapshot(panes={})
         self.assertEqual(report["sessions"][0]["recent_events"],
                          ["SessionStart"] * ops_status.RECENT_EVENTS)
@@ -243,8 +263,8 @@ class ReportShape(OpsStatusCase):
         transcript = self.transcript(SID_A, [assistant()])
         self.journal(SUP_A, [(self.now - 60, 1, "SessionStart", SID_A,
                               transcript)])
-        self.write_proc(4001, ["claude", "--resume", SID_B, "--fork-session"],
-                        self.child_env(), ppid=1)
+        self.supervised(4001, ["claude", "--resume", SID_B,
+                               "--fork-session"])
         report, _ok = self.snapshot(panes={})
         self.assertEqual(report["sessions"][0]["session_id"], SID_A)
 
@@ -254,22 +274,53 @@ class ReportShape(OpsStatusCase):
         self.journal(SUP_A, [
             (self.now - 900, 1, "SessionStart", SID_B, old),
             (self.now - 100, 2, "SessionStart", SID_A, new)])
-        self.write_proc(4001, ["claude"], self.child_env(generation=1),
-                        ppid=1)
+        self.supervised(4001, environ=self.child_env(generation=1))
         report, _ok = self.snapshot(panes={})
         self.assertEqual(report["sessions"][0]["session_id"], SID_B)
         self.assertEqual(report["sessions"][0]["generation"], 1)
 
+    def test_a_generation_with_no_sessionstart_yet_reports_unknown(self):
+        # a handoff respawns the child as generation 2 and its SessionStart
+        # lands a moment later. Borrowing generation 1's record would dress
+        # the live session in the retired one's identity — a phantom old
+        # session reported while the new one goes missing (Codex review)
+        old = self.transcript(SID_B, [assistant()])
+        self.journal(SUP_A, [(self.now - 900, 1, "SessionStart", SID_B, old)])
+        self.supervised(4001, environ=self.child_env(generation=2))
+        report, _ok = self.snapshot(panes={})
+        session = report["sessions"][0]
+        self.assertEqual(session["generation"], 2)
+        self.assertIsNone(session["session_id"])
+        self.assertNotEqual(session["session_id"], SID_B)
+        self.assertEqual(session["turn"], "unknown")
+        self.assertEqual(session["subagents"], "unknown")
+        self.assertIsNone(session["context_remaining_percentage"])
+        self.assertIsNone(session["last_transcript_write"])
+        # the session itself is still reported, and still identified
+        self.assertEqual(session["supervisor_id"], SUP_A)
+        self.assertEqual(session["pid"], 4001)
+
+    def test_a_child_with_no_generation_takes_the_newest_record(self):
+        # nothing to filter on: the pre-existing read is the honest one
+        transcript = self.transcript(SID_A, [assistant()])
+        self.journal(SUP_A, [(self.now - 60, 3, "SessionStart", SID_A,
+                              transcript)])
+        environ = self.child_env()
+        del environ["HEADROOM_CHILD_GENERATION"]
+        self.supervised(4001, environ=environ)
+        report, _ok = self.snapshot(panes={})
+        self.assertEqual(report["sessions"][0]["session_id"], SID_A)
+        self.assertIsNone(report["sessions"][0]["generation"])
+
     def test_sessions_sort_by_container_then_supervisor(self):
         transcript = self.transcript(SID_A, [assistant()])
         for index, (supervisor_id, pid) in enumerate(
-                ((SUP_B, 5001), (SUP_A, 5002))):
+                ((SUP_B, 5001), (SUP_A, 5003))):
             self.journal(supervisor_id, [(self.now - 60 + index, 1,
                                           "SessionStart", SID_A, transcript)])
-            self.write_proc(pid, ["claude"],
-                            self.child_env(supervisor_id=supervisor_id),
-                            ppid=1)
-        report, _ok = self.snapshot(panes={5001: "zeta", 5002: "alpha"})
+            self.supervised(pid, environ=self.child_env(
+                supervisor_id=supervisor_id))
+        report, _ok = self.snapshot(panes={5001: "zeta", 5003: "alpha"})
         self.assertEqual([row["container"] for row in report["sessions"]],
                          ["alpha", "zeta"])
 
@@ -302,13 +353,56 @@ class Discovery(OpsStatusCase):
         report, _ok = self.snapshot(panes={})
         self.assertEqual([row["pid"] for row in report["sessions"]], [4001])
 
+    def test_a_reparented_headless_worker_is_not_a_phantom_session(self):
+        # THE reproduced phantom (Codex review): a `claude -p …` worker the
+        # session launched in the background outlives the shell that started
+        # it, is reparented to init, and keeps the inherited supervisor id.
+        # Its parent then carries no id at all — so a parent-env test alone
+        # passes it, and it stands beside the real session wearing the same
+        # supervisor UUID. Its parent is not a supervisor, so it is not a
+        # session.
+        self.one_live_session()
+        self.write_proc(4003, ["claude", "-p", "write the email"],
+                        self.child_env(), ppid=1)
+        report, _ok = self.snapshot(panes={})
+        self.assertEqual([row["pid"] for row in report["sessions"]], [4001])
+        self.assertEqual(
+            [row["supervisor_id"] for row in report["sessions"]], [SUP_A])
+
+    def test_a_worker_reparented_under_another_session_is_not_a_session(self):
+        # the same worker adopted by an unrelated process: still not a
+        # supervisor's child, whichever way it was reparented
+        self.one_live_session()
+        self.write_proc(4500, ["bash", "-c", "unrelated"], {}, ppid=1)
+        self.write_proc(4501, ["claude", "-p", "…"], self.child_env(),
+                        ppid=4500)
+        report, _ok = self.snapshot(panes={})
+        self.assertEqual([row["pid"] for row in report["sessions"]], [4001])
+
+    def test_a_claude_whose_parent_vanished_is_not_a_session(self):
+        # no parent entry at all cannot prove supervision either
+        self.one_live_session()
+        self.write_proc(4600, ["claude"], self.child_env(), ppid=9999)
+        report, _ok = self.snapshot(panes={})
+        self.assertEqual([row["pid"] for row in report["sessions"]], [4001])
+
+    def test_launcher_shapes_all_count_as_supervisors(self):
+        for index, argv in enumerate((
+                ["python3", "-m", "headroom", "claude"],
+                ["/home/x/.local/bin/headroom", "claude"],
+                SUPERVISOR_ARGV)):
+            pid = 8000 + index * 10
+            self.supervised(pid, environ=self.child_env(), sup_argv=argv)
+        report, _ok = self.snapshot(panes={})
+        self.assertEqual(sorted(row["pid"] for row in report["sessions"]),
+                         [8000, 8010, 8020])
+
     def test_a_nested_supervisor_is_still_a_session(self):
         # a session that launches `headroom claude` gets a FRESH supervisor
         # id, so its child's parent carries a different one
         self.one_live_session()
         nested_env = self.child_env(supervisor_id=SUP_B)
-        self.write_proc(4002, ["python3", "-c", "...", "claude"],
-                        self.child_env(), ppid=4001)
+        self.write_proc(4002, SUPERVISOR_ARGV, self.child_env(), ppid=4001)
         self.write_proc(4003, ["claude"], nested_env, ppid=4002)
         report, _ok = self.snapshot(panes={})
         self.assertEqual(sorted(row["pid"] for row in report["sessions"]),
@@ -316,8 +410,8 @@ class Discovery(OpsStatusCase):
 
     def test_unsupervised_claude_is_not_a_session(self):
         # a goal runner is a claude process with no supervisor of its own
-        self.write_proc(7001, ["claude", "--name", "side-task"],
-                        {"CLAUDE_CONFIG_DIR": self.home}, ppid=1)
+        self.supervised(7001, ["claude", "--name", "side-task"],
+                        environ={"CLAUDE_CONFIG_DIR": self.home})
         report, _ok = self.snapshot(panes={})
         self.assertEqual(report["sessions"], [])
 
@@ -325,23 +419,21 @@ class Discovery(OpsStatusCase):
         transcript = self.transcript(SID_A, [assistant()])
         self.journal(SUP_A, [(self.now - 60, 1, "SessionStart", SID_A,
                               transcript)])
-        self.write_proc(4001, ["node", "/opt/cli.js", "--settings",
-                               f"/state/supervisors/{SUP_A}-1.settings.json"],
-                        self.child_env(), ppid=1)
+        self.supervised(4001, ["node", "/opt/cli.js", "--settings",
+                               f"/state/supervisors/{SUP_A}-1.settings.json"])
         report, _ok = self.snapshot(panes={})
         self.assertEqual([row["pid"] for row in report["sessions"]], [4001])
 
     def test_a_foreign_settings_file_is_not_a_session(self):
-        self.write_proc(4001, ["node", "/opt/cli.js", "--settings",
-                               f"/state/supervisors/{SUP_B}-1.settings.json"],
-                        self.child_env(), ppid=1)
+        self.supervised(4001, ["node", "/opt/cli.js", "--settings",
+                               f"/state/supervisors/{SUP_B}-1.settings.json"])
         report, _ok = self.snapshot(panes={})
         self.assertEqual(report["sessions"], [])
 
     def test_a_malformed_supervisor_id_is_refused(self):
-        self.write_proc(4001, ["claude"],
-                        {"HEADROOM_SUPERVISOR_ID": "not-a-uuid",
-                         "HEADROOM_CHILD_GENERATION": "1"}, ppid=1)
+        self.supervised(4001, environ={
+            "HEADROOM_SUPERVISOR_ID": "not-a-uuid",
+            "HEADROOM_CHILD_GENERATION": "1"})
         report, _ok = self.snapshot(panes={})
         self.assertEqual(report["sessions"], [])
 
@@ -405,11 +497,30 @@ class Containers(OpsStatusCase):
                 side_effect=ops_status.subprocess.TimeoutExpired("tmux", 2)):
             self.assertIsNone(ops_status.tmux_panes())
 
-    def test_ancestry_cycle_cannot_hang(self):
+    def test_ancestry_cycle_is_unknown_not_bare(self):
+        # a cycle proves only that the ancestry is unreadable; "" would be a
+        # positive claim that the session is outside tmux
         self.one_live_session()
         self.rewrite_ppid(4000, 4001)  # 4001 -> 4000 -> 4001 …
         self.rewrite_ppid(4001, 4000)
         report, _ok = self.snapshot(panes={})
+        self.assertIsNone(report["sessions"][0]["container"])
+
+    def test_the_hop_limit_is_unknown_not_bare(self):
+        self.one_live_session()
+        with mock.patch.object(ops_status, "MAX_ANCESTRY", 1):
+            report, _ok = self.snapshot(panes={})
+        self.assertIsNone(report["sessions"][0]["container"])
+
+    def test_a_vanished_ancestor_is_unknown_not_bare(self):
+        self.one_live_session()
+        self.rewrite_ppid(4000, 9999)  # a parent with no /proc entry
+        report, _ok = self.snapshot(panes={})
+        self.assertIsNone(report["sessions"][0]["container"])
+
+    def test_only_reaching_the_process_root_proves_bare(self):
+        self.one_live_session()
+        report, _ok = self.snapshot(panes={9999: "somewhere-else"})
         self.assertEqual(report["sessions"][0]["container"], "")
 
 
@@ -477,11 +588,30 @@ class Context(OpsStatusCase):
         transcript = self.transcript(SID_A, [user(), assistant(total=100_000)])
         self.journal(SUP_A, [(self.now - 60, 1, "SessionStart", SID_A,
                               transcript)])
-        self.write_proc(4001, ["claude", "--model", "opus[1m]"],
-                        self.child_env(), ppid=1)
+        self.supervised(4001, ["claude", "--model", "opus[1m]"])
         report, _ok = self.snapshot(panes={})
         self.assertEqual(
             report["sessions"][0]["context_remaining_percentage"], 90.0)
+
+    def test_the_fallback_never_parses_a_whole_transcript(self):
+        # usage only at the HEAD, past the bounded tail: `_context_used` given
+        # no records would re-read the entire file, making a status command
+        # cost scale with conversation history. Handed the tail, it says None
+        filler = {"type": "system", "subtype": "pad", "pad": "x" * 4000}
+        records = [assistant(total=supervisor.CONTEXT_WINDOW_FIT_LIMIT
+                             + 50_000)]
+        size = 0
+        while size < supervisor.TRANSCRIPT_TAIL_BYTES * 2:
+            records.append(dict(filler))
+            size += 4100
+        records.append(user())  # a tail with no assistant usage at all
+        self.one_live_session(records=records)
+        started = time.time()
+        report, _ok = self.snapshot(panes={})
+        elapsed = time.time() - started
+        self.assertIsNone(
+            report["sessions"][0]["context_remaining_percentage"])
+        self.assertLess(elapsed, 1.0)
 
     def test_a_fresh_ctx_file_beats_the_transcript(self):
         big = supervisor.CONTEXT_WINDOW_FIT_LIMIT + 50_000
@@ -567,7 +697,7 @@ class Activity(OpsStatusCase):
         self.subagent(SID_A, age=supervisor.PREEMPT_IDLE_SECONDS + 600,
                       records=[assistant(), user()])
         # move the child's start AFTER that write
-        self.write_proc(4004, ["claude"], self.child_env(SUP_B), ppid=1,
+        self.supervised(4004, environ=self.child_env(SUP_B), sup_pid=4005,
                         started=self.now - 1.0)
         self.journal(SUP_B, [(self.now - 5, 1, "SessionStart", SID_A,
                               os.path.join(self.home, "projects", "-home-x",
@@ -634,7 +764,7 @@ class Degradation(OpsStatusCase):
 
     def test_one_broken_session_never_costs_the_others(self):
         self.one_live_session()
-        self.write_proc(6001, ["claude"], self.child_env(SUP_B), ppid=1)
+        self.supervised(6001, environ=self.child_env(SUP_B))
         real = ops_status._session_report
 
         def explode(child, *args, **kwargs):
@@ -654,7 +784,7 @@ class Degradation(OpsStatusCase):
         self.assertEqual(rows[4001]["turn"], "complete")
 
     def test_an_absent_journal_leaves_a_row_with_unknowns(self):
-        self.write_proc(4001, ["claude"], self.child_env(), ppid=1)
+        self.supervised(4001)
         report, ok = self.snapshot(panes={})
         self.assertTrue(ok)
         session = report["sessions"][0]
@@ -670,29 +800,54 @@ class Degradation(OpsStatusCase):
         with open(path, "a") as handle:
             handle.write("{not json\n")
             handle.write(json.dumps({"schema": "someone_elses@1"}) + "\n")
-        self.write_proc(4001, ["claude"], self.child_env(), ppid=1)
+        self.supervised(4001)
         report, _ok = self.snapshot(panes={})
         self.assertEqual(report["sessions"][0]["session_id"], SID_A)
 
     def test_an_unreadable_process_table_is_not_an_empty_fleet(self):
+        # "sessions": [] is a claim to have seen the whole host. A census
+        # that FAILED must be distinguishable from one that found nothing
         self.usage([{"name": "acct-a", "windows": {}}])
         report, ok = ops_status.snapshot(
             now=self.now, proc_root=os.path.join(self.temp.name, "gone"),
             panes={}, fallback_path=os.path.join(self.temp.name, "absent"))
-        # the usage feed still read, so the report is real — just sessionless
+        self.assertTrue(ok)          # the seats really were read
+        self.assertIsNone(report["sessions"])
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertTrue(report["errors"][0].startswith(
+            "session_discovery_failed: "))
+        self.assertEqual(len(report["seats"]), 1)
+
+    def test_an_empty_host_is_an_empty_list_with_no_error(self):
+        # the other side of the same coin: nothing running is a FACT
+        self.usage([{"name": "acct-a", "windows": {}}])
+        report, ok = self.snapshot(panes={})
         self.assertTrue(ok)
         self.assertEqual(report["sessions"], [])
-        self.assertEqual(len(report["seats"]), 1)
+        self.assertEqual(report["errors"], [])
+
+    def test_an_unreadable_seat_snapshot_is_null_with_an_error(self):
+        self.one_live_session()
+        report, ok = self.snapshot(panes={})
+        self.assertTrue(ok)
+        self.assertIsNone(report["seats"])
+        self.assertEqual(report["errors"],
+                         ["seat_snapshot_unreadable: no usage snapshot could "
+                          "be read"])
 
     def test_nothing_readable_is_the_only_nonzero_exit(self):
         report, ok = ops_status.snapshot(
             now=self.now, proc_root=os.path.join(self.temp.name, "gone"),
             panes={}, fallback_path=os.path.join(self.temp.name, "absent"))
         self.assertFalse(ok)
-        # even then the output is valid JSON of the declared schema
+        # even then the output is valid JSON of the declared schema, and it
+        # says WHICH censuses failed rather than reporting an empty estate
         self.assertEqual(report["schema"], "headroom_ops_status@1")
-        self.assertEqual(report["sessions"], [])
-        self.assertEqual(report["seats"], [])
+        self.assertIsNone(report["sessions"])
+        self.assertIsNone(report["seats"])
+        self.assertEqual(len(report["errors"]), 2)
+        self.assertEqual(json.loads(json.dumps(report, allow_nan=False)),
+                         report)
 
 
 # --- the command ------------------------------------------------------------
