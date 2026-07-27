@@ -944,6 +944,42 @@ class SupervisorContract(OpsStatusCase):
         self.assertEqual(ops_status._turn_state("something new happened"),
                          "in_flight")
 
+    def test_a_user_settings_launch_reads_as_a_normal_session(self):
+        """A `--settings` launch used to be exec-only: no supervisor id, no
+        journal, nothing here — the session simply did not exist to an ops
+        layer. Built from the argv the supervisor actually spawns now."""
+        given = os.path.join(self.temp.name, "user.json")
+        with open(given, "w") as handle:
+            json.dump({"ultracode": True}, handle)
+        account = {"name": "acct-a", "provider": "claude",
+                   "home": self.home}
+        runner = supervisor.Supervisor(
+            "fable", ["--settings", given, "--model", "fable"], account,
+            supervisor_id=SUP_A)
+        settings = runner._settings_file(1)
+        transcript = self.transcript(SID_A, [user(), assistant()])
+        self.journal(SUP_A, [(self.now - 60, 1, "SessionStart", SID_A,
+                              transcript)])
+        # exactly what _spawn builds: the supervisor's file on the flag, the
+        # user's own document merged INSIDE it
+        self.supervised(4001, ["claude", "--settings", settings]
+                        + runner.initial_args)
+        report, ok = self.snapshot(panes={})
+        self.assertTrue(ok)
+        session = report["sessions"][0]
+        self.assertEqual(session["pid"], 4001)
+        self.assertEqual(session["supervisor_id"], SUP_A)
+        self.assertEqual(session["session_id"], SID_A)
+        self.assertEqual(session["turn"], "complete")
+        # the flag the child was given is the supervisor's, and it still
+        # carries the user's keys
+        self.assertTrue(ops_status._is_supervised_child(
+            ["node", "/opt/cli.js", "--settings", settings], SUP_A))
+        with open(settings, encoding="utf-8") as handle:
+            document = json.load(handle)
+        self.assertTrue(document["ultracode"])
+        self.assertIn("SessionStart", document["hooks"])
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

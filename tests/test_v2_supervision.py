@@ -1242,6 +1242,162 @@ class HeadlessSupervision(TempDirCase):
         supervised.assert_called_once_with("sonnet", ["--model", "sonnet"])
 
 
+class UserSettingsAreMergedNotObeyed(TempDirCase):
+    """`--settings` used to disarm supervision for the whole run — silently,
+    because the session still started: no cap rotation, no context backstop,
+    no journal, and nothing in `ops-status`. The supervisor now takes the flag
+    off the child's argv and merges the user's document UNDER its own, and a
+    document it cannot merge refuses the launch instead of degrading it."""
+
+    def user_settings(self, document, name="user.json"):
+        path = os.path.join(self.temp.name, name)
+        with open(path, "w") as handle:
+            json.dump(document, handle)
+        return path
+
+    def _dispatch(self, argv, tty=True):
+        # a stream that is BOTH readable text and a claimed terminal: the
+        # dispatch decision reads isatty(), and the refusal has to be legible
+        class Stream(io.StringIO):
+            def isatty(self):
+                return tty
+
+        stream = Stream()
+        with mock.patch.object(__main__.sys, "stdin", stream), \
+                mock.patch.object(__main__.sys, "stdout", stream), \
+                mock.patch.object(__main__.sys, "stderr", stream), \
+                mock.patch.object(registry, "auto_handoff",
+                                  return_value=True), \
+                mock.patch("headroom.supervisor.cmd_claude",
+                           return_value=41) as supervised, \
+                mock.patch("headroom.route.cmd_exec",
+                           return_value=42) as execed, \
+                mock.patch.object(route, "bare_fallback_exec",
+                                  return_value=0) as bare, \
+                mock.patch.object(route.os, "execvp") as raw_exec, \
+                mock.patch.object(route.os, "execvpe") as raw_exece:
+            code = __main__._dispatch(argv)
+        return code, supervised, execed, bare, (raw_exec, raw_exece), stream
+
+    def test_a_settings_launch_is_supervised(self):
+        path = self.user_settings({"ultracode": True})
+        code, supervised, execed, _bare, _raw, _err = self._dispatch(
+            ["claude", "--settings", path, "--model", "sonnet"])
+        self.assertEqual(code, 41)
+        supervised.assert_called_once_with(
+            "sonnet", ["--settings", path, "--model", "sonnet"])
+        execed.assert_not_called()
+
+    def test_a_headless_settings_launch_is_supervised(self):
+        path = self.user_settings({"ultracode": True})
+        code, supervised, execed, _bare, _raw, _err = self._dispatch(
+            ["claude", "--headroom-auto-handoff", "--settings", path],
+            tty=False)
+        self.assertEqual(code, 41)
+        supervised.assert_called_once_with("claude", ["--settings", path])
+        execed.assert_not_called()
+
+    def test_malformed_settings_refuse_the_launch_and_never_exec(self):
+        path = os.path.join(self.temp.name, "absent.json")
+        code, supervised, execed, bare, raw, errors = self._dispatch(
+            ["claude", "--settings", path, "--model", "sonnet"])
+        self.assertEqual(code, 2)
+        supervised.assert_not_called()
+        execed.assert_not_called()        # NOT an unsupervised launch
+        bare.assert_not_called()
+        for call in raw:
+            call.assert_not_called()
+        self.assertIn(path, errors.getvalue())
+        self.assertIn("refusing to launch", errors.getvalue())
+
+    def test_an_unmergeable_key_is_refused_by_name(self):
+        path = self.user_settings({"ultracode": True,
+                                   "disableAllHooks": True})
+        code, supervised, execed, _bare, _raw, errors = self._dispatch(
+            ["claude", "--settings", path])
+        self.assertEqual(code, 2)
+        supervised.assert_not_called()
+        execed.assert_not_called()
+        self.assertIn("disableAllHooks", errors.getvalue())
+
+    def test_a_settings_refusal_never_takes_the_bare_fallback(self):
+        # the opt-in launch fallback exists for "the CLI never started" — it
+        # must not be a back door to the unsupervised child we just closed
+        path = self.user_settings({"disableAllHooks": True})
+        code, supervised, execed, bare, raw, _err = self._dispatch(
+            ["claude", "--headroom-launch-fallback", "--settings", path])
+        self.assertEqual(code, 2)
+        supervised.assert_not_called()
+        execed.assert_not_called()
+        bare.assert_not_called()
+        for call in raw:
+            call.assert_not_called()
+
+    def test_cmd_claude_itself_refuses_rather_than_falling_back(self):
+        # defence in depth: even reached directly, with a fallback argv armed
+        path = self.user_settings({"disableAllHooks": True})
+        with mock.patch.object(supervisor, "_initial_account",
+                               return_value=self.account()), \
+                mock.patch.object(route, "bare_fallback_exec") as bare, \
+                mock.patch.object(route.os, "execvpe") as execute, \
+                redirect_stderr(io.StringIO()) as errors:
+            code = supervisor.cmd_claude(
+                "sonnet", ["--settings", path],
+                fallback_argv=["claude", "--settings", path])
+        self.assertEqual(code, 2)
+        bare.assert_not_called()
+        execute.assert_not_called()
+        self.assertIn("disableAllHooks", errors.getvalue())
+
+    def test_the_child_is_launched_with_the_supervisors_file_alone(self):
+        path = self.user_settings({"ultracode": True, "effortLevel": "high"})
+        spawned = []
+        runner = supervisor.Supervisor(
+            "sonnet", ["--settings", path, "--model", "sonnet"],
+            self.account(),
+            popen=lambda argv, **kw: spawned.append(argv) or mock.Mock())
+        child = runner._spawn(self.account(), runner.initial_args,
+                              self.temp.name, True)
+        argv = spawned[0]
+        # exactly ONE --settings, and it is the supervisor's own file: a
+        # second occurrence would REPLACE the injected hooks in Claude
+        self.assertEqual(argv.count("--settings"), 1)
+        self.assertNotIn(path, argv)
+        self.assertEqual(argv[:2], ["claude", "--settings"])
+        self.assertEqual(argv[2], child.settings_path)
+        self.assertEqual(argv[3:], ["--model", "sonnet"])
+        with open(child.settings_path, encoding="utf-8") as handle:
+            document = json.load(handle)
+        self.assertTrue(document["ultracode"])        # the user's keys ride
+        self.assertEqual(document["effortLevel"], "high")
+        self.assertEqual(document["hooks"]["SessionStart"],   # supervision too
+                         supervisor.hook_settings()["hooks"]["SessionStart"])
+
+    def test_the_merge_rides_every_generation(self):
+        # a rotation respawns as generation n+1 with a resume argv that carries
+        # no user flags at all — the merged document must survive it
+        path = self.user_settings({"ultracode": True})
+        runner = supervisor.Supervisor(
+            "sonnet", ["--settings", path], self.account())
+        for generation in (1, 2, 3):
+            with open(runner._settings_file(generation),
+                      encoding="utf-8") as handle:
+                document = json.load(handle)
+            self.assertTrue(document["ultracode"])
+            self.assertIn("StopFailure", document["hooks"])
+
+    def test_a_settings_edit_mid_run_cannot_change_a_live_child(self):
+        path = self.user_settings({"ultracode": True})
+        runner = supervisor.Supervisor(
+            "sonnet", ["--settings", path], self.account())
+        with open(path, "w") as handle:
+            json.dump({"disableAllHooks": True}, handle)
+        with open(runner._settings_file(2), encoding="utf-8") as handle:
+            document = json.load(handle)
+        self.assertTrue(document["ultracode"])
+        self.assertNotIn("disableAllHooks", document)
+
+
 # ==========================================================================
 # Round-2 red-team fixes
 # ==========================================================================

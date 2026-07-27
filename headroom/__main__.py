@@ -262,6 +262,21 @@ def _prepare_launch(command, args):
             headless_ok = (headless_env != "0"
                            and (auto_flag or headless_env == "1"))
             if not incompatible and (all_tty or headless_ok):
+                # A user `--settings` is MERGED under the supervisor's own
+                # document, never obeyed instead of it. Prove that merge here,
+                # before the launch commits: this is the last point that can
+                # still refuse cleanly, ahead of every fallback boundary, so an
+                # unreadable or unmergeable document exits — it never degrades
+                # into the unsupervised child this replaced.
+                try:
+                    supervisor.validate_user_settings(args)
+                except supervisor.UserSettingsError as error:
+                    print(f"headroom: refusing to launch: {error}",
+                          file=sys.stderr)
+                    print("[headroom] headroom never runs an unsupervised "
+                          "child to work around a settings file",
+                          file=sys.stderr)
+                    return 2
                 use_supervisor = True
             else:
                 why = incompatible or "stdin/stdout/stderr are not all TTYs"

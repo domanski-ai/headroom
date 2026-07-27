@@ -6,6 +6,7 @@ narrow subscription-cap phrase, and be corroborated by a fresh identity-bound
 usage collect before every remaining pre-stop check succeeds.
 """
 import contextlib
+import copy
 import json
 import math
 import os
@@ -193,9 +194,38 @@ HEADROOM_OVERRIDE_FLAGS = {
     "--headroom-auto-handoff", "--headroom-no-auto-handoff",
     "--headroom-launch-fallback"}
 
+# --- user --settings, merged rather than obeyed ----------------------------
+# Claude takes ONE `--settings` (a path or an inline JSON string); a second
+# occurrence replaces the first. Passing the user's file straight through
+# would therefore DELETE the supervisor's injected hooks — no SessionStart
+# handshake, no cap rotation, no context backstop, no journal — so the
+# supervisor takes the flag off the child's argv, merges the user's document
+# UNDER its own, and writes the single file it owns. Supervision is never
+# traded away for a settings file: an unmergeable document refuses the launch.
+#
+# Two settings keys can suppress hooks outright. There is no merge that keeps
+# supervision armed once either is set, so either one is a refusal.
+HOOK_RESTRICTING_KEYS = ("disableAllHooks", "allowManagedHooksOnly")
+# Environment the supervisor OWNS: the hook adapter authenticates every event
+# against these, and CLAUDE_CONFIG_DIR decides WHICH account the child is on.
+# A settings `env` block that rebinds any of them would point the handshake at
+# another supervisor (or another home) while this one waits for a hook that
+# can never arrive, so it is a refusal, not a merge.
+RESERVED_SETTINGS_ENV = (
+    "CLAUDE_CONFIG_DIR", "HEADROOM_SUPERVISOR_ID", "HEADROOM_CHILD_GENERATION",
+    "HEADROOM_SOURCE_SLOT", "HEADROOM_HOOK_MATCHER", "CLAUDE_CODE_SAFE_MODE")
+
 
 class SupervisorError(RuntimeError):
     """A fail-closed supervisor refusal."""
+
+
+class UserSettingsError(SupervisorError):
+    """A user `--settings` document that cannot be merged under supervision.
+
+    Its own class because it is the ONE refusal that must never degrade into a
+    bare CLI exec: falling back would run exactly the unsupervised child this
+    merge exists to prevent."""
 
 
 class PermanentSupervisorError(SupervisorError):
@@ -499,11 +529,10 @@ def write_hook_event(stream=None, environ=None, now=None):
 
 
 def incompatible_args(args):
-    for arg in args:
-        if arg == "--":
-            break
-        if arg == "--settings" or arg.startswith("--settings="):
-            return "user-supplied --settings"
+    # NOTE: `--settings` is deliberately NOT here. It used to return
+    # "user-supplied --settings" and disarm supervision for the whole run —
+    # silently, since the run still started. It is now merged instead; see
+    # split_user_settings/merge_user_settings.
     value_expected = False
     for arg in args:
         if value_expected:
@@ -556,6 +585,160 @@ def strip_headroom_overrides(args):
     cleaned, found = split_headroom_flags(args)
     return (cleaned, "--headroom-auto-handoff" in found,
             "--headroom-no-auto-handoff" in found)
+
+
+def split_user_settings(args):
+    """`(cleaned_args, raw_value)` — lift the user's `--settings` off the argv.
+
+    Value-aware exactly like `split_headroom_flags`: an argument that is the
+    VALUE of another option (`--model --settings`) is that option's value, and
+    everything after `--` is the prompt, not options. Claude honours one
+    `--settings` and a later one replaces an earlier one, so when several are
+    given the LAST wins here too — the supervisor merges what Claude would
+    have loaded, never more."""
+    cleaned = []
+    raw = ""
+    value_expected = False
+    after_separator = False
+    pending_settings = False
+    for arg in args:
+        if after_separator:
+            cleaned.append(arg)
+            continue
+        if pending_settings:            # this argument is --settings' value
+            raw = arg
+            pending_settings = False
+            value_expected = False
+            continue
+        if value_expected:
+            cleaned.append(arg)
+            value_expected = False
+            continue
+        if arg == "--":
+            cleaned.append(arg)
+            after_separator = True
+            continue
+        if arg == "--settings":
+            pending_settings = True
+            continue
+        if arg.startswith("--settings="):
+            raw = arg.split("=", 1)[1]
+            continue
+        cleaned.append(arg)
+        if arg in CLAUDE_VALUE_FLAGS:
+            value_expected = True
+    if pending_settings:
+        # `--settings` with nothing after it: Claude would refuse the option,
+        # and a supervisor that silently dropped it would be guessing
+        raise UserSettingsError("--settings was given no value")
+    return cleaned, raw
+
+
+def load_user_settings(raw):
+    """`(document, source)` — read a user `--settings` value the way Claude
+    does: a JSON object literal is inline settings, anything else is a path.
+
+    Every failure is loud and names what was read. A settings document that
+    cannot be read is never a reason to run the child unsupervised."""
+    value = (raw or "").strip()
+    if not value:
+        raise UserSettingsError("--settings was given an empty value")
+    if value[0] in "{[":            # a path never starts with a JSON opener
+        source = "the inline --settings JSON"
+        try:
+            document = json.loads(value)
+        except ValueError as error:
+            raise UserSettingsError(
+                f"{source} is not valid JSON: {error}") from error
+    else:
+        source = os.path.abspath(os.path.expanduser(value))
+        try:
+            with open(source, encoding="utf-8") as handle:
+                document = json.load(handle)
+        except FileNotFoundError as error:
+            raise UserSettingsError(
+                f"--settings file {source} does not exist") from error
+        except (OSError, UnicodeError) as error:
+            raise UserSettingsError(
+                f"--settings file {source} could not be read: "
+                f"{error}") from error
+        except ValueError as error:
+            raise UserSettingsError(
+                f"--settings file {source} is not valid JSON: "
+                f"{error}") from error
+    if not isinstance(document, dict):
+        raise UserSettingsError(
+            f"{source} must be a JSON object, not "
+            f"{type(document).__name__}")
+    try:
+        # the merged document is written back out with allow_nan=False; a NaN
+        # or Infinity accepted here would only fail at spawn time, after the
+        # launch was already committed
+        json.dumps(document, allow_nan=False)
+    except ValueError as error:
+        raise UserSettingsError(
+            f"{source} holds a value that is not portable JSON: "
+            f"{error}") from error
+    return document, source
+
+
+def merge_user_settings(document=None, source=""):
+    """The single settings document the child is launched with.
+
+    The user's keys pass through untouched — model preferences, `ultracode`,
+    `effortLevel`, statusline, permissions, anything Claude accepts — and the
+    supervisor's own keys are merged ON TOP, so supervision always wins the
+    collision it cares about. For the four supervised hook events the
+    supervisor's hook groups are PREPENDED to the user's rather than replacing
+    them: Claude runs every matching group, so the handshake fires first and
+    the user's own hooks still fire.
+
+    With no user document this returns exactly `hook_settings()`, so the
+    unmerged launch is byte-identical to the one before merging existed."""
+    document = {} if document is None else document
+    where = source or "the --settings document"
+    offenders = [key for key in HOOK_RESTRICTING_KEYS if document.get(key)]
+    if offenders:
+        raise UserSettingsError(
+            f"{where} sets {', '.join(offenders)}, which suppresses the hooks "
+            f"supervision runs on — remove it, or launch without headroom")
+    environment = document.get("env")
+    if environment is not None and not isinstance(environment, dict):
+        raise UserSettingsError(f"{where} has a non-object \"env\"")
+    reserved = [key for key in RESERVED_SETTINGS_ENV
+                if key in (environment or {})]
+    if reserved:
+        raise UserSettingsError(
+            f"{where} sets {', '.join(reserved)} in \"env\", which headroom "
+            f"owns for this child — remove it, or launch without headroom")
+    hooks = document.get("hooks")
+    if hooks is not None and not isinstance(hooks, dict):
+        raise UserSettingsError(f"{where} has a non-object \"hooks\"")
+    merged = copy.deepcopy(document)
+    # an explicit null `hooks` normalises to an empty block: the injected
+    # hooks still have to land somewhere
+    supervised = merged["hooks"] = dict(merged.get("hooks") or {})
+    for event, groups in hook_settings()["hooks"].items():
+        existing = supervised.get(event, [])
+        if not isinstance(existing, list):
+            raise UserSettingsError(
+                f"{where} has a non-list \"hooks.{event}\", which cannot be "
+                f"merged with the supervisor's own {event} hook")
+        supervised[event] = list(groups) + list(existing)
+    return merged
+
+
+def validate_user_settings(args):
+    """Pre-launch gate: prove the user's `--settings` can be merged.
+
+    Raises :class:`UserSettingsError` — never returns a "supervision off"
+    answer, because there is no such answer: the launch either runs supervised
+    with the merged document or it does not run."""
+    _cleaned, raw = split_user_settings(args)
+    if not raw:
+        return {}
+    document, source = load_user_settings(raw)
+    return merge_user_settings(document, source)
 
 
 def _strings(value):
@@ -1538,7 +1721,20 @@ class Supervisor:
     def __init__(self, family, args, account, *, collect_fn=None,
                  popen=None, now=None, sleep=None, supervisor_id=None):
         self.family = family
-        self.initial_args = list(args)
+        # The user's `--settings` never reaches the child as a flag — Claude
+        # honours only one and the child must be launched with the
+        # supervisor's. It is lifted off the argv here, read ONCE (a mid-run
+        # edit can no more flip settings under a live child than it can flip
+        # the rotation policy), and merged under the injected document for
+        # every generation. Anything unmergeable raises out of the
+        # constructor: no child is spawned at all.
+        self.initial_args, raw_settings = split_user_settings(list(args))
+        self.user_settings = {}
+        self.user_settings_source = ""
+        if raw_settings:
+            self.user_settings, self.user_settings_source = \
+                load_user_settings(raw_settings)
+            merge_user_settings(self.user_settings, self.user_settings_source)
         self.account = account
         self.collect_fn = collect.run_collect if collect_fn is None else collect_fn
         self.popen = subprocess.Popen if popen is None else popen
@@ -1593,7 +1789,11 @@ class Supervisor:
         directory = paths.ensure_private(_supervisors_dir())
         filename = f"{self.supervisor_id}-{generation}.settings.json"
         destination = os.path.join(directory, filename)
-        paths.write_json_atomic(destination, hook_settings(), mode=0o600)
+        # one file, supervisor keys on top; identical to hook_settings() when
+        # the user gave none
+        document = merge_user_settings(self.user_settings,
+                                       self.user_settings_source)
+        paths.write_json_atomic(destination, document, mode=0o600)
         self.settings_files.append(destination)
         return destination
 
@@ -3415,6 +3615,15 @@ def cmd_claude(family, args, fallback_argv=None):
             # settings/argv/env preparation, so a marker can never exist
             # without a child having been given its chance to start
             runner = Supervisor(family, args, account)
+    except UserSettingsError as error:
+        # The one pre-spawn failure that must NOT bare-exec: the bare argv
+        # still carries the user's `--settings`, so falling back here would
+        # start exactly the unsupervised child the merge exists to prevent —
+        # and silently, since the session would look launched.
+        print(f"headroom: refusing to launch: {error}", file=sys.stderr)
+        print("[headroom] headroom never runs an unsupervised child to work "
+              "around a settings file", file=sys.stderr)
+        return 2
     except route.LeaseError as error:
         # HEADROOM_SLOT_LEASE=1 fails closed: refuse the routed launch. With
         # the explicit fallback opt-in, still degrade to a bare CLI (the

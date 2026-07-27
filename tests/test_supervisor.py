@@ -996,19 +996,173 @@ class CliWiring(unittest.TestCase):
         self.assertEqual(cleaned, ["--brief", "--future-boolean"])
         self.assertTrue(auto)
         self.assertTrue(no_auto)
+        # a user --settings is merged, never a reason to drop supervision
         self.assertEqual(supervisor.incompatible_args(
-            ["--brief", "--settings", "custom.json"]),
-            "user-supplied --settings")
+            ["--brief", "--settings", "custom.json"]), "")
 
-    def test_settings_detection_scans_every_pre_separator_position(self):
-        self.assertEqual(supervisor.incompatible_args(
-            ["--model", "--settings", "--", "--settings=after.json"]),
-            "user-supplied --settings")
-        self.assertEqual(supervisor.incompatible_args(
-            ["--brief", "--settings=custom.json"]),
-            "user-supplied --settings")
-        self.assertEqual(supervisor.incompatible_args(
-            ["--brief", "--", "--settings=prompt-text"]), "")
+    def test_settings_is_never_an_incompatible_flag(self):
+        # the old behaviour returned "user-supplied --settings" here and the
+        # whole run went unsupervised — silently, since it still started
+        for argv in (["--brief", "--settings", "custom.json"],
+                     ["--brief", "--settings=custom.json"],
+                     ["--model", "--settings", "--", "--settings=after.json"],
+                     ["--brief", "--", "--settings=prompt-text"]):
+            self.assertEqual(supervisor.incompatible_args(argv), "", argv)
+
+    def test_settings_split_is_value_aware_and_last_wins(self):
+        self.assertEqual(
+            supervisor.split_user_settings(["--brief", "--settings=one.json"]),
+            (["--brief"], "one.json"))
+        # a second --settings replaces the first exactly as Claude's does
+        self.assertEqual(
+            supervisor.split_user_settings(
+                ["--settings", "one.json", "--model", "sonnet",
+                 "--settings=two.json"]),
+            (["--model", "sonnet"], "two.json"))
+        # --settings as ANOTHER option's value is that option's value
+        self.assertEqual(
+            supervisor.split_user_settings(
+                ["--model", "--settings", "--", "--settings=after.json"]),
+            (["--model", "--settings", "--", "--settings=after.json"], ""))
+        # and after `--` it is prompt text, never an option
+        self.assertEqual(
+            supervisor.split_user_settings(
+                ["--brief", "--", "--settings=prompt-text"]),
+            (["--brief", "--", "--settings=prompt-text"], ""))
+
+    def test_settings_with_no_value_refuses_instead_of_guessing(self):
+        with self.assertRaises(supervisor.UserSettingsError):
+            supervisor.split_user_settings(["--brief", "--settings"])
+
+    def test_settings_merge_keeps_supervision_and_the_user_document(self):
+        merged = supervisor.merge_user_settings({
+            "ultracode": True, "effortLevel": "high", "model": "opus",
+            "statusLine": {"type": "command", "command": "mine"},
+            "hooks": {"SessionStart": [{"hooks": [{"type": "command",
+                                                   "command": "mine"}]}],
+                      "PreToolUse": [{"matcher": "Bash", "hooks": []}]},
+        }, "/tmp/user.json")
+        # user keys pass through untouched
+        self.assertTrue(merged["ultracode"])
+        self.assertEqual(merged["effortLevel"], "high")
+        self.assertEqual(merged["model"], "opus")
+        self.assertEqual(merged["statusLine"]["command"], "mine")
+        self.assertEqual(merged["hooks"]["PreToolUse"],
+                         [{"matcher": "Bash", "hooks": []}])
+        # every supervised event carries the supervisor's group FIRST, and
+        # the user's own SessionStart hook still runs after it
+        injected = supervisor.hook_settings()["hooks"]
+        for event, groups in injected.items():
+            self.assertEqual(merged["hooks"][event][:len(groups)], groups)
+        self.assertEqual(merged["hooks"]["SessionStart"][1],
+                         {"hooks": [{"type": "command", "command": "mine"}]})
+
+    def test_settings_merge_without_a_user_document_is_unchanged(self):
+        # the no-settings launch must stay byte-identical to before merging
+        self.assertEqual(supervisor.merge_user_settings(),
+                         supervisor.hook_settings())
+        self.assertEqual(supervisor.merge_user_settings({}),
+                         supervisor.hook_settings())
+
+    def test_settings_merge_never_mutates_the_user_document(self):
+        document = {"hooks": {"SessionStart": []}}
+        supervisor.merge_user_settings(document, "/tmp/user.json")
+        self.assertEqual(document, {"hooks": {"SessionStart": []}})
+
+    def test_settings_that_cannot_be_merged_are_refused_by_name(self):
+        for document, offender in (
+                ({"disableAllHooks": True}, "disableAllHooks"),
+                ({"allowManagedHooksOnly": True}, "allowManagedHooksOnly"),
+                ({"env": {"CLAUDE_CONFIG_DIR": "/elsewhere"}},
+                 "CLAUDE_CONFIG_DIR"),
+                ({"env": {"HEADROOM_SUPERVISOR_ID": "x"}},
+                 "HEADROOM_SUPERVISOR_ID"),
+                ({"env": {"CLAUDE_CODE_SAFE_MODE": "1"}},
+                 "CLAUDE_CODE_SAFE_MODE"),
+                ({"env": ["nope"]}, "env"),
+                ({"hooks": ["nope"]}, "hooks"),
+                ({"hooks": {"SessionStart": "mine"}}, "hooks.SessionStart")):
+            with self.assertRaises(supervisor.UserSettingsError) as caught:
+                supervisor.merge_user_settings(document, "/tmp/user.json")
+            self.assertIn(offender, str(caught.exception))
+            self.assertIn("/tmp/user.json", str(caught.exception))
+
+    def test_a_hook_restricting_key_that_is_off_still_merges(self):
+        merged = supervisor.merge_user_settings({"disableAllHooks": False},
+                                                "/tmp/user.json")
+        self.assertFalse(merged["disableAllHooks"])
+        self.assertIn("SessionStart", merged["hooks"])
+
+    def test_an_explicit_null_hooks_block_still_takes_the_injection(self):
+        merged = supervisor.merge_user_settings({"hooks": None},
+                                                "/tmp/user.json")
+        self.assertEqual(merged["hooks"], supervisor.hook_settings()["hooks"])
+
+    def test_settings_are_loaded_from_a_file_or_inline_json(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "user.json")
+            with open(path, "w") as handle:
+                json.dump({"ultracode": True}, handle)
+            document, source = supervisor.load_user_settings(path)
+            self.assertEqual(document, {"ultracode": True})
+            self.assertEqual(source, path)
+        document, source = supervisor.load_user_settings('{"ultracode": true}')
+        self.assertEqual(document, {"ultracode": True})
+        self.assertEqual(source, "the inline --settings JSON")
+
+    def test_unreadable_settings_refuse_and_name_the_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            missing = os.path.join(root, "absent.json")
+            with self.assertRaises(supervisor.UserSettingsError) as caught:
+                supervisor.load_user_settings(missing)
+            self.assertIn(missing, str(caught.exception))
+            self.assertIn("does not exist", str(caught.exception))
+
+            broken = os.path.join(root, "broken.json")
+            with open(broken, "w") as handle:
+                handle.write('{"ultracode": ')
+            with self.assertRaises(supervisor.UserSettingsError) as caught:
+                supervisor.load_user_settings(broken)
+            self.assertIn(broken, str(caught.exception))
+            self.assertIn("not valid JSON", str(caught.exception))
+
+            listy = os.path.join(root, "list.json")
+            with open(listy, "w") as handle:
+                handle.write("[1, 2]")
+            with self.assertRaises(supervisor.UserSettingsError) as caught:
+                supervisor.load_user_settings(listy)
+            self.assertIn("must be a JSON object", str(caught.exception))
+
+            # NaN parses but cannot be written back out — catch it at the
+            # gate, not at spawn time with the launch already committed
+            nan = os.path.join(root, "nan.json")
+            with open(nan, "w") as handle:
+                handle.write('{"budget": NaN}')
+            with self.assertRaises(supervisor.UserSettingsError) as caught:
+                supervisor.load_user_settings(nan)
+            self.assertIn("portable JSON", str(caught.exception))
+
+        for empty in ("", "   "):
+            with self.assertRaises(supervisor.UserSettingsError):
+                supervisor.load_user_settings(empty)
+        with self.assertRaises(supervisor.UserSettingsError) as caught:
+            supervisor.load_user_settings('{"ultracode": ')
+        self.assertIn("inline --settings JSON", str(caught.exception))
+
+    def test_validate_user_settings_is_the_pre_launch_gate(self):
+        self.assertEqual(supervisor.validate_user_settings(["--model", "x"]),
+                         {})
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "user.json")
+            with open(path, "w") as handle:
+                json.dump({"disableAllHooks": True}, handle)
+            with self.assertRaises(supervisor.UserSettingsError):
+                supervisor.validate_user_settings(["--settings", path])
+            with open(path, "w") as handle:
+                json.dump({"ultracode": True}, handle)
+            merged = supervisor.validate_user_settings(["--settings", path])
+        self.assertTrue(merged["ultracode"])
+        self.assertIn("SessionStart", merged["hooks"])
 
     def test_initial_account_prefers_env_pinned_slot(self):
         pinned = {"name": "pinned", "provider": "claude", "home": "/tmp/p"}
