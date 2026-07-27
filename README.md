@@ -225,6 +225,17 @@ One-run overrides are `headroom claude --headroom-auto-handoff` and
 and stderr are TTYs and no hook-incompatible Claude flag is present; otherwise
 the normal direct-exec launch path is used.
 
+Your own `--settings` (a file or an inline JSON string) is **merged**, not
+obeyed instead of supervision. Claude honours one `--settings` and a second
+replaces the first, so the supervisor lifts the flag off the child's argv,
+merges your document underneath its own, and launches the child with the one
+file it owns: your keys pass through, its hook groups run first, and the
+merged document rides every rotation. A document it cannot merge — missing,
+unparseable, or setting `disableAllHooks`/`allowManagedHooksOnly` or a
+headroom-owned variable in `env` — **refuses the launch** and names the file
+and the key. It never degrades to an unsupervised child, because a session
+that looks launched but rotates on nothing is the failure this replaced.
+
 What carries is the conversation, model-family routing, and latest session cwd.
 Background tasks, live MCP connections, pending MCP/permission approvals,
 permission mode, and other ephemeral launch flags do not carry. If termination

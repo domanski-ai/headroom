@@ -47,7 +47,9 @@ Restart Claude Code and type `/rotator`.
 Run `headroom setup` and answer Yes to the explicit automatic-handoff consent,
 then launch interactive sessions through `headroom claude`. Headroom injects
 private per-run hooks through `--settings`; it does not edit this file. A
-missing hook handshake leaves Claude running and disables automation.
+missing hook handshake leaves Claude running and disables automation. Your own
+`--settings` is merged under those hooks and launches supervised; a document
+that would suppress them refuses the launch instead.
 
 Conversation history, model-family routing, and the latest cwd carry. Background
 tasks, MCP connections/approvals, permission approvals/mode, and other

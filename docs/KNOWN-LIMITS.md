@@ -124,6 +124,16 @@ or a future settings-precedence change can suppress or replace those hooks. A
 matching `SessionStart` handshake is mandatory. If it is absent for 30 seconds,
 headroom disables automation for that child and leaves the child running.
 
+A user-supplied `--settings` is merged under that fragment rather than passed
+through beside it (Claude accepts one, and the second replaces the first), so
+the supervisor refuses to launch a document that would suppress its hooks:
+`disableAllHooks`, `allowManagedHooksOnly`, or an `env` block rebinding
+`CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_SAFE_MODE` or a `HEADROOM_*` variable. The
+merge only covers what headroom can see in that one document — managed and
+policy settings still sit above it, which is the limit this section opened
+with. The user document is read ONCE, at launch: editing the file mid-session
+cannot change the live child, exactly like the rotation policy.
+
 ## An interrupted tool call may execute again after handoff
 
 A live cross-account test showed that Claude can resume a transcript ending in
