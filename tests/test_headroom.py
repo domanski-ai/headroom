@@ -56,6 +56,27 @@ def _account(name="a", provider="claude"):
     return {"name": name, "provider": provider, "home": "/tmp/hr-t/" + name}
 
 
+# The vars a supervisor injects into the sessions it owns (supervisor.py
+# scrubs exactly these when it spawns an unsupervised child). Anything that
+# renders differently under supervision must pin them rather than inherit
+# whatever the box running the suite happens to export.
+_SUPERVISION_ENV = ("HEADROOM_SUPERVISOR_ID", "HEADROOM_CHILD_GENERATION",
+                    "HEADROOM_SOURCE_SLOT", "HEADROOM_HOOK_MATCHER")
+
+
+def _unsupervised_environ(**overrides):
+    """Ambient environment minus supervision, plus `overrides`.
+
+    Feed to `mock.patch.dict(os.environ, ..., clear=True)`: the block then
+    sees exactly this mapping, so a suite run under a live supervisor (any
+    box where `headroom supervise` is up) takes the same branch as clean CI.
+    """
+    env = {key: value for key, value in os.environ.items()
+           if key not in _SUPERVISION_ENV}
+    env.update(overrides)
+    return env
+
+
 def _install_fake_claude(directory):
     os.makedirs(directory)
     fake = os.path.join(os.path.dirname(__file__), "fake_claude.py")
@@ -1125,7 +1146,11 @@ class StatuslineJournal(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "POSIX permission bits do not apply")
     def test_writes_payload_and_throttles_for_60_seconds(self):
         with mock.patch.object(statusline.time, "time",
-                               side_effect=[1000, 1030, 1061]):
+                               side_effect=[1000, 1030, 1061]), \
+                mock.patch.dict(
+                    os.environ,
+                    _unsupervised_environ(CLAUDE_CONFIG_DIR="/tmp/source"),
+                    clear=True):
             self.assertTrue(statusline.journal_session(self.payload))
             self.assertFalse(statusline.journal_session(self.payload))
             self.assertTrue(statusline.journal_session(self.payload))
@@ -1134,8 +1159,7 @@ class StatuslineJournal(unittest.TestCase):
             rows = [json.loads(line) for line in handle]
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["model"], "Sonnet")
-        self.assertEqual(rows[0]["config_dir"],
-                         os.environ.get("CLAUDE_CONFIG_DIR") or "")
+        self.assertEqual(rows[0]["config_dir"], "/tmp/source")
         self.assertEqual(os.stat(journal).st_mode & 0o777, 0o600)
 
     def test_malformed_payload_never_raises(self):
@@ -1152,7 +1176,10 @@ class StatuslineJournal(unittest.TestCase):
         with mock.patch.object(statusline.sys, "stdin", io.StringIO("{}")), \
                 mock.patch.object(statusline.paths, "load_json", return_value=snapshot), \
                 mock.patch.object(statusline.registry, "accounts", return_value=[account]), \
-                mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/tmp/source"}), \
+                mock.patch.dict(
+                    os.environ,
+                    _unsupervised_environ(CLAUDE_CONFIG_DIR="/tmp/source"),
+                    clear=True), \
                 redirect_stdout(output):
             self.assertEqual(statusline.main(), 0)
         self.assertIn("capped -> /exit, then: headroom handoff", output.getvalue())
