@@ -55,6 +55,12 @@ TRANSIENT_RE = re.compile(
 LIMIT_RE = re.compile(
     "(?:%s)|(?:%s)" % (CAP_RE.pattern, TRANSIENT_RE.pattern), re.I)
 WEEKLY_RE = re.compile(r"week", re.I)
+# The credits wording is not just another way to say "capped": it NAMES the
+# model-scoped weekly pool ("Run /usage-credits to keep using Fable 5"). That
+# makes it the one cap phrase that decides a different cooldown scope and a
+# different corroborating window, so it gets its own name here rather than
+# being inferred twice from prose.
+CREDITS_RE = re.compile(r"out of usage credits", re.I)
 # The same vocabulary read the other way round: which provider window a cap
 # phrase points at.  `cap_scope` narrows corroboration with it, so it has to
 # know every wording `CAP_RE` admits — a "five hour" cap corroborated by the
@@ -870,7 +876,9 @@ def cap_scope(snapshot, name, fam, message=""):
     ``CAP_RE`` admits) only accepts 5h; weekly wording accepts the all-model
     7d or the requested model's scoped weekly window.  A generic usage-limit
     phrase may use any single applicable scope.  Multiple account-wide caps
-    are one scope and retain their latest reset.
+    are one scope and retain their latest reset — but the credits wording
+    (``CREDITS_RE``) names the scoped weekly pool, so a scoped hit wins over
+    a simultaneous account-wide one for that phrase alone.
     """
     row = _snapshot_accounts(snapshot).get(name)
     if not isinstance(row, dict):
@@ -898,6 +906,20 @@ def cap_scope(snapshot, name, fam, message=""):
         if isinstance(scoped, dict) and _number(scoped.get("used_percent")) \
                 and scoped["used_percent"] >= 99:
             scoped_hit = scoped
+    scoped_scope = {
+        "key": f"{name}:{fam}", "account_wide": False,
+        "family": fam, "window": "scoped:" + fam,
+        "used_percent": float(scoped_hit["used_percent"]),
+        "reset": scoped_hit.get("resets_at")
+        if _number(scoped_hit.get("resets_at")) else None,
+    } if scoped_hit is not None else None
+    # A generic phrase may use any single applicable scope, and when two
+    # apply the account-wide one wins — EXCEPT for the credits wording, which
+    # names its scope out loud. Cooling the whole account for 5h on a "keep
+    # using Fable 5" refusal leaves the pool that actually refused uncooled,
+    # so the next launch picks the same spent family again five hours later.
+    if scoped_scope is not None and CREDITS_RE.search(text):
+        return scoped_scope
     if account_hits:
         resets = [window.get("resets_at") for _, window in account_hits
                   if _number(window.get("resets_at"))]
@@ -909,15 +931,7 @@ def cap_scope(snapshot, name, fam, message=""):
             "used_percent": float(used),
             "reset": max(resets) if resets else None,
         }
-    if scoped_hit is not None:
-        return {
-            "key": f"{name}:{fam}", "account_wide": False,
-            "family": fam, "window": "scoped:" + fam,
-            "used_percent": float(scoped_hit["used_percent"]),
-            "reset": scoped_hit.get("resets_at")
-            if _number(scoped_hit.get("resets_at")) else None,
-        }
-    return None
+    return scoped_scope
 
 
 def earliest_reset(snapshot, fam=None, exclude=None):
@@ -962,6 +976,40 @@ def clear(key=None):
 def window_reset(snapshot, name, window_key):
     row = _snapshot_accounts(snapshot).get(name) or {}
     return ((row.get("windows") or {}).get(window_key) or {}).get("resets_at")
+
+
+def run_cooldown_scope(stderr):
+    """``(account_wide, window)`` for a CAP on a `run` child's stderr.
+
+    Three wordings, three different things to spend:
+
+    * credits — "out of usage credits" is the model-SCOPED weekly pool. Going
+      account-wide would take every other family down with it, and a 5h
+      window would let the next launch pick the same spent family again in
+      five hours. One family, seven days.
+    * weekly — the all-model weekly window: account-wide, seven days.
+    * anything else — a session cap: account-wide, five hours.
+
+    This is `cap_scope`'s reasoning without a usage snapshot to corroborate
+    against; the two must agree on what a phrase MEANS, which is why both
+    read the same CREDITS_RE/WEEKLY_RE."""
+    if CREDITS_RE.search(stderr):
+        return False, "7d"
+    if WEEKLY_RE.search(stderr):
+        return True, "7d"
+    return True, "5h"
+
+
+def _cap_window_reset(snapshot, name, fam, account_wide, window_key):
+    """The reset the cooled window itself reports, or a window-sized guess."""
+    if account_wide:
+        reset = window_reset(snapshot, name, window_key)
+    else:
+        row = _snapshot_accounts(snapshot).get(name) or {}
+        scoped = scoped_window_for(fam, row.get("windows") or {})
+        reset = (scoped or {}).get("resets_at")
+    return reset if _number(reset) else \
+        time.time() + (7 * 86400 if window_key == "7d" else 5 * 3600)
 
 
 def cmd_status(fam):
@@ -1023,14 +1071,30 @@ def cmd_run(fam, command):
         # FAILED run whose stderr shows a provider limit — matching stdout
         # of a successful run must never trigger a replay.
         if process.returncode != 0 and LIMIT_RE.search(process.stderr or ""):
+            stderr = process.stderr or ""
             sys.stdout.write(process.stdout or "")
-            sys.stderr.write(process.stderr or "")
-            window_key = "7d" if WEEKLY_RE.search(process.stderr or "") else "5h"
-            reset = window_reset(snapshot, account["name"], window_key) \
-                or time.time() + (7 * 86400 if window_key == "7d" else 5 * 3600)
-            mark(account["name"], fam, reset, account_wide=True, window=window_key)
+            sys.stderr.write(stderr)
+            if not CAP_RE.search(stderr):
+                # TRANSIENT (429 / overload): the seat is fine, the provider
+                # hiccuped, and the CLI has already done its own retrying by
+                # the time it exits. Move to the next candidate WITHOUT
+                # cooling — a blip that took a healthy account out of routing
+                # for five hours was the worst possible reading of "rotate on
+                # a limit", and it is the partition CAP_RE/TRANSIENT_RE exists
+                # to state.
+                print(f"[headroom] {account['name']} hit a transient provider "
+                      f"limit (not a cap) -> not cooled; rotating",
+                      file=sys.stderr)
+                continue
+            account_wide, window_key = run_cooldown_scope(stderr)
+            reset = _cap_window_reset(snapshot, account["name"], fam,
+                                      account_wide, window_key)
+            mark(account["name"], fam, reset, account_wide=account_wide,
+                 window=window_key)
+            scope = "account-wide" if account_wide else f"{fam}-only"
             print(f"[headroom] {account['name']} hit its {window_key} limit -> "
-                  f"cooled until {tfmt(reset)}; rotating", file=sys.stderr)
+                  f"cooled {scope} until {tfmt(reset)}; rotating",
+                  file=sys.stderr)
             continue
         sys.stdout.write(process.stdout or "")
         sys.stderr.write(process.stderr or "")

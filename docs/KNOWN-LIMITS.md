@@ -311,6 +311,17 @@ with a provider-limit error on stderr. If your command has side effects
 before the limit hits, those side effects happen once per attempt. Use
 `headroom claude`/`env`/`pick` for non-idempotent work.
 
+Two kinds of limit reach that branch and they are spent differently. A
+**cap** cools the account and rotates; a **transient** (429, overload,
+`rate_limit_error`) rotates *without* cooling, because the seat is fine and
+the CLI has already done its own retrying by the time it exits — a blip
+should never take a healthy account out of routing for five hours. The cap's
+cooldown follows the wording: `out of usage credits` names the model-scoped
+weekly pool, so it cools that one family for seven days (account-wide would
+take the other families down with it, and a five-hour window would let the
+next launch re-pick the spent family); "week" cools the account for seven
+days; anything else cools it for five hours.
+
 ## The local dashboard is plain HTTP on 127.0.0.1
 
 `headroom serve` binds loopback only AND validates the `Host` header — a

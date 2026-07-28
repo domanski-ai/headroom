@@ -2290,6 +2290,105 @@ class CmdRunCodexClassification(unittest.TestCase):
         marked.assert_called_once()
 
 
+class RunLimitPartition(unittest.TestCase):
+    """`run` is the main consumer of the cap/transient split, and it used to
+    branch on the UNION: a 429 cooled a healthy account for five hours and
+    "out of usage credits" — a model-scoped WEEKLY pool — cooled the whole
+    account for five hours, which spends the wrong thing twice over."""
+
+    CREDITS = ("You're out of usage credits. Run /usage-credits to keep "
+               "using Fable 5")
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        patcher = mock.patch.dict(os.environ,
+                                  {"HEADROOM_DIR": self.temp.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_claude(self, stderr):
+        now = int(time.time())
+        row = _claude_row("a")
+        row["windows"]["scoped:Fable"] = {
+            "used_percent": 100.0, "resets_at": now + 6 * 86400,
+            "window_minutes": 10080}
+        snapshot = {"generated": time.time(), "accounts": [row,
+                                                           _claude_row("b")]}
+        marks = []
+        with mock.patch.object(route, "ensure_fresh_snapshot",
+                               return_value=snapshot), \
+                mock.patch.object(route, "candidates",
+                                  return_value=[(_account("a"), None),
+                                                (_account("b"), None)]), \
+                mock.patch.object(route, "block_reason", return_value=None), \
+                mock.patch.object(
+                    route, "mark",
+                    side_effect=lambda name, fam, epoch=None,
+                    account_wide=False, window="5h": marks.append(
+                        (name, fam, account_wide, window, epoch)) or epoch), \
+                mock.patch.object(
+                    route.subprocess, "run",
+                    side_effect=[FakeProcess(returncode=1, stderr=stderr),
+                                 FakeProcess(returncode=0)]) as child, \
+                redirect_stdout(io.StringIO()), \
+                redirect_stderr(io.StringIO()) as errors:
+            code = route.cmd_run("fable", ["claude", "-p", "task"])
+        return code, child.call_count, marks, errors.getvalue()
+
+    def test_the_scope_table_is_the_one_cap_scope_reasons_from(self):
+        self.assertEqual(route.run_cooldown_scope(self.CREDITS), (False, "7d"))
+        self.assertEqual(route.run_cooldown_scope("hit your weekly limit"),
+                         (True, "7d"))
+        self.assertEqual(route.run_cooldown_scope("hit your 5-hour limit"),
+                         (True, "5h"))
+
+    def test_a_transient_rotates_without_cooling_a_healthy_seat(self):
+        for stderr in ("429 Too Many Requests", "overloaded_error",
+                       "rate_limit_error", "status 429"):
+            code, children, marks, errors = self.run_claude(stderr)
+            self.assertEqual((code, children), (0, 2), stderr)
+            self.assertEqual(marks, [], stderr)   # the seat is fine
+            self.assertIn("not a cap", errors)
+
+    def test_the_credits_wording_cools_one_family_for_a_week(self):
+        code, children, marks, errors = self.run_claude(self.CREDITS)
+        self.assertEqual((code, children), (0, 2))
+        name, fam, account_wide, window, epoch = marks[0]
+        self.assertEqual((name, fam, account_wide, window),
+                         ("a", "fable", False, "7d"))
+        # the reset comes from the pool that actually refused
+        self.assertGreater(epoch - time.time(), 5 * 86400)
+        self.assertIn("cooled fable-only", errors)
+
+    def test_a_session_and_a_weekly_cap_keep_their_old_scopes(self):
+        _code, _children, marks, _errors = self.run_claude(
+            "You've hit your 5-hour limit")
+        self.assertEqual(marks[0][:4], ("a", "fable", True, "5h"))
+        _code, _children, marks, _errors = self.run_claude(
+            "You've hit your weekly limit")
+        self.assertEqual(marks[0][:4], ("a", "fable", True, "7d"))
+
+    def test_cap_scope_reads_the_credits_wording_the_same_way(self):
+        now = int(time.time())
+        row = _claude_row("a", used5h=100.0)
+        row["windows"]["scoped:Fable"] = {
+            "used_percent": 100.0, "resets_at": now + 6 * 86400,
+            "window_minutes": 10080}
+        snapshot = {"accounts": [row]}
+        # BOTH the 5h and the scoped pool read >=99%: the phrase names which
+        # one refused, and cooling the account for 5h instead would leave the
+        # spent family to be re-picked five hours later
+        scope = route.cap_scope(snapshot, "a", "fable", self.CREDITS)
+        self.assertEqual((scope["key"], scope["window"], scope["account_wide"]),
+                         ("a:fable", "scoped:fable", False))
+        # with no scoped pool in the row there is nothing to prefer, and the
+        # account-wide hit is still the answer
+        row["windows"].pop("scoped:Fable")
+        scope = route.cap_scope(snapshot, "a", "fable", self.CREDITS)
+        self.assertEqual((scope["key"], scope["window"]), ("a:*", "5h"))
+
+
 class CmdExecCodexRefusal(unittest.TestCase):
     """HEADROOM_CODEX_ROUTING=0 means headroom REFUSES codex routing — the
     old 'launch the first codex account anyway' fail-open path is gone."""
