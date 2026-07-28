@@ -739,13 +739,13 @@ def reading_unavailable(reason, fam):
                       f"{fam} weekly cap reading expired — no current proof")
 
 
-def at_wall(window):
+def _at_wall(window):
     """Whether a window reading is provably spent (>=99%)."""
     used = window.get("used_percent") if isinstance(window, dict) else None
     return bool(_number(used) and used >= 99)
 
 
-def wall_flags(text, windows, fam):
+def _wall_flags(text, windows, fam):
     """``(5h, 7d, scoped)`` — which windows this PHRASE admits AND this ROW
     shows at the wall.
 
@@ -754,10 +754,10 @@ def wall_flags(text, windows, fam):
     windows = windows if isinstance(windows, dict) else {}
     wants_weekly = WEEKLY_RE.search(text or "") is not None
     wants_session = SESSION_RE.search(text or "") is not None
-    return (at_wall(windows.get("5h")) and not wants_weekly,
-            at_wall(windows.get("7d")) and not wants_session,
+    return (_at_wall(windows.get("5h")) and not wants_weekly,
+            _at_wall(windows.get("7d")) and not wants_session,
             (not wants_session) and fam in SCOPED_FAMILIES
-            and at_wall(scoped_window_for(fam, windows)))
+            and _at_wall(scoped_window_for(fam, windows)))
 
 
 def cooldown_scope_for(text, windows, fam):
@@ -787,7 +787,7 @@ def cooldown_scope_for(text, windows, fam):
       reaches this: it has no corroboration duty and a child really was
       refused, so it cools the broadest thing the phrase supports, while
       cap_scope returns None rather than cool an uncorroborated window."""
-    five, seven, scoped = wall_flags(text, windows, fam)
+    five, seven, scoped = _wall_flags(text, windows, fam)
     if scoped and CREDITS_RE.search(text or ""):
         return False, "7d"
     if five or seven:
@@ -1037,7 +1037,7 @@ def cap_scope(snapshot, name, fam, message=""):
     text = message if isinstance(message, str) else ""
     # the narrowing and the readings: the SAME two lines `run` decides from,
     # so one refusal can never cool two different things
-    five, seven, scoped_ok = wall_flags(text, windows, fam)
+    five, seven, scoped_ok = _wall_flags(text, windows, fam)
     if not (five or seven or scoped_ok):
         return None                     # nothing corroborates this phrase
     account_wide, window_key = cooldown_scope_for(text, windows, fam)

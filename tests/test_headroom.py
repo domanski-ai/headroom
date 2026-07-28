@@ -108,8 +108,9 @@ def _collector_error_codes():
                 and isinstance(node.args[0], ast.Constant) \
                 and isinstance(node.args[0].value, str):
             codes.add(node.args[0].value)
-        elif isinstance(node, ast.Assign) and isinstance(
-                node.value, ast.Constant) and isinstance(node.value.value, str):
+        elif isinstance(node, ast.Assign) \
+                and isinstance(node.value, ast.Constant) \
+                and isinstance(node.value.value, str):
             for target in node.targets:
                 if isinstance(target, ast.Subscript) \
                         and isinstance(target.slice, ast.Constant) \
@@ -772,7 +773,8 @@ class UnreadableIsNotUntrusted(unittest.TestCase):
         self.assertGreater(len(emitted), 15, emitted)   # discovery still works
         both = route.UNREADABLE_ERROR_CODES & route.MUST_DISARM_ERROR_CODES
         self.assertEqual(both, set(), "a code cannot be in both classes")
-        classified = route.UNREADABLE_ERROR_CODES | route.MUST_DISARM_ERROR_CODES
+        classified = (route.UNREADABLE_ERROR_CODES
+                      | route.MUST_DISARM_ERROR_CODES)
         self.assertEqual(
             emitted - classified, set(),
             "collect.py emits codes route.py has not classified")
@@ -2678,7 +2680,7 @@ class RunLimitPartition(unittest.TestCase):
         self.assertEqual(route.run_cooldown_scope("hit your weekly limit"),
                          (True, "7d"))
 
-    def test_weekly_wording_over_a_healthy_weekly_window_is_not_account_wide(self):
+    def test_weekly_wording_over_a_healthy_weekly_window(self):
         """The fixture row says the account's 7d window is 20% used and the
         Fable pool is spent. `cap_scope` has always read that as the scoped
         pool — it may not corroborate a 7d cap against a window at 20% — while
