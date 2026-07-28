@@ -3335,14 +3335,20 @@ class CapWaitsForCapacity(TempDirCase):
             os.path.join(self.temp.name, "no-such-events.jsonl"), "",
             self.clock["t"] - 60, True, binding=self.binding, session_epoch=1)
 
-    def snapshot(self, source5=100.0, target5=100.0):
+    def snapshot(self, source5=100.0, target5=100.0, target7=10.0,
+                 target_scoped=None, source_scoped=None):
         """Built from the CURRENT clock, the way a real collect would be."""
         captured = int(self.clock["t"]) + 1
+        source = usage_row("source", used5=source5, captured=captured)
+        target = usage_row("target", used5=target5, used7=target7,
+                           captured=captured)
+        for row, scoped in ((source, source_scoped), (target, target_scoped)):
+            if scoped is not None:
+                row["windows"]["scoped:Fable"] = {
+                    "used_percent": scoped, "resets_at": captured + 6 * 86400,
+                    "window_minutes": 10080}
         return {"run_started": captured, "generated": captured,
-                "accounts": [usage_row("source", used5=source5,
-                                       captured=captured),
-                             usage_row("target", used5=target5,
-                                       captured=captured)]}
+                "accounts": [source, target]}
 
     def runner(self, snapshots):
         """`snapshots` is a list of (source5, target5) the collects walk
@@ -3398,13 +3404,57 @@ class CapWaitsForCapacity(TempDirCase):
         with open(path, encoding="utf-8") as source:
             return [json.loads(line) for line in source if line.strip()]
 
+    # -- who a capped session may be moved ONTO ------------------------------
+
+    def test_a_seat_at_99_percent_is_no_destination_for_a_real_cap(self):
+        # The routing gate rejects 100%, critical, reserve and unreadable —
+        # and nothing else — so this seat was a legal target for a proven
+        # cap: a handoff, a restart and a third of the loop budget spent to
+        # arrive at the same wall. The preemptive path had a fitness rule;
+        # the cap-reactive path, which is the one that MUST move, did not.
+        runner, child = self.runner([(100.0, 99.0)]), self.child()
+        with self.assertRaises(supervisor.CapacityHold) as caught:
+            runner._preflight(child, self.proof())
+        self.assertIn("target (5h at 99%)", str(caught.exception))
+        self.assertEqual(self.ledger(), [])          # nothing was admitted
+
+    def test_a_capped_source_is_not_picky_about_a_merely_busy_seat(self):
+        # and the rule must not overshoot: no margin here. The source is
+        # already refusing, so 96% of a five-hour window beats nothing —
+        # demanding the preemptive margin would strand a dead session.
+        runner, child = self.runner([(100.0, 96.0)]), self.child()
+        self.assertEqual(
+            runner._preflight(child, self.proof()).target["name"], "target")
+
+    def test_a_busy_weekly_seat_is_still_worth_moving_to(self):
+        # 97% of a five-hour window is nine minutes; 97% of a week is most of
+        # a working day, so the weekly ceiling is its own, later number
+        runner, child = self.runner([(100.0, 10.0, 98.0)]), self.child()
+        self.assertEqual(
+            runner._preflight(child, self.proof()).target["name"], "target")
+
+    def test_a_weekly_window_at_the_wall_is_not_a_destination(self):
+        runner, child = self.runner([(100.0, 10.0, 99.5)]), self.child()
+        with self.assertRaises(supervisor.CapacityHold) as caught:
+            runner._preflight(child, self.proof())
+        self.assertIn("target (7d at 99.5%)", str(caught.exception))
+
+    def test_a_spent_scoped_weekly_seat_is_not_a_destination_either(self):
+        runner, child = self.runner([(100.0, 10.0, 10.0, 99.5)]), self.child()
+        with self.assertRaises(supervisor.CapacityHold) as caught:
+            runner._preflight(child, self.proof())
+        self.assertIn("target (scoped:fable at 99.5%)", str(caught.exception))
+
     # -- the hold itself ----------------------------------------------------
 
     def test_no_seat_anywhere_raises_capacity_not_a_generic_refusal(self):
         runner, child = self.runner([(100.0, 100.0)]), self.child()
         with self.assertRaises(supervisor.CapacityHold) as caught:
             runner._preflight(child, self.proof())
-        self.assertIn("no account has proven headroom", str(caught.exception))
+        self.assertIn("no seat has headroom worth moving to",
+                      str(caught.exception))
+        # and it names each seat and why — this text is the cap_held reason
+        self.assertIn("target (5h at 100%)", str(caught.exception))
         # and it is a SupervisorError, so nothing that catches the base class
         # (a caller that has not been taught about holds) changes behaviour
         self.assertIsInstance(caught.exception, supervisor.SupervisorError)

@@ -100,6 +100,22 @@ CAP_HOLD_MAX = max(0, paths.env_int("HEADROOM_CAP_HOLD_MAX", 60))
 # not a contradicted proof, and 6s is a short window to bet a session on.
 # HEADROOM_CAP_MODEL_RETRIES=0 restores the single-window behaviour.
 CAP_MODEL_RETRIES = max(0, paths.env_int("HEADROOM_CAP_MODEL_RETRIES", 2))
+# What a CAPPED session may be moved onto. The routing gate rejects a seat at
+# 100%, critical, under reserve or unreadable — and nothing else, so a seat
+# reading 99% was a legal destination for a real cap: a handoff, a restart and
+# a third of the loop budget spent to arrive at the same wall.
+#
+# The bar here is deliberately LOWER than the preemptive one. A preemptive
+# rotation is elective, so it can demand margin; a capped source is already
+# refusing, so demanding margin would strand a dead session over a merely busy
+# seat. All this asks is that the destination is not itself about to refuse —
+# and how close "about to" is depends on how long the window runs. 97% of a
+# five-hour window is nine minutes; 97% of a week is most of a working day.
+# The 5h ceiling is therefore the same "the wall is imminent" number the 5h
+# trigger uses, and the weekly one is its own, later number.
+# HEADROOM_CAP_TARGET_WEEKLY=100 restores the routing gate's own bar.
+CAP_TARGET_WEEKLY_PERCENT = min(100.0, max(0.0, float(
+    paths.env_int("HEADROOM_CAP_TARGET_WEEKLY", 99))))
 # how much of a transcript's END the poll parses (see _transcript_records)
 TRANSCRIPT_TAIL_BYTES = max(64 * 1024, paths.env_int(
     "HEADROOM_TRANSCRIPT_TAIL_BYTES", 256 * 1024))
@@ -2373,11 +2389,7 @@ class Supervisor:
             if (not isinstance(reset, (int, float)) or isinstance(reset, bool)
                     or not math.isfinite(reset) or reset <= self.now()):
                 raise SupervisorError("fresh cap reset is missing or ambiguous")
-            try:
-                target = handoff.select_target(
-                    child.account["name"], snapshot, proof.family)
-            except handoff.NoHeadroomError as error:
-                raise CapacityHold(str(error)) from error
+            target = self._cap_target(child, proof.family, snapshot)
             binding = child.binding
             source = handoff.SourceSession(
                 proof.session_id, proof.transcript_path, child.account,
@@ -2423,6 +2435,70 @@ class Supervisor:
         except (handoff.HandoffError, registry.RegistryError, RuntimeError,
                 OSError, ValueError) as error:
             raise SupervisorError(str(error)) from error
+
+    def _cap_target_unfit(self, family, row):
+        """Why a CAPPED session should not be moved onto this seat, or "".
+
+        The preemptive twin of this (`_target_unfit`) asks a harder question,
+        because that rotation is optional. This one asks only whether the
+        destination is about to refuse too — see CAP_TARGET_WEEKLY_PERCENT.
+
+        Readability stays route.block_reason's job: it has already refused
+        every candidate whose windows are missing, invalid, expired or at
+        100%, so an unreadable percentage here adds nothing."""
+        windows = row.get("windows") if isinstance(row, dict) else None
+        if not isinstance(windows, dict):
+            return ""
+        checks = [("5h", windows.get("5h"), self.preemptive_session_percent),
+                  ("7d", windows.get("7d"), CAP_TARGET_WEEKLY_PERCENT)]
+        if family in ("opus", "sonnet", "haiku", "fable"):
+            checks.append(("scoped:" + family,
+                           route.scoped_window_for(family, windows),
+                           CAP_TARGET_WEEKLY_PERCENT))
+        for key, window, ceiling in checks:
+            if not isinstance(window, dict) \
+                    or window.get("freshness") == "expired_observation":
+                continue
+            used = window.get("used_percent")
+            if _number(used) and 0 <= used <= 100 and used >= ceiling:
+                return f"{key} at {used:g}%"
+        return ""
+
+    def _cap_target(self, child, family, snapshot):
+        """The best routable seat that is not itself at a wall.
+
+        `select_target` alone is not enough here: its gate is the ROUTING
+        gate, which is about whether a seat may be used at all, not about
+        whether moving a capped conversation onto it is worth the handoff.
+        Walk the same ranking the router produces, skip the seats that are
+        about to refuse, and put the winner back through the full gate so
+        nothing bypasses it.
+
+        Finding nothing raises CapacityHold, not a bare refusal: "every seat
+        is at a wall" is the textbook thing to wait out rather than disarm
+        for, and the hold is bounded."""
+        source = child.account["name"]
+        skipped = []
+        for account, reason in route.candidates(family, snapshot):
+            if account.get("name") == source:
+                continue
+            if reason is None:
+                reason = self._cap_target_unfit(
+                    family, _snapshot_row(snapshot, account["name"]))
+            if reason:
+                # say WHY per seat: this text is what a 3am operator (and the
+                # cap_held event) has to reason from
+                skipped.append(f"{account['name']} ({reason})")
+                continue
+            try:
+                return handoff.select_target(source, snapshot, family,
+                                             requested=account["name"])
+            except handoff.NoHeadroomError as error:
+                raise CapacityHold(str(error)) from error
+        detail = f" (skipped: {', '.join(skipped)})" if skipped else ""
+        raise CapacityHold(
+            f"no seat has headroom worth moving to for the {family} family"
+            f"{detail}")
 
     # ---- waiting out a cap: hold, don't disarm ---------------------------
 
