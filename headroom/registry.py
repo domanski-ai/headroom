@@ -389,6 +389,56 @@ def preemptive_thresholds(config=None):
                        PREEMPTIVE_OVERALL_PERCENT))
 
 
+# The 5-hour window is a DIFFERENT kind of wall from the weekly ones, so it
+# gets its own, higher threshold rather than a share of theirs.  A weekly
+# window that fills is gone for days — leaving early is nearly free.  A 5h
+# window heals by itself within hours, so rotating off one costs a restart to
+# buy back a few minutes unless the seat really is about to refuse.  97% is
+# late enough that the wall is imminent and early enough to leave through the
+# front door instead of mid-turn.
+PREEMPTIVE_SESSION_PERCENT = 97.0
+
+
+def preemptive_session(config=None):
+    """Whether a 5-hour window may trigger an early rotation at all.
+
+    ON by default: continuous autonomous work hits the 5h wall mid-task, and
+    "the 5h heals on its own" is only true for a session that can afford to
+    sit and wait.  ``HEADROOM_PREEMPTIVE_SESSION=0`` is the one-run kill
+    switch for JUST this trigger (``HEADROOM_PREEMPTIVE=0`` still disables
+    every preemptive rotation), and ``routing.preemptive_session_handoff:
+    false`` turns it off permanently.  Turning it off never turns off the 5h
+    TARGET rule: an exhausted seat is never a destination either way."""
+    if os.environ.get("HEADROOM_PREEMPTIVE_SESSION", "").strip() == "0":
+        return False
+    try:
+        config = load() if config is None else config
+    except RegistryError:
+        return True
+    routing = (config or {}).get("routing")
+    if isinstance(routing, dict) \
+            and routing.get("preemptive_session_handoff") is False:
+        return False
+    return True
+
+
+def preemptive_session_threshold(config=None):
+    """The 5h % at which a session is moved off a seat, default 97.
+
+    Read from ``config['routing']['preemptive_session_percent']``.  Never
+    raises, and nonsense keeps the default — same contract as
+    :func:`preemptive_thresholds`."""
+    try:
+        config = load() if config is None else config
+    except RegistryError:
+        return PREEMPTIVE_SESSION_PERCENT
+    routing = (config or {}).get("routing")
+    if not isinstance(routing, dict):
+        return PREEMPTIVE_SESSION_PERCENT
+    return _threshold(routing, "preemptive_session_percent",
+                      PREEMPTIVE_SESSION_PERCENT)
+
+
 CONTEXT_BACKSTOP_PERCENT = 10.0
 
 

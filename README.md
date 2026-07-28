@@ -93,8 +93,21 @@ turn. A seat that climbs to 97% while your session sits idle would otherwise
 strand you: you notice the percentage, `/exit`, and hand off by hand. So the
 supervisor also watches the usage feed it already collects and rotates
 **early** — when the account crosses **93%** of the model-family window it is
-running (e.g. fable) or **95%** of the all-model weekly window, *and* a target
-seat with proven headroom exists, *and* the child is idle.
+running (e.g. fable), **95%** of the all-model weekly window, or **97%** of
+the **5-hour** window, *and* a target seat with proven headroom exists, *and*
+the child is idle.
+
+The 5-hour window is deliberately the latest of the three and has its own
+rules, because it is the only one that heals by itself. For a session that
+will go idle and wait, moving off it buys nothing; for continuous autonomous
+work the wall lands mid-task and "it resets in four hours" means four hours of
+nothing. So headroom leaves late, and only when leaving actually helps: the
+destination must have **real** 5h headroom (by default ten points below the
+threshold — swapping 97% for 96% is a restart, not a rotation). If every seat
+is near its own 5h cap, headroom **holds and says so** rather than spending a
+seat to arrive at the same wall — that hold is the correct answer, not a
+failure. Regardless of the trigger, a seat at or past the 5h threshold is
+never a rotation *destination*.
 
 "Idle" means no active turn, and quiet is not enough to prove that — a model
 can think silently for minutes. So the transcript must have been quiet for a
@@ -134,18 +147,24 @@ holding — only defers (with a backoff, so a stranded session never thrashes)
 and leaves cap handoff fully armed. If a rotation is aborted *after* the child
 has stopped, the session is recovered on its own seat with auto-handoff still
 armed — an elective rotation never costs you the guarantee. It is on
-by default; `HEADROOM_PREEMPTIVE=0` is the one-run kill switch, and the
-thresholds are config:
+by default; `HEADROOM_PREEMPTIVE=0` is the one-run kill switch for all of it
+and `HEADROOM_PREEMPTIVE_SESSION=0` for just the 5-hour trigger (which never
+disables the 5h *target* rule), and the thresholds are config:
 
 ```json
 {
   "routing": {
     "preemptive_handoff": true,
     "preemptive_scoped_percent": 93,
-    "preemptive_overall_percent": 95
+    "preemptive_overall_percent": 95,
+    "preemptive_session_handoff": true,
+    "preemptive_session_percent": 97
   }
 }
 ```
+
+`HEADROOM_PREEMPTIVE_SESSION_MARGIN` (default 10) is how many points below the
+5h threshold a target must be before a 5h crossing will move onto it.
 
 ### Context backstop: never lose a session to its own window
 

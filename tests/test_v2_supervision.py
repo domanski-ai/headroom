@@ -95,7 +95,7 @@ class TempDirCase(unittest.TestCase):
                   "HEADROOM_SLOT_LEASE", "HEADROOM_NOTIFY_CMD",
                   "HEADROOM_NOTIFY_TIMEOUT", "CLAUDE_CONFIG_DIR",
                   "CODEX_HOME", "HEADROOM_PREEMPTIVE", "HEADROOM_CTX_WINDOW",
-                  "HEADROOM_CONTEXT_BACKSTOP")
+                  "HEADROOM_CONTEXT_BACKSTOP", "HEADROOM_PREEMPTIVE_SESSION")
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -2581,6 +2581,30 @@ class PreemptiveConfig(TempDirCase):
         self.assertEqual(registry.preemptive_thresholds(
             dict(self.BASE, routing="broken")), (93.0, 95.0))
 
+    def test_the_five_hour_trigger_is_on_by_default_at_97(self):
+        # its own switch and its own, higher threshold: a 5h window heals by
+        # itself, so leaving one early has to be worth the restart
+        self.assertTrue(registry.preemptive_session(self.BASE))
+        self.assertEqual(registry.preemptive_session_threshold(self.BASE), 97.0)
+        self.assertEqual(registry.preemptive_session_threshold(
+            dict(self.BASE, routing="broken")), 97.0)
+        self.assertEqual(registry.preemptive_session_threshold(
+            dict(self.BASE, routing={"preemptive_session_percent": 88})), 88.0)
+        for bad in ("x", None, [], 0, -1, 101):
+            self.assertEqual(registry.preemptive_session_threshold(
+                dict(self.BASE, routing={"preemptive_session_percent": bad})),
+                97.0, bad)
+
+    def test_the_five_hour_trigger_has_its_own_kill_switch(self):
+        self.assertFalse(registry.preemptive_session(
+            dict(self.BASE, routing={"preemptive_session_handoff": False})))
+        with mock.patch.dict(os.environ, {"HEADROOM_PREEMPTIVE_SESSION": "0"}):
+            self.assertFalse(registry.preemptive_session(self.BASE))
+            # and it is JUST this trigger: everything else stays armed
+            self.assertTrue(registry.preemptive_handoff(self.BASE))
+        with mock.patch.dict(os.environ, {"HEADROOM_PREEMPTIVE_SESSION": "1"}):
+            self.assertTrue(registry.preemptive_session(self.BASE))
+
     def test_only_explicit_false_or_the_env_kill_switch_disables(self):
         self.assertFalse(registry.preemptive_handoff(
             dict(self.BASE, routing={"preemptive_handoff": False})))
@@ -2605,21 +2629,35 @@ class PreemptiveConfig(TempDirCase):
             self.assertEqual(scoped, 1.0 if bad is True else 93.0, bad)
 
 
-class PreemptiveThresholds(TempDirCase):
+class _WindowCase(TempDirCase):
+    """One usage row and a supervisor to read it with — shared by the two
+    classes below (a mixin, not a base with tests: inheriting tests would run
+    the whole crossing suite twice)."""
+
     def runner(self, account=None):
         return supervisor.Supervisor("fable", [], account or self.account())
 
-    def windows(self, seven=10.0, scoped=None, **over):
-        windows = {"5h": {"used_percent": 99.0},
+    def windows(self, seven=10.0, scoped=None, five=10.0, **over):
+        windows = {"5h": (five if isinstance(five, dict)
+                          else {"used_percent": five}),
                    "7d": dict({"used_percent": seven}, **over)}
         if scoped is not None:
             windows["scoped:Fable"] = (scoped if isinstance(scoped, dict)
                                        else {"used_percent": scoped})
         return {"windows": windows}
 
+
+class PreemptiveThresholds(_WindowCase):
     def test_scoped_family_window_trips_first(self):
         crossing = self.runner()._threshold_crossing(
             "fable", self.windows(seven=10.0, scoped=93.0))
+        self.assertEqual(crossing, ("scoped:fable", 93.0))
+
+    def test_a_weekly_crossing_is_reported_ahead_of_a_full_5h_one(self):
+        # both have crossed; the weekly one is the one that does not heal, so
+        # it names the rotation (and picks the stricter target rule)
+        crossing = self.runner()._threshold_crossing(
+            "fable", self.windows(seven=10.0, scoped=93.0, five=99.0))
         self.assertEqual(crossing, ("scoped:fable", 93.0))
 
     def test_overall_seven_day_window_trips_at_its_own_threshold(self):
@@ -2628,10 +2666,45 @@ class PreemptiveThresholds(TempDirCase):
         self.assertEqual(self.runner()._threshold_crossing(
             "fable", self.windows(seven=95.0, scoped=10.0)), ("7d", 95.0))
 
-    def test_a_full_5h_window_is_never_a_preemptive_trigger(self):
-        # 5h heals within hours and the cap path already covers it
-        self.assertIsNone(self.runner()._threshold_crossing(
-            "fable", self.windows(seven=10.0, scoped=10.0)))
+    def test_the_5h_window_triggers_at_its_own_higher_threshold(self):
+        # SUPERSEDES test_a_full_5h_window_is_never_a_preemptive_trigger.
+        # That test pinned "5h heals within hours and the cap path already
+        # covers it", which holds for a session that can afford to sit and
+        # wait and fails for the continuous autonomous work headroom is for:
+        # the wall lands mid-task. So the 5h IS a trigger — later than the
+        # weekly ones (97 vs 93/95), and only ever acted on when a seat with
+        # real 5h headroom exists to move to (see TargetFitness).
+        runner = self.runner()
+        self.assertIsNone(runner._threshold_crossing(
+            "fable", self.windows(seven=10.0, scoped=10.0, five=96.9)))
+        self.assertEqual(runner._threshold_crossing(
+            "fable", self.windows(seven=10.0, scoped=10.0, five=97.0)),
+            ("5h", 97.0))
+        self.assertEqual(runner._threshold_crossing(
+            "fable", self.windows(seven=10.0, scoped=10.0, five=99.0)),
+            ("5h", 99.0))
+
+    def test_the_5h_trigger_can_be_switched_off_without_the_others(self):
+        with mock.patch.dict(os.environ, {"HEADROOM_PREEMPTIVE_SESSION": "0"}):
+            runner = self.runner()          # policy is read at construction
+        self.assertIsNone(runner._threshold_crossing(
+            "fable", self.windows(seven=10.0, scoped=10.0, five=99.0)))
+        self.assertEqual(runner._threshold_crossing(
+            "fable", self.windows(seven=95.0, scoped=10.0, five=99.0)),
+            ("7d", 95.0))
+        # ...and switching the TRIGGER off never makes a spent seat a target
+        self.assertEqual(runner._target_unfit(
+            "fable", self.windows(five=99.0)), "5h at 99%")
+
+    def test_an_expired_or_unreadable_5h_reading_is_not_a_crossing(self):
+        runner = self.runner()
+        for five in (None, "97", 101.0, float("nan"),
+                     {"used_percent": 99.0,
+                      "freshness": "expired_observation"}):
+            row = self.windows(seven=10.0, scoped=10.0, five=five)
+            if five is None:
+                row["windows"]["5h"] = None
+            self.assertIsNone(runner._threshold_crossing("fable", row), five)
 
     def test_absence_of_proof_is_never_a_crossing(self):
         runner = self.runner()
@@ -2653,6 +2726,65 @@ class PreemptiveThresholds(TempDirCase):
         self.assertEqual(runner._threshold_crossing(
             "fable", self.windows(seven=10.0, scoped=71.0)),
             ("scoped:fable", 71.0))
+
+
+class TargetFitness(_WindowCase):
+    """Who is worth moving TO.
+
+    Defect: preemptive rotation skipped a candidate only on the scoped and 7d
+    thresholds, so a seat whose 5h window read 99% was a perfectly legal
+    target — the rotation spent a handoff, a restart and the loop budget to
+    land on a window that was about to refuse."""
+
+    def test_a_spent_5h_seat_is_never_a_target_even_for_a_weekly_crossing(self):
+        runner = self.runner()
+        for window in ("7d", "scoped:fable", "5h", ""):
+            self.assertEqual(
+                runner._target_unfit("fable", self.windows(five=99.0), window),
+                "5h at 99%", window)
+
+    def test_a_weekly_crossing_accepts_a_busy_but_healing_5h_seat(self):
+        # a spent WEEKLY window is gone for days; a target at 90% of a window
+        # that resets within hours is still a much better place to be
+        self.assertEqual(self.runner()._target_unfit(
+            "fable", self.windows(five=90.0), "7d"), "")
+
+    def test_a_5h_crossing_demands_a_margin_the_move_can_buy_time_with(self):
+        # 97 → 96 is not a rotation, it is a restart with a short reprieve
+        runner = self.runner()
+        self.assertEqual(runner._target_unfit(
+            "fable", self.windows(five=90.0), "5h"), "5h at 90%")
+        self.assertEqual(runner._target_unfit(
+            "fable", self.windows(five=86.9), "5h"), "")
+
+    def test_a_seat_over_a_weekly_threshold_is_unfit_whatever_the_crossing(self):
+        runner = self.runner()
+        self.assertEqual(runner._target_unfit(
+            "fable", self.windows(seven=96.0), "5h"), "7d at 96%")
+        self.assertEqual(runner._target_unfit(
+            "fable", self.windows(scoped=94.0), "7d"), "scoped:fable at 94%")
+
+    def test_an_unreadable_5h_percentage_is_left_to_block_reason(self):
+        # route.block_reason has already refused every candidate whose 5h is
+        # missing, invalid, expired or at 100%; silence here is not consent
+        runner = self.runner()
+        for row in ({}, {"windows": {}}, self.windows(five="99"),
+                    self.windows(five=101.0)):
+            self.assertEqual(runner._target_unfit("fable", row, "5h"), "", row)
+
+    def test_the_target_ceiling_follows_the_configured_threshold(self):
+        registry.save({"schema_version": 1, "routing": {
+            "preemptive_session_percent": 60}, "accounts": [self.account()]})
+        runner = self.runner()
+        self.assertEqual(runner._target_unfit(
+            "fable", self.windows(five=60.0), "7d"), "5h at 60%")
+        self.assertEqual(runner._target_unfit(
+            "fable", self.windows(five=59.0), "7d"), "")
+        # 5h crossing: 60 - 10 margin
+        self.assertEqual(runner._target_unfit(
+            "fable", self.windows(five=50.0), "5h"), "5h at 50%")
+        self.assertEqual(runner._target_unfit(
+            "fable", self.windows(five=49.0), "5h"), "")
 
 
 class TurnCompleteness(TempDirCase):
@@ -3195,13 +3327,14 @@ class PreemptiveRotation(TempDirCase):
         when = time.time() - seconds
         os.utime(self.transcript, (when, when))
 
-    def usage(self, scoped=94.0, seven=20.0, target_ok=True):
+    def usage(self, scoped=94.0, seven=20.0, target_ok=True, five=10.0,
+              target_five=10.0):
         captured = int(self.clock["t"])
-        source = usage_row("source", used7=seven, captured=captured)
+        source = usage_row("source", used5=five, used7=seven, captured=captured)
         source["windows"]["scoped:Fable"] = {
             "used_percent": scoped, "resets_at": captured + 6 * 86400,
             "window_minutes": 10080}
-        target = usage_row("target", captured=captured)
+        target = usage_row("target", used5=target_five, captured=captured)
         if not target_ok:
             target["ok"] = False
             target["error_code"] = "collect_failed"
@@ -3273,6 +3406,71 @@ class PreemptiveRotation(TempDirCase):
                 redirect_stderr(io.StringIO()):
             runner._preemptive_cycle(self.child)
         self.assertEqual(stop.call_args.args[2].window, "7d")
+
+    def test_a_five_hour_crossing_rotates_before_the_wall(self):
+        # the whole point: a session doing continuous work does not get to
+        # "wait a few hours for the 5h to heal", so it leaves at 97% through
+        # the front door instead of being refused mid-task
+        runner = self.runner(self.usage(scoped=10.0, seven=20.0, five=97.0))
+        with mock.patch.object(runner, "_stop_and_commit",
+                               return_value=None) as stop, \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            runner._preemptive_cycle(self.child)
+        plan, proof = stop.call_args.args[1], stop.call_args.args[2]
+        self.assertEqual((proof.window, proof.used_percent), ("5h", 97.0))
+        self.assertEqual(plan.target["name"], "target")
+        # nothing is cooled: the seat is not capped, it is nearly spent
+        self.assertEqual(plan.cooldown_scope, {})
+        scheduled = [event for event in self.events(emit)
+                     if event["event"] == "preemptive_scheduled"]
+        self.assertEqual(scheduled[0]["window"], "5h")
+
+    def test_a_five_hour_crossing_holds_when_no_seat_has_5h_headroom(self):
+        # rotating would not help: the only other seat is nearly at the same
+        # wall, so staying put and letting the window heal is strictly better
+        # than spending a seat, a restart and the loop budget to arrive there
+        runner = self.runner(self.usage(scoped=10.0, seven=20.0, five=99.0,
+                                        target_five=95.0))
+        with mock.patch.object(runner, "_stop_and_commit") as stop, \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            self.assertIsNone(runner._preemptive_cycle(self.child))
+        stop.assert_not_called()
+        held = [event for event in self.events(emit)
+                if event["event"] == "preemptive_held"]
+        self.assertIn("no seat has real 5h headroom", held[0]["reason"])
+        self.assertIn("5h at 95%", held[0]["reason"])
+        self.assertIn("heals on its own", held[0]["reason"])
+        self.assertEqual(self.ledger(), [])
+        self.assertTrue(self.child.automation)
+
+    def test_that_same_seat_is_still_a_target_for_a_weekly_crossing(self):
+        # the 5h margin is a rule about 5h rotations, not a general embargo:
+        # a weekly window is gone for days, a 95% 5h heals within hours
+        runner = self.runner(self.usage(scoped=94.0, seven=20.0,
+                                        target_five=95.0))
+        with mock.patch.object(runner, "_stop_and_commit",
+                               return_value=None) as stop, \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            runner._preemptive_cycle(self.child)
+        self.assertEqual(stop.call_args.args[1].target["name"], "target")
+        self.assertEqual(stop.call_args.args[2].window, "scoped:fable")
+
+    def test_a_spent_5h_seat_is_never_a_weekly_crossings_target_either(self):
+        runner = self.runner(self.usage(scoped=94.0, seven=20.0,
+                                        target_five=99.0))
+        with mock.patch.object(runner, "_stop_and_commit") as stop, \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            self.assertIsNone(runner._preemptive_cycle(self.child))
+        stop.assert_not_called()
+        held = [event for event in self.events(emit)
+                if event["event"] == "preemptive_held"]
+        self.assertIn("itself near its limit: target (5h at 99%)",
+                      held[0]["reason"])
+        self.assertTrue(self.child.automation)
 
     def test_below_threshold_never_rotates_and_clears_the_announcement(self):
         runner = self.runner(self.usage(scoped=10.0, seven=20.0))

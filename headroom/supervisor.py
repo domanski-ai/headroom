@@ -65,6 +65,14 @@ PREEMPT_DECISION_TTL = max(PREEMPT_IDLE_SECONDS + 10.0, float(
 # private collect (a running `headroom serve` refreshes it continuously)
 PREEMPT_SNAPSHOT_MAX_AGE = max(30, paths.env_int(
     "HEADROOM_PREEMPTIVE_SNAPSHOT_MAX_AGE", 300))
+# How much better a target's 5h window must be before moving there ANSWERS a
+# 5h crossing. Leaving a seat at 97% for one at 96% is not a rotation, it is a
+# restart with a five-minute reprieve: the successor trips the same threshold
+# almost immediately and the loop guard, not the routing, ends up doing the
+# thinking. Only applied to a 5h-triggered rotation — for a spent WEEKLY
+# window a target with a busy-but-healing 5h is still a fine place to be.
+PREEMPT_SESSION_MARGIN = max(0.0, float(
+    paths.env_int("HEADROOM_PREEMPTIVE_SESSION_MARGIN", 10)))
 # how much of a transcript's END the poll parses (see _transcript_records)
 TRANSCRIPT_TAIL_BYTES = max(64 * 1024, paths.env_int(
     "HEADROOM_TRANSCRIPT_TAIL_BYTES", 256 * 1024))
@@ -1926,6 +1934,12 @@ class Supervisor:
         self.preemptive = registry.preemptive_handoff()
         self.preemptive_scoped, self.preemptive_overall = \
             registry.preemptive_thresholds()
+        # The 5h window: its own switch and its own (higher) threshold, for
+        # the reasons in registry.preemptive_session. The THRESHOLD is read
+        # whether or not the trigger is armed, because it also defines when a
+        # candidate seat is too close to its own 5h wall to be a target.
+        self.preemptive_session = registry.preemptive_session()
+        self.preemptive_session_percent = registry.preemptive_session_threshold()
         # a supervisor-wide hold that survives a child swap, so an aborted
         # rotation cannot immediately re-target the recovered session
         self.preemptive_hold_until = 0.0
@@ -2348,10 +2362,19 @@ class Supervisor:
         preemptive threshold, else None.
 
         Absence of proof is never a crossing: a missing, malformed, expired,
-        or out-of-range reading returns None and the session stays put. The 5h
-        window is deliberately NOT a trigger — it heals within hours and the
-        cap-reactive path already covers it; moving a whole conversation for a
-        window that resets by itself would burn seats for nothing."""
+        or out-of-range reading returns None and the session stays put.
+
+        The 5h window used to be excluded here, on the argument that it heals
+        within hours and the cap-reactive path already covers it. That is true
+        of a session that will go idle and wait for it, and false of the one
+        headroom exists for: continuous autonomous work, where the wall
+        arrives mid-task and "it resets by itself in four hours" means four
+        hours of nothing. So it IS a trigger now — but the last one checked,
+        at its own higher threshold (registry.preemptive_session), off with
+        one env var, and only ever acted on when a target with real 5h
+        headroom exists (see _target_unfit). A weekly window is reported ahead
+        of it because a weekly window does not heal.
+        """
         windows = row.get("windows") if isinstance(row, dict) else None
         if not isinstance(windows, dict):
             return None
@@ -2359,7 +2382,9 @@ class Supervisor:
             "opus", "sonnet", "haiku", "fable") else None
         for window, key, threshold in (
                 (scoped, "scoped:" + family, self.preemptive_scoped),
-                (windows.get("7d"), "7d", self.preemptive_overall)):
+                (windows.get("7d"), "7d", self.preemptive_overall),
+                (windows.get("5h") if self.preemptive_session else None,
+                 "5h", self.preemptive_session_percent)):
             if not isinstance(window, dict) \
                     or window.get("freshness") == "expired_observation":
                 continue
@@ -2367,6 +2392,43 @@ class Supervisor:
             if _number(used) and 0 <= used <= 100 and used >= threshold:
                 return key, float(used)
         return None
+
+    def _target_unfit(self, family, row, window=""):
+        """Why this candidate is not worth moving to, or "".
+
+        `window` is the crossing being answered, so the rule can be as strict
+        as that crossing requires:
+
+        * ALWAYS — a seat that has itself crossed a preemptive threshold, and
+          a seat at or past the 5h threshold whether or not the 5h TRIGGER is
+          armed. Rotating into a window that is about to refuse is the one
+          move that is worse than staying: it spends a handoff, a restart and
+          the loop budget to arrive at the same wall (defect: a 99% 5h seat
+          was a legal target, because only the scoped and 7d windows were
+          checked).
+        * 5h CROSSINGS ONLY — a margin on top, so the move actually buys time.
+
+        Readability is route.block_reason's job, not this one's: it has
+        already refused every candidate whose 5h window is missing, invalid,
+        expired or at 100%, so an unreadable percentage here means "nothing
+        further proven against this seat", not "safe".
+        """
+        crossing = self._threshold_crossing(family, row)
+        if crossing is not None:
+            return "%s at %g%%" % crossing
+        windows = row.get("windows") if isinstance(row, dict) else None
+        session = windows.get("5h") if isinstance(windows, dict) else None
+        if not isinstance(session, dict):
+            return ""
+        used = session.get("used_percent")
+        if not _number(used) or not 0 <= used <= 100:
+            return ""
+        ceiling = self.preemptive_session_percent
+        if window == "5h":
+            ceiling = max(0.0, ceiling - PREEMPT_SESSION_MARGIN)
+        if used >= ceiling:
+            return f"5h at {used:g}%"
+        return ""
 
     def _preemptive_observation(self, child):
         """``(proof, snapshot)`` for a live threshold crossing, else None."""
@@ -2389,31 +2451,42 @@ class Supervisor:
             deadline=observed_at + PREEMPT_DECISION_TTL)
         return proof, snapshot
 
-    def _preemptive_target(self, child, family, snapshot):
-        """The best seat that is BOTH routable and not itself near the
-        preemptive threshold.
+    def _preemptive_target(self, child, family, snapshot, window=""):
+        """The best seat that is BOTH routable and not itself near a limit.
 
         Ranking is Fable-headroom-primary, so for an Opus/Sonnet or overall-7d
         crossing the top-ranked candidate can easily be the one already over
         the relevant threshold — rejecting only that one and backing off would
         strand a session while a healthy seat sat two places down the list.
-        Walk the ranking instead, skipping near-limit seats (moving onto one
-        would just be undone by the next poll), and re-run the full
-        select_target gate on the winner so nothing bypasses it."""
+        Walk the ranking instead, skipping unfit seats (moving onto one would
+        just be undone by the next poll), and re-run the full select_target
+        gate on the winner so nothing bypasses it.
+
+        When NO seat is fit, this raises and the caller only defers. For a 5h
+        crossing that is the right answer and not a failure: if every seat is
+        near its own 5h cap, staying put costs one wait and burns nothing,
+        while moving costs a restart AND a seat and still hits a wall. Say so
+        in the message — a hold nobody can explain gets "fixed" by someone
+        raising the threshold."""
         source = child.account["name"]
         skipped = []
         for account, reason in route.candidates(family, snapshot):
             if reason is not None or account.get("name") == source:
                 continue
-            if self._threshold_crossing(
-                    family,
-                    _snapshot_row(snapshot, account["name"])) is not None:
-                skipped.append(account["name"])
+            unfit = self._target_unfit(
+                family, _snapshot_row(snapshot, account["name"]), window)
+            if unfit:
+                skipped.append(f"{account['name']} ({unfit})")
                 continue
             return handoff.select_target(source, snapshot, family,
                                          requested=account["name"])
         detail = (f" (skipped, itself near its limit: {', '.join(skipped)})"
                   if skipped else "")
+        if window == "5h":
+            raise SupervisorError(
+                f"no seat has real 5h headroom for the {family} family"
+                f"{detail} — holding here: this window heals on its own, so "
+                "waiting it out beats spending a seat to land on another wall")
         raise SupervisorError(
             f"no target with proven headroom for the {family} family"
             f"{detail}")
@@ -2476,7 +2549,8 @@ class Supervisor:
         proof, snapshot = observed
         try:
             # reuse the ranked route selection: no proven target, no rotation
-            self._preemptive_target(child, proof.family, snapshot)
+            self._preemptive_target(child, proof.family, snapshot,
+                                    proof.window)
         except Exception as error:  # noqa: BLE001
             self._preemptive_defer(child, str(error))
             return None
@@ -2560,7 +2634,8 @@ class Supervisor:
             _snapshot_row(snapshot, child.account["name"]), self.now())
         if reason:
             raise SupervisorError(reason)
-        target = self._preemptive_target(child, proof.family, snapshot)
+        target = self._preemptive_target(child, proof.family, snapshot,
+                                         proof.window)
         binding = child.binding
         source = handoff.SourceSession(
             proof.session_id, proof.transcript_path, child.account,
