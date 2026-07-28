@@ -492,10 +492,12 @@ class Child:
     cap_hold_reason: str = ""
     # which proof the hold above belongs to; a different one resets it
     cap_hold_key: tuple = ()
-    # WHICH window fresh usage corroborated the cap in ("5h", "7d",
-    # "scoped:<family>"; "" = none yet). Only that window may later be read
-    # as having reset — a bare "something corroborated it once" would let any
-    # unreadable snapshot pass for a reset.
+    # WHICH cap fresh usage corroborated: the cooldown key it would spend
+    # ("<account>:*" / "<account>:<family>") and the window that proved it
+    # ("5h", "7d", "scoped:<family>"; "" = none yet). Written once per proof
+    # and never rewritten — a retry that finds a DIFFERENT scope has found a
+    # different cap, and only the recorded window may say this one is over.
+    cap_scope_key: str = ""
     cap_scope_window: str = ""
     # the last disarm reason already notified ("" / False = none yet)
     supervision_loss_notified: object = False
@@ -1883,6 +1885,21 @@ def _preemptive_row_bound(account, family, row, now):
     return ""
 
 
+def _source_reading_unavailable(reason, family):
+    """Whether a `_source_row_is_bound` refusal is "no current reading".
+
+    route.reading_unavailable owns the block_reason vocabulary; these three
+    are this function's OWN strings, and they say the same thing about the
+    snapshot as a whole — it is too old, or it is not there. A cap that has
+    already been corroborated once waits those out; it never disarms on them.
+    Nothing about identity, trust or policy is in either list."""
+    return reason in ("collect returned no snapshot",
+                      "collect did not start after the cap event",
+                      "collect did not finish after the cap event",
+                      "source observation predates the cap event") \
+        or route.reading_unavailable(reason, family)
+
+
 def _source_row_is_bound(account, family, snapshot, collect_started):
     if not isinstance(snapshot, dict):
         return "collect returned no snapshot"
@@ -2352,12 +2369,14 @@ class Supervisor:
             return route.scoped_window_for(family, windows)
         return windows.get(key)
 
-    def _preflight(self, child, proof, held=""):
+    def _preflight(self, child, proof, held=False):
         """The cap path's admission chain.
 
-        `held` is the window a previous attempt on THIS proof corroborated the
-        cap in (see Child.cap_scope_window); it changes exactly one verdict —
-        the `scope is None` branch below."""
+        `held` says a previous attempt on THIS proof already corroborated the
+        cap, and Child.cap_scope_key / .cap_scope_window record exactly which
+        scope it corroborated. Those two are written ONCE and read on every
+        retry: they decide whether an unreadable snapshot waits or disarms,
+        and they are the only cap this proof may ever admit."""
         self._proof_current(child, proof)
         try:
             handoff.guard_source_stable(
@@ -2381,43 +2400,66 @@ class Supervisor:
             reason = _source_row_is_bound(
                 child.account, proof.family, snapshot, started)
             if reason:
+                # A held cap must reach the HOLD path on an unreadable
+                # snapshot, not the disarm path. This gate runs before any of
+                # the cap-scope reasoning below, so without this line the one
+                # case the whole wait was built for — the corroborating window
+                # going expired or malformed mid-hold — walked straight into
+                # _lose_supervision, on the dead seat, exactly like the bug
+                # the wait replaced. Trust, identity and policy refusals are
+                # NOT in this class and disarm as they always did.
+                if held and _source_reading_unavailable(reason, proof.family):
+                    raise CapacityHold(
+                        f"{reason} — holding the proof rather than disarming "
+                        "on a snapshot that proves nothing")
                 raise SupervisorError(reason)
             scope = route.cap_scope(snapshot, child.account["name"],
                                     proof.family, proof.message)
-            if scope is None:
+            if not held:
                 # First look: the hook says capped and fresh usage does not.
                 # That is a CONTRADICTION and it disarms, unchanged — a proof
                 # nobody can corroborate must never move a session.
-                if not held:
+                if scope is None:
                     raise SupervisorError(
                         "fresh usage is below 99% or the cap scope is ambiguous")
-                # On a re-attempt, `scope is None` has two very different
-                # causes and only one of them ends the cap. Ask the window
-                # that actually corroborated it: a READABLE reading below 99%
-                # is the window resetting under us — nothing left to rotate
-                # away from. A window that is merely missing or unreadable in
-                # this snapshot proves nothing at all, and discarding a good
-                # proof on it strands the session (observed: a scoped Fable
-                # cap "cleared" because the snapshot simply omitted the
-                # scoped window, while a healthy seat sat unused).
+                child.cap_scope_key = scope.get("key") or ""
+                child.cap_scope_window = scope.get("window") or ""
+            elif (scope or {}).get("key") != child.cap_scope_key:
+                # A re-attempt may only ever admit THE cap it recorded. A
+                # different scope here is a different cap: reading it as this
+                # one would cool a window we never corroborated and quietly
+                # rewrite what we are holding for (observed: a scoped Fable
+                # cap whose pool reset to 4% while the 5h window filled came
+                # back as a 5h handoff). So interrogate only the recorded
+                # window — a readable reading below 99% means the cap we held
+                # for is genuinely over, and anything unreadable means this
+                # snapshot proves nothing and the proof is kept.
                 window = self._scope_window(
-                    proof.family, _snapshot_row(
-                        snapshot, child.account["name"]), held)
+                    proof.family,
+                    _snapshot_row(snapshot, child.account["name"]),
+                    child.cap_scope_window)
                 used = window.get("used_percent") \
                     if isinstance(window, dict) else None
                 if isinstance(window, dict) \
                         and window.get("freshness") != "expired_observation" \
                         and _number(used) and 0 <= used < 99:
                     raise CapCleared(
-                        f"the capped {held} window is back to {used:g}% — "
-                        "it reset while we waited for a seat")
+                        f"the capped {child.cap_scope_window} window is back "
+                        f"to {used:g}% — it reset while we waited for a seat")
                 raise CapacityHold(
-                    f"the capped {held} window is not readable in fresh "
-                    "usage — holding the proof rather than assuming it reset")
-            child.cap_scope_window = scope.get("window") or ""
+                    f"the capped {child.cap_scope_window} window is not "
+                    "readable in fresh usage — holding the proof rather than "
+                    "assuming it reset")
             reset = scope.get("reset")
             if (not isinstance(reset, (int, float)) or isinstance(reset, bool)
                     or not math.isfinite(reset) or reset <= self.now()):
+                # Same rule as the row gate above: on a first look this is an
+                # unprovable cap and disarms; mid-hold it is one snapshot's
+                # missing metadata about a cap we already corroborated.
+                if held:
+                    raise CapacityHold(
+                        "fresh cap reset is missing or ambiguous — holding "
+                        "the proof rather than disarming on it")
                 raise SupervisorError("fresh cap reset is missing or ambiguous")
             target = self._cap_target(child, proof.family, snapshot)
             binding = child.binding
@@ -2537,6 +2579,7 @@ class Supervisor:
         child.cap_hold_next = 0.0
         child.cap_hold_reason = ""
         child.cap_hold_key = ()
+        child.cap_scope_key = ""
         child.cap_scope_window = ""
 
     def _cap_hold_sync(self, child, proof):
@@ -3809,7 +3852,8 @@ class Supervisor:
                         and self.now() >= child.cap_hold_next:
                     try:
                         plan = self._preflight(
-                            child, proof, held=child.cap_scope_window)
+                            child, proof,
+                            held=bool(child.cap_scope_key))
                     except CapCleared as error:
                         # the window reset under us: nothing to rotate away
                         # from, and every reason to stay armed for the next one

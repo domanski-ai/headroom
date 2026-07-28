@@ -3339,7 +3339,13 @@ class CapWaitsForCapacity(TempDirCase):
                  target_scoped=None, source_scoped=None):
         """Built from the CURRENT clock, the way a real collect would be."""
         captured = int(self.clock["t"]) + 1
-        source = usage_row("source", used5=source5, captured=captured)
+        source = usage_row("source", used5=0.0, captured=captured)
+        # a dict source5 REPLACES the 5h window, so a test can make the very
+        # window that corroborated the cap go expired or malformed mid-hold
+        source["windows"]["5h"] = dict(
+            source["windows"]["5h"],
+            **(source5 if isinstance(source5, dict)
+               else {"used_percent": source5}))
         target = usage_row("target", used5=target5, used7=target7,
                            captured=captured)
         for row, scoped in ((source, source_scoped), (target, target_scoped)):
@@ -3564,6 +3570,44 @@ class CapWaitsForCapacity(TempDirCase):
         self.assertTrue(child.automation)
         self.assertEqual(child.cap_scope_window, "scoped:fable")
 
+    def test_an_unreadable_window_mid_hold_holds_and_stays_armed(self):
+        # THE case the wait was built for, and it was defeated by ordering:
+        # the source-binding gate runs before any of the cap-scope reasoning,
+        # so an expired or malformed corroborating window raised a plain
+        # SupervisorError and disarmed the child — on the dead seat, exactly
+        # like the bug the wait replaced. Driven through _monitor, because
+        # that is where the disarm lived.
+        for bad in ({"used_percent": 100.0, "freshness": "expired_observation"},
+                    {"used_percent": "?"},
+                    {"used_percent": 100.0, "resets_at": None}):
+            runner = self.runner([(100.0, 100.0), (bad, 5.0)])
+            child = self.child()
+            outcome, events, err = self.monitor(
+                runner, child, self.proof(), polls=8)
+            self.assertEqual(outcome, 0, bad)
+            self.assertTrue(child.automation, bad)
+            self.assertNotIn("supervision_lost",
+                             [event["event"] for event in events], bad)
+            self.assertEqual({event["event"] for event in events},
+                             {"cap_held"}, bad)
+            self.assertIn("holding the proof rather than", err.getvalue())
+            # and the proof it is holding is untouched
+            self.assertEqual(child.cap_scope_window, "5h", bad)
+
+    def test_the_same_unreadable_window_still_disarms_on_a_first_look(self):
+        # the hold is for a cap already corroborated once; with nothing
+        # corroborated there is nothing to wait on, and the fail-closed
+        # first look is unchanged
+        runner = self.runner(
+            [({"used_percent": 100.0, "freshness": "expired_observation"},
+              5.0)])
+        child = self.child()
+        outcome, events, _err = self.monitor(runner, child, self.proof())
+        self.assertEqual(outcome, 0)
+        self.assertFalse(child.automation)
+        self.assertEqual([event["event"] for event in events],
+                         ["supervision_lost"])
+
     def test_the_corroborating_window_reading_low_does_clear_it(self):
         outcome, _child = self.scoped_hold((10.0, 10.0, 10.0, 5.0, 4.0))
         self.assertIsInstance(outcome, supervisor.CapCleared)
@@ -3572,6 +3616,17 @@ class CapWaitsForCapacity(TempDirCase):
     def test_a_held_scoped_cap_moves_once_a_seat_frees(self):
         outcome, _child = self.scoped_hold((10.0, 10.0, 10.0, 5.0, 100.0))
         self.assertEqual(outcome.target["name"], "target")
+
+    def test_a_proof_may_only_ever_admit_the_cap_it_recorded(self):
+        # the scoped pool it was holding for resets to 4% while the 5h window
+        # fills. That is a DIFFERENT cap: reading it as this one cooled a
+        # window nobody corroborated and quietly rewrote what the hold was
+        # for. Only the recorded scope may speak, and it says it is over.
+        outcome, child = self.scoped_hold((100.0, 10.0, 10.0, 5.0, 4.0))
+        self.assertIsInstance(outcome, supervisor.CapCleared)
+        self.assertIn("scoped:fable window is back to 4%", str(outcome))
+        self.assertEqual((child.cap_scope_key, child.cap_scope_window),
+                         ("source:fable", "scoped:fable"))
 
     def test_an_uncorroborated_cap_still_disarms_on_the_first_look(self):
         # NOT a hold: the hook says capped and fresh usage says otherwise, on

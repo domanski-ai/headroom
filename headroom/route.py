@@ -655,6 +655,61 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     return None
 
 
+def reading_unavailable(reason, fam):
+    """Whether a :func:`block_reason` string means "there is no current
+    reading", as opposed to "this seat is spent" or "this seat cannot be
+    trusted".
+
+    Three classes come out of that function and they deserve three different
+    answers. Spent is the whole point of a rotation. Untrusted must fail
+    closed and stay closed — an identity that moved under us is not something
+    waiting fixes. But UNREADABLE is an absence of evidence: a window that is
+    missing, malformed, or an expired observation says nothing about the
+    account, and the next collect routinely says something. A caller holding
+    an already-corroborated cap must be able to wait that out instead of
+    disarming a live session over one bad snapshot.
+
+    Enumerated HERE, beside the messages themselves, because a copy of this
+    list in another module would drift the first time one is reworded — and a
+    test drives block_reason through every unreadable shape to prove this
+    stays exhaustive."""
+    if not reason:
+        return False
+    # the collector itself failed for this seat ("held: <error_code>")
+    if reason.startswith("held: "):
+        return True
+    if reason in ("no usage reading yet", "reading stale",
+                  "reading clock invalid", "reading expired",
+                  "windows invalid"):
+        return True
+    for key in ("5h", "7d"):
+        if reason in (f"{key} window missing", f"{key} reading invalid",
+                      f"{key} reading expired — no current capacity proof"):
+            return True
+    return reason in (f"{fam} weekly cap reading invalid",
+                      f"{fam} weekly cap reading expired — no current proof")
+
+
+def credits_scope_applies(text, windows, fam):
+    """Whether the credits wording may cool the model-scoped weekly pool.
+
+    "Out of usage credits … keep using Fable 5" NAMES that pool, but naming is
+    not proof: there has to be a reading at the wall to cool. Both consumers
+    ask this one question — :func:`cap_scope`, which corroborates a hook
+    against fresh usage, and :func:`run_cooldown_scope`, which reacts to a
+    child's stderr — so they cannot answer it differently for the same seat.
+
+    Without a scoped reading neither may claim the pool is spent: cap_scope
+    would be inventing corroboration, which is the one thing the cap path may
+    never do. Both then fall back to the window that IS provably at the wall,
+    and the pool gets cooled on the next refusal that can show it."""
+    if not CREDITS_RE.search(text or "") or not isinstance(windows, dict):
+        return False
+    scoped = scoped_window_for(fam, windows)
+    used = scoped.get("used_percent") if isinstance(scoped, dict) else None
+    return bool(_number(used) and used >= 99)
+
+
 def _codex_gate(account, snapshot_row, identity):
     """Codex-only fail-closed eligibility (never touches the Claude path).
 
@@ -918,7 +973,11 @@ def cap_scope(snapshot, name, fam, message=""):
     # names its scope out loud. Cooling the whole account for 5h on a "keep
     # using Fable 5" refusal leaves the pool that actually refused uncooled,
     # so the next launch picks the same spent family again five hours later.
-    if scoped_scope is not None and CREDITS_RE.search(text):
+    # `scoped_scope is not None` stays the structural precondition: a message
+    # carrying BOTH credits and session wording narrows to 5h, which leaves no
+    # scoped hit to prefer, and preferring a None here would return "no cap"
+    # for a seat that is provably capped.
+    if scoped_scope is not None and credits_scope_applies(text, windows, fam):
         return scoped_scope
     if account_hits:
         resets = [window.get("resets_at") for _, window in account_hits
@@ -978,24 +1037,27 @@ def window_reset(snapshot, name, window_key):
     return ((row.get("windows") or {}).get(window_key) or {}).get("resets_at")
 
 
-def run_cooldown_scope(stderr):
+def run_cooldown_scope(stderr, windows=None, fam=None):
     """``(account_wide, window)`` for a CAP on a `run` child's stderr.
 
     Three wordings, three different things to spend:
 
-    * credits — "out of usage credits" is the model-SCOPED weekly pool. Going
-      account-wide would take every other family down with it, and a 5h
-      window would let the next launch pick the same spent family again in
-      five hours. One family, seven days.
+    * credits — "out of usage credits" is the model-SCOPED weekly pool, so
+      when the row can show that pool at the wall it is the only thing cooled:
+      one family, seven days. Account-wide would take every other family down
+      with it, and a 5h window would let the next launch pick the same spent
+      family again in five hours.
     * weekly — the all-model weekly window: account-wide, seven days.
-    * anything else — a session cap: account-wide, five hours.
+    * anything else, INCLUDING credits with no scoped reading to justify it —
+      a session cap: account-wide, five hours.
 
-    This is `cap_scope`'s reasoning without a usage snapshot to corroborate
-    against; the two must agree on what a phrase MEANS, which is why both
-    read the same CREDITS_RE/WEEKLY_RE."""
-    if CREDITS_RE.search(stderr):
+    The fallback is not a shrug: it is the same answer `cap_scope` gives for
+    the same seat, through the same :func:`credits_scope_applies` predicate.
+    The two consumers of this vocabulary must not cool different things for
+    one refusal."""
+    if credits_scope_applies(stderr, windows, fam):
         return False, "7d"
-    if WEEKLY_RE.search(stderr):
+    if WEEKLY_RE.search(stderr or ""):
         return True, "7d"
     return True, "5h"
 
@@ -1087,7 +1149,8 @@ def cmd_run(fam, command):
                       f"limit (not a cap) -> not cooled; rotating",
                       file=sys.stderr)
                 continue
-            account_wide, window_key = run_cooldown_scope(stderr)
+            account_wide, window_key = run_cooldown_scope(
+                stderr, (rows.get(account["name"]) or {}).get("windows"), fam)
             reset = _cap_window_reset(snapshot, account["name"], fam,
                                       account_wide, window_key)
             mark(account["name"], fam, reset, account_wide=account_wide,

@@ -599,6 +599,88 @@ class BlockReasonFailClosed(unittest.TestCase):
         self.assertIn("5h window missing", reason)
 
 
+class UnreadableIsNotUntrusted(unittest.TestCase):
+    """`reading_unavailable` splits block_reason's output three ways, and the
+    supervisor bets a live session on the split: an absence of evidence is
+    waited out, a spent or untrusted seat is not.
+
+    Every case below drives block_reason ITSELF and classifies whatever string
+    comes back, so rewording a message cannot silently drop it out of the
+    class it belongs to. (Its own harness rather than a subclass of the
+    fixture above — inheriting would run that whole suite twice.)"""
+
+    def setUp(self):
+        self.now = time.time()
+        self._orig_binding = collect.local_binding
+        collect.local_binding = lambda provider, home: ("AAAA", "BBBB")
+        self.addCleanup(
+            setattr, collect, "local_binding", self._orig_binding)
+
+    def reason(self, row, fam="sonnet", cool=None):
+        return route.block_reason(_account(), fam, row, cool or {}, self.now)
+
+    def scoped(self, **over):
+        row = _claude_row()
+        row["windows"]["scoped:Sonnet"] = dict(
+            {"used_percent": 10.0, "resets_at": self.now + 6 * 86400}, **over)
+        return row
+
+    def broken(self, key, **over):
+        row = _claude_row()
+        row["windows"][key] = dict(row["windows"][key], **over)
+        return row
+
+    def missing(self, key):
+        row = _claude_row()
+        row["windows"].pop(key)
+        return row
+
+    def test_every_unreadable_shape_is_classified_as_unreadable(self):
+        old = _claude_row()
+        old["captured_at"] = self.now - 10 * route.OBSERVATION_MAX_AGE
+        future = _claude_row()
+        future["captured_at"] = self.now + 10_000
+        no_windows = _claude_row()
+        no_windows["windows"] = "broken"
+        shapes = [
+            None, _claude_row(ok=False), _claude_row(stale=True), old, future,
+            no_windows, self.missing("5h"), self.missing("7d"),
+            self.broken("5h", used_percent="x"),
+            self.broken("7d", used_percent=None),
+            self.broken("5h", freshness="expired_observation"),
+            self.broken("7d", freshness="expired_observation"),
+            self.scoped(used_percent="x"),
+            self.scoped(freshness="expired_observation"),
+        ]
+        for row in shapes:
+            reason = self.reason(row)
+            self.assertIsNotNone(reason, row)
+            self.assertTrue(route.reading_unavailable(reason, "sonnet"),
+                            f"{reason!r} should be an absence of evidence")
+
+    def test_spent_untrusted_and_policy_are_never_unreadable(self):
+        cooling = _claude_row()
+        shapes = [
+            (_claude_row(used5h=100), {}),                    # spent
+            (self.broken("5h", severity="critical", is_active=True), {}),
+            (self.scoped(used_percent=100.0), {}),
+            (_claude_row(ok=True, routable=False), {}),       # untrusted
+            (dict(_claude_row(), identity={}), {}),
+            (dict(_claude_row(), trust_state="held"), {}),
+            (cooling, {"a:*": self.now + 3600}),              # policy
+        ]
+        for row, cool in shapes:
+            reason = self.reason(row, cool=cool)
+            self.assertIsNotNone(reason, row)
+            self.assertFalse(route.reading_unavailable(reason, "sonnet"),
+                             f"{reason!r} must never be waited out")
+
+    def test_a_healthy_row_has_no_reason_to_classify(self):
+        self.assertIsNone(self.reason(_claude_row(used5h=10)))
+        self.assertFalse(route.reading_unavailable(None, "sonnet"))
+        self.assertFalse(route.reading_unavailable("", "sonnet"))
+
+
 class ReservePercent(unittest.TestCase):
     """`reserve_percent` skips accounts with less than N% headroom left so a
     session starts fresh instead of hitting a wall mid-task."""
@@ -2336,12 +2418,44 @@ class RunLimitPartition(unittest.TestCase):
             code = route.cmd_run("fable", ["claude", "-p", "task"])
         return code, child.call_count, marks, errors.getvalue()
 
+    def spent_pool(self, used=100.0):
+        return {"5h": {"used_percent": 100.0}, "7d": {"used_percent": 10.0},
+                "scoped:Fable": {"used_percent": used}}
+
     def test_the_scope_table_is_the_one_cap_scope_reasons_from(self):
-        self.assertEqual(route.run_cooldown_scope(self.CREDITS), (False, "7d"))
+        # credits names the scoped pool, and cools it when the row can SHOW
+        # that pool at the wall
+        self.assertEqual(
+            route.run_cooldown_scope(self.CREDITS, self.spent_pool(), "fable"),
+            (False, "7d"))
         self.assertEqual(route.run_cooldown_scope("hit your weekly limit"),
                          (True, "7d"))
         self.assertEqual(route.run_cooldown_scope("hit your 5-hour limit"),
                          (True, "5h"))
+
+    def test_credits_with_nothing_to_show_for_it_cools_what_is_provable(self):
+        # No scoped reading, or one that is not at the wall: naming a pool is
+        # not proof it is spent. cap_scope may not invent corroboration, so
+        # the agreement has to be here — both fall back to the window that IS
+        # provably at the wall, and the pool is cooled by the next refusal
+        # that can show it.
+        for windows in (None, {}, "broken", {"5h": {"used_percent": 100.0}},
+                        self.spent_pool(used=40.0),
+                        self.spent_pool(used="x")):
+            self.assertEqual(
+                route.run_cooldown_scope(self.CREDITS, windows, "fable"),
+                (True, "5h"), windows)
+            base = windows if isinstance(windows, dict) else {}
+            scope = route.cap_scope(
+                {"accounts": [dict(_claude_row("a", used5h=100.0),
+                                   windows=dict(base,
+                                               **{"5h": {"used_percent": 100.0,
+                                                         "resets_at":
+                                                         time.time() + 3600}}))]},
+                "a", "fable", self.CREDITS)
+            # ...and the corroborating consumer says the same thing
+            self.assertEqual((scope["account_wide"], scope["window"]),
+                             (True, "5h"), windows)
 
     def test_a_transient_rotates_without_cooling_a_healthy_seat(self):
         for stderr in ("429 Too Many Requests", "overloaded_error",
@@ -2382,6 +2496,12 @@ class RunLimitPartition(unittest.TestCase):
         scope = route.cap_scope(snapshot, "a", "fable", self.CREDITS)
         self.assertEqual((scope["key"], scope["window"], scope["account_wide"]),
                          ("a:fable", "scoped:fable", False))
+        # a message carrying BOTH wordings narrows to 5h, so there is no
+        # scoped hit to prefer — and preferring a missing one would report "no
+        # cap" for a seat that is provably capped
+        both = self.CREDITS + " You've hit your session limit."
+        scope = route.cap_scope(snapshot, "a", "fable", both)
+        self.assertEqual((scope["key"], scope["window"]), ("a:*", "5h"))
         # with no scoped pool in the row there is nothing to prefer, and the
         # account-wide hit is still the answer
         row["windows"].pop("scoped:Fable")
