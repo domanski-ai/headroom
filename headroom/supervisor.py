@@ -344,8 +344,11 @@ class PendingCapTimeout(PermanentSupervisorError):
 class CapacityHold(SupervisorError):
     """A proven cap that cannot be acted on YET, and might be later.
 
-    The proof is intact and uncontradicted; what is missing is somewhere to
-    go. Every OTHER cap-path refusal disarms this child permanently, which is
+    The proof is intact and uncontradicted; what is missing is somewhere to go
+    (no seat has headroom) or the means to look (the collect failed). Neither
+    says the cap is false, and both fix themselves.
+
+    Every OTHER cap-path refusal disarms this child permanently, which is
     right for a proof that was contradicted and catastrophic for one that was
     merely unlucky: the session is sitting on the capped seat, which is the
     one state where it most needs the rotation it just gave up on. So this
@@ -2215,7 +2218,12 @@ class Supervisor:
         except TypeError:
             snapshot = self.collect_fn()
         except Exception as error:  # noqa: BLE001 — a failed proof never stops
-            raise SupervisorError(f"fresh usage collect failed: {error}") from error
+            # A collect that failed proves nothing either way: it is the same
+            # "no information" class as an empty target ranking, not a
+            # contradiction, so it holds and retries rather than costing a
+            # live session its automation over one network blip.
+            raise CapacityHold(
+                f"fresh usage collect failed: {error}") from error
         return snapshot, started
 
     def _prove_cap(self, child, record):

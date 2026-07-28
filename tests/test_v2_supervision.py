@@ -3472,6 +3472,17 @@ class CapWaitsForCapacity(TempDirCase):
         self.assertIn("the seat is usable again", err.getvalue())
         self.assertEqual(child.cap_hold_attempts, 0)
 
+    def test_a_failed_collect_holds_rather_than_costing_the_automation(self):
+        # one network blip on the single collect after a cap used to disarm a
+        # live session permanently; it is "no information", not a refutation
+        runner, child = self.runner([(100.0, 5.0)]), self.child()
+        runner.collect_fn = mock.Mock(side_effect=OSError("network down"))
+        outcome, events, err = self.monitor(runner, child, self.proof())
+        self.assertEqual(outcome, 0)
+        self.assertTrue(child.automation)
+        self.assertEqual([event["event"] for event in events], ["cap_held"])
+        self.assertIn("fresh usage collect failed", err.getvalue())
+
     def test_an_uncorroborated_cap_still_disarms_on_the_first_look(self):
         # NOT a hold: the hook says capped and fresh usage says otherwise, on
         # the first look. That contradiction is exactly what fail-closed is
