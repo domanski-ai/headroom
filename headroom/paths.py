@@ -10,6 +10,7 @@ override with ``HEADROOM_DIR``):
 """
 import json
 import os
+import stat
 import tempfile
 
 
@@ -43,16 +44,72 @@ def ensure_private(directory):
     return directory
 
 
+# A POSIX ACL keeps its MASK in the group bits, and chmod rewrites that mask
+# from whatever group bits it is handed. So an unconditional `chmod 0700`
+# silently strips every named grant on the path: getfacl still lists the entry
+# and it grants nothing (`user:svc:r-x  #effective:---`). ensure_private runs
+# on every supervisor tick, so a grant an operator applied and verified green
+# decays minutes later with no error anywhere — observed 2026-07-27 on
+# state/, granted to a read-only HTTP service under its own uid.
+ACL_MASK_BITS = 0o070
+ACL_XATTRS = ("system.posix_acl_access", "system.posix_acl_default")
+
+
+def _extended_acl(target):
+    """Whether ``target`` (a path or an open descriptor) carries a POSIX ACL
+    beyond its mode bits.
+
+    Linux only, via the xattr the kernel stores the ACL in — there is no ACL
+    in the stdlib. Everywhere else (macOS's NFSv4 ACLs included) this reports
+    False and the mode is enforced exactly as it always was: this may only
+    ever RELAX enforcement where an ACL is provably present."""
+    lister = getattr(os, "listxattr", None)
+    if lister is None:
+        return False
+    try:
+        names = lister(target)
+    except OSError:
+        # no xattr support, or the mode cannot be read: enforce, don't guess
+        return False
+    return any(name in names for name in ACL_XATTRS)
+
+
+def _apply_mode(target, mode, stat_fn, chmod_fn):
+    """chmod ``target`` to ``mode`` only when that changes something.
+
+    Two jobs. The cheap one: skip the syscall when the mode is already right,
+    which is the overwhelmingly common case. The load-bearing one: when the
+    path carries an ACL, enforce the OWNER and OTHER bits and pass the current
+    group bits straight back through, so the mask survives. The privacy
+    invariant is unchanged and still enforced on every call — nothing gains
+    access to `other`, the owner keeps exactly what it needs — but a grant the
+    operator made deliberately is no longer collateral damage."""
+    try:
+        current = stat.S_IMODE(stat_fn(target).st_mode)
+    except OSError:
+        # unreadable: fall through so the chmod raises what it always raised
+        chmod_fn(target, mode)
+        return
+    if current == mode:
+        return
+    wanted = mode
+    if _extended_acl(target):
+        wanted = (mode & ~ACL_MASK_BITS) | (current & ACL_MASK_BITS)
+        if wanted == current:
+            return
+    chmod_fn(target, wanted)
+
+
 def chmod_private(path, mode):
     """Apply owner-only permissions where POSIX modes are meaningful."""
     if os.name != "nt":
-        os.chmod(path, mode)
+        _apply_mode(path, mode, os.stat, os.chmod)
 
 
 def fchmod_private(descriptor, mode):
     """Descriptor form of :func:`chmod_private`; a no-op on Windows."""
     if os.name != "nt":
-        os.fchmod(descriptor, mode)
+        _apply_mode(descriptor, mode, os.fstat, os.fchmod)
 
 
 def config_path():
@@ -128,7 +185,13 @@ def load_json(path):
 
 
 def write_json_atomic(path, value, mode=0o600):
-    """Write JSON so readers never observe a partial file."""
+    """Write JSON so readers never observe a partial file.
+
+    NOTE for operators: an ACL set on one of these FILES cannot survive this.
+    The write lands on a fresh temp inode and `os.replace` swaps it in, so the
+    old file's ACL goes with the old inode — no chmod involved and nothing
+    here can preserve it. Grant on the containing DIRECTORY instead (that
+    inode is stable, and :func:`chmod_private` now leaves its mask alone)."""
     ensure_private(base_dir())
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)

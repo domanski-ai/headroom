@@ -12,6 +12,9 @@ import json
 import hashlib
 import io
 import os
+import shutil
+import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -158,6 +161,102 @@ class LockAbstraction(unittest.TestCase):
             paths.fchmod_private(7, 0o600)
         chmod.assert_not_called()
         fchmod.assert_not_called()
+
+
+def _acl_tools():
+    """setfacl+getfacl on a filesystem that actually stores ACLs, or None."""
+    if os.name == "nt" or not hasattr(os, "listxattr"):
+        return "POSIX ACLs are a Linux-only concern here"
+    if not (shutil.which("setfacl") and shutil.which("getfacl")):
+        return "setfacl/getfacl are not installed"
+    with tempfile.TemporaryDirectory() as directory:
+        probe = subprocess.run(
+            ["setfacl", "-m", f"u:{os.getuid()}:r-X", directory],
+            capture_output=True)
+        if probe.returncode != 0:
+            return "the filesystem under TMPDIR does not support ACLs"
+    return None
+
+
+ACL_SKIP = _acl_tools()
+
+
+class PrivateModes(unittest.TestCase):
+    """chmod_private is conditional, and an operator's ACL survives it.
+
+    An unconditional chmod rewrites a POSIX ACL's mask from the group bits it
+    is given, so it strips every named grant on the path — the entry stays
+    listed and grants nothing. ensure_private runs on every supervisor tick,
+    so a grant verified green at provisioning time decayed minutes later with
+    no error anywhere (observed live 2026-07-27 on state/).
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = os.path.join(self.temp.name, "state")
+        os.makedirs(self.directory, mode=0o700)
+
+    def mode(self, path=None):
+        return stat.S_IMODE(os.stat(path or self.directory).st_mode)
+
+    def facl(self):
+        return subprocess.run(["getfacl", "-p", self.directory],
+                              capture_output=True, text=True).stdout
+
+    def test_an_already_correct_mode_never_calls_chmod(self):
+        with mock.patch.object(paths.os, "chmod") as chmod:
+            paths.ensure_private(self.directory)
+        chmod.assert_not_called()
+
+    def test_a_wrong_mode_is_still_corrected(self):
+        os.chmod(self.directory, 0o755)
+        paths.ensure_private(self.directory)
+        self.assertEqual(self.mode(), 0o700)
+
+    def test_a_missing_path_still_raises_from_the_chmod(self):
+        with self.assertRaises(FileNotFoundError):
+            paths.chmod_private(os.path.join(self.temp.name, "nope"), 0o700)
+
+    def test_a_correct_descriptor_mode_never_calls_fchmod(self):
+        path = os.path.join(self.temp.name, "f.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("{}")
+        os.chmod(path, 0o600)
+        with open(path, "r", encoding="utf-8") as handle:
+            with mock.patch.object(paths.os, "fchmod") as fchmod:
+                paths.fchmod_private(handle.fileno(), 0o600)
+            fchmod.assert_not_called()
+            paths.fchmod_private(handle.fileno(), 0o640)
+        self.assertEqual(self.mode(path), 0o640)
+
+    @unittest.skipIf(ACL_SKIP, ACL_SKIP or "")
+    def test_an_operator_acl_survives_ensure_private(self):
+        uid = os.getuid()
+        subprocess.run(["setfacl", "-m", f"u:{uid}:r-X,m::r-X", self.directory],
+                       check=True, capture_output=True)
+        # the mask lives in the group bits, so the mode is no longer 0700 —
+        # which is exactly why "chmod only when the mode differs" is not
+        # enough on its own: it would differ forever, and chmod every time
+        self.assertEqual(self.mode(), 0o750)
+        self.assertIn("mask::r-x", self.facl())
+        for _ in range(3):                       # every supervisor tick
+            paths.ensure_private(self.directory)
+        self.assertIn("mask::r-x", self.facl())
+        self.assertNotIn("#effective:---", self.facl())
+        self.assertEqual(self.mode(), 0o750)
+
+    @unittest.skipIf(ACL_SKIP, ACL_SKIP or "")
+    def test_privacy_still_wins_over_an_acl_bearing_mode(self):
+        uid = os.getuid()
+        subprocess.run(["setfacl", "-m", f"u:{uid}:r-X,m::r-X", self.directory],
+                       check=True, capture_output=True)
+        os.chmod(self.directory, 0o755)          # world access, ACL and all
+        paths.ensure_private(self.directory)
+        # `other` is gone, the owner is intact, and the mask is left alone
+        self.assertEqual(self.mode(), 0o750)
+        self.assertIn("mask::r-x", self.facl())
+        self.assertNotIn("#effective:---", self.facl())
 
 
 class PlatformImportCleanliness(unittest.TestCase):
