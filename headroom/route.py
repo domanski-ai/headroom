@@ -661,11 +661,15 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
 # `block_reason` reports EVERY not-ok collector row as "held: <error_code>",
 # but those rows are not one class. The collector puts transport failures and
 # trust failures through the same field, and the difference decides whether a
-# capped session waits or is disarmed. Only these heal without a human: the
-# provider throttling the usage API or holding us in backoff, and a codex
-# app-server that would not spawn, answer, or speak protocol (including the
-# display-only fallback an unavailable app-server produces — the identity was
-# bound, only the live read was lost).
+# capped session waits or is disarmed. The class is an ABSENCE OF A CURRENT
+# READING: the provider throttling the usage API or holding us in backoff, a
+# codex app-server that would not spawn, answer, or speak protocol (including
+# the display-only fallback an unavailable app-server produces — the identity
+# was bound, only the live read was lost), and an app-server that answered
+# with capacity we could not map to a window. Most of these heal on the next
+# collect; the ones that may not (a dashboard-only install, schema drift)
+# still say nothing AGAINST the seat, and the wait they cost is bounded by
+# the hold budget, where a wrong disarm costs the session.
 UNREADABLE_ERROR_CODES = frozenset({
     "usage_source_rate_limited",        # provider rate-limited the usage API
     "codex_provider_backoff",           # provider-wide backoff window
@@ -675,6 +679,13 @@ UNREADABLE_ERROR_CODES = frozenset({
     "codex_app_server_no_response",
     "codex_app_server_protocol_error",
     "codex_dashboard_only",             # app-server down; telemetry not live
+    # Answered, but with windows we could not map. That is provider-schema
+    # drift or a truncated answer — missing capacity EVIDENCE about a seat
+    # whose identity checks all passed. It sat in the disarm class below and
+    # cost a healthy capped seat its automation the moment the provider
+    # changed a field name; a protocol error already waited, and these are
+    # the same shape of failure.
+    "codex_capacity_unrecognized",
 })
 # Everything else a `held:` row can carry is a trust boundary or a standing
 # fact about the seat, and neither is a latency cost: a revoked credential
@@ -692,7 +703,6 @@ MUST_DISARM_ERROR_CODES = frozenset({
     "codex_auth_missing",
     "codex_auth_rejected",              # provider invalidated the login
     "codex_capacity_unavailable",       # API-key seat: no subscription pools
-    "codex_capacity_unrecognized",      # answered, but with no window we know
     "codex_cli_missing",
     "codex_identity_email_missing",
     "identity_id_missing",

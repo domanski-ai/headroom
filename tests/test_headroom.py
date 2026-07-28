@@ -753,6 +753,23 @@ class UnreadableIsNotUntrusted(unittest.TestCase):
             self.assertFalse(route.reading_unavailable(reason, "sonnet"),
                              f"{code} is a trust boundary, not a latency cost")
 
+    def test_unmapped_capacity_is_missing_evidence_not_a_trust_failure(self):
+        """The round-4 adjudication of a placement the builder had flagged as
+        judgement: `codex_capacity_unrecognized` means the app-server ANSWERED
+        and we could not map any window it described — provider-schema drift
+        about a seat whose identity checks all passed. It sat in the disarm
+        set, so one renamed provider field cost a healthy capped seat its
+        automation mid-hold, while the same-shaped protocol error waited.
+        Pinned by name so the classification cannot quietly revert; its
+        API-key sibling stays a disarm, because "this seat has no
+        subscription windows" is a standing fact, not a missing reading."""
+        held = self.reason(self.held("codex_capacity_unrecognized"))
+        self.assertTrue(route.reading_unavailable(held, "sonnet"),
+                        "unmapped capacity is an absence of evidence — wait")
+        fact = self.reason(self.held("codex_capacity_unavailable"))
+        self.assertFalse(route.reading_unavailable(fact, "sonnet"),
+                         "an API-key seat does not grow windows by waiting")
+
     def test_an_unclassified_collector_failure_disarms(self):
         """`block_reason` falls back to the row's free-text note, and to a
         bare "not ok" when there is not even that. Neither is evidence that
@@ -791,11 +808,16 @@ class UnreadableIsNotUntrusted(unittest.TestCase):
         the predicate is left quoting the old wording."""
         self.assertEqual(inspect.getsourcefile(route.reading_unavailable),
                          inspect.getsourcefile(route.block_reason))
-        producer = inspect.getsource(route.block_reason)
+        # Membership in the producer's LITERAL SET, not its source text: a
+        # substring check passed when a producer message was extended in
+        # place ("reading stale" -> "reading stale — retry" still CONTAINS
+        # the old wording), which is precisely the drift this test exists to
+        # refuse.
+        producer = _string_literals(route.block_reason)
         for literal in _string_literals(route.reading_unavailable):
             if literal in ("held: ", "5h", "7d"):
                 continue                # composed prefixes, not messages
-            self.assertTrue(literal in producer,   # assertIn dumps the source
+            self.assertTrue(literal in producer,   # assertIn dumps every literal
                             f"{literal!r} is no longer a block_reason message")
 
     def test_spent_untrusted_and_policy_are_never_unreadable(self):
