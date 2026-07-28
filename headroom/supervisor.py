@@ -95,6 +95,17 @@ CAP_HOLD_SECONDS = max(30.0, float(
 # HEADROOM_CAP_HOLD_MAX=0 restores the pre-hold behaviour exactly: the first
 # capacity refusal disarms.
 CAP_HOLD_MAX = max(0, paths.env_int("HEADROOM_CAP_HOLD_MAX", 60))
+# Mid-hold, fresh usage can legitimately resolve to a DIFFERENT cooldown key
+# than the one the hold recorded — the 5h window fills behind a scoped weekly
+# pool and the account-wide scope starts winning. The recorded scope stays
+# immutable either way (only the cap it corroborated may ever move a session),
+# but "different key" used to have only two endings: the recorded window reads
+# below 99 and the cap is over, or it holds as "not readable". A recorded
+# window sitting at a readable, legitimate 100% fell into the second and could
+# never proceed — so the session waited out the whole budget with a free seat
+# in front of it and then disarmed on the capped account.
+# HEADROOM_CAP_ROTATE_AT_WALL=0 restores that two-outcome behaviour.
+CAP_ROTATE_AT_WALL = os.environ.get("HEADROOM_CAP_ROTATE_AT_WALL", "1") != "0"
 # How many extra CAP_MODEL_TIMEOUT windows the cap-time model lookup may wait
 # before the child is disarmed. A transcript that has not yet been flushed is
 # not a contradicted proof, and 6s is a short window to bet a session on.
@@ -2365,6 +2376,25 @@ class Supervisor:
             raise SupervisorError("cap proof expired after a newer hook event")
 
     @staticmethod
+    def _recorded_scope(child, family, window):
+        """The cap the hold recorded, re-read off THIS snapshot.
+
+        Same shape `route.cap_scope` returns, but the key, the window and the
+        account-wide flag come from what was corroborated when the hold began
+        — only the percentage and the reset are refreshed. That is the whole
+        point: the session moves on the cap it proved, cooling the window it
+        proved, with this snapshot's reset rather than a stale one."""
+        reset = window.get("resets_at")
+        return {
+            "key": child.cap_scope_key,
+            "account_wide": not child.cap_scope_window.startswith("scoped:"),
+            "family": family,
+            "window": child.cap_scope_window,
+            "used_percent": float(window["used_percent"]),
+            "reset": reset if _number(reset) else None,
+        }
+
+    @staticmethod
     def _scope_window(family, row, key):
         """The window a cap scope key names, in this row, or None."""
         windows = row.get("windows") if isinstance(row, dict) else None
@@ -2436,25 +2466,34 @@ class Supervisor:
                 # rewrite what we are holding for (observed: a scoped Fable
                 # cap whose pool reset to 4% while the 5h window filled came
                 # back as a 5h handoff). So interrogate only the recorded
-                # window — a readable reading below 99% means the cap we held
-                # for is genuinely over, and anything unreadable means this
-                # snapshot proves nothing and the proof is kept.
+                # window. It has THREE answers, not two: a readable reading
+                # below 99% means the cap we held for is genuinely over; a
+                # readable reading still AT the wall means it is genuinely
+                # not over and this attempt should proceed on it; and only an
+                # unreadable one proves nothing and keeps the proof.
                 window = self._scope_window(
                     proof.family,
                     _snapshot_row(snapshot, child.account["name"]),
                     child.cap_scope_window)
                 used = window.get("used_percent") \
                     if isinstance(window, dict) else None
-                if isinstance(window, dict) \
-                        and window.get("freshness") != "expired_observation" \
-                        and _number(used) and 0 <= used < 99:
+                readable = isinstance(window, dict) \
+                    and window.get("freshness") != "expired_observation" \
+                    and _number(used) and 0 <= used <= 100
+                if readable and used < 99:
                     raise CapCleared(
                         f"the capped {child.cap_scope_window} window is back "
                         f"to {used:g}% — it reset while we waited for a seat")
-                raise CapacityHold(
-                    f"the capped {child.cap_scope_window} window is not "
-                    "readable in fresh usage — holding the proof rather than "
-                    "assuming it reset")
+                if not (readable and CAP_ROTATE_AT_WALL):
+                    raise CapacityHold(
+                        f"the capped {child.cap_scope_window} window is not "
+                        "readable in fresh usage — holding the proof rather "
+                        "than assuming it reset")
+                # Still at the wall. Rotate on the RECORDED scope, rebuilt
+                # from the recorded window's own fresh reading — never on the
+                # different scope we just read, which is the cap nobody
+                # corroborated.
+                scope = self._recorded_scope(child, proof.family, window)
             reset = scope.get("reset")
             if (not isinstance(reset, (int, float)) or isinstance(reset, bool)
                     or not math.isfinite(reset) or reset <= self.now()):

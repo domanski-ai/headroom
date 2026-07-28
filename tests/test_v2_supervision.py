@@ -3617,6 +3617,70 @@ class CapWaitsForCapacity(TempDirCase):
         outcome, _child = self.scoped_hold((10.0, 10.0, 10.0, 5.0, 100.0))
         self.assertEqual(outcome.target["name"], "target")
 
+    GENERIC = "You've hit your usage limit"
+
+    def wall_hold(self, second, message=None):
+        """A held cap recorded on the SCOPED pool under a generic phrase, so
+        a later snapshot can legitimately resolve to a different key."""
+        runner = self.runner([(10.0, 100.0, 10.0, None, 100.0), second])
+        child, proof = self.child(), self.proof(message or self.GENERIC)
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(supervisor.CapacityHold):
+                runner._preflight(child, proof)
+            self.assertEqual((child.cap_scope_key, child.cap_scope_window),
+                             ("source:fable", "scoped:fable"))
+            try:
+                return runner._preflight(
+                    child, proof, held=child.cap_scope_window), child
+            except supervisor.SupervisorError as error:
+                return error, child
+
+    def test_a_recorded_window_still_at_the_wall_rotates(self):
+        """The recorded scope had two outcomes and needed three.
+
+        Below 99 cleared it; ANYTHING else was reported as "not readable" and
+        held. So a recorded window sitting at a legitimate, perfectly
+        readable 100% could never proceed — the session waited out the whole
+        hold budget with a fit seat in front of it and then disarmed on the
+        capped account, which is the exact failure the hold was built to
+        prevent.
+
+        Here the Fable pool the hold recorded is still at 100% and the 5h
+        window has filled behind it, so fresh usage resolves to `source:*`
+        while the recorded key is `source:fable`. The recorded window is
+        still provably spent and a seat is free: move."""
+        outcome, child = self.wall_hold((100.0, 5.0, 10.0, None, 100.0))
+        self.assertNotIsInstance(outcome, supervisor.SupervisorError)
+        self.assertEqual(outcome.target["name"], "target")
+        # ...on the scope it CORROBORATED, never the one it just read: the
+        # immutability of the recorded scope is what stops a hold quietly
+        # turning into a 5h account-wide handoff nobody proved.
+        self.assertEqual((child.cap_scope_key, child.cap_scope_window),
+                         ("source:fable", "scoped:fable"))
+        self.assertEqual(outcome.cooldown_scope["key"], "source:fable")
+        self.assertEqual(outcome.cooldown_scope["window"], "scoped:fable")
+        self.assertIs(outcome.cooldown_scope["account_wide"], False)
+        self.assertEqual(outcome.cooldown_scope["used_percent"], 100.0)
+        self.assertGreater(outcome.cooldown_scope["reset"], self.clock["t"])
+
+    def test_a_recorded_wall_with_no_seat_still_holds(self):
+        """Rotating needs a destination as much as it ever did."""
+        outcome, _child = self.wall_hold((100.0, 100.0, 10.0, None, 100.0))
+        self.assertIsInstance(outcome, supervisor.CapacityHold)
+
+    def test_a_recorded_wall_that_went_unreadable_still_holds(self):
+        """Only a window that can be READ at the wall may rotate. An expired
+        observation of it proves nothing and keeps the proof."""
+        outcome, _child = self.wall_hold((100.0, 5.0, 10.0, None, None))
+        self.assertIsInstance(outcome, supervisor.CapacityHold)
+        self.assertIn("not readable in fresh usage", str(outcome))
+
+    def test_the_wall_rotation_has_a_kill_switch(self):
+        with mock.patch.object(supervisor, "CAP_ROTATE_AT_WALL", False):
+            outcome, _child = self.wall_hold((100.0, 5.0, 10.0, None, 100.0))
+        self.assertIsInstance(outcome, supervisor.CapacityHold)
+        self.assertIn("not readable in fresh usage", str(outcome))
+
     def test_a_proof_may_only_ever_admit_the_cap_it_recorded(self):
         # the scoped pool it was holding for resets to 4% while the 5h window
         # fills. That is a DIFFERENT cap: reading it as this one cooled a

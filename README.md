@@ -87,7 +87,15 @@ window resets first, the hold ends with the session still armed (`cap_cleared`)
 hours (`HEADROOM_CAP_HOLD_SECONDS`, `HEADROOM_CAP_HOLD_MAX`; set the max to `0`
 for the old give-up-immediately behaviour), after which it disarms and says so
 exactly as before. A cap that fresh usage *contradicts* is not a hold and
-never was: that still disarms on the first look.
+never was: that still disarms on the first look — and neither is a seat whose
+login was rejected, revoked, or bound to a different account than expected.
+Those are trust failures, not slow ones; they disarm rather than wait.
+
+A hold only ever moves the session on the cap it corroborated when the hold
+began, even if a *different* window has hit the wall meanwhile. If that
+recorded window is still readable and still at the wall when a seat frees up,
+the session rotates on it (`HEADROOM_CAP_ROTATE_AT_WALL=0` to keep waiting
+instead); if it has dropped below the wall the cap is simply over.
 
 What comes back is the **conversation**, not the turn that was refused. The
 resumed session starts idle: nothing re-sends the prompt Claude refused, and
