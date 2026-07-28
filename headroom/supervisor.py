@@ -2496,22 +2496,27 @@ class Supervisor:
                         f"the capped {child.cap_scope_window} window is not "
                         "readable in fresh usage — holding the proof rather "
                         "than assuming it reset")
+                if not CAP_ROTATE_AT_WALL:
+                    # The switch's documented meaning (README): a recorded
+                    # window still readable and still at the wall KEEPS
+                    # WAITING when the operator sets 0 — whichever key fresh
+                    # usage now prefers. Round 5 refused the first version of
+                    # this branch, which exempted the same-key relabel on the
+                    # grounds that it predated the switch; predating the
+                    # switch is not an exemption from its contract.
+                    raise CapacityHold(
+                        f"the capped {child.cap_scope_window} window is "
+                        "still at the wall and rotation at the wall is "
+                        "disabled — holding the proof")
                 if (scope or {}).get("key") == child.cap_scope_key:
                     # Same key, and the recorded window itself is still at
                     # the wall: this is the account-wide RELABEL — the other
                     # account window crossed too and now binds the cooldown.
                     # That was never a scope change and it proceeds on the
-                    # fresh scope, exactly as it did before the wall rotation
-                    # existed (which is why the switch below does not gate
-                    # it). What the window comparison above added is only
-                    # this: the relabel may no longer swallow a recorded
+                    # fresh scope. What the window comparison above added is
+                    # only this: the relabel may no longer swallow a recorded
                     # window that has provably RESET.
                     pass
-                elif not CAP_ROTATE_AT_WALL:
-                    raise CapacityHold(
-                        f"the capped {child.cap_scope_window} window is "
-                        "still at the wall and rotation at the wall is "
-                        "disabled — holding the proof")
                 else:
                     # Still at the wall under a different key. Rotate on the
                     # RECORDED scope, rebuilt from the recorded window's own

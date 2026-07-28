@@ -90,6 +90,31 @@ def _return_literals(func):
             and isinstance(node.value.value, str)}
 
 
+def _returned_message_literals(func):
+    """Every string constant that appears INSIDE a return expression of
+    `func` — bare literals, f-string constant parts, and the pieces of a
+    concatenation — and nothing that appears anywhere else.
+
+    `_string_literals` collects the whole function body, so an obsolete
+    literal parked in an unrelated expression would keep a wording property
+    passing after the produced message changed. Messages are what a function
+    RETURNS; only those may witness that a classifier's quotation is still
+    real."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    out = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Return) or node.value is None:
+            continue
+        for inner in ast.walk(node.value):
+            if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+                out.add(inner.value)
+            elif isinstance(inner, ast.JoinedStr):
+                out.update(part.value for part in inner.values
+                           if isinstance(part, ast.Constant)
+                           and isinstance(part.value, str))
+    return {value for value in out if value.strip()}
+
+
 def _collector_error_codes():
     """Every `error_code` collect.py can put on a row, read out of its SOURCE
     rather than listed here — a list here would be the same drifting copy the
@@ -808,12 +833,14 @@ class UnreadableIsNotUntrusted(unittest.TestCase):
         the predicate is left quoting the old wording."""
         self.assertEqual(inspect.getsourcefile(route.reading_unavailable),
                          inspect.getsourcefile(route.block_reason))
-        # Membership in the producer's LITERAL SET, not its source text: a
-        # substring check passed when a producer message was extended in
-        # place ("reading stale" -> "reading stale — retry" still CONTAINS
-        # the old wording), which is precisely the drift this test exists to
-        # refuse.
-        producer = _string_literals(route.block_reason)
+        # Membership in the producer's RETURNED literals, not its source
+        # text and not its whole body: a substring check passed when a
+        # message was extended in place ("reading stale" -> "reading stale
+        # — retry" still CONTAINS the old wording), and a whole-body
+        # collection would let an obsolete literal parked in an unrelated
+        # expression keep witnessing a message the function no longer
+        # returns. Only what block_reason RETURNS may vouch for a quotation.
+        producer = _returned_message_literals(route.block_reason)
         for literal in _string_literals(route.reading_unavailable):
             if literal in ("held: ", "5h", "7d"):
                 continue                # composed prefixes, not messages

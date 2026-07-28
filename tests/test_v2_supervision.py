@@ -3741,6 +3741,22 @@ class CapWaitsForCapacity(TempDirCase):
                 (4.0, 5.0, 10.0, None, None, 100.0))
         self.assertIsInstance(outcome, supervisor.CapCleared)
 
+    def test_the_switch_pins_the_shared_key_relabel_too(self):
+        """Round 5: the switch's contract is the README's, not the branch
+        history's — a recorded window still readable and still at the wall
+        KEEPS WAITING under HEADROOM_CAP_ROTATE_AT_WALL=0, whichever key
+        fresh usage now prefers. The first fix exempted the same-key relabel
+        because it predated the switch, and a session the operator asked to
+        pin moved anyway."""
+        with mock.patch.object(supervisor, "CAP_ROTATE_AT_WALL", False):
+            outcome, child = self.account_hold(
+                (100.0, 5.0, 10.0, None, None, 100.0))
+        self.assertIsInstance(outcome, supervisor.CapacityHold)
+        self.assertIn("rotation at the wall is disabled", str(outcome))
+        self.assertEqual((child.cap_scope_key, child.cap_scope_window),
+                         ("source:*", "5h"))
+        self.assertEqual(self.ledger(), [])
+
     def test_a_shared_key_relabel_still_stands_when_both_windows_hold(self):
         """The round-2 agreement is untouched: when the recorded 5h window is
         STILL at the wall and the 7d crossed too, the account-wide scope
