@@ -2608,9 +2608,25 @@ class RunLimitPartition(unittest.TestCase):
         _code, _children, marks, _errors = self.run_claude(
             "You've hit your 5-hour limit")
         self.assertEqual(marks[0][:4], ("a", "fable", True, "5h"))
-        _code, _children, marks, _errors = self.run_claude(
+        # Weekly wording with NOTHING to read still cools the account for a
+        # week: no row, so nothing can contradict the phrase.
+        self.assertEqual(route.run_cooldown_scope("hit your weekly limit"),
+                         (True, "7d"))
+
+    def test_weekly_wording_over_a_healthy_weekly_window_is_not_account_wide(self):
+        """The fixture row says the account's 7d window is 20% used and the
+        Fable pool is spent. `cap_scope` has always read that as the scoped
+        pool — it may not corroborate a 7d cap against a window at 20% — while
+        `run` cooled the whole account for seven days on the word "weekly".
+
+        Same seat, same refusal, two different things spent, and the account
+        one costs every other family six days to protect the one family that
+        was actually the only thing at the wall. `run` now follows the reading
+        the way the corroborating consumer always had to."""
+        _code, _children, marks, errors = self.run_claude(
             "You've hit your weekly limit")
-        self.assertEqual(marks[0][:4], ("a", "fable", True, "7d"))
+        self.assertEqual(marks[0][:4], ("a", "fable", False, "7d"))
+        self.assertIn("cooled fable-only", errors)
 
     def test_cap_scope_reads_the_credits_wording_the_same_way(self):
         now = int(time.time())
@@ -2636,6 +2652,103 @@ class RunLimitPartition(unittest.TestCase):
         row["windows"].pop("scoped:Fable")
         scope = route.cap_scope(snapshot, "a", "fable", self.CREDITS)
         self.assertEqual((scope["key"], scope["window"]), ("a:*", "5h"))
+
+
+class OneRefusalCoolsOneThing(unittest.TestCase):
+    """The cap vocabulary has exactly two consumers and they must never spend
+    different things for the same refusal on the same seat.
+
+    `cap_scope` corroborates a supervisor hook against a fresh row; `run`
+    reacts to a child's stderr with the row it has. Sharing only the credits
+    predicate left them disagreeing wherever the PHRASE named one window and
+    the READING showed another — three such cases below, all of which
+    disagreed before `cooldown_scope_for` became the one decision.
+
+    They report in two vocabularies on purpose: `cap_scope`'s window is the
+    READING it corroborated ("scoped:fable"), `run`'s is the cooldown
+    DURATION to write ("7d"). Agreement is the pool and the duration, so the
+    scoped reading is normalised to its seven days before comparing."""
+
+    CREDITS = ("You're out of usage credits. Run /usage-credits to keep "
+               "using Fable 5")
+
+    def windows(self, five=10.0, seven=20.0, scoped=None):
+        now = int(time.time())
+        out = {"5h": {"used_percent": five, "resets_at": now + 3600,
+                      "window_minutes": 300},
+               "7d": {"used_percent": seven, "resets_at": now + 8 * 86400,
+                      "window_minutes": 10080}}
+        if scoped is not None:
+            out["scoped:Fable"] = {"used_percent": scoped,
+                                   "resets_at": now + 6 * 86400,
+                                   "window_minutes": 10080}
+        return out
+
+    def both(self, message, windows, fam="fable"):
+        """(cap_scope, run) normalised to one (account_wide, duration)."""
+        snapshot = {"accounts": [dict(_claude_row("a"), windows=windows)]}
+        scope = route.cap_scope(snapshot, "a", fam, message)
+        corroborating = None if scope is None else (
+            scope["account_wide"],
+            "7d" if scope["window"].startswith("scoped:") else scope["window"])
+        return corroborating, route.run_cooldown_scope(message, windows, fam)
+
+    def test_credits_wording_plus_session_wording(self):
+        """P1(a). Session wording narrows corroboration to 5h, which leaves
+        no scoped hit — but `run` was still reading the credits phrase off
+        the pool and cooling one family for a week while the supervisor
+        cooled the account for five hours."""
+        message = self.CREDITS + " You've hit your 5-hour limit."
+        windows = self.windows(five=100.0, scoped=100.0)
+        corroborating, running = self.both(message, windows)
+        self.assertEqual(corroborating, (True, "5h"))
+        self.assertEqual(running, corroborating)
+
+    def test_credits_wording_with_no_scoped_reading_follows_the_wall(self):
+        """P1(b). Nothing corroborates the pool the phrase names, so both
+        fall back — and the fallback is the account window that is ACTUALLY
+        at the wall, not the one the wording implies. 7d is spent here; a 5h
+        cooldown would send the next launch back into a wall it cannot pass
+        for another week."""
+        corroborating, running = self.both(
+            self.CREDITS, self.windows(five=10.0, seven=100.0))
+        self.assertEqual(corroborating, (True, "7d"))
+        self.assertEqual(running, corroborating)
+
+    def test_weekly_wording_with_only_the_pool_at_the_wall(self):
+        """The third disagreement. `cap_scope` cannot corroborate a 7d cap
+        against a 7d window at 20%, so it reads the spent pool; `run` took
+        the word "weekly" at face value and cooled the account for a week."""
+        corroborating, running = self.both(
+            "You've hit your weekly limit", self.windows(seven=20.0,
+                                                         scoped=100.0))
+        self.assertEqual(corroborating, (False, "7d"))
+        self.assertEqual(running, corroborating)
+
+    def test_they_agree_across_the_whole_vocabulary(self):
+        """Every phrase against every shape of row. `cap_scope` abstains when
+        nothing is at the wall (it may not invent corroboration); wherever it
+        does answer, `run` must answer the same."""
+        messages = [
+            self.CREDITS, self.CREDITS + " You've hit your 5-hour limit.",
+            self.CREDITS + " weekly limit reached",
+            "You've hit your 5-hour limit", "You've hit your weekly limit",
+            "You've hit your usage limit", "You've hit your session limit",
+        ]
+        rows = [self.windows(f, s, p)
+                for f in (10.0, 100.0) for s in (10.0, 100.0)
+                for p in (None, 40.0, 100.0)]
+        answered = 0
+        for message in messages:
+            for windows in rows:
+                corroborating, running = self.both(message, windows)
+                if corroborating is None:
+                    continue        # nothing at the wall: run cools on faith
+                answered += 1
+                self.assertEqual(
+                    running, corroborating,
+                    f"{message!r} disagrees on {windows!r}")
+        self.assertGreater(answered, 30)   # the sweep really is exercising it
 
 
 class CmdExecCodexRefusal(unittest.TestCase):

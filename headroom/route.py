@@ -55,6 +55,9 @@ TRANSIENT_RE = re.compile(
 LIMIT_RE = re.compile(
     "(?:%s)|(?:%s)" % (CAP_RE.pattern, TRANSIENT_RE.pattern), re.I)
 WEEKLY_RE = re.compile(r"week", re.I)
+# The families that HAVE a per-model weekly pool. Named once: three copies of
+# this tuple were deciding three different things about the same seat.
+SCOPED_FAMILIES = ("opus", "sonnet", "haiku", "fable")
 # The credits wording is not just another way to say "capped": it NAMES the
 # model-scoped weekly pool ("Run /usage-credits to keep using Fable 5"). That
 # makes it the one cap phrase that decides a different cooldown scope and a
@@ -620,8 +623,8 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     # scoped weekly caps are per-MODEL (e.g. Opus); only gate on them for a
     # specific model family, never for the generic "claude" route — otherwise
     # an Opus cap would wrongly hold Sonnet/Haiku work.
-    scoped = scoped_window_for(fam, windows) if fam in (
-        "opus", "sonnet", "haiku", "fable") else None
+    scoped = scoped_window_for(fam, windows) \
+        if fam in SCOPED_FAMILIES else None
     if scoped is not None:
         # fail CLOSED like 5h/7d: a scoped cap that is unreadable or expired
         # must hold, not silently route an exhausted model family
@@ -736,24 +739,62 @@ def reading_unavailable(reason, fam):
                       f"{fam} weekly cap reading expired — no current proof")
 
 
-def credits_scope_applies(text, windows, fam):
-    """Whether the credits wording may cool the model-scoped weekly pool.
-
-    "Out of usage credits … keep using Fable 5" NAMES that pool, but naming is
-    not proof: there has to be a reading at the wall to cool. Both consumers
-    ask this one question — :func:`cap_scope`, which corroborates a hook
-    against fresh usage, and :func:`run_cooldown_scope`, which reacts to a
-    child's stderr — so they cannot answer it differently for the same seat.
-
-    Without a scoped reading neither may claim the pool is spent: cap_scope
-    would be inventing corroboration, which is the one thing the cap path may
-    never do. Both then fall back to the window that IS provably at the wall,
-    and the pool gets cooled on the next refusal that can show it."""
-    if not CREDITS_RE.search(text or "") or not isinstance(windows, dict):
-        return False
-    scoped = scoped_window_for(fam, windows)
-    used = scoped.get("used_percent") if isinstance(scoped, dict) else None
+def at_wall(window):
+    """Whether a window reading is provably spent (>=99%)."""
+    used = window.get("used_percent") if isinstance(window, dict) else None
     return bool(_number(used) and used >= 99)
+
+
+def wall_flags(text, windows, fam):
+    """``(5h, 7d, scoped)`` — which windows this PHRASE admits AND this ROW
+    shows at the wall.
+
+    The narrowing and the reading in one place, because both consumers of the
+    cap vocabulary have to apply them identically."""
+    windows = windows if isinstance(windows, dict) else {}
+    wants_weekly = WEEKLY_RE.search(text or "") is not None
+    wants_session = SESSION_RE.search(text or "") is not None
+    return (at_wall(windows.get("5h")) and not wants_weekly,
+            at_wall(windows.get("7d")) and not wants_session,
+            (not wants_session) and fam in SCOPED_FAMILIES
+            and at_wall(scoped_window_for(fam, windows)))
+
+
+def cooldown_scope_for(text, windows, fam):
+    """``(account_wide, window)`` — what one cap phrase points at on one row.
+
+    THE decision, shared. :func:`cap_scope` corroborates a hook against fresh
+    usage and :func:`run_cooldown_scope` reacts to a child's stderr, but they
+    must never cool different things for the same refusal on the same seat,
+    so neither gets its own opinion about what a phrase means. Sharing only
+    the credits predicate was not enough: the two still disagreed whenever
+    the phrase named one thing and the row showed another.
+
+    * credits wording with the scoped pool provably at the wall — that pool,
+      one family, seven days. Naming a pool is not proof it is spent, so
+      without a reading at the wall this does not fire (cap_scope would be
+      inventing corroboration, the one thing the cap path may never do).
+    * otherwise, whichever ACCOUNT-wide window is at the wall — 7d if the
+      weekly one is, else 5h. This is the fallback the credits wording lands
+      in with no scoped reading, and it follows the reading rather than the
+      phrase: "out of credits" on a row showing 5h at 10% and 7d at 100% is
+      a weekly wall, whatever the sentence calls it.
+    * scoped-only at the wall — that pool, seven days, whatever the phrase
+      says. Cooling the account for a week over its 20%-used weekly window
+      because the message said "weekly" spends six days of every other
+      family to protect one that is already the only thing spent.
+    * nothing at the wall — fall back to what the WORDING says. Only `run`
+      reaches this: it has no corroboration duty and a child really was
+      refused, so it cools the broadest thing the phrase supports, while
+      cap_scope returns None rather than cool an uncorroborated window."""
+    five, seven, scoped = wall_flags(text, windows, fam)
+    if scoped and CREDITS_RE.search(text or ""):
+        return False, "7d"
+    if five or seven:
+        return True, ("7d" if seven else "5h")
+    if scoped:
+        return False, "7d"
+    return (True, "7d") if WEEKLY_RE.search(text or "") else (True, "5h")
 
 
 def _codex_gate(account, snapshot_row, identity):
@@ -980,6 +1021,12 @@ def cap_scope(snapshot, name, fam, message=""):
     are one scope and retain their latest reset — but the credits wording
     (``CREDITS_RE``) names the scoped weekly pool, so a scoped hit wins over
     a simultaneous account-wide one for that phrase alone.
+
+    WHICH scope is :func:`cooldown_scope_for`'s call, not this function's —
+    `run` asks the same question of the same row and the two may not answer
+    it differently. All this adds is the corroboration duty `run` does not
+    have: no window at the wall means None (a cap nobody can corroborate),
+    never a window picked from the wording alone.
     """
     row = _snapshot_accounts(snapshot).get(name)
     if not isinstance(row, dict):
@@ -988,55 +1035,34 @@ def cap_scope(snapshot, name, fam, message=""):
     if not isinstance(windows, dict):
         return None
     text = message if isinstance(message, str) else ""
-    wants_weekly = WEEKLY_RE.search(text) is not None
-    wants_session = SESSION_RE.search(text) is not None
-    account_hits = []
-    scoped_hit = None
-    if not wants_weekly:
-        window = windows.get("5h")
-        if isinstance(window, dict) and _number(window.get("used_percent")) \
-                and window["used_percent"] >= 99:
-            account_hits.append(("5h", window))
-    if not wants_session:
-        window = windows.get("7d")
-        if isinstance(window, dict) and _number(window.get("used_percent")) \
-                and window["used_percent"] >= 99:
-            account_hits.append(("7d", window))
-        scoped = scoped_window_for(fam, windows) if fam in (
-            "opus", "sonnet", "haiku", "fable") else None
-        if isinstance(scoped, dict) and _number(scoped.get("used_percent")) \
-                and scoped["used_percent"] >= 99:
-            scoped_hit = scoped
-    scoped_scope = {
-        "key": f"{name}:{fam}", "account_wide": False,
-        "family": fam, "window": "scoped:" + fam,
-        "used_percent": float(scoped_hit["used_percent"]),
-        "reset": scoped_hit.get("resets_at")
-        if _number(scoped_hit.get("resets_at")) else None,
-    } if scoped_hit is not None else None
-    # A generic phrase may use any single applicable scope, and when two
-    # apply the account-wide one wins — EXCEPT for the credits wording, which
-    # names its scope out loud. Cooling the whole account for 5h on a "keep
-    # using Fable 5" refusal leaves the pool that actually refused uncooled,
-    # so the next launch picks the same spent family again five hours later.
-    # `scoped_scope is not None` stays the structural precondition: a message
-    # carrying BOTH credits and session wording narrows to 5h, which leaves no
-    # scoped hit to prefer, and preferring a None here would return "no cap"
-    # for a seat that is provably capped.
-    if scoped_scope is not None and credits_scope_applies(text, windows, fam):
-        return scoped_scope
-    if account_hits:
-        resets = [window.get("resets_at") for _, window in account_hits
-                  if _number(window.get("resets_at"))]
-        used = max(window["used_percent"] for _, window in account_hits)
+    # the narrowing and the readings: the SAME two lines `run` decides from,
+    # so one refusal can never cool two different things
+    five, seven, scoped_ok = wall_flags(text, windows, fam)
+    if not (five or seven or scoped_ok):
+        return None                     # nothing corroborates this phrase
+    account_wide, window_key = cooldown_scope_for(text, windows, fam)
+    if not account_wide:
+        scoped_hit = scoped_window_for(fam, windows)
         return {
-            "key": f"{name}:*", "account_wide": True,
-            "family": fam, "window": "7d" if any(
-                key == "7d" for key, _ in account_hits) else "5h",
-            "used_percent": float(used),
-            "reset": max(resets) if resets else None,
+            "key": f"{name}:{fam}", "account_wide": False,
+            "family": fam, "window": "scoped:" + fam,
+            "used_percent": float(scoped_hit["used_percent"]),
+            "reset": scoped_hit.get("resets_at")
+            if _number(scoped_hit.get("resets_at")) else None,
         }
-    return scoped_scope
+    # account-wide: both windows can be at the wall at once, and they are ONE
+    # scope that keeps the latest reset of them
+    account_hits = [windows[key] for key, hit
+                    in (("5h", five), ("7d", seven)) if hit]
+    resets = [window.get("resets_at") for window in account_hits
+              if _number(window.get("resets_at"))]
+    return {
+        "key": f"{name}:*", "account_wide": True,
+        "family": fam, "window": window_key,
+        "used_percent": float(max(window["used_percent"]
+                                  for window in account_hits)),
+        "reset": max(resets) if resets else None,
+    }
 
 
 def earliest_reset(snapshot, fam=None, exclude=None):
@@ -1086,26 +1112,12 @@ def window_reset(snapshot, name, window_key):
 def run_cooldown_scope(stderr, windows=None, fam=None):
     """``(account_wide, window)`` for a CAP on a `run` child's stderr.
 
-    Three wordings, three different things to spend:
-
-    * credits — "out of usage credits" is the model-SCOPED weekly pool, so
-      when the row can show that pool at the wall it is the only thing cooled:
-      one family, seven days. Account-wide would take every other family down
-      with it, and a 5h window would let the next launch pick the same spent
-      family again in five hours.
-    * weekly — the all-model weekly window: account-wide, seven days.
-    * anything else, INCLUDING credits with no scoped reading to justify it —
-      a session cap: account-wide, five hours.
-
-    The fallback is not a shrug: it is the same answer `cap_scope` gives for
-    the same seat, through the same :func:`credits_scope_applies` predicate.
-    The two consumers of this vocabulary must not cool different things for
-    one refusal."""
-    if credits_scope_applies(stderr, windows, fam):
-        return False, "7d"
-    if WEEKLY_RE.search(stderr or ""):
-        return True, "7d"
-    return True, "5h"
+    A thin alias for :func:`cooldown_scope_for` and deliberately nothing
+    more: the moment this function has an opinion of its own, `run` and the
+    supervisor cool different things for the same refusal on the same seat.
+    It exists to name the caller in tracebacks and to keep `run`'s call site
+    reading like what it is."""
+    return cooldown_scope_for(stderr, windows, fam)
 
 
 def _cap_window_reset(snapshot, name, fam, account_wide, window_key):
