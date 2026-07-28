@@ -247,6 +247,21 @@ class PrivateModes(unittest.TestCase):
         self.assertEqual(self.mode(), 0o750)
 
     @unittest.skipIf(ACL_SKIP, ACL_SKIP or "")
+    def test_a_default_acl_alone_never_buys_group_bits(self):
+        # A DEFAULT ACL is a template for files created inside the directory.
+        # It grants nothing on the directory itself and chmod does not touch
+        # it, so reading it as "these group bits are a mask" left state at
+        # 0750 where 0700 was enforced before — a privacy regression.
+        subprocess.run(["setfacl", "-d", "-m", f"u:{os.getuid()}:r--",
+                        self.directory], check=True, capture_output=True)
+        os.chmod(self.directory, 0o750)
+        paths.ensure_private(self.directory)
+        self.assertEqual(self.mode(), 0o700)
+        # ...and the template itself is untouched, because chmod never had it
+        self.assertIn("system.posix_acl_default",
+                      os.listxattr(self.directory))
+
+    @unittest.skipIf(ACL_SKIP, ACL_SKIP or "")
     def test_privacy_still_wins_over_an_acl_bearing_mode(self):
         uid = os.getuid()
         subprocess.run(["setfacl", "-m", f"u:{uid}:r-X,m::r-X", self.directory],

@@ -52,12 +52,17 @@ def ensure_private(directory):
 # decays minutes later with no error anywhere — observed 2026-07-27 on
 # state/, granted to a read-only HTTP service under its own uid.
 ACL_MASK_BITS = 0o070
-ACL_XATTRS = ("system.posix_acl_access", "system.posix_acl_default")
+# ONLY the access ACL. A DEFAULT ACL is a template for files created inside a
+# directory — it grants nothing on the directory itself, its group bits are
+# not a mask for anyone's access to it, and chmod does not touch it. Treating
+# it as licence to keep group bits left a 0750 state directory at 0750 where
+# the old code enforced 0700: a privacy regression, not a preserved grant.
+ACL_XATTRS = ("system.posix_acl_access",)
 
 
 def _extended_acl(target):
-    """Whether ``target`` (a path or an open descriptor) carries a POSIX ACL
-    beyond its mode bits.
+    """Whether ``target`` (a path or an open descriptor) carries a POSIX
+    ACCESS ACL beyond its mode bits.
 
     Linux only, via the xattr the kernel stores the ACL in — there is no ACL
     in the stdlib. Everywhere else (macOS's NFSv4 ACLs included) this reports
