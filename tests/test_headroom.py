@@ -81,6 +81,15 @@ def _string_literals(func):
     return {value for value in out if value.strip()}
 
 
+def _return_literals(func):
+    """Every string `func` returns as a bare literal (`return "..."`)."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    return {node.value.value for node in ast.walk(tree)
+            if isinstance(node, ast.Return)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)}
+
+
 def _collector_error_codes():
     """Every `error_code` collect.py can put on a row, read out of its SOURCE
     rather than listed here — a list here would be the same drifting copy the
@@ -808,6 +817,62 @@ class UnreadableIsNotUntrusted(unittest.TestCase):
         self.assertIsNone(self.reason(_claude_row(used5h=10)))
         self.assertFalse(route.reading_unavailable(None, "sonnet"))
         self.assertFalse(route.reading_unavailable("", "sonnet"))
+
+
+class TheSupervisorsOwnUnreadableStrings(unittest.TestCase):
+    """`route.reading_unavailable` owns block_reason's vocabulary, but the
+    supervisor adds four strings of its own about the SNAPSHOT — it is not
+    there, it is older than the cap event — and classifies them in a second
+    function, `_source_reading_unavailable`.
+
+    Those four are written twice, as literals, in two functions that sit next
+    to each other and are read together exactly once: now. Reword one in the
+    producer and the classifier silently stops matching it, which puts a
+    held cap back on the disarm path this whole mechanism was built to close
+    — no test failed, the wait just quietly stopped happening."""
+
+    def producer_strings(self):
+        return _return_literals(supervisor._source_row_is_bound) - {""}
+
+    def classifier_strings(self):
+        return _string_literals(supervisor._source_reading_unavailable)
+
+    def test_neither_list_may_drift_from_the_other(self):
+        producer = self.producer_strings()
+        self.assertEqual(len(producer), 4, producer)
+        self.assertEqual(
+            producer - self.classifier_strings(), set(),
+            "_source_row_is_bound returns a snapshot-age reason that "
+            "_source_reading_unavailable no longer recognises")
+        self.assertEqual(
+            self.classifier_strings() - producer, set(),
+            "_source_reading_unavailable still quotes a reason "
+            "_source_row_is_bound cannot return")
+
+    def test_each_one_really_is_classified_as_unreadable(self):
+        """The literals agreeing is not enough — the predicate has to SAY
+        unreadable for each, which is what the hold path asks it."""
+        for reason in sorted(self.producer_strings()):
+            self.assertTrue(
+                supervisor._source_reading_unavailable(reason, "fable"),
+                f"{reason!r} must be waited out, not disarmed on")
+
+    def test_they_stay_in_one_file_beside_each_other(self):
+        self.assertEqual(
+            inspect.getsourcefile(supervisor._source_reading_unavailable),
+            inspect.getsourcefile(supervisor._source_row_is_bound))
+
+    def test_a_trust_refusal_passing_through_is_still_not_unreadable(self):
+        """`_source_row_is_bound` also passes block_reason's refusals straight
+        out. The supervisor's own list must not widen those back into holds —
+        the P0 this class's sibling fixed."""
+        for reason in ("held: codex_auth_rejected",
+                       "held: slot_bound_to_unexpected_email",
+                       "slot identity changed since snapshot — recollect",
+                       "5h at 100%"):
+            self.assertFalse(
+                supervisor._source_reading_unavailable(reason, "fable"),
+                f"{reason!r} must never be waited out")
 
 
 class ReservePercent(unittest.TestCase):

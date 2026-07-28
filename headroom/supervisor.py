@@ -1888,11 +1888,16 @@ def _preemptive_row_bound(account, family, row, now):
 def _source_reading_unavailable(reason, family):
     """Whether a `_source_row_is_bound` refusal is "no current reading".
 
-    route.reading_unavailable owns the block_reason vocabulary; these three
+    route.reading_unavailable owns the block_reason vocabulary; these four
     are this function's OWN strings, and they say the same thing about the
     snapshot as a whole — it is too old, or it is not there. A cap that has
     already been corroborated once waits those out; it never disarms on them.
-    Nothing about identity, trust or policy is in either list."""
+    Nothing about identity, trust or policy is in either list.
+
+    They are literals in two functions, so they can only drift apart, never
+    fail loudly. `TheSupervisorsOwnUnreadableStrings` compares this list
+    against what `_source_row_is_bound` actually returns and fails if a
+    reword touches one and not the other."""
     return reason in ("collect returned no snapshot",
                       "collect did not start after the cap event",
                       "collect did not finish after the cap event",
