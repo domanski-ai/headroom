@@ -30,11 +30,36 @@ SNAPSHOT_MAX_AGE = paths.env_int("HEADROOM_SNAPSHOT_MAX_AGE", 900)
 OBSERVATION_MAX_AGE = paths.env_int("HEADROOM_OBSERVATION_MAX_AGE", 1800)
 CLOCK_SKEW = paths.env_int("HEADROOM_CLOCK_SKEW", 300)
 
+# --- one cap vocabulary, for every surface that reads a refusal ------------
+# A subscription cap and a transient refusal demand OPPOSITE actions: a cap
+# cools the account and moves the conversation, a 429/overload is simply
+# retried on the same seat. So the words are kept apart here, and every
+# consumer composes the pair it needs — never its own copy of the phrases.
+#
+# They were copies, and they drifted twice. `out of usage credits` (a
+# scoped-model weekly cap, e.g. Fable) reached the supervisor only after a
+# real cap slipped past on 2026-07-23, and the 5-hour wordings reached only
+# `route`, so a session refused with "you've hit your 5-hour limit" was
+# invisible to the supervisor's cap-reactive path — a dead seat with no
+# rotation at all. One definition, no drift.
+CAP_RE = re.compile(
+    r"\b(?:(?:you(?:'|’)ve\s+)?hit your "
+    r"(?:session|weekly|usage|5[- ]?hour|five[- ]?hour)[^.\n]*limit"
+    r"|usage limit reached|out of usage credits)\b", re.I)
+# Deliberately NOT caps: these heal on their own and are retried, never
+# rotated. Nothing here may ever reach the supervisor's cap path.
+TRANSIENT_RE = re.compile(
+    r"(?:rate_limit_error|\brate limit\b|429 Too Many|status 429"
+    r"|overloaded_error)", re.I)
+# What `run` reacts to: either kind ends the attempt on this account.
 LIMIT_RE = re.compile(
-    r"(hit your (?:session|weekly|usage|5[- ]?hour|five[- ]?hour)[^.\n]*limit"
-    r"|usage limit reached|rate_limit_error|\brate limit\b"
-    r"|429 Too Many|status 429|overloaded_error)", re.I)
+    "(?:%s)|(?:%s)" % (CAP_RE.pattern, TRANSIENT_RE.pattern), re.I)
 WEEKLY_RE = re.compile(r"week", re.I)
+# The same vocabulary read the other way round: which provider window a cap
+# phrase points at.  `cap_scope` narrows corroboration with it, so it has to
+# know every wording `CAP_RE` admits — a "five hour" cap corroborated by the
+# 7d window would cool a seat for a week over a window that heals in hours.
+SESSION_RE = re.compile(r"(?:session|\b5[- ]?hour\b|\bfive[- ]?hour\b)", re.I)
 
 # Codex failure classification (provider-gated; never used for Claude).
 # A stderr regex is a HINT — the classes drive different protective actions:
@@ -841,8 +866,9 @@ def cap_scope(snapshot, name, fam, message=""):
     """Return the unambiguous >=99% cap scope for one fresh account row.
 
     The hook phrase narrows which provider window may corroborate the event.
-    Session wording only accepts 5h; weekly wording accepts the all-model 7d
-    or the requested model's scoped weekly window.  A generic usage-limit
+    Session wording (``SESSION_RE`` — "session" and every 5-hour spelling
+    ``CAP_RE`` admits) only accepts 5h; weekly wording accepts the all-model
+    7d or the requested model's scoped weekly window.  A generic usage-limit
     phrase may use any single applicable scope.  Multiple account-wide caps
     are one scope and retain their latest reset.
     """
@@ -852,10 +878,9 @@ def cap_scope(snapshot, name, fam, message=""):
     windows = row.get("windows")
     if not isinstance(windows, dict):
         return None
-    lower = message.lower() if isinstance(message, str) else ""
-    wants_weekly = "week" in lower
-    wants_session = "session" in lower or "5-hour" in lower \
-        or "5 hour" in lower or "five-hour" in lower
+    text = message if isinstance(message, str) else ""
+    wants_weekly = WEEKLY_RE.search(text) is not None
+    wants_session = SESSION_RE.search(text) is not None
     account_hits = []
     scoped_hit = None
     if not wants_weekly:

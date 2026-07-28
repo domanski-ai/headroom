@@ -135,16 +135,13 @@ CONTEXT_BACKSTOP_MAX = max(1, paths.env_int("HEADROOM_CONTEXT_BACKSTOP_MAX", 2))
 CONTEXT_BACKSTOP_ALWAYS = (
     os.environ.get("HEADROOM_CONTEXT_BACKSTOP_ALWAYS", "").strip() == "1")
 
-# A subscription cap surfaces two ways: the classic "hit your … limit" wording,
-# and — for a scoped-model weekly cap (e.g. Fable) — "You're out of usage
-# credits. Run /usage-credits to keep using Fable 5". The second form never
-# matched, so a Fable cap slipped past the supervisor and never handed off
-# (observed 2026-07-23 on the sales seat). Both are genuine caps; transient
-# 429/overload deliberately stay out (they are retried, not rotated).
-CAP_RE = re.compile(
-    r"\b(?:(?:you(?:'|’)ve\s+)?hit your "
-    r"(?:session|weekly|usage) limit|usage limit reached"
-    r"|out of usage credits)\b", re.I)
+# The cap vocabulary is route's, not a second copy of it (see route.CAP_RE).
+# This file held the copy that drifted: it knew "out of usage credits" and did
+# NOT know "hit your 5-hour limit", which route has always matched, so a
+# 5-hour refusal worded that way never reached the cap-reactive path and the
+# session sat on a dead seat. Transient 429/overload stay out of it — those
+# are retried on the same seat, never rotated.
+CAP_RE = route.CAP_RE
 
 # Background-agent lifecycle, as the parent transcript actually records it.
 # Every discriminator below is pinned from live fleet data (50 sessions):

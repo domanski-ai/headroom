@@ -68,6 +68,71 @@ def reserve_worker(plan, now, queue):
         queue.put(("error", str(error)))
 
 
+class CapVocabulary(unittest.TestCase):
+    """One cap vocabulary, shared by route and the supervisor.
+
+    It was two copies and they drifted twice: `out of usage credits` reached
+    only the supervisor (after a Fable cap slipped past on 2026-07-23), and
+    every 5-hour wording reached only route — so a session refused with "hit
+    your 5-hour limit" was invisible to the cap-reactive path.
+    """
+
+    CAPS = (
+        "You've hit your session limit",
+        "You’ve hit your weekly limit · resets Friday",
+        "hit your usage limit",
+        "You've hit your weekly limit for Claude Opus 5",
+        "You've hit your 5-hour limit",
+        "You've hit your 5 hour limit",
+        "You've hit your 5hour limit",
+        "you've hit your five-hour limit",
+        "You've hit your five hour limit",
+        "Usage limit reached",
+        "You're out of usage credits. Run /usage-credits to keep using Fable 5",
+    )
+    TRANSIENT = (
+        "rate_limit_error",
+        "API Error: hit the rate limit, retrying",
+        "429 Too Many Requests",
+        "status 429",
+        "overloaded_error",
+    )
+
+    def test_the_supervisor_reads_the_same_object_route_does(self):
+        self.assertIs(supervisor.CAP_RE, route.CAP_RE)
+
+    def test_every_cap_wording_either_side_knows_is_a_cap_on_both(self):
+        for text in self.CAPS:
+            self.assertTrue(route.CAP_RE.search(text), text)
+            self.assertTrue(supervisor.CAP_RE.search(text), text)
+            # a cap is also a limit: `route.run` must end the attempt too
+            self.assertTrue(route.LIMIT_RE.search(text), text)
+
+    def test_transient_refusals_are_limits_but_never_caps(self):
+        # they heal on their own — retried on the same seat, never rotated
+        for text in self.TRANSIENT:
+            self.assertTrue(route.LIMIT_RE.search(text), text)
+            self.assertIsNone(route.CAP_RE.search(text), text)
+            self.assertIsNone(supervisor.CAP_RE.search(text), text)
+
+    def test_every_five_hour_spelling_scopes_to_the_5h_window(self):
+        # a "five hour" cap corroborated by the 7d window would cool the seat
+        # for a week over a window that heals in hours (the old inline check
+        # knew "5 hour" and "five-hour" but not "five hour" or "5hour")
+        now = int(time.time())
+        capped_weekly = {"accounts": [usage_row("a", used5=10, used7=100,
+                                                captured=now)]}
+        capped_session = {"accounts": [usage_row("a", used5=99, used7=10,
+                                                 captured=now)]}
+        for text in self.CAPS:
+            if not route.SESSION_RE.search(text):
+                continue
+            self.assertIsNone(
+                route.cap_scope(capped_weekly, "a", "sonnet", text), text)
+            scope = route.cap_scope(capped_session, "a", "sonnet", text)
+            self.assertEqual((scope or {}).get("window"), "5h", text)
+
+
 class ConfigAndScope(unittest.TestCase):
     def test_auto_handoff_defaults_on_and_only_explicit_false_disables(self):
         base = {"schema_version": 1, "accounts": [
@@ -524,6 +589,16 @@ class HookProof(unittest.TestCase):
                           "keep using Fable 5 or /model to switch models.")
         self.assertIn("out of usage credits",
                       supervisor.cap_message(rec, self.child))
+
+    def test_parser_accepts_every_five_hour_wording(self):
+        # route has always matched these; the supervisor's copy did not, so a
+        # 5-hour refusal worded this way never reached the cap-reactive path
+        for text in ("You've hit your 5-hour limit · resets 12:20pm (UTC)",
+                     "You've hit your 5 hour limit",
+                     "you've hit your five-hour limit",
+                     "You've hit your five hour limit"):
+            self.assertEqual(supervisor.cap_message(self.record(text),
+                                                    self.child), text, text)
 
     def test_rejects_overload_429_wrong_nonce_generation_and_session(self):
         for record in (
