@@ -1019,15 +1019,16 @@ def cmd_status(fam):
     chosen = None
     for account, reason in candidates(fam, snapshot):
         windows = (rows.get(account["name"]) or {}).get("windows") or {}
-        head = "5h=%s 7d=%s" % (
-            collector.display_percent(windows.get("5h")),
-            collector.display_percent(windows.get("7d")))
+        # BATTERIES: remaining, not used. See collect.display_left.
+        head = "5h %s / 7d %s" % (
+            collector.display_left(windows.get("5h")),
+            collector.display_left(windows.get("7d")))
         scoped = scoped_window_for(fam, windows)
         if scoped is not None:
-            head += " %s=%s" % (fam, collector.display_percent(scoped))
+            head += " / %s %s" % (fam, collector.display_left(scoped))
         marker = "AVAIL" if reason is None else "skip "
         note = "" if reason is None else f"({reason})"
-        print(f"  {marker}  {account['name']:<18} {head:<28} {note}")
+        print(f"  {marker}  {account['name']:<18} {head:<40} {note}")
         if reason is None and chosen is None:
             chosen = account["name"]
     print(f"-> chosen: {chosen or 'NONE — no account has proven headroom'}")

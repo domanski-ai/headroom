@@ -1547,6 +1547,26 @@ def display_percent(window):
     return "%d%%" % round(window["used_percent"])
 
 
+def display_left(window):
+    """Remaining percent, the way the statusline batteries read.
+
+    The provider reports USED and the statusline shows LEFT, so the two
+    surfaces disagreed on what a bare number meant: `7d=99%` was one percent
+    of a week remaining, while `7d=34%` was two thirds remaining. Paul reads
+    batteries (2026-07-28: "we work on batteries, batteries run out"), and an
+    emergency should not have to be arithmetic. Anything human-facing prints
+    LEFT and says so; `display_percent` stays for anything that genuinely
+    means used.
+    """
+    if not window or window.get("used_percent") is None:
+        return "-"
+    used = window["used_percent"]
+    try:
+        return "%d%% left" % round(100 - float(used))
+    except (TypeError, ValueError):
+        return "-"
+
+
 def print_snapshot(snapshot):
     for account in snapshot["accounts"]:
         windows = account.get("windows") or {}
