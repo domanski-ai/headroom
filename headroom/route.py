@@ -655,6 +655,48 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     return None
 
 
+# `block_reason` reports EVERY not-ok collector row as "held: <error_code>",
+# but those rows are not one class. The collector puts transport failures and
+# trust failures through the same field, and the difference decides whether a
+# capped session waits or is disarmed. Only these heal without a human: the
+# provider throttling the usage API or holding us in backoff, and a codex
+# app-server that would not spawn, answer, or speak protocol (including the
+# display-only fallback an unavailable app-server produces — the identity was
+# bound, only the live read was lost).
+UNREADABLE_ERROR_CODES = frozenset({
+    "usage_source_rate_limited",        # provider rate-limited the usage API
+    "codex_provider_backoff",           # provider-wide backoff window
+    "codex_app_server_throttled",       # documented transient, not capacity
+    "codex_app_server_spawn_failed",
+    "codex_app_server_io_failed",
+    "codex_app_server_no_response",
+    "codex_app_server_protocol_error",
+    "codex_dashboard_only",             # app-server down; telemetry not live
+})
+# Everything else a `held:` row can carry is a trust boundary or a standing
+# fact about the seat, and neither is a latency cost: a revoked credential
+# does not stop being revoked in five hours, and an API-key seat does not
+# grow subscription windows while a session waits on it. Listed rather than
+# inferred so that adding a code to collect.py has to be classified by a
+# human — `test_every_collector_error_code_is_classified` fails until it is.
+MUST_DISARM_ERROR_CODES = frozenset({
+    "claude_credentials_missing",       # token unreadable — needs a re-login
+    "claude_local_binding_missing",
+    "claude_usage_org_changed",         # the login underneath was swapped
+    "claude_usage_org_unverifiable",
+    "claude_usage_token_expired",
+    "claude_usage_token_rejected",      # expired or REVOKED
+    "codex_auth_missing",
+    "codex_auth_rejected",              # provider invalidated the login
+    "codex_capacity_unavailable",       # API-key seat: no subscription pools
+    "codex_capacity_unrecognized",      # answered, but with no window we know
+    "codex_cli_missing",
+    "codex_identity_email_missing",
+    "identity_id_missing",
+    "slot_bound_to_unexpected_email",   # this slot is not who we think it is
+})
+
+
 def reading_unavailable(reason, fam):
     """Whether a :func:`block_reason` string means "there is no current
     reading", as opposed to "this seat is spent" or "this seat cannot be
@@ -675,9 +717,13 @@ def reading_unavailable(reason, fam):
     stays exhaustive."""
     if not reason:
         return False
-    # the collector itself failed for this seat ("held: <error_code>")
+    # The collector failed for this seat ("held: <error_code>"). Only a
+    # transport failure is an absence of evidence; see UNREADABLE_ERROR_CODES.
+    # An UNRECOGNISED suffix is never waited out either — the field also
+    # carries free-text notes and a bare "not ok", and a string nobody
+    # classified is not evidence that anything will change.
     if reason.startswith("held: "):
-        return True
+        return reason[len("held: "):] in UNREADABLE_ERROR_CODES
     if reason in ("no usage reading yet", "reading stale",
                   "reading clock invalid", "reading expired",
                   "windows invalid"):

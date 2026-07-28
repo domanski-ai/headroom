@@ -8,6 +8,7 @@ router (`block_reason`), redaction, and the public-snapshot projection.
 import ast
 import errno
 import importlib
+import inspect
 import json
 import hashlib
 import io
@@ -17,6 +18,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -57,6 +59,60 @@ def _claude_row(name="a", used5h=10.0, used7d=20.0, ok=True, **over):
 
 def _account(name="a", provider="claude"):
     return {"name": name, "provider": provider, "home": "/tmp/hr-t/" + name}
+
+
+def _string_literals(func):
+    """Every string constant in `func`, f-string literal parts included and
+    docstrings/bare-string comments excluded."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    prose = {id(node.value) for node in ast.walk(tree)
+             if isinstance(node, ast.Expr)
+             and isinstance(node.value, ast.Constant)
+             and isinstance(node.value.value, str)}
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if id(node) not in prose:
+                out.add(node.value)
+        elif isinstance(node, ast.JoinedStr):
+            out.update(part.value for part in node.values
+                       if isinstance(part, ast.Constant)
+                       and isinstance(part.value, str))
+    return {value for value in out if value.strip()}
+
+
+def _collector_error_codes():
+    """Every `error_code` collect.py can put on a row, read out of its SOURCE
+    rather than listed here — a list here would be the same drifting copy the
+    classification is trying to avoid.
+
+    Three producers: `IdentityBindingError("<code>")`, a literal assigned
+    straight to ``result["error_code"]``, and the return values of
+    `classify_codex_appserver_error`. The two published constants are folded
+    in so a code that only ever appears as a dict key still counts."""
+    tree = ast.parse(inspect.getsource(collect))
+    codes = set(collect.CODEX_HOLD_NOTES) | set(
+        collect.CODEX_DASHBOARD_FALLBACK_CODES)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id == "IdentityBindingError" and node.args \
+                and isinstance(node.args[0], ast.Constant) \
+                and isinstance(node.args[0].value, str):
+            codes.add(node.args[0].value)
+        elif isinstance(node, ast.Assign) and isinstance(
+                node.value, ast.Constant) and isinstance(node.value.value, str):
+            for target in node.targets:
+                if isinstance(target, ast.Subscript) \
+                        and isinstance(target.slice, ast.Constant) \
+                        and target.slice.value == "error_code":
+                    codes.add(node.value.value)
+        elif isinstance(node, ast.FunctionDef) \
+                and node.name == "classify_codex_appserver_error":
+            codes.update(sub.value.value for sub in ast.walk(node)
+                         if isinstance(sub, ast.Return)
+                         and isinstance(sub.value, ast.Constant)
+                         and isinstance(sub.value.value, str))
+    return codes
 
 
 # The vars a supervisor injects into the sessions it owns (supervisor.py
@@ -635,6 +691,14 @@ class UnreadableIsNotUntrusted(unittest.TestCase):
         row["windows"].pop(key)
         return row
 
+    def held(self, code):
+        """The row the COLLECTOR actually writes when it fails with `code`:
+        not ok, not routable, held. `_claude_row(ok=False)` on its own is not
+        this test's subject — an anonymous failure carries no code, and
+        classifying it by the `held: ` prefix is exactly the bug that let a
+        revoked credential wait out a five-hour window."""
+        return _claude_row(ok=False, error_code=code)
+
     def test_every_unreadable_shape_is_classified_as_unreadable(self):
         old = _claude_row()
         old["captured_at"] = self.now - 10 * route.OBSERVATION_MAX_AGE
@@ -643,7 +707,7 @@ class UnreadableIsNotUntrusted(unittest.TestCase):
         no_windows = _claude_row()
         no_windows["windows"] = "broken"
         shapes = [
-            None, _claude_row(ok=False), _claude_row(stale=True), old, future,
+            None, _claude_row(stale=True), old, future,
             no_windows, self.missing("5h"), self.missing("7d"),
             self.broken("5h", used_percent="x"),
             self.broken("7d", used_percent=None),
@@ -657,6 +721,71 @@ class UnreadableIsNotUntrusted(unittest.TestCase):
             self.assertIsNotNone(reason, row)
             self.assertTrue(route.reading_unavailable(reason, "sonnet"),
                             f"{reason!r} should be an absence of evidence")
+
+    def test_a_transport_failure_from_the_collector_is_waited_out(self):
+        """The `held:` rows that really are an absence of evidence — driven
+        through block_reason as the codes collect.py emits them."""
+        for code in sorted(route.UNREADABLE_ERROR_CODES):
+            reason = self.reason(self.held(code))
+            self.assertEqual(reason, "held: " + code)
+            self.assertTrue(route.reading_unavailable(reason, "sonnet"),
+                            f"{code} is a transport failure — wait it out")
+
+    def test_a_trust_failure_from_the_collector_is_never_waited_out(self):
+        """The finding this class exists for. Every one of these reached
+        `reading_unavailable` as True through the `held: ` prefix, so a
+        supervisor holding a corroborated cap would sit on a revoked
+        credential, a slot bound to the wrong email, or an org that changed
+        under us for the whole hold budget instead of disarming."""
+        for code in sorted(route.MUST_DISARM_ERROR_CODES):
+            reason = self.reason(self.held(code))
+            self.assertEqual(reason, "held: " + code)
+            self.assertFalse(route.reading_unavailable(reason, "sonnet"),
+                             f"{code} is a trust boundary, not a latency cost")
+
+    def test_an_unclassified_collector_failure_disarms(self):
+        """`block_reason` falls back to the row's free-text note, and to a
+        bare "not ok" when there is not even that. Neither is evidence that
+        anything will change, so neither may be waited out."""
+        for row in (_claude_row(ok=False),
+                    _claude_row(ok=False, note="something new broke"),
+                    self.held("code_from_a_future_release")):
+            reason = self.reason(row)
+            self.assertTrue(reason.startswith("held: "), reason)
+            self.assertFalse(route.reading_unavailable(reason, "sonnet"),
+                             f"{reason!r} was classified by nobody")
+
+    def test_every_collector_error_code_is_classified(self):
+        """The two sets must PARTITION what collect.py can emit. Adding a new
+        `error_code` over there without deciding what it means over here
+        fails here rather than silently inheriting "wait it out"."""
+        emitted = _collector_error_codes()
+        self.assertGreater(len(emitted), 15, emitted)   # discovery still works
+        both = route.UNREADABLE_ERROR_CODES & route.MUST_DISARM_ERROR_CODES
+        self.assertEqual(both, set(), "a code cannot be in both classes")
+        classified = route.UNREADABLE_ERROR_CODES | route.MUST_DISARM_ERROR_CODES
+        self.assertEqual(
+            emitted - classified, set(),
+            "collect.py emits codes route.py has not classified")
+        self.assertEqual(
+            classified - emitted, set(),
+            "route.py classifies codes collect.py can no longer emit")
+
+    def test_the_predicate_still_names_the_messages_it_classifies(self):
+        """The placement discipline, as a property rather than a comment.
+
+        `reading_unavailable` matches block_reason's strings by VALUE, so the
+        two only stay in step while they sit in one file and one reword
+        touches both. This fails if a message is reworded in block_reason and
+        the predicate is left quoting the old wording."""
+        self.assertEqual(inspect.getsourcefile(route.reading_unavailable),
+                         inspect.getsourcefile(route.block_reason))
+        producer = inspect.getsource(route.block_reason)
+        for literal in _string_literals(route.reading_unavailable):
+            if literal in ("held: ", "5h", "7d"):
+                continue                # composed prefixes, not messages
+            self.assertTrue(literal in producer,   # assertIn dumps the source
+                            f"{literal!r} is no longer a block_reason message")
 
     def test_spent_untrusted_and_policy_are_never_unreadable(self):
         cooling = _claude_row()
