@@ -3367,10 +3367,13 @@ class CapWaitsForCapacity(TempDirCase):
             "fable", [], self.source, collect_fn=collect_fn,
             now=lambda: self.clock["t"], sleep=sleep, popen=mock.Mock())
 
-    def proof(self):
+    CREDITS = ("You're out of usage credits. Run /usage-credits to keep "
+               "using Fable 5")
+
+    def proof(self, message=None):
         return supervisor.CapProof(
-            {"received_at": self.clock["t"] - 30}, self.CAP, "fable",
-            self.SID, self.transcript, 1,
+            {"received_at": self.clock["t"] - 30}, message or self.CAP,
+            "fable", self.SID, self.transcript, 1,
             handoff._transcript_stat(self.transcript))
 
     def monitor(self, runner, child, proof, polls=2):
@@ -3533,6 +3536,43 @@ class CapWaitsForCapacity(TempDirCase):
         self.assertEqual([event["event"] for event in events], ["cap_held"])
         self.assertIn("fresh usage collect failed", err.getvalue())
 
+    # -- only the window that corroborated it may declare it over ------------
+
+    def scoped_hold(self, second):
+        """A held SCOPED weekly cap, then one more snapshot. Returns the
+        second attempt's outcome."""
+        runner = self.runner([(10.0, 10.0, 10.0, 100.0, 100.0), second])
+        child, proof = self.child(), self.proof(self.CREDITS)
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(supervisor.CapacityHold):
+                runner._preflight(child, proof)
+            self.assertEqual(child.cap_scope_window, "scoped:fable")
+            try:
+                return runner._preflight(
+                    child, proof, held=child.cap_scope_window), child
+            except supervisor.SupervisorError as error:
+                return error, child
+
+    def test_a_window_that_merely_vanished_is_not_a_reset(self):
+        # the hold remembered only THAT something corroborated the cap, so a
+        # snapshot that simply omitted the scoped window read as "it reset":
+        # a good proof discarded on no evidence, with a healthy seat unused
+        outcome, child = self.scoped_hold((10.0, 10.0, 10.0, 5.0, None))
+        self.assertIsInstance(outcome, supervisor.CapacityHold)
+        self.assertIn("scoped:fable window is not readable",
+                      str(outcome))
+        self.assertTrue(child.automation)
+        self.assertEqual(child.cap_scope_window, "scoped:fable")
+
+    def test_the_corroborating_window_reading_low_does_clear_it(self):
+        outcome, _child = self.scoped_hold((10.0, 10.0, 10.0, 5.0, 4.0))
+        self.assertIsInstance(outcome, supervisor.CapCleared)
+        self.assertIn("scoped:fable window is back to 4%", str(outcome))
+
+    def test_a_held_scoped_cap_moves_once_a_seat_frees(self):
+        outcome, _child = self.scoped_hold((10.0, 10.0, 10.0, 5.0, 100.0))
+        self.assertEqual(outcome.target["name"], "target")
+
     def test_an_uncorroborated_cap_still_disarms_on_the_first_look(self):
         # NOT a hold: the hook says capped and fresh usage says otherwise, on
         # the first look. That contradiction is exactly what fail-closed is
@@ -3563,12 +3603,12 @@ class CapWaitsForCapacity(TempDirCase):
             child.process.poll.side_effect = [None, 0]
             runner._monitor(child)
         self.assertEqual(child.cap_hold_attempts, 1)
-        self.assertTrue(child.cap_corroborated)
+        self.assertEqual(child.cap_scope_window, "5h")
         later = dataclasses.replace(
             first, event={"received_at": self.clock["t"]})
         runner._cap_hold_sync(child, later)
         self.assertEqual(child.cap_hold_attempts, 0)
-        self.assertFalse(child.cap_corroborated)
+        self.assertEqual(child.cap_scope_window, "")
 
 
 class PreemptiveRotation(TempDirCase):

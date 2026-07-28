@@ -492,10 +492,11 @@ class Child:
     cap_hold_reason: str = ""
     # which proof the hold above belongs to; a different one resets it
     cap_hold_key: tuple = ()
-    # whether fresh usage has EVER corroborated the cap in flight. Only then
-    # may a later "below 99%" reading be read as "the window reset" rather
-    # than as a hook contradicting the provider's own numbers.
-    cap_corroborated: bool = False
+    # WHICH window fresh usage corroborated the cap in ("5h", "7d",
+    # "scoped:<family>"; "" = none yet). Only that window may later be read
+    # as having reset — a bare "something corroborated it once" would let any
+    # unreadable snapshot pass for a reset.
+    cap_scope_window: str = ""
     # the last disarm reason already notified ("" / False = none yet)
     supervision_loss_notified: object = False
     # preemptive rotation state (never affects the cap-reactive path)
@@ -2341,10 +2342,22 @@ class Supervisor:
         if size != child.event_offset:
             raise SupervisorError("cap proof expired after a newer hook event")
 
-    def _preflight(self, child, proof, held=False):
-        """The cap path's admission chain. `held` says this is a RE-attempt of
-        a cap whose fresh usage already corroborated it at least once, which
-        changes exactly one verdict — see the `scope is None` branch."""
+    @staticmethod
+    def _scope_window(family, row, key):
+        """The window a cap scope key names, in this row, or None."""
+        windows = row.get("windows") if isinstance(row, dict) else None
+        if not isinstance(windows, dict):
+            return None
+        if key.startswith("scoped:"):
+            return route.scoped_window_for(family, windows)
+        return windows.get(key)
+
+    def _preflight(self, child, proof, held=""):
+        """The cap path's admission chain.
+
+        `held` is the window a previous attempt on THIS proof corroborated the
+        cap in (see Child.cap_scope_window); it changes exactly one verdict —
+        the `scope is None` branch below."""
         self._proof_current(child, proof)
         try:
             handoff.guard_source_stable(
@@ -2375,16 +2388,33 @@ class Supervisor:
                 # First look: the hook says capped and fresh usage does not.
                 # That is a CONTRADICTION and it disarms, unchanged — a proof
                 # nobody can corroborate must never move a session.
-                # On a re-attempt it means something else entirely: this same
-                # usage feed already showed >=99% for this proof, and now does
-                # not, so the window reset while we were waiting for a seat.
-                # Nothing to rotate away from, and no reason to disarm.
-                if held:
+                if not held:
+                    raise SupervisorError(
+                        "fresh usage is below 99% or the cap scope is ambiguous")
+                # On a re-attempt, `scope is None` has two very different
+                # causes and only one of them ends the cap. Ask the window
+                # that actually corroborated it: a READABLE reading below 99%
+                # is the window resetting under us — nothing left to rotate
+                # away from. A window that is merely missing or unreadable in
+                # this snapshot proves nothing at all, and discarding a good
+                # proof on it strands the session (observed: a scoped Fable
+                # cap "cleared" because the snapshot simply omitted the
+                # scoped window, while a healthy seat sat unused).
+                window = self._scope_window(
+                    proof.family, _snapshot_row(
+                        snapshot, child.account["name"]), held)
+                used = window.get("used_percent") \
+                    if isinstance(window, dict) else None
+                if isinstance(window, dict) \
+                        and window.get("freshness") != "expired_observation" \
+                        and _number(used) and 0 <= used < 99:
                     raise CapCleared(
-                        "the capped window reset while we waited for a seat")
-                raise SupervisorError(
-                    "fresh usage is below 99% or the cap scope is ambiguous")
-            child.cap_corroborated = True
+                        f"the capped {held} window is back to {used:g}% — "
+                        "it reset while we waited for a seat")
+                raise CapacityHold(
+                    f"the capped {held} window is not readable in fresh "
+                    "usage — holding the proof rather than assuming it reset")
+            child.cap_scope_window = scope.get("window") or ""
             reset = scope.get("reset")
             if (not isinstance(reset, (int, float)) or isinstance(reset, bool)
                     or not math.isfinite(reset) or reset <= self.now()):
@@ -2507,7 +2537,7 @@ class Supervisor:
         child.cap_hold_next = 0.0
         child.cap_hold_reason = ""
         child.cap_hold_key = ()
-        child.cap_corroborated = False
+        child.cap_scope_window = ""
 
     def _cap_hold_sync(self, child, proof):
         """Bind the hold to ONE proof. A different proof (a later refusal, a
@@ -3779,7 +3809,7 @@ class Supervisor:
                         and self.now() >= child.cap_hold_next:
                     try:
                         plan = self._preflight(
-                            child, proof, held=child.cap_corroborated)
+                            child, proof, held=child.cap_scope_window)
                     except CapCleared as error:
                         # the window reset under us: nothing to rotate away
                         # from, and every reason to stay armed for the next one
