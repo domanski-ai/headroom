@@ -3269,6 +3269,247 @@ class TranscriptTail(TempDirCase):
         self.assertEqual(len(records), 401)
 
 
+class CapWaitsForCapacity(TempDirCase):
+    """A proven cap with nowhere to go.
+
+    Every failure in the cap-proof chain used to end in _lose_supervision:
+    automation off for good, on the capped seat, with the child still alive —
+    the one state where it most needs the rotation it just gave up on. When
+    the reason is "every seat is capped too", that answer is wrong twice
+    over: nothing was disproven, and the condition fixes itself. So a
+    capacity refusal HOLDS, bounded, and the session moves the moment a seat
+    comes back.
+    """
+
+    SID = "44444444-4444-4444-8444-444444444444"
+    CAP = "You've hit your 5-hour limit · resets 3pm (UTC)"
+
+    def setUp(self):
+        super().setUp()
+        self.clock = {"t": time.time()}
+        self.source = self.account("source")
+        self.target = self.account("target")
+        for account in (self.source, self.target):
+            os.makedirs(os.path.join(account["home"], "projects"),
+                        exist_ok=True)
+        registry.save({"schema_version": 1,
+                       "accounts": [self.source, self.target]})
+        directory = os.path.join(self.source["home"], "projects", "p")
+        os.makedirs(directory)
+        self.transcript = os.path.join(directory, self.SID + ".jsonl")
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "hi"}]}}) + "\n")
+            out.write(json.dumps({"type": "assistant", "message": {
+                "model": "claude-fable-5-20260701",
+                "content": [{"type": "text", "text": "done"}]}}) + "\n")
+        when = time.time() - 600            # quiet: no turn in flight
+        os.utime(self.transcript, (when, when))
+        self.cwd = os.path.join(self.temp.name, "work")
+        os.makedirs(self.cwd)
+        self.binding = supervisor.Binding(
+            self.SID, self.transcript, self.cwd, "Fable", "2.1",
+            self.source["home"], epoch=1)
+        for target, value in ((collect, ("AAAA", "BBBB")),):
+            patch = mock.patch.object(target, "local_binding",
+                                      return_value=value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        which = mock.patch.object(handoff.shutil, "which",
+                                  side_effect=lambda name: "/usr/bin/" + name)
+        which.start()
+        self.addCleanup(which.stop)
+        for constant, value in (("CAP_HOLD_SECONDS", 1.0),
+                                ("CAP_HOLD_MAX", 3)):
+            patch = mock.patch.object(supervisor, constant, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    # -- fixture ------------------------------------------------------------
+
+    def child(self):
+        process = mock.Mock(pid=os.getpid())
+        process.poll.return_value = None
+        return supervisor.Child(
+            process, self.source, 1,
+            os.path.join(self.temp.name, "no-such-events.jsonl"), "",
+            self.clock["t"] - 60, True, binding=self.binding, session_epoch=1)
+
+    def snapshot(self, source5=100.0, target5=100.0):
+        """Built from the CURRENT clock, the way a real collect would be."""
+        captured = int(self.clock["t"]) + 1
+        return {"run_started": captured, "generated": captured,
+                "accounts": [usage_row("source", used5=source5,
+                                       captured=captured),
+                             usage_row("target", used5=target5,
+                                       captured=captured)]}
+
+    def runner(self, snapshots):
+        """`snapshots` is a list of (source5, target5) the collects walk
+        through, the last one repeating for every further attempt."""
+        state = {"index": 0}
+
+        def collect_fn(quiet=True):
+            index = min(state["index"], len(snapshots) - 1)
+            state["index"] += 1
+            return self.snapshot(*snapshots[index])
+
+        def sleep(seconds):
+            self.clock["t"] += max(float(seconds), 0.0)
+
+        return supervisor.Supervisor(
+            "fable", [], self.source, collect_fn=collect_fn,
+            now=lambda: self.clock["t"], sleep=sleep, popen=mock.Mock())
+
+    def proof(self):
+        return supervisor.CapProof(
+            {"received_at": self.clock["t"] - 30}, self.CAP, "fable",
+            self.SID, self.transcript, 1,
+            handoff._transcript_stat(self.transcript))
+
+    def monitor(self, runner, child, proof, polls=2):
+        """Drive _monitor for `polls` iterations, then let the child exit.
+
+        _handle_events is modelled exactly as the real one behaves: the hook
+        journal delivers the cap ONCE, and every later poll echoes back
+        whatever proof it was handed (so a proof the loop discards stays
+        discarded — nothing re-delivers it)."""
+        codes = [None] * (polls - 1) + [0]
+        child.process.poll.side_effect = lambda: codes.pop(0)
+        delivered = {"done": False}
+
+        def handle_events(_child, _pending_id, current=None):
+            if delivered["done"]:
+                return current
+            delivered["done"] = True
+            return proof
+
+        with mock.patch.object(runner, "_handle_events",
+                               side_effect=handle_events), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as err:
+            outcome = runner._monitor(child)
+        return outcome, [call.args[0] for call in emit.call_args_list], err
+
+    def ledger(self):
+        path = os.path.join(paths.state_dir(), "handoffs.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as source:
+            return [json.loads(line) for line in source if line.strip()]
+
+    # -- the hold itself ----------------------------------------------------
+
+    def test_no_seat_anywhere_raises_capacity_not_a_generic_refusal(self):
+        runner, child = self.runner([(100.0, 100.0)]), self.child()
+        with self.assertRaises(supervisor.CapacityHold) as caught:
+            runner._preflight(child, self.proof())
+        self.assertIn("no account has proven headroom", str(caught.exception))
+        # and it is a SupervisorError, so nothing that catches the base class
+        # (a caller that has not been taught about holds) changes behaviour
+        self.assertIsInstance(caught.exception, supervisor.SupervisorError)
+
+    def test_a_capped_fleet_holds_the_child_instead_of_disarming_it(self):
+        runner, child = self.runner([(100.0, 100.0)]), self.child()
+        outcome, events, err = self.monitor(runner, child, self.proof())
+        self.assertEqual(outcome, 0)
+        self.assertTrue(child.automation)
+        self.assertEqual(child.cap_hold_attempts, 1)
+        self.assertEqual([event["event"] for event in events], ["cap_held"])
+        self.assertIn("waiting for capacity", err.getvalue())
+        self.assertEqual(self.ledger(), [])
+
+    def test_the_session_moves_the_moment_a_seat_comes_back(self):
+        # the whole point of holding: nobody is watching a percentage at 3am
+        runner, child = self.runner([(100.0, 100.0), (100.0, 5.0)]), self.child()
+        relaunch = {}
+
+        def stop(child, plan, proof):
+            relaunch["plan"] = plan
+            return supervisor.Relaunch(plan.target, [], plan.cwd, True,
+                                       plan.handoff_id, plan)
+
+        with mock.patch.object(runner, "_stop_and_commit", side_effect=stop):
+            outcome, events, _err = self.monitor(
+                runner, child, self.proof(), polls=8)
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.account["name"], "target")
+        self.assertEqual(relaunch["plan"].target["name"], "target")
+        self.assertEqual([event["event"] for event in events], ["cap_held"])
+        self.assertEqual(child.cap_hold_attempts, 0)   # cleared on admission
+
+    def test_the_hold_is_bounded_and_ends_in_the_same_disarm(self):
+        runner, child = self.runner([(100.0, 100.0)]), self.child()
+        outcome, events, err = self.monitor(
+            runner, child, self.proof(), polls=40)
+        self.assertEqual(outcome, 0)
+        self.assertFalse(child.automation)
+        self.assertEqual([event["event"] for event in events],
+                         ["cap_held", "supervision_lost"])
+        self.assertIn("no seat came free", err.getvalue())
+        self.assertIn("automatic handoff disabled", err.getvalue())
+
+    def test_zero_budget_restores_the_old_immediate_disarm(self):
+        with mock.patch.object(supervisor, "CAP_HOLD_MAX", 0):
+            runner, child = self.runner([(100.0, 100.0)]), self.child()
+            outcome, events, _err = self.monitor(runner, child, self.proof())
+        self.assertEqual(outcome, 0)
+        self.assertFalse(child.automation)
+        self.assertEqual([event["event"] for event in events],
+                         ["supervision_lost"])
+
+    def test_a_window_that_heals_first_ends_the_hold_still_armed(self):
+        # every seat capped, then the SOURCE's own window resets: there is
+        # nothing left to rotate away from and no reason to disarm
+        runner, child = self.runner(
+            [(100.0, 100.0), (4.0, 100.0)]), self.child()
+        outcome, events, err = self.monitor(
+            runner, child, self.proof(), polls=8)
+        self.assertEqual(outcome, 0)
+        self.assertTrue(child.automation)
+        self.assertEqual([event["event"] for event in events],
+                         ["cap_held", "cap_cleared"])
+        self.assertIn("the seat is usable again", err.getvalue())
+        self.assertEqual(child.cap_hold_attempts, 0)
+
+    def test_an_uncorroborated_cap_still_disarms_on_the_first_look(self):
+        # NOT a hold: the hook says capped and fresh usage says otherwise, on
+        # the first look. That contradiction is exactly what fail-closed is
+        # for, and it disarms today as it always has.
+        runner, child = self.runner([(4.0, 4.0)]), self.child()
+        outcome, events, err = self.monitor(runner, child, self.proof())
+        self.assertEqual(outcome, 0)
+        self.assertFalse(child.automation)
+        self.assertEqual([event["event"] for event in events],
+                         ["supervision_lost"])
+        self.assertIn("below 99%", err.getvalue())
+
+    def test_a_deliberate_human_stop_is_never_revived(self):
+        runner, child = self.runner([(100.0, 100.0)]), self.child()
+        child.automation = False              # e.g. a shutdown signal
+        outcome, events, _err = self.monitor(runner, child, self.proof())
+        self.assertEqual(outcome, 0)
+        self.assertEqual(child.cap_hold_attempts, 0)
+        self.assertEqual(events, [])
+        self.assertEqual(self.ledger(), [])
+
+    def test_a_second_cap_gets_its_own_budget_and_no_inherited_trust(self):
+        runner, child = self.runner([(100.0, 100.0)]), self.child()
+        first = self.proof()
+        with mock.patch.object(runner, "_handle_events", return_value=first), \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            child.process.poll.side_effect = [None, 0]
+            runner._monitor(child)
+        self.assertEqual(child.cap_hold_attempts, 1)
+        self.assertTrue(child.cap_corroborated)
+        later = dataclasses.replace(
+            first, event={"received_at": self.clock["t"]})
+        runner._cap_hold_sync(child, later)
+        self.assertEqual(child.cap_hold_attempts, 0)
+        self.assertFalse(child.cap_corroborated)
+
+
 class PreemptiveRotation(TempDirCase):
     """The whole preemptive path against real transcripts, a real registry and
     the real handoff ledger — only the child process and the stop are faked."""

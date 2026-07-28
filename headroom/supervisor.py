@@ -73,6 +73,33 @@ PREEMPT_SNAPSHOT_MAX_AGE = max(30, paths.env_int(
 # window a target with a busy-but-healing 5h is still a fine place to be.
 PREEMPT_SESSION_MARGIN = max(0.0, float(
     paths.env_int("HEADROOM_PREEMPTIVE_SESSION_MARGIN", 10)))
+
+# --- waiting out a cap -----------------------------------------------------
+# A cap arrives and there is nowhere to go: every seat is capped too. The old
+# answer was to disarm this child permanently, on the capped seat, while it is
+# still alive — so when a seat came back forty minutes later, nothing rotated
+# and nothing said why. Nobody is watching a percentage at 3am; that is the
+# whole reason this program exists.
+#
+# So a capacity refusal HOLDS instead. The child keeps running, automation
+# stays armed, and the proof is re-tried on this cadence until a seat frees
+# up, until the cap's own window resets (which ends the hold — see
+# CapCleared), or until the budget runs out and it disarms exactly as before.
+# The bound is what keeps it honest: a fleet where every account is capped
+# retries at this interval and then stops, rather than collecting forever.
+CAP_HOLD_SECONDS = max(30.0, float(
+    paths.env_int("HEADROOM_CAP_HOLD_SECONDS", 300)))
+# 60 × 300s ≈ five hours: long enough to outlast a 5h window (the common
+# case — every seat capped on the same 5h clock), short enough that a
+# permanently capped fleet stops paying for collects the same day.
+# HEADROOM_CAP_HOLD_MAX=0 restores the pre-hold behaviour exactly: the first
+# capacity refusal disarms.
+CAP_HOLD_MAX = max(0, paths.env_int("HEADROOM_CAP_HOLD_MAX", 60))
+# How many extra CAP_MODEL_TIMEOUT windows the cap-time model lookup may wait
+# before the child is disarmed. A transcript that has not yet been flushed is
+# not a contradicted proof, and 6s is a short window to bet a session on.
+# HEADROOM_CAP_MODEL_RETRIES=0 restores the single-window behaviour.
+CAP_MODEL_RETRIES = max(0, paths.env_int("HEADROOM_CAP_MODEL_RETRIES", 2))
 # how much of a transcript's END the poll parses (see _transcript_records)
 TRANSCRIPT_TAIL_BYTES = max(64 * 1024, paths.env_int(
     "HEADROOM_TRANSCRIPT_TAIL_BYTES", 256 * 1024))
@@ -314,6 +341,25 @@ class PendingCapTimeout(PermanentSupervisorError):
     """A payload-proven cap whose transcript model never became available."""
 
 
+class CapacityHold(SupervisorError):
+    """A proven cap that cannot be acted on YET, and might be later.
+
+    The proof is intact and uncontradicted; what is missing is somewhere to
+    go. Every OTHER cap-path refusal disarms this child permanently, which is
+    right for a proof that was contradicted and catastrophic for one that was
+    merely unlucky: the session is sitting on the capped seat, which is the
+    one state where it most needs the rotation it just gave up on. So this
+    class holds instead — bounded, backed off, and disarming in the end if
+    capacity never comes back."""
+
+
+class CapCleared(SupervisorError):
+    """The proven cap is over: its own window reset while we were holding.
+
+    Not a failure and not a retry — there is nothing left to rotate away
+    from. Drop the proof, leave automation armed for the next one."""
+
+
 @dataclass(frozen=True)
 class Binding:
     session_id: str
@@ -395,6 +441,9 @@ class PendingCap:
     epoch: int
     received_at: float
     deadline: float
+    # how many extra CAP_MODEL_TIMEOUT windows this lookup has already been
+    # given (bounded by CAP_MODEL_RETRIES)
+    extensions: int = 0
 
 
 @dataclass
@@ -417,6 +466,17 @@ class Child:
     session_epochs: dict = field(default_factory=dict)
     last_received_at: float = 0.0
     pending_cap: PendingCap = None
+    # a proven cap that has nowhere to go yet: how many times it has been
+    # re-tried, when the next attempt is due, and the last reason announced
+    cap_hold_attempts: int = 0
+    cap_hold_next: float = 0.0
+    cap_hold_reason: str = ""
+    # which proof the hold above belongs to; a different one resets it
+    cap_hold_key: tuple = ()
+    # whether fresh usage has EVER corroborated the cap in flight. Only then
+    # may a later "below 99%" reading be read as "the window reset" rather
+    # than as a hook contradicting the provider's own numbers.
+    cap_corroborated: bool = False
     # the last disarm reason already notified ("" / False = none yet)
     supervision_loss_notified: object = False
     # preemptive rotation state (never affects the cap-reactive path)
@@ -2185,10 +2245,20 @@ class Supervisor:
                 binding.transcript_path)
             if evidence is None:
                 if self.now() >= pending.deadline:
+                    # A timed-out lookup is an ABSENCE of information, not a
+                    # contradicted proof: the transcript may simply not be
+                    # flushed yet. Give it a bounded number of further
+                    # windows before disarming a live session over 6 seconds.
+                    if pending.extensions < CAP_MODEL_RETRIES:
+                        pending = replace(
+                            pending, extensions=pending.extensions + 1,
+                            deadline=self.now() + CAP_MODEL_TIMEOUT)
+                        child.pending_cap = pending
+                        return pending
                     child.pending_cap = None
                     raise PendingCapTimeout(
                         "could not determine the cap-time model before "
-                        f"{CAP_MODEL_TIMEOUT:g}s")
+                        f"{CAP_MODEL_TIMEOUT * (CAP_MODEL_RETRIES + 1):g}s")
                 return pending
             source = handoff.SourceSession(
                 binding.session_id, binding.transcript_path,
@@ -2247,7 +2317,10 @@ class Supervisor:
         if size != child.event_offset:
             raise SupervisorError("cap proof expired after a newer hook event")
 
-    def _preflight(self, child, proof):
+    def _preflight(self, child, proof, held=False):
+        """The cap path's admission chain. `held` says this is a RE-attempt of
+        a cap whose fresh usage already corroborated it at least once, which
+        changes exactly one verdict — see the `scope is None` branch."""
         self._proof_current(child, proof)
         try:
             handoff.guard_source_stable(
@@ -2275,14 +2348,28 @@ class Supervisor:
             scope = route.cap_scope(snapshot, child.account["name"],
                                     proof.family, proof.message)
             if scope is None:
+                # First look: the hook says capped and fresh usage does not.
+                # That is a CONTRADICTION and it disarms, unchanged — a proof
+                # nobody can corroborate must never move a session.
+                # On a re-attempt it means something else entirely: this same
+                # usage feed already showed >=99% for this proof, and now does
+                # not, so the window reset while we were waiting for a seat.
+                # Nothing to rotate away from, and no reason to disarm.
+                if held:
+                    raise CapCleared(
+                        "the capped window reset while we waited for a seat")
                 raise SupervisorError(
                     "fresh usage is below 99% or the cap scope is ambiguous")
+            child.cap_corroborated = True
             reset = scope.get("reset")
             if (not isinstance(reset, (int, float)) or isinstance(reset, bool)
                     or not math.isfinite(reset) or reset <= self.now()):
                 raise SupervisorError("fresh cap reset is missing or ambiguous")
-            target = handoff.select_target(
-                child.account["name"], snapshot, proof.family)
+            try:
+                target = handoff.select_target(
+                    child.account["name"], snapshot, proof.family)
+            except handoff.NoHeadroomError as error:
+                raise CapacityHold(str(error)) from error
             binding = child.binding
             source = handoff.SourceSession(
                 proof.session_id, proof.transcript_path, child.account,
@@ -2297,28 +2384,84 @@ class Supervisor:
                 binding.cwd, cooldown_scope=scope, automatic=True,
                 child_generation=child.generation)
             route.preflight_cooldowns()
-            handoff.select_target(
-                child.account["name"], snapshot, proof.family,
-                requested=target["name"])
+            try:
+                handoff.select_target(
+                    child.account["name"], snapshot, proof.family,
+                    requested=target["name"])
+            except handoff.NoHeadroomError as error:
+                raise CapacityHold(str(error)) from error
             self._proof_current(child, proof)
             self._events_pending(child)
             if handoff._transcript_stat(proof.transcript_path) \
                     != plan.source_stat:
                 raise SupervisorError("source transcript changed before admission")
             if reset <= self.now():
-                raise SupervisorError("cap reset elapsed before admission")
+                # the cap ended on its own: there is nothing to move away from
+                raise CapCleared("cap reset elapsed before admission")
             handoff.reserve_automatic(
                 plan, self.now(), loop_window=LOOP_WINDOW, loop_max=LOOP_MAX)
             self._proof_current(child, proof)
             self._events_pending(child)
             if reset <= self.now():
-                raise SupervisorError("cap reset elapsed before stop")
+                # Past the reservation, so release it explicitly: a failure
+                # row frees the target slot and costs no loop budget (nothing
+                # was ever stopped). Then treat it as what it is — the cap
+                # ended, the session is fine, automation stays armed.
+                self._failure(plan, "cap_reset_elapsed_before_stop")
+                raise CapCleared("cap reset elapsed before stop")
             return plan
         except SupervisorError:
             raise
         except (handoff.HandoffError, registry.RegistryError, RuntimeError,
                 OSError, ValueError) as error:
             raise SupervisorError(str(error)) from error
+
+    # ---- waiting out a cap: hold, don't disarm ---------------------------
+
+    def _cap_hold_clear(self, child):
+        child.cap_hold_attempts = 0
+        child.cap_hold_next = 0.0
+        child.cap_hold_reason = ""
+        child.cap_hold_key = ()
+        child.cap_corroborated = False
+
+    def _cap_hold_sync(self, child, proof):
+        """Bind the hold to ONE proof. A different proof (a later refusal, a
+        new session) starts its own hold with its own budget and its own
+        corroboration — nothing about the last one may vouch for it."""
+        event = getattr(proof, "event", None)
+        key = (getattr(proof, "session_id", None),
+               getattr(proof, "epoch", None),
+               event.get("received_at") if isinstance(event, dict) else None)
+        # an unidentifiable proof gets a fresh hold every time: full budget,
+        # and nothing inherited from whatever came before it
+        if key[0] is None or child.cap_hold_key != key:
+            self._cap_hold_clear(child)
+            child.cap_hold_key = key
+
+    def _cap_hold(self, child, error):
+        """Hold this proof for another interval. False once the budget is
+        spent, and the caller then disarms exactly as it always did.
+
+        A hold is a delay, never a promise: the child keeps running with
+        automation armed, and every attempt is the same full preflight, so
+        nothing is admitted on weaker proof than a first attempt would need."""
+        child.cap_hold_attempts += 1
+        if child.cap_hold_attempts > CAP_HOLD_MAX:
+            return False
+        child.cap_hold_next = self.now() + CAP_HOLD_SECONDS
+        reason = str(error)
+        if child.cap_hold_reason == reason:
+            return True
+        child.cap_hold_reason = reason
+        print(f"[headroom] automatic handoff is waiting for capacity "
+              f"({reason}); child continues with the cap handoff still armed, "
+              f"retrying every {CAP_HOLD_SECONDS:g}s",
+              file=sys.stderr)
+        notify.emit({"event": "cap_held",
+                     "account": child.account.get("name", ""),
+                     "reason": reason})
+        return True
 
     # ---- preemptive rotation: leave BEFORE the wall ----------------------
     #
@@ -3547,8 +3690,37 @@ class Supervisor:
                     if outcome is not None:
                         return outcome
                 if proof is not None and child.automation:
+                    self._cap_hold_sync(child, proof)
+                if proof is not None and child.automation \
+                        and self.now() >= child.cap_hold_next:
                     try:
-                        plan = self._preflight(child, proof)
+                        plan = self._preflight(
+                            child, proof, held=child.cap_corroborated)
+                    except CapCleared as error:
+                        # the window reset under us: nothing to rotate away
+                        # from, and every reason to stay armed for the next one
+                        print(f"[headroom] {error}; the seat is usable again "
+                              "and automatic handoff stays armed",
+                              file=sys.stderr)
+                        notify.emit({"event": "cap_cleared",
+                                     "account": child.account.get("name", ""),
+                                     "reason": str(error)})
+                        self._cap_hold_clear(child)
+                        proof = None
+                    except CapacityHold as error:
+                        # nowhere to go YET. Hold the proof, keep the child
+                        # running, keep automation armed — and disarm only
+                        # once the budget for waiting is genuinely spent.
+                        if not self._cap_hold(child, error):
+                            print(f"[headroom] automatic handoff held: {error}; "
+                                  f"no seat came free in "
+                                  f"{CAP_HOLD_MAX * CAP_HOLD_SECONDS / 3600:g}h "
+                                  "— automatic handoff disabled for this child",
+                                  file=sys.stderr)
+                            _lose_supervision(
+                                child, f"automatic handoff held: {error}")
+                            self._cap_hold_clear(child)
+                            proof = None
                     except handoff.HandoffError as error:
                         # A recent mtime is expected just after StopFailure; keep
                         # polling until the required five quiet seconds pass.
@@ -3565,6 +3737,8 @@ class Supervisor:
                             child, f"automatic handoff held: {error}")
                         proof = None
                     else:
+                        # admitted: whatever we were waiting for arrived
+                        self._cap_hold_clear(child)
                         relaunch = None
                         try:
                             relaunch = self._stop_and_commit(child, plan, proof)

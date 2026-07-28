@@ -75,6 +75,25 @@ one still in flight — so an admission released without ever stopping a child
 (an aborted preemptive attempt, a lost target race) cannot spend the budget a
 genuine cap needs.
 
+**When there is nowhere to go, headroom waits instead of giving up.** A cap
+that cannot be answered — every other seat is capped too — used to disarm
+automatic handoff for that child permanently, while it sat on the capped seat:
+the one state where it most needs to move. Nothing was disproven, and the
+condition fixes itself, so headroom now HOLDS the proof (child alive,
+automation armed, a `cap_held` event) and re-runs the full preflight every
+five minutes. The moment a seat frees up, the session moves. If the capped
+window resets first, the hold ends with the session still armed (`cap_cleared`)
+— there is nothing left to rotate away from. The wait is bounded: about five
+hours (`HEADROOM_CAP_HOLD_SECONDS`, `HEADROOM_CAP_HOLD_MAX`; set the max to `0`
+for the old give-up-immediately behaviour), after which it disarms and says so
+exactly as before. A cap that fresh usage *contradicts* is not a hold and
+never was: that still disarms on the first look.
+
+What comes back is the **conversation**, not the turn that was refused. The
+resumed session starts idle: nothing re-sends the prompt Claude refused, and
+background tasks, MCP connections and permission state do not survive a
+handoff (see `docs/KNOWN-LIMITS.md`).
+
 Turn it off in `headroom setup`, or explicitly in config:
 
 ```json
@@ -621,7 +640,11 @@ Six affordances make headroom composable with launch wrappers:
   "window", "used_percent"}` when a seat crosses its threshold and a target
   exists, `{"event": "preemptive_handoff", …, "target", "handoff_id"}` when
   the session actually moves, and `{"event": "preemptive_held", "account",
-  "reason"}` when an early rotation is deferred. The context backstop adds
+  "reason"}` when an early rotation is deferred. A cap with nowhere to go adds
+  `{"event": "cap_held", "account", "reason"}` while it waits for a seat and
+  `{"event": "cap_cleared", "account", "reason"}` if the capped window resets
+  first — neither is a loss of supervision, and a `supervision_lost` still
+  follows if the wait runs out. The context backstop adds
   `{"event": "context_backstop_scheduled", "account", "used", "window",
   "remaining_percent"}`, `{"event": "context_backstop_rotation", …, "model",
   "forked"}` when a session is forcibly continued, `{"event":

@@ -36,6 +36,17 @@ class HandoffError(RuntimeError):
     """A user-actionable refusal; handoff guards intentionally fail closed."""
 
 
+class NoHeadroomError(HandoffError):
+    """No seat can be routed to right now.
+
+    Its own class because it is the one refusal in this module that says
+    nothing is WRONG — the request is well formed, the proof is intact, there
+    is simply no capacity this second. A later snapshot resolves it without
+    anyone doing anything, so a caller that would otherwise give up
+    permanently (the supervisor disarming a capped child) can tell it apart
+    from a refusal that no amount of waiting will change."""
+
+
 @dataclass(frozen=True)
 class SourceSession:
     session_id: str
@@ -493,12 +504,13 @@ def select_target(source_slot, snapshot, family="claude", requested=None):
         if account["name"] == source_slot:
             raise HandoffError("source and target slots must be different")
         if reason is not None:
-            raise HandoffError(f"target {requested} has no proven headroom: {reason}")
+            raise NoHeadroomError(
+                f"target {requested} has no proven headroom: {reason}")
         return account
     target = next((account for account, reason in ranked
                    if reason is None and account["name"] != source_slot), None)
     if target is None:
-        raise HandoffError(
+        raise NoHeadroomError(
             f"no account has proven headroom for the {family} family")
     return target
 

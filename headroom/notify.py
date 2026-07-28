@@ -13,6 +13,8 @@ transitions with a single JSON argument describing the event:
     {"event": "preemptive_handoff", "account": ..., "target": ...,
      "family": ..., "window": ..., "used_percent": ..., "handoff_id": ...}
     {"event": "preemptive_held", "account": ..., "reason": ...}
+    {"event": "cap_held", "account": ..., "reason": ...}
+    {"event": "cap_cleared", "account": ..., "reason": ...}
 
 ``supervision_lost`` fires for EVERY path that disarms a supervised child's
 automatic handoff, once per distinct reason — a dashboard should treat it as

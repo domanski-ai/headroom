@@ -790,6 +790,15 @@ class HookProof(unittest.TestCase):
             supervisor_id=self.SUPERVISOR)
         hold = runner._prove_cap(self.child, record)
         self.assertIsInstance(hold, supervisor.PendingCap)
+        # Each timeout buys another window, bounded by CAP_MODEL_RETRIES. A
+        # transcript that has not been flushed yet is an ABSENCE of evidence,
+        # not a contradicted proof, and 6s is a short window to bet a live
+        # session's automation on.
+        for extension in range(1, supervisor.CAP_MODEL_RETRIES + 1):
+            clock[0] += supervisor.CAP_MODEL_TIMEOUT
+            hold = runner._prove_cap(self.child, hold.event)
+            self.assertIsInstance(hold, supervisor.PendingCap)
+            self.assertEqual(hold.extensions, extension)
         clock[0] += supervisor.CAP_MODEL_TIMEOUT
         with self.assertRaises(supervisor.PendingCapTimeout):
             runner._prove_cap(
@@ -811,12 +820,19 @@ class HookProof(unittest.TestCase):
             "sonnet", [], self.child.account, now=lambda: clock[0],
             supervisor_id=self.SUPERVISOR)
         output = io.StringIO()
+        windows = supervisor.CAP_MODEL_RETRIES + 1
         with mock.patch.object(supervisor, "_read_events",
-                               side_effect=[[record], []]), \
+                               side_effect=[[record]] + [[]] * windows), \
                 mock.patch("headroom.supervisor.os.kill") as kill, \
                 redirect_stderr(output):
             self.assertIsNone(runner._handle_events(self.child, ""))
             self.assertTrue(self.child.automation)
+            for _ in range(supervisor.CAP_MODEL_RETRIES):
+                clock[0] += supervisor.CAP_MODEL_TIMEOUT
+                self.assertIsNone(runner._handle_events(self.child, ""))
+                # one 6-second window no longer costs a live session its
+                # automation — the lookup gets a bounded number of them
+                self.assertTrue(self.child.automation)
             clock[0] += supervisor.CAP_MODEL_TIMEOUT
             self.assertIsNone(runner._handle_events(self.child, ""))
         self.assertFalse(self.child.automation)
@@ -824,7 +840,7 @@ class HookProof(unittest.TestCase):
         kill.assert_not_called()
         self.assertIn(
             f"could not determine the cap-time model before "
-            f"{supervisor.CAP_MODEL_TIMEOUT:g}s", output.getvalue())
+            f"{supervisor.CAP_MODEL_TIMEOUT * windows:g}s", output.getvalue())
         self.assertIn("/exit then `headroom handoff` to move manually",
                       output.getvalue())
 

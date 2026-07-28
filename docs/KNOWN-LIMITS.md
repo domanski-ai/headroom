@@ -167,6 +167,25 @@ twice. All manual handoffs require `--force` for a dangling call: a 99–100%
 usage snapshot alone is not an authenticated cap event and does not relax this
 guard.
 
+## Nothing re-runs the turn a cap refused
+
+When capacity comes back, headroom moves the conversation and resumes it — see
+"waiting for capacity" in the README. The session comes back *idle*: the
+prompt the provider refused is not re-sent, and neither headroom nor any
+supported Claude Code interface can inject one into a live interactive
+session. `--resume` with a prompt means `-p`, which is non-interactive and
+incompatible with supervision, and typing into the child's stdin would race
+the human at the same terminal. So "the work resumes" means a human or the
+session's own operator loop asks again; what headroom guarantees is that
+asking again lands on a seat with headroom instead of a wall.
+
+Two consequences worth planning around. A session doing continuous autonomous
+work should be driven by something that re-asks (a queue, a loop, a scheduled
+prompt) rather than assuming the refused turn is retried. And a supervisor
+that is not running cannot revive anything at all: the hold lives in the
+supervisor process, so a session launched outside `headroom claude` — or one
+whose supervisor exited — has no revival path.
+
 ## Handoff carries conversation state, not process state
 
 The fork preserves conversation continuity, routes for the same model family,
