@@ -3336,7 +3336,7 @@ class CapWaitsForCapacity(TempDirCase):
             self.clock["t"] - 60, True, binding=self.binding, session_epoch=1)
 
     def snapshot(self, source5=100.0, target5=100.0, target7=10.0,
-                 target_scoped=None, source_scoped=None):
+                 target_scoped=None, source_scoped=None, source7=None):
         """Built from the CURRENT clock, the way a real collect would be."""
         captured = int(self.clock["t"]) + 1
         source = usage_row("source", used5=0.0, captured=captured)
@@ -3346,6 +3346,13 @@ class CapWaitsForCapacity(TempDirCase):
             source["windows"]["5h"],
             **(source5 if isinstance(source5, dict)
                else {"used_percent": source5}))
+        # source7 the same way, so the OTHER account-wide window can cross
+        # mid-hold — the shape that shares the recorded cooldown key
+        if source7 is not None:
+            source["windows"]["7d"] = dict(
+                source["windows"]["7d"],
+                **(source7 if isinstance(source7, dict)
+                   else {"used_percent": source7}))
         target = usage_row("target", used5=target5, used7=target7,
                            captured=captured)
         for row, scoped in ((source, source_scoped), (target, target_scoped)):
@@ -3679,7 +3686,9 @@ class CapWaitsForCapacity(TempDirCase):
         with mock.patch.object(supervisor, "CAP_ROTATE_AT_WALL", False):
             outcome, _child = self.wall_hold((100.0, 5.0, 10.0, None, 100.0))
         self.assertIsInstance(outcome, supervisor.CapacityHold)
-        self.assertIn("not readable in fresh usage", str(outcome))
+        # and the hold says WHY: the window read fine, rotation is off — it
+        # used to claim "not readable" about a reading it had just made
+        self.assertIn("rotation at the wall is disabled", str(outcome))
 
     def test_a_proof_may_only_ever_admit_the_cap_it_recorded(self):
         # the scoped pool it was holding for resets to 4% while the 5h window
@@ -3691,6 +3700,78 @@ class CapWaitsForCapacity(TempDirCase):
         self.assertIn("scoped:fable window is back to 4%", str(outcome))
         self.assertEqual((child.cap_scope_key, child.cap_scope_window),
                          ("source:fable", "scoped:fable"))
+
+    def account_hold(self, second):
+        """A held ACCOUNT-WIDE cap recorded on the 5h window under a generic
+        phrase, so a later snapshot can resolve to the 7d window behind the
+        SAME `source:*` cooldown key. Returns the second attempt's outcome."""
+        runner = self.runner([(100.0, 100.0), second])
+        child, proof = self.child(), self.proof(self.GENERIC)
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(supervisor.CapacityHold):
+                runner._preflight(child, proof)
+            self.assertEqual((child.cap_scope_key, child.cap_scope_window),
+                             ("source:*", "5h"))
+            try:
+                return runner._preflight(
+                    child, proof, held=child.cap_scope_window), child
+            except supervisor.SupervisorError as error:
+                return error, child
+
+    def test_a_shared_key_does_not_relabel_a_recorded_window_that_reset(self):
+        """Both account-wide windows share `source:*`, so a matching key is
+        not a matching cap. The recorded 5h window reset to 4% while the 7d
+        filled behind it: the retry resolved the same key, took the relabel
+        path, and produced a live handoff cooling seven days nobody
+        corroborated — instead of the CapCleared the reading proves."""
+        outcome, child = self.account_hold(
+            (4.0, 5.0, 10.0, None, None, 100.0))
+        self.assertIsInstance(outcome, supervisor.CapCleared)
+        self.assertIn("5h window is back to 4%", str(outcome))
+        self.assertEqual((child.cap_scope_key, child.cap_scope_window),
+                         ("source:*", "5h"))
+        self.assertEqual(self.ledger(), [])          # no handoff was admitted
+
+    def test_the_shared_key_reset_clears_with_rotation_disabled_too(self):
+        """The relabel path predates the wall-rotation switch and was never
+        gated by it — so neither is the correction. A recorded window that
+        provably reset is CapCleared with the switch in every position."""
+        with mock.patch.object(supervisor, "CAP_ROTATE_AT_WALL", False):
+            outcome, _child = self.account_hold(
+                (4.0, 5.0, 10.0, None, None, 100.0))
+        self.assertIsInstance(outcome, supervisor.CapCleared)
+
+    def test_a_shared_key_relabel_still_stands_when_both_windows_hold(self):
+        """The round-2 agreement is untouched: when the recorded 5h window is
+        STILL at the wall and the 7d crossed too, the account-wide scope
+        legitimately relabels onto the window that now binds — that is not a
+        scope change, and the recorded proof does not move."""
+        outcome, child = self.account_hold(
+            (100.0, 5.0, 10.0, None, None, 100.0))
+        self.assertNotIsInstance(outcome, supervisor.SupervisorError)
+        self.assertEqual(outcome.target["name"], "target")
+        self.assertEqual(outcome.cooldown_scope["key"], "source:*")
+        self.assertEqual(outcome.cooldown_scope["window"], "7d")
+        self.assertIs(outcome.cooldown_scope["account_wide"], True)
+        # the RECORD stays what was corroborated at the first look
+        self.assertEqual((child.cap_scope_key, child.cap_scope_window),
+                         ("source:*", "5h"))
+
+    def test_a_shared_key_with_the_recorded_window_unreadable_holds(self):
+        """Same key, the 7d provably at the wall, and the recorded 5h window
+        unreadable: that proves nothing about the cap we held for, so the
+        proof is kept — no relabel proceeds on the other window's reading
+        alone, and no disarm. (The source-binding gate raises this hold for
+        an account-wide window, since 5h is mandatory in every bound row; the
+        scope interrogation's own unreadable arm answers the same way for a
+        recorded window the row can be bound without, like a vanished scoped
+        pool — test_a_window_that_merely_vanished_is_not_a_reset.)"""
+        outcome, child = self.account_hold(
+            ({"used_percent": 100.0, "freshness": "expired_observation"},
+             5.0, 10.0, None, None, 100.0))
+        self.assertIsInstance(outcome, supervisor.CapacityHold)
+        self.assertEqual((child.cap_scope_key, child.cap_scope_window),
+                         ("source:*", "5h"))
 
     def test_an_uncorroborated_cap_still_disarms_on_the_first_look(self):
         # NOT a hold: the hook says capped and fresh usage says otherwise, on

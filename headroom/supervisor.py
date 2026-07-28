@@ -2459,18 +2459,25 @@ class Supervisor:
                         "fresh usage is below 99% or the cap scope is ambiguous")
                 child.cap_scope_key = scope.get("key") or ""
                 child.cap_scope_window = scope.get("window") or ""
-            elif (scope or {}).get("key") != child.cap_scope_key:
+            elif ((scope or {}).get("key") != child.cap_scope_key
+                    or (scope or {}).get("window") != child.cap_scope_window):
                 # A re-attempt may only ever admit THE cap it recorded. A
                 # different scope here is a different cap: reading it as this
                 # one would cool a window we never corroborated and quietly
                 # rewrite what we are holding for (observed: a scoped Fable
                 # cap whose pool reset to 4% while the 5h window filled came
-                # back as a 5h handoff). So interrogate only the recorded
-                # window. It has THREE answers, not two: a readable reading
-                # below 99% means the cap we held for is genuinely over; a
-                # readable reading still AT the wall means it is genuinely
-                # not over and this attempt should proceed on it; and only an
-                # unreadable one proves nothing and keeps the proof.
+                # back as a 5h handoff). And a matching KEY is not a matching
+                # cap: both account-wide windows share `source:*`, so a held
+                # 5h proof whose window reset while the 7d filled behind it
+                # arrived here with the same key, sailed past this guard, and
+                # produced a live handoff cooling a week nobody corroborated
+                # — with the rotation switch off, even. So interrogate the
+                # recorded window whenever EITHER differs. It has THREE
+                # answers, not two: a readable reading below 99% means the
+                # cap we held for is genuinely over; a readable reading still
+                # AT the wall means it is genuinely not over and this attempt
+                # should proceed; and only an unreadable one proves nothing
+                # and keeps the proof.
                 window = self._scope_window(
                     proof.family,
                     _snapshot_row(snapshot, child.account["name"]),
@@ -2484,16 +2491,33 @@ class Supervisor:
                     raise CapCleared(
                         f"the capped {child.cap_scope_window} window is back "
                         f"to {used:g}% — it reset while we waited for a seat")
-                if not (readable and CAP_ROTATE_AT_WALL):
+                if not readable:
                     raise CapacityHold(
                         f"the capped {child.cap_scope_window} window is not "
                         "readable in fresh usage — holding the proof rather "
                         "than assuming it reset")
-                # Still at the wall. Rotate on the RECORDED scope, rebuilt
-                # from the recorded window's own fresh reading — never on the
-                # different scope we just read, which is the cap nobody
-                # corroborated.
-                scope = self._recorded_scope(child, proof.family, window)
+                if (scope or {}).get("key") == child.cap_scope_key:
+                    # Same key, and the recorded window itself is still at
+                    # the wall: this is the account-wide RELABEL — the other
+                    # account window crossed too and now binds the cooldown.
+                    # That was never a scope change and it proceeds on the
+                    # fresh scope, exactly as it did before the wall rotation
+                    # existed (which is why the switch below does not gate
+                    # it). What the window comparison above added is only
+                    # this: the relabel may no longer swallow a recorded
+                    # window that has provably RESET.
+                    pass
+                elif not CAP_ROTATE_AT_WALL:
+                    raise CapacityHold(
+                        f"the capped {child.cap_scope_window} window is "
+                        "still at the wall and rotation at the wall is "
+                        "disabled — holding the proof")
+                else:
+                    # Still at the wall under a different key. Rotate on the
+                    # RECORDED scope, rebuilt from the recorded window's own
+                    # fresh reading — never on the different scope we just
+                    # read, which is the cap nobody corroborated.
+                    scope = self._recorded_scope(child, proof.family, window)
             reset = scope.get("reset")
             if (not isinstance(reset, (int, float)) or isinstance(reset, bool)
                     or not math.isfinite(reset) or reset <= self.now()):
@@ -2567,7 +2591,7 @@ class Supervisor:
             return ""
         checks = [("5h", windows.get("5h"), self.preemptive_session_percent),
                   ("7d", windows.get("7d"), CAP_TARGET_WEEKLY_PERCENT)]
-        if family in ("opus", "sonnet", "haiku", "fable"):
+        if family in route.SCOPED_FAMILIES:
             checks.append(("scoped:" + family,
                            route.scoped_window_for(family, windows),
                            CAP_TARGET_WEEKLY_PERCENT))
@@ -2722,8 +2746,8 @@ class Supervisor:
         windows = row.get("windows") if isinstance(row, dict) else None
         if not isinstance(windows, dict):
             return None
-        scoped = route.scoped_window_for(family, windows) if family in (
-            "opus", "sonnet", "haiku", "fable") else None
+        scoped = route.scoped_window_for(family, windows) \
+            if family in route.SCOPED_FAMILIES else None
         for window, key, threshold in (
                 (scoped, "scoped:" + family, self.preemptive_scoped),
                 (windows.get("7d"), "7d", self.preemptive_overall),
