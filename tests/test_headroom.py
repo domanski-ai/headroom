@@ -295,6 +295,11 @@ class PrivateModes(unittest.TestCase):
         return subprocess.run(["getfacl", "-p", self.directory],
                               capture_output=True, text=True).stdout
 
+    def preserving(self):
+        """The operator's opt-in. Preserving a mask relaxes the mode, so it
+        is never inferred from the mere presence of an ACL."""
+        return mock.patch.dict(os.environ, {"HEADROOM_PRESERVE_ACL": "1"})
+
     def test_an_already_correct_mode_never_calls_chmod(self):
         with mock.patch.object(paths.os, "chmod") as chmod:
             paths.ensure_private(self.directory)
@@ -331,8 +336,9 @@ class PrivateModes(unittest.TestCase):
         # enough on its own: it would differ forever, and chmod every time
         self.assertEqual(self.mode(), 0o750)
         self.assertIn("mask::r-x", self.facl())
-        for _ in range(3):                       # every supervisor tick
-            paths.ensure_private(self.directory)
+        with self.preserving():
+            for _ in range(3):                   # every supervisor tick
+                paths.ensure_private(self.directory)
         self.assertIn("mask::r-x", self.facl())
         self.assertNotIn("#effective:---", self.facl())
         self.assertEqual(self.mode(), 0o750)
@@ -358,11 +364,32 @@ class PrivateModes(unittest.TestCase):
         subprocess.run(["setfacl", "-m", f"u:{uid}:r-X,m::r-X", self.directory],
                        check=True, capture_output=True)
         os.chmod(self.directory, 0o755)          # world access, ACL and all
-        paths.ensure_private(self.directory)
+        with self.preserving():
+            paths.ensure_private(self.directory)
         # `other` is gone, the owner is intact, and the mask is left alone
         self.assertEqual(self.mode(), 0o750)
         self.assertIn("mask::r-x", self.facl())
         self.assertNotIn("#effective:---", self.facl())
+
+    @unittest.skipIf(ACL_SKIP, ACL_SKIP or "")
+    def test_an_acl_alone_is_not_the_operators_consent(self):
+        # A directory created under a parent carrying a DEFAULT ACL is BORN
+        # with an access ACL nobody asked for. Treating that as a deliberate
+        # grant published ~/.headroom and its state directory at 0770 — a
+        # foreign uid able to read the state — where the plain chmod gives
+        # 0700. Without the opt-in the inherited ACL buys nothing.
+        stranger = 65534 if os.getuid() != 65534 else 65533
+        subprocess.run(["setfacl", "-d", "-m", f"u:{stranger}:rwx",
+                        self.temp.name], check=True, capture_output=True)
+        inherited = os.path.join(self.temp.name, "headroom")
+        paths.ensure_private(inherited)
+        # the ACL really is there — this is the branch, not a missing xattr
+        self.assertIn("system.posix_acl_access", os.listxattr(inherited))
+        self.assertEqual(self.mode(inherited), 0o700)
+        granted = subprocess.run(["getfacl", "-pn", inherited],
+                                 capture_output=True, text=True).stdout
+        self.assertIn(f"user:{stranger}:rwx", granted)
+        self.assertIn("#effective:---", granted)
 
 
 class PlatformImportCleanliness(unittest.TestCase):
@@ -2903,7 +2930,7 @@ class RegistryCodexSeats(unittest.TestCase):
 
     def fleet(self):
         return {"schema_version": 1, "accounts": [
-            {"name": "domanski-ai", "provider": "claude",
+            {"name": "acct-a", "provider": "claude",
              "home": "~/ai-accounts/homes/claude-acct-a",
              "expected_email": "a@example.com"},
             {"name": "codex-acct-a", "provider": "codex",

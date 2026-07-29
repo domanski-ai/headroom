@@ -42,10 +42,11 @@ cp -r integrations/claude-code/skills/rotator ~/.claude/skills/
 
 Restart Claude Code and type `/rotator`.
 
-## 3. Opt-in automatic handoff
+## 3. Automatic handoff (on by default)
 
-Run `headroom setup` and answer Yes to the explicit automatic-handoff consent,
-then launch interactive sessions through `headroom claude`. Headroom injects
+Automatic handoff is on unless you turn it off — `headroom setup` asks, and
+`{"routing": {"auto_handoff": false}}` in `~/.headroom/config.json` disables
+it. Launch interactive sessions through `headroom claude`. Headroom injects
 private per-run hooks through `--settings`; it does not edit this file. A
 missing hook handshake leaves Claude running and disables automation. Your own
 `--settings` is merged under those hooks and launches supervised; a document

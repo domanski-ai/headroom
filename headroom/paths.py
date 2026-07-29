@@ -58,6 +58,22 @@ ACL_MASK_BITS = 0o070
 # it as licence to keep group bits left a 0750 state directory at 0750 where
 # the old code enforced 0700: a privacy regression, not a preserved grant.
 ACL_XATTRS = ("system.posix_acl_access",)
+# ...and the presence of an access ACL is not consent either. A directory
+# created under a parent carrying a DEFAULT ACL is BORN with an access ACL its
+# owner never asked for, so "there is an ACL here" cannot be read as "an
+# operator granted this deliberately": under a parent with a default
+# `u:nobody:rwx`, inferring consent published ~/.headroom and ~/.headroom/state
+# at 0770 — a foreign uid able to read the state directory — where the plain
+# chmod gives 0700. So the relaxation is stated, never inferred: the operator
+# who set the grant sets this too, and everyone else keeps the old
+# unconditional private mode.
+PRESERVE_ACL_ENV = "HEADROOM_PRESERVE_ACL"
+
+
+def preserve_acl(environ=None):
+    """Whether the operator asked for POSIX ACL masks to survive chmod."""
+    environ = os.environ if environ is None else environ
+    return str(environ.get(PRESERVE_ACL_ENV, "")).strip() == "1"
 
 
 def _extended_acl(target):
@@ -83,12 +99,16 @@ def _apply_mode(target, mode, stat_fn, chmod_fn):
     """chmod ``target`` to ``mode`` only when that changes something.
 
     Two jobs. The cheap one: skip the syscall when the mode is already right,
-    which is the overwhelmingly common case. The load-bearing one: when the
-    path carries an ACL, enforce the OWNER and OTHER bits and pass the current
-    group bits straight back through, so the mask survives. The privacy
-    invariant is unchanged and still enforced on every call — nothing gains
-    access to `other`, the owner keeps exactly what it needs — but a grant the
-    operator made deliberately is no longer collateral damage."""
+    which is the overwhelmingly common case. The other one, and only with
+    ``HEADROOM_PRESERVE_ACL=1``: when the path carries an access ACL, enforce
+    the OWNER and OTHER bits and pass the current group bits straight back
+    through, so the mask survives and a grant the operator made deliberately
+    is not collateral damage.
+
+    That opt-in DOES relax the mode headroom would otherwise enforce — group
+    access is whatever the ACL's mask says, on every path this touches,
+    credential homes included. Without it the mode is applied exactly as it
+    always was."""
     try:
         current = stat.S_IMODE(stat_fn(target).st_mode)
     except OSError:
@@ -98,7 +118,7 @@ def _apply_mode(target, mode, stat_fn, chmod_fn):
     if current == mode:
         return
     wanted = mode
-    if _extended_acl(target):
+    if preserve_acl() and _extended_acl(target):
         wanted = (mode & ~ACL_MASK_BITS) | (current & ACL_MASK_BITS)
         if wanted == current:
             return
@@ -196,7 +216,8 @@ def write_json_atomic(path, value, mode=0o600):
     The write lands on a fresh temp inode and `os.replace` swaps it in, so the
     old file's ACL goes with the old inode — no chmod involved and nothing
     here can preserve it. Grant on the containing DIRECTORY instead (that
-    inode is stable, and :func:`chmod_private` now leaves its mask alone)."""
+    inode is stable, and with ``HEADROOM_PRESERVE_ACL=1`` set,
+    :func:`chmod_private` leaves its mask alone)."""
     ensure_private(base_dir())
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)

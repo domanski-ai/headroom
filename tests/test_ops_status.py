@@ -206,7 +206,7 @@ class ReportShape(OpsStatusCase):
         self.usage([{"name": "acct-a", "windows": {
             "5h": {"used_percent": 21.0}, "7d": {"used_percent": 43.0},
             "scoped:Fable": {"used_percent": 13.0}}}])
-        report, ok = self.snapshot(panes={4000: "sales"})
+        report, ok = self.snapshot(panes={4000: "work"})
         self.assertTrue(ok)
         self.assertEqual(set(report), {"schema", "generated_at", "sessions",
                                        "seats", "errors"})
@@ -218,7 +218,7 @@ class ReportShape(OpsStatusCase):
         self.assertEqual(len(report["sessions"]), 1)
         session = report["sessions"][0]
         self.assertEqual(set(session), SESSION_KEYS)
-        self.assertEqual(session["container"], "sales")
+        self.assertEqual(session["container"], "work")
         self.assertEqual(session["supervisor_id"], SUP_A)
         self.assertEqual(session["session_id"], SID_A)
         self.assertEqual(session["seat"], "claude-acct-a")
@@ -409,7 +409,8 @@ class Discovery(OpsStatusCase):
                          [4001, 4003])
 
     def test_unsupervised_claude_is_not_a_session(self):
-        # a goal runner is a claude process with no supervisor of its own
+        # a plain hand-started CLI is a claude process with no supervisor of
+        # its own, so nothing here may claim it
         self.supervised(7001, ["claude", "--name", "side-task"],
                         environ={"CLAUDE_CONFIG_DIR": self.home})
         report, _ok = self.snapshot(panes={})
@@ -463,8 +464,8 @@ class Containers(OpsStatusCase):
 
     def test_a_session_matched_at_its_own_pid(self):
         self.one_live_session()
-        report, _ok = self.snapshot(panes={4001: "sales"})
-        self.assertEqual(report["sessions"][0]["container"], "sales")
+        report, _ok = self.snapshot(panes={4001: "work"})
+        self.assertEqual(report["sessions"][0]["container"], "work")
 
     def test_bare_session_reports_empty_container(self):
         self.one_live_session()
@@ -858,7 +859,9 @@ class Command(OpsStatusCase):
         """The dispatcher, pointed at this test's synthetic host."""
         absent = os.path.join(self.temp.name, "absent.json")
         return (mock.patch.object(ops_status, "PROC_ROOT", self.proc),
-                mock.patch.object(ops_status, "FALLBACK_USAGE_PATH", absent),
+                mock.patch.dict(
+                    os.environ,
+                    {ops_status.FALLBACK_USAGE_ENV: absent}),
                 mock.patch.object(ops_status, "tmux_panes", return_value={}))
 
     def test_dispatch_prints_json_and_exits_zero(self):

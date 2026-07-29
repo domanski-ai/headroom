@@ -452,8 +452,8 @@ def codex_lineage_digest(home):
     The access token rotates on every normal refresh (credential_digest
     changes), but the refresh token only changes on a fresh login — so a
     lineage change distinguishes "same login, refreshed" from "someone
-    re-logged this account in somewhere" (e.g. Paul's Mac desktop re-login
-    invalidating a server seat). None when unreadable (callers hold)."""
+    re-logged this account in somewhere" (a desktop re-login invalidating a
+    seat on another machine). None when unreadable (callers hold)."""
     try:
         tokens = (paths.load_json(os.path.join(home, "auth.json"))
                   or {}).get("tokens") or {}
@@ -1552,11 +1552,11 @@ def display_left(window):
 
     The provider reports USED and the statusline shows LEFT, so the two
     surfaces disagreed on what a bare number meant: `7d=99%` was one percent
-    of a week remaining, while `7d=34%` was two thirds remaining. Paul reads
-    batteries (2026-07-28: "we work on batteries, batteries run out"), and an
-    emergency should not have to be arithmetic. Anything human-facing prints
-    LEFT and says so; `display_percent` stays for anything that genuinely
-    means used.
+    of a week remaining, while `7d=34%` was two thirds remaining. Capacity is
+    read the way a battery is read — how much is left — and deciding where to
+    work should not require arithmetic under pressure. Anything human-facing
+    prints LEFT and says so; `display_percent` stays for anything that
+    genuinely means used.
     """
     if not window or window.get("used_percent") is None:
         return "-"

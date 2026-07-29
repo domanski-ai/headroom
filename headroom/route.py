@@ -490,12 +490,12 @@ def _fable_room(row):
     """Remaining Fable weekly headroom (0-100, higher = more capacity), or None
     when there is no readable Fable reading.
 
-    Paul 2026-07-22: Claude account selection PREFERS seats that still have
-    Fable capacity, so an interactive session can always switch to Fable —
-    even a session currently running Opus. This is a RANKING signal only;
-    eligibility is still decided by block_reason. A seat with no readable Fable
-    reading ranks after those with one (fail-closed ordering: never prefer an
-    unknown over a proven-capacity seat)."""
+    Claude account selection PREFERS seats that still have Fable capacity, so
+    an interactive session can always switch to Fable — even one currently
+    running Opus. This is a RANKING signal only; eligibility is still decided
+    by block_reason. A seat with no readable Fable reading ranks after those
+    with one (fail-closed ordering: never prefer an unknown over a
+    proven-capacity seat)."""
     if not isinstance(row, dict):
         return None
     windows = row.get("windows")
@@ -836,8 +836,8 @@ def _codex_gate(account, snapshot_row, identity):
         return "cannot verify refresh-token lineage — recollect"
     if current_lineage != lineage:
         # a lineage change means a FRESH LOGIN happened somewhere (a normal
-        # access refresh keeps the lineage) — for a seat shared with Paul's
-        # Mac desktop that is the collision signature; either way, hold
+        # access refresh keeps the lineage) — on a seat also used from a
+        # desktop that is the collision signature; either way, hold
         if account.get("shared_desktop"):
             return ("shared_desktop_identity — Mac re-login can invalidate "
                     "this seat")
@@ -867,13 +867,13 @@ def candidates(fam, snapshot=_UNSET):
     cool = cooldowns()
     now = time.time()
     reserve = registry.reserve_percent()
-    # Claude selection ranks eligible seats by remaining FABLE headroom first
-    # (Paul 2026-07-22, superseding the 2026-07-18 pure registry-order sticky
-    # primary): a new session must land where Fable is still usable — even one
-    # running Opus — so the operator can always switch to Fable. Codex keeps
-    # registry order. This reorders only FRESH picks; a session that already
-    # exported its CLAUDE_CONFIG_DIR stays put via env_pinned_account, so live
-    # work is never hopped mid-flight.
+    # Claude selection ranks eligible seats by remaining FABLE headroom first,
+    # superseding the older pure registry-order sticky primary: a new session
+    # must land where Fable is still usable — even one running Opus — so the
+    # operator can always switch to Fable. Codex keeps registry order. This
+    # reorders only FRESH picks; a session that already exported its
+    # CLAUDE_CONFIG_DIR stays put via env_pinned_account, so live work is
+    # never hopped mid-flight.
     prefer_fable = registry.family_provider(fam) == "claude"
     ranked = []
     for index, account in enumerate(registry.ordered_for(fam)):

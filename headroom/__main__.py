@@ -331,14 +331,15 @@ def _prepare_launch(command, args):
                        and sys.stderr.isatty())
             # Headless supervision (opt-in). A piped / non-TTY launch is
             # normally exec-only, and an exec-only child CANNOT rotate when it
-            # hits a cap mid-run — it just stalls (the exact daily-pipeline
-            # failure). When auto-handoff was requested EXPLICITLY with
-            # --headroom-auto-handoff (every dispatched brief passes it) OR
-            # HEADROOM_HEADLESS_SUPERVISION=1 is set, supervise the non-TTY run
-            # too, so its stateful baton/resume handoff fires on a cap exactly
-            # like an interactive run — it stops the child, then RESUMES the
-            # same session on a fresh account (never replays completed work).
-            # HEADROOM_HEADLESS_SUPERVISION=0 forces the old exec-only path.
+            # hits a cap mid-run — it just stalls, which is how a scheduled or
+            # piped run silently loses the rest of its work. When auto-handoff
+            # was requested EXPLICITLY with --headroom-auto-handoff (the way a
+            # wrapper opts in) OR HEADROOM_HEADLESS_SUPERVISION=1 is set,
+            # supervise the non-TTY run too, so its baton/resume handoff fires
+            # on a cap exactly like an interactive run — it stops the child,
+            # then RESUMES the same session on a fresh account (it never
+            # replays completed work). HEADROOM_HEADLESS_SUPERVISION=0 forces
+            # the old exec-only path.
             # `incompatible_args` still gates in every mode: a -p/--print/
             # --output-format run has no resumable session, so it stays
             # exec-only regardless of TTY or opt-in.

@@ -63,9 +63,14 @@ TMUX_TIMEOUT = 1.0
 JOURNAL_TAIL_BYTES = 256 * 1024
 # walking a pid's ancestry is bounded: a cycle in /proc would otherwise hang
 MAX_ANCESTRY = 64
-# the fleet's public battery feed, used only when headroom's own private
-# snapshot cannot be read
-FALLBACK_USAGE_PATH = "/var/lib/headroom/usage-fallback.json"
+# An OPTIONAL second usage feed, read only when headroom's own private
+# snapshot cannot be read. There is deliberately no default path: a shipped
+# default would name a directory this build knows nothing about on the machine
+# it runs on, and any path a web server or deploy tooling can write is an
+# unowned source of numbers the router would then be trusting. Unset, an
+# unreadable private snapshot stays unreadable and `seat_snapshot_unreadable`
+# says so, which is the honest answer.
+FALLBACK_USAGE_ENV = "HEADROOM_OPS_FALLBACK_USAGE"
 
 # `_turn_is_complete` answers "" or WHY the child may be mid-turn. Two of its
 # reasons are not evidence of a turn at all — they say the transcript could
@@ -475,9 +480,9 @@ def _window_is_certain(used, model, environ=None):
     inferred from a coin-flip.
 
     ~200k tokens used is both "nearly dead" (standard window) and "barely
-    started" (1M) — the estate's own §5 trap. A number is only reported when
-    the window is pinned: an explicit override, a `[1m]` model on the child's
-    own argv, or usage a standard window could not have served at all."""
+    started" (1M). A number is only reported when the window is pinned: an
+    explicit override, a `[1m]` model on the child's own argv, or usage a
+    standard window could not have served at all."""
     environ = os.environ if environ is None else environ
     override = str(environ.get("HEADROOM_CTX_WINDOW", "")).strip()
     if override:
@@ -618,16 +623,22 @@ def _seat_index():
     return by_name, by_home
 
 
-def seats(fallback_path=None):
+def fallback_usage_path(environ=None):
+    """The operator's opt-in second usage feed, or None when there is none."""
+    environ = os.environ if environ is None else environ
+    return str(environ.get(FALLBACK_USAGE_ENV, "")).strip() or None
+
+
+def seats(fallback_path=None, environ=None):
     """Per-seat batteries, or None when no usage snapshot could be read."""
-    fallback_path = (FALLBACK_USAGE_PATH if fallback_path is None
-                     else fallback_path)
+    if fallback_path is None:
+        fallback_path = fallback_usage_path(environ)
     snapshot = None
     try:
         snapshot = paths.load_json(paths.private_snapshot_path())
     except (OSError, ValueError):
         snapshot = None
-    if not isinstance(snapshot, dict):
+    if not isinstance(snapshot, dict) and fallback_path:
         snapshot = paths.load_json(fallback_path)
     rows = snapshot.get("accounts") if isinstance(snapshot, dict) else None
     if not isinstance(rows, list):
@@ -710,18 +721,16 @@ def snapshot(now=None, proc_root=None, panes=None,
     `panes` may be pre-supplied (tests, or a caller that already asked tmux);
     None means consult tmux once for the whole report. The path defaults are
     resolved HERE rather than bound as argument defaults, so the module-level
-    constants stay overridable at run time."""
+    constant and the environment stay overridable at run time."""
     now = time.time() if now is None else now
     proc_root = PROC_ROOT if proc_root is None else proc_root
-    fallback_path = (FALLBACK_USAGE_PATH if fallback_path is None
-                     else fallback_path)
     errors = []
     children, reason = supervised_children(proc_root)
     if children is None:
         errors.append("session_discovery_failed: " + (reason or "unknown"))
     if panes is None:
         panes = tmux_panes()
-    battery = seats(fallback_path)
+    battery = seats(fallback_path, environ)
     if battery is None:
         errors.append("seat_snapshot_unreadable: no usage snapshot could be "
                       "read")

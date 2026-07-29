@@ -11,10 +11,10 @@
   │  Claude     │◄──────────────────│                │
   │  provider   │  (read-only, the  │   collect      │──► state/usage-private.json
   └────────────┘   app's own call)  │  identity-bound│        (0600, full detail)
-  ┌────────────┐   session logs     │   fail-closed  │──► state/public/usage.json
-  │  Codex CLI  │◄──────────────────│                │        (sanitized, dashboard)
-  │  telemetry  │   (on disk, free) └────────────────┘
-  └────────────┘                            │
+  ┌────────────┐   codex app-server │   fail-closed  │──► state/public/usage.json
+  │  Codex      │◄──────────────────│                │        (sanitized, dashboard)
+  │  provider   │  (live, identity- └────────────────┘
+  └────────────┘   bound, free)             │
                                             ▼
               ┌──────────────┐      ┌──────────────┐
               │  dashboard   │      │    route     │
@@ -55,9 +55,40 @@ Consequences:
 | `7d` | both | weekly all-models window |
 | `scoped:<Model>` | Claude | weekly cap for a specific model tier (e.g. Opus) |
 
-The dashboard and router treat *remaining* capacity (100 − used) as the
-primary number. The router additionally honours provider `severity` flags and
-holds anything at 100%.
+The provider reports each window as a *used* percentage. The dashboard, the
+widgets and `headroom status` all present *remaining* capacity (100 − used)
+instead, and label it (`7d 31% left`); `headroom collect`'s per-account line
+and the Claude Code status line print used, and label that. The router works
+in used-percent internally and honours provider `severity` flags — a window
+the provider flags critical while it is still the live one is treated as
+spent, on the account-wide windows and on the model-scoped weekly window
+alike — and holds anything at 100%.
+
+A window that is absent, malformed, or an expired observation is never read as
+a fresh one: the account is held with that window named as the reason, and the
+display surfaces render it as unknown rather than as 0% used. The single
+exception is Codex's 5-hour window, which OpenAI lifted: a Codex row with no
+`5h` key at all is a lifted limit rather than a missing reading, while a `5h`
+key that is present and unusable still holds.
+
+## Routing order
+
+`block_reason` decides *eligibility* — that part is fail-closed and nothing
+below can override it. Order among the eligible accounts is decided
+afterwards:
+
+- **Claude** accounts are ranked by remaining headroom on the model-scoped
+  weekly window (`fable`), most first, so a new session lands where a model
+  family is still switchable. An account with no readable scoped reading ranks
+  last among the eligible ones (never prefer an unknown over proven capacity),
+  and the order accounts appear in `config.json` breaks ties.
+- **Codex** accounts keep config order.
+- Blocked accounts always sort after eligible ones, so `headroom status` reads
+  top-down as "what you can use, then what you cannot and why".
+
+This reorders *fresh* picks only. A caller that already exported
+`CLAUDE_CONFIG_DIR`/`CODEX_HOME` naming a registered account keeps that
+account as its initial slot, so live work is never hopped mid-flight.
 
 ## Stats history
 
@@ -187,6 +218,18 @@ the provider's own `resets_at` when known, else a conservative future floor
 own; `headroom clear <account>` (or `<account>:<scope>`) removes them early,
 and `headroom clear` with no argument resets all.
 
+Which scope a refusal points at is decided **once**, from one shared reading
+of the provider's wording *and* the account's own windows, so the two
+consumers of that vocabulary (`headroom run` reacting to a child's stderr, and
+the supervisor corroborating a cap hook) can never cool different things for
+the same refusal. Naming is not proof: `out of usage credits` names the
+model-scoped weekly pool and cools that one family for seven days, but only
+when that pool actually reads at the wall — otherwise the cooldown follows
+whichever account-wide window is provably spent. A **transient** refusal
+(`429`, overload, `rate_limit_error`) is not a cap at all: `headroom run`
+rotates off the account without cooling it, and the supervisor's cap path
+never sees it.
+
 ## Session handoff (EXPERIMENTAL)
 
 `headroom handoff` stages a verified copy of one Claude conversation transcript
@@ -217,6 +260,17 @@ picked on unproven capacity.
 | `~/.headroom/state/tokens/scan.lock` | 0600 | token-scan and slot-purge serialization |
 | `~/.headroom/state/cooldowns.json` | 0600 | active cooldowns |
 | `~/.headroom/state/provider-backoff.json` | 0600 | usage-endpoint 429 backoff |
+| `~/.headroom/state/handoffs.jsonl` | 0600 | append-only handoff ledger (manual and automatic) |
+| `~/.headroom/state/session-journal/` | 0700 | one marker per session id, written by `headroom statusline`, so handoff can identify the current conversation |
+| `~/.headroom/state/supervisors/` | 0700 | per-run injected settings + hook event journals; removed on a clean supervisor exit |
+| `~/.headroom/state/leases/` | 0700 | per-account `flock` files, only with `HEADROOM_SLOT_LEASE=1` |
+
+Directory modes are re-asserted on every tick, and by default that is
+unconditional. With `HEADROOM_PRESERVE_ACL=1` a directory carrying a POSIX
+access ACL keeps its group bits (the ACL's mask) instead of having them
+flattened — see "POSIX ACLs on the state directory" in
+[KNOWN-LIMITS.md](KNOWN-LIMITS.md), including why an ACL a directory merely
+inherited is the reason that is opt-in.
 
 ## Environment overrides
 
@@ -227,4 +281,35 @@ Everything is overridable for testing or custom layouts: `HEADROOM_DIR`,
 `HEADROOM_HISTORY_MIN_INTERVAL`, `HEADROOM_HISTORY_RETENTION_DAYS`,
 `HEADROOM_HISTORY_MAX_BYTES` (32 MiB default, 1 MiB floor),
 `HEADROOM_TOKEN_STATS`, `HEADROOM_TOKEN_SCAN_INTERVAL`,
-`HEADROOM_BIN_DIR`.
+`HEADROOM_BIN_DIR`, `HEADROOM_CODEX_ROUTING`.
+
+Two are opt-ins rather than tuning, unset by default because each one widens
+something:
+
+| variable | default | effect |
+|---|---|---|
+| `HEADROOM_PRESERVE_ACL` | unset | `1` keeps the group bits of a directory that carries a POSIX access ACL, so its mask survives `chmod`. This relaxes the enforced mode on every path headroom re-asserts, credential homes included |
+| `HEADROOM_OPS_FALLBACK_USAGE` | unset | a second usage feed for `headroom ops-status` to read when headroom's own private snapshot cannot be read. Unset, an unreadable snapshot reports `seat_snapshot_unreadable` instead of substituting numbers from somewhere else |
+
+### Supervision knobs
+
+These affect a `headroom claude`/`codex` launch and the supervisor that stays
+resident around a Claude session. The README section for each explains the
+reasoning behind the default.
+
+| variable | default | effect |
+|---|---|---|
+| `HEADROOM_HEADLESS_SUPERVISION` | unset | `1` supervises a piped/non-TTY run; `0` forces exec-only there. `--headroom-auto-handoff` implies `1` |
+| `HEADROOM_CAP_HOLD_SECONDS` | 300 | how often a held cap re-runs the full preflight (30s floor) |
+| `HEADROOM_CAP_HOLD_MAX` | 60 | how many of those attempts before it disarms; `0` disarms on the first refusal, as before holds existed |
+| `HEADROOM_CAP_ROTATE_AT_WALL` | 1 | `0` keeps waiting instead of rotating when the recorded window is still readable and still at the wall |
+| `HEADROOM_CAP_MODEL_RETRIES` | 2 | extra six-second windows the cap-time model lookup may wait before disarming |
+| `HEADROOM_CAP_TARGET_WEEKLY` | 99 | weekly / scoped-weekly ceiling above which an account is not a destination for a capped session; `100` restores the plain routing bar |
+| `HEADROOM_PREEMPTIVE` | 1 | `0` disables every early rotation for the run |
+| `HEADROOM_PREEMPTIVE_SESSION` | 1 | `0` disables just the 5-hour trigger (never the 5h *target* rule) |
+| `HEADROOM_PREEMPTIVE_SESSION_MARGIN` | 10 | points below the 5h threshold a destination must be before a 5h crossing will move onto it |
+| `HEADROOM_CONTEXT_BACKSTOP` | 1 | `0` disables the context-window backstop |
+| `HEADROOM_CONTEXT_BACKSTOP_ALWAYS` | unset | `1` forces a backstop rotation even when the session is already on the largest window |
+| `HEADROOM_CTX_WINDOW` | inferred | force the context-window size in tokens instead of inferring it |
+| `HEADROOM_NOTIFY_CMD` / `HEADROOM_NOTIFY_TIMEOUT` | unset / 10s | launch and supervision event hook, and its hard timeout |
+| `HEADROOM_LAUNCH_MARKER`, `HEADROOM_LAUNCH_FALLBACK`, `HEADROOM_SLOT_LEASE` | unset | the scripting affordances described in the README |

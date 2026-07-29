@@ -583,8 +583,8 @@ class HookProof(unittest.TestCase):
     def test_parser_accepts_scoped_model_out_of_credits_cap(self):
         # a Fable-scoped weekly cap surfaces as "out of usage credits", not
         # "hit your … limit"; it must still be recognised so the seat hands off
-        # (regression 2026-07-23: the sales seat capped on Fable and never
-        # rotated because this wording slipped past CAP_RE).
+        # (regression: this wording slipped past CAP_RE, so a seat that had
+        # capped on Fable sat there and never rotated).
         rec = self.record("You're out of usage credits. Run /usage-credits to "
                           "keep using Fable 5 or /model to switch models.")
         self.assertIn("out of usage credits",

@@ -184,7 +184,25 @@ work should be driven by something that re-asks (a queue, a loop, a scheduled
 prompt) rather than assuming the refused turn is retried. And a supervisor
 that is not running cannot revive anything at all: the hold lives in the
 supervisor process, so a session launched outside `headroom claude` — or one
-whose supervisor exited — has no revival path.
+whose supervisor exited — has no revival path. Nothing about the wait is
+persisted: a supervisor that is killed while holding a cap takes the hold with
+it, and the child it was watching keeps running unsupervised on the capped
+account.
+
+## Headless supervision inherits stdin; it cannot replay it
+
+`--headroom-auto-handoff` (or `HEADROOM_HEADLESS_SUPERVISION=1`) supervises a
+piped, non-TTY `headroom claude` run so it rotates on a cap instead of
+stalling. The child inherits the supervisor's own stdin, stdout and stderr —
+there is no pty and no buffering layer — so a rotation continues the
+*conversation*, not the *stream*. Whatever the pipe already delivered to the
+stopped child is gone; the resumed session comes back idle, with the rest of
+the pipe (if any) still ahead of it. Drive a headless run from something that
+holds the work itself — a queue, a baton file, an operator loop — rather than
+from a one-shot prompt on stdin that only the first child will ever see.
+
+A `-p`/`--print` run is not this case: it stays exec-only (no resumable
+session exists), so it is never supervised and never rotates.
 
 ## Handoff carries conversation state, not process state
 
@@ -202,6 +220,62 @@ loss, or filesystem error can leave those private files under
 deleted once no matching supervisor is running. Handoff publication recovery
 markers are different: headroom reconciles those under the global handoff lock
 on the next handoff operation.
+
+## POSIX ACLs on the state directory survive only if you ask (`HEADROOM_PRESERVE_ACL=1`)
+
+headroom keeps its own directories at `0700` and its own files at `0600`. A
+POSIX ACL stores its **mask** in the group bits, so an unconditional
+`chmod 0700` silently reduces every named grant on those paths to
+`#effective:---` — and because `ensure_private()` runs on every supervisor
+tick, a grant an operator had applied and verified decayed minutes later with
+no error anywhere. Set `HEADROOM_PRESERVE_ACL=1` and, on Linux, a directory
+carrying a POSIX **access** ACL keeps its group bits: headroom enforces the
+owner and `other` bits and passes the mask through unchanged.
+
+It is opt-in because headroom cannot tell an ACL you set from one the
+directory merely **inherited** from a parent's default ACL — a directory
+created under such a parent is born with an access ACL nobody chose. So the
+opt-in relaxes more than the grant you had in mind: with it set, and
+`~/.headroom` (or wherever `HEADROOM_DIR` points) under a directory carrying a
+default ACL, `~/.headroom` itself plus `state/` and its subtrees (history,
+token scan state, supervisor journals, the session journal, handoff recovery)
+are left at `0770` with that inherited ACL effective. `other` never gains
+anything and every file headroom writes is still `0600`, but a group or named
+user the inherited ACL grants can list those directories. Leave the variable
+unset — the default — and the mode is enforced exactly as it always was,
+whatever ACL is on the path.
+
+The per-account credential homes under `homes/` are created once with
+`mkdir(0700)` and are not re-chmod'd, so they keep `0700` and any inherited
+grant stays `#effective:---` on them either way. The exception is the
+temporary login-backup directory `headroom connect` makes inside a home while
+re-logging in, which goes through the same call as the state directories — so
+with the opt-in set, that one is relaxed too.
+
+Two narrower notes. This is Linux-only: it keys off the
+`system.posix_acl_access` xattr, so macOS (NFSv4 ACLs) and every other
+platform enforce the mode exactly as before. And an ACL set on one of
+headroom's JSON **files** cannot survive: those are written to a fresh temp
+inode and swapped in with `os.replace`, so the old inode's ACL goes with it.
+Grant on the containing directory instead.
+
+## `headroom ops-status` is Linux-only and reads only local state
+
+The session half of the report walks `/proc`; on macOS it degrades to
+`"sessions": null` plus `session_discovery_failed` in `errors`, and the
+per-account battery half still works. Container names come from one `tmux`
+call with a one-second timeout — a wedged tmux server costs every session its
+`container` field (null), not the report. The battery half is read from
+headroom's own private snapshot, which is only as fresh as the last
+`headroom collect`; the command never collects, never writes, and makes no
+network calls. If that snapshot cannot be read, `seats` is `null` with
+`seat_snapshot_unreadable` in `errors` — there is no built-in second source,
+because a path shipped as a default names a directory this build knows nothing
+about on the machine it runs on. If you publish a usage feed of your own
+(`{"accounts": [...]}`, the shape `headroom collect` writes), point
+`HEADROOM_OPS_FALLBACK_USAGE` at it and the command reads it when the private
+snapshot is unreadable. Anything that can write that file can set the numbers
+an ops layer sees, so keep it somewhere you own.
 
 ## Claude usage binding is trust-on-first-use
 

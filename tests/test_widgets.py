@@ -1457,11 +1457,11 @@ class LiquidGlassWidgetTests(unittest.TestCase):
     def fleet(mutate=None):
         """A design-shaped fleet: five Claude accounts plus two Codex ones."""
         accounts = [
-            usage_account("domanski-ai", used5=0, used7=4),
-            usage_account("system", used5=8, used7=26),
-            usage_account("ops", used5=22, used7=39),
-            usage_account("gmail", used5=36, used7=42),
-            usage_account("acct-a", used5=45, used7=51),
+            usage_account("acct-a", used5=0, used7=4),
+            usage_account("acct-b", used5=8, used7=26),
+            usage_account("acct-c", used5=22, used7=39),
+            usage_account("acct-d", used5=36, used7=42),
+            usage_account("acct-e", used5=45, used7=51),
             usage_account("codex-acct-a", used5=29, used7=15,
                           provider="codex"),
             usage_account("codex-acct-b", used5=17, used7=23,
