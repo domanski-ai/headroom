@@ -287,6 +287,15 @@ class PrivateModes(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.directory = os.path.join(self.temp.name, "state")
         os.makedirs(self.directory, mode=0o700)
+        # The default-off assertions below are about the DEFAULT. An operator
+        # who exports HEADROOM_PRESERVE_ACL=1 in their shell (the documented
+        # opt-in) would otherwise fail this class from the environment alone —
+        # observed live the day the opt-in shipped. Pin it absent; the opt-in
+        # tests turn it on deliberately through preserving().
+        clear = mock.patch.dict(os.environ)
+        clear.start()
+        self.addCleanup(clear.stop)
+        os.environ.pop("HEADROOM_PRESERVE_ACL", None)
 
     def mode(self, path=None):
         return stat.S_IMODE(os.stat(path or self.directory).st_mode)
@@ -1291,6 +1300,198 @@ class ThrottleCarryover(unittest.TestCase):
         row = public["accounts"][0]
         self.assertIs(row["ok"], True)
         self.assertIs(row["throttle_carryover"], True)
+
+
+class ClaudeUsageBackoff(unittest.TestCase):
+    """An open `anthropic_usage_api` window must stop the calls, not just the
+    reading. Calling a throttled usage endpoint makes the provider push the
+    window further out — that is how five accounts stayed held for hours while
+    the endpoint answered 429 to every retry. These tests SPY on the provider
+    call, because a row that says "rate-limited" looks identical whether the
+    endpoint was skipped or hammered."""
+
+    ACCOUNT = {"id": "s1", "name": "a", "provider": "claude", "home": "/tmp/h"}
+    IDENTITY = {"verified": True, "method": "oauth", "email": "e@x.com",
+                "account_fingerprint": "AAAA"}
+
+    def _ledger(self, retry_at):
+        return {"schema_version": 1, "providers": {
+            "anthropic_usage_api": {"retry_at": retry_at,
+                                    "observed_at": retry_at - 300}}}
+
+    def _collect(self, backoff, previous=None, limits=None):
+        """Returns (row, provider_call_count)."""
+        limits = mock.DEFAULT if limits is None else limits
+        with mock.patch.object(collect, "claude_identity",
+                               return_value=dict(self.IDENTITY)), \
+                mock.patch.object(collect, "credential_digest",
+                                  return_value="BBBB"), \
+                mock.patch.object(collect, "claude_plan",
+                                  return_value="Max 20x"), \
+                mock.patch.object(collect, "claude_limits") as spy:
+            if limits is not mock.DEFAULT:
+                spy.side_effect = limits
+            snapshot = collect.collect([dict(self.ACCOUNT)], backoff,
+                                       previous=previous)
+        return snapshot["accounts"][0], spy.call_count
+
+    def _previous(self, captured_at):
+        return {"accounts": [{
+            "id": "s1", "name": "a", "provider": "claude", "ok": True,
+            "routable": True, "trust_state": "verified", "stale": False,
+            "captured_at": captured_at,
+            "identity": dict(self.IDENTITY, credential_digest="BBBB"),
+            "windows": {
+                "5h": {"used_percent": 10.0, "resets_at": captured_at + 3600,
+                       "observed_at": captured_at, "window_minutes": 300},
+                "7d": {"used_percent": 20.0,
+                       "resets_at": captured_at + 7 * 86400,
+                       "observed_at": captured_at, "window_minutes": 10080}},
+        }]}
+
+    def test_a_429_arms_the_provider_ledger(self):
+        armed = {}
+
+        def persist(retry_at, provider="anthropic_usage_api"):
+            armed["retry_at"], armed["provider"] = retry_at, provider
+        retry_at = int(time.time()) + 900
+        throttle = collect.ProviderThrottleError(retry_at,
+                                                 provider_response=True)
+        with mock.patch.object(collect, "claude_identity",
+                               return_value=dict(self.IDENTITY)), \
+                mock.patch.object(collect, "credential_digest",
+                                  return_value="BBBB"), \
+                mock.patch.object(collect, "claude_plan",
+                                  return_value="Max 20x"), \
+                mock.patch.object(collect, "claude_limits",
+                                  side_effect=throttle):
+            collect.collect([dict(self.ACCOUNT)], persist_backoff=persist)
+        self.assertEqual(armed, {"retry_at": retry_at,
+                                 "provider": "anthropic_usage_api"})
+
+    def test_an_open_window_holds_without_calling_the_provider(self):
+        row, calls = self._collect(self._ledger(int(time.time()) + 600))
+        self.assertEqual(calls, 0)
+        # the shape every consumer already handles — no new error code
+        self.assertIs(row["ok"], False)
+        self.assertEqual(row["error_code"], "usage_source_rate_limited")
+        self.assertEqual(row["trust_state"], "held")
+        self.assertIn("rate-limited", row["note"])
+        self.assertGreater(row["retry_at"], time.time())
+
+    def test_an_open_window_still_serves_the_last_verified_reading(self):
+        # a backoff must not make the fleet look emptier than a bare throttle
+        now = int(time.time())
+        row, calls = self._collect(self._ledger(now + 600),
+                                   previous=self._previous(now - 60))
+        self.assertEqual(calls, 0)
+        self.assertIs(row["ok"], True)
+        self.assertIs(row["throttle_carryover"], True)
+        self.assertIs(row["routable"], True)
+        self.assertEqual(row["windows"]["5h"]["used_percent"], 10.0)
+
+    def test_an_expired_window_lets_collection_resume(self):
+        # bounded and self-clearing: a backoff that outlives its own window
+        # would hold the fleet for longer than the provider ever asked
+        for retry_at in (int(time.time()) - 1, int(time.time()) - 3600):
+            row, calls = self._collect(self._ledger(retry_at))
+            self.assertEqual(calls, 1, retry_at)
+        self.assertEqual(collect.active_backoff(
+            self._ledger(int(time.time()) - 1), "anthropic_usage_api",
+            int(time.time())), 0)
+
+    def test_a_malformed_ledger_never_becomes_an_open_window(self):
+        now = int(time.time())
+        for retry_at in ("soon", None, True, float("inf"), float("nan")):
+            document = {"schema_version": 1, "providers": {
+                "anthropic_usage_api": {"retry_at": retry_at}}}
+            self.assertEqual(collect.active_backoff(
+                document, "anthropic_usage_api", now), 0, retry_at)
+
+    def test_a_claude_window_never_touches_codex(self):
+        # codex is the only fleet the operator can still see during a claude
+        # throttle: its collection must not notice this ledger entry at all
+        backoff = self._ledger(int(time.time()) + 600)
+        with mock.patch.object(collect, "codex_live") as live:
+            live.side_effect = collect.IdentityBindingError("codex_offline")
+            snapshot = collect.collect(
+                [{"id": "c1", "name": "cx", "provider": "codex",
+                  "home": "/tmp/hr-t/none"}], backoff)
+        live.assert_called_once()
+        self.assertNotEqual(snapshot["accounts"][0].get("error_code"),
+                            "usage_source_rate_limited")
+
+
+class ClaudeUsageBackoffLedger(unittest.TestCase):
+    """The ledger end to end: a run that meets a 429 must leave something on
+    disk that the NEXT run reads. The docstring promise ("a 429 from the usage
+    endpoint sets a provider-wide backoff ledger honoured by later runs") is
+    only true if the file is written, found again, and expires on its own."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.env = mock.patch.dict(os.environ,
+                                   {"HEADROOM_DIR": self.temp.name})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.home = os.path.join(paths.homes_dir(), "claude-a")
+        os.makedirs(self.home)
+        registry.save({"schema_version": 1, "accounts": [{
+            "name": "claude-a", "provider": "claude", "home": self.home}]})
+        self.identity = mock.patch.object(
+            collect, "claude_identity",
+            return_value={"verified": True, "method": "oauth",
+                          "email": "e@x.com", "account_fingerprint": "AAAA"})
+        self.identity.start()
+        self.addCleanup(self.identity.stop)
+        for name, value in (("credential_digest", "BBBB"),
+                            ("claude_plan", "Max 20x")):
+            patched = mock.patch.object(collect, name, return_value=value)
+            patched.start()
+            self.addCleanup(patched.stop)
+
+    def _run(self, limits):
+        with mock.patch.object(collect, "claude_limits",
+                               side_effect=limits) as spy:
+            collect.run_collect(quiet=True)
+        return spy.call_count
+
+    def _ledger(self):
+        return (paths.load_json(paths.backoff_path())
+                or {}).get("providers", {}).get("anthropic_usage_api")
+
+    def test_a_429_is_written_down_and_read_back_by_the_next_run(self):
+        retry_at = int(time.time()) + 900
+        throttled = collect.ProviderThrottleError(retry_at,
+                                                  provider_response=True)
+        self.assertEqual(self._run(throttled), 1)
+        self.assertEqual(self._ledger()["retry_at"], retry_at)
+        # the leak this closes: without the ledger the next run calls the
+        # throttled endpoint again and the provider pushes the window out
+        self.assertEqual(self._run(AssertionError("provider called")), 0)
+        row = paths.load_json(paths.private_snapshot_path())["accounts"][0]
+        self.assertEqual(row["error_code"], "usage_source_rate_limited")
+        self.assertEqual(row["retry_at"], retry_at)
+
+    def test_the_window_expiring_is_all_it_takes_to_resume(self):
+        past = collect.ProviderThrottleError(int(time.time()) - 1,
+                                             provider_response=True)
+        self.assertEqual(self._run(past), 1)
+        self.assertIsNotNone(self._ledger())  # written, but already elapsed
+
+        def healthy(*_args, **_kwargs):
+            now = int(time.time())
+            return {"captured_at": now, "source": "usage_api", "stale": False,
+                    "windows": {
+                        "5h": {"used_percent": 10.0, "resets_at": now + 3600,
+                               "observed_at": now, "window_minutes": 300},
+                        "7d": {"used_percent": 20.0,
+                               "resets_at": now + 7 * 86400,
+                               "observed_at": now, "window_minutes": 10080}}}
+        self.assertEqual(self._run(healthy), 1)
+        # a clean run clears the entry, so the ledger cannot outlive the 429
+        self.assertIsNone(self._ledger())
 
 
 class PublicSnapshot(unittest.TestCase):
