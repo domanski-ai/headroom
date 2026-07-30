@@ -314,15 +314,25 @@ class PrivateModes(unittest.TestCase):
             paths.ensure_private(self.directory)
         chmod.assert_not_called()
 
+    # The three tests below assert POSIX chmod semantics. chmod_private and
+    # fchmod_private are DOCUMENTED no-ops on Windows ("where POSIX modes
+    # are meaningful"), Windows chmod honours little beyond the read-only
+    # bit, and os.fchmod does not exist there at all — so on nt these would
+    # test a contract the module deliberately does not make. The nt contract
+    # (never touch the mode) is pinned by
+    # test_windows_gets_the_documented_no_op below.
+    @unittest.skipIf(os.name == "nt", "POSIX modes are not meaningful here")
     def test_a_wrong_mode_is_still_corrected(self):
         os.chmod(self.directory, 0o755)
         paths.ensure_private(self.directory)
         self.assertEqual(self.mode(), 0o700)
 
+    @unittest.skipIf(os.name == "nt", "POSIX modes are not meaningful here")
     def test_a_missing_path_still_raises_from_the_chmod(self):
         with self.assertRaises(FileNotFoundError):
             paths.chmod_private(os.path.join(self.temp.name, "nope"), 0o700)
 
+    @unittest.skipIf(os.name == "nt", "POSIX modes are not meaningful here")
     def test_a_correct_descriptor_mode_never_calls_fchmod(self):
         path = os.path.join(self.temp.name, "f.json")
         with open(path, "w", encoding="utf-8") as handle:
@@ -334,6 +344,17 @@ class PrivateModes(unittest.TestCase):
             fchmod.assert_not_called()
             paths.fchmod_private(handle.fileno(), 0o640)
         self.assertEqual(self.mode(path), 0o640)
+
+    def test_windows_gets_the_documented_no_op(self):
+        # On nt both entry points must return without ever reaching
+        # _apply_mode — os.fchmod does not exist there, and a chmod that
+        # only half-works is worse than the documented no-op. Runs on every
+        # platform by pinning the name the implementation branches on.
+        with mock.patch.object(paths.os, "name", "nt"), \
+                mock.patch.object(paths, "_apply_mode") as apply_mode:
+            paths.chmod_private(self.directory, 0o700)
+            paths.fchmod_private(3, 0o600)
+        apply_mode.assert_not_called()
 
     @unittest.skipIf(ACL_SKIP, ACL_SKIP or "")
     def test_an_operator_acl_survives_ensure_private(self):
