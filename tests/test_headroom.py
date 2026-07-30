@@ -2510,23 +2510,105 @@ class GreatestHeadroom(unittest.TestCase):
         ranked = self.ranked("sonnet", accounts, rows)
         self.assertEqual([r[0]["name"] for r in ranked], ["a", "b"])
 
-    def test_claude_prefers_most_fable_headroom_over_registry_primary(self):
+    def test_claude_fable_route_prefers_most_fable_headroom(self):
         # a is the registry primary but its Fable is nearly gone; b has plenty.
-        # Claude selection must land on b so Fable stays usable.
+        # A FABLE launch must land on b, where the Fable week is still usable.
+        accounts = [_account("a"), _account("b")]
+        rows = [self._with_fable(_claude_row("a", used5h=10.0, used7d=10.0), 95.0),
+                self._with_fable(_claude_row("b", used5h=10.0, used7d=10.0), 20.0)]
+        ranked = self.ranked("fable", accounts, rows)
+        self.assertEqual([a["name"] for a, r in ranked if r is None], ["b", "a"])
+
+    def test_claude_nonfable_route_prefers_most_slack(self):
+        # SUPERSESSION (maximization doctrine, 2026-07-30): a non-Fable launch
+        # used to chase the seat with the most Fable left "so the operator can
+        # switch any time" — which is exactly how a 7d wall strands a Fable
+        # week. It now lands where non-Fable burn threatens the least Fable:
+        # a's Fable is nearly spent (5% left -> slack +85), b's week is intact
+        # (80% left -> slack +10), so Sonnet work belongs on a.
         accounts = [_account("a"), _account("b")]
         rows = [self._with_fable(_claude_row("a", used5h=10.0, used7d=10.0), 95.0),
                 self._with_fable(_claude_row("b", used5h=10.0, used7d=10.0), 20.0)]
         ranked = self.ranked("sonnet", accounts, rows)
-        self.assertEqual([a["name"] for a, r in ranked if r is None], ["b", "a"])
+        self.assertEqual([a["name"] for a, r in ranked if r is None], ["a", "b"])
 
-    def test_claude_fable_preference_applies_even_on_an_opus_route(self):
-        # the crux of Paul's ask: a session running Opus should still land on
-        # the seat with Fable left, so he can switch to Fable any time.
+    def test_claude_opus_route_lands_on_the_spent_fable_seat(self):
+        # same doctrine on the Opus route: a's Fable week is fully spent, so
+        # Opus burning a's 7d window strands nothing; b still has 70% of a
+        # Fable week to protect.
         accounts = [_account("a"), _account("b")]
         rows = [self._with_fable(_claude_row("a", used5h=10.0, used7d=10.0), 100.0),
                 self._with_fable(_claude_row("b", used5h=10.0, used7d=10.0), 30.0)]
         ranked = self.ranked("opus", accounts, rows)
+        self.assertEqual(ranked[0][0]["name"], "a")
+
+    def test_fable_guard_demotes_a_seat_opus_would_strand(self):
+        # a: 7d 40% left vs Fable 80% left -> slack -40, an Opus session there
+        # eats capacity the Fable pool still needs. b: slack +85. With b
+        # eligible, the guard turns a into a BLOCKED row with a named reason.
+        accounts = [_account("a"), _account("b")]
+        rows = [self._with_fable(_claude_row("a", used5h=10.0, used7d=60.0), 20.0),
+                self._with_fable(_claude_row("b", used5h=10.0, used7d=10.0), 95.0)]
+        ranked = self.ranked("opus", accounts, rows)
         self.assertEqual(ranked[0][0]["name"], "b")
+        self.assertIsNone(ranked[0][1])
+        blocked = {a["name"]: r for a, r in ranked if r is not None}
+        self.assertIn("fable guard", blocked.get("a", ""))
+
+    def test_fable_guard_stands_down_when_every_seat_is_negative(self):
+        # both seats have negative slack: the guard must not brick the fleet.
+        # Both stay eligible, ranked least-harm-first (a: -20 beats b: -60).
+        accounts = [_account("a"), _account("b")]
+        rows = [self._with_fable(_claude_row("a", used5h=10.0, used7d=60.0), 40.0),
+                self._with_fable(_claude_row("b", used5h=10.0, used7d=70.0), 10.0)]
+        ranked = self.ranked("opus", accounts, rows)
+        self.assertEqual([a["name"] for a, r in ranked if r is None],
+                         ["a", "b"])
+
+    def test_fable_guard_ignores_reserve_blocked_positives(self):
+        # the only positive-slack seat sits below the reserve, hence is
+        # INELIGIBLE: the guard acts on eligible positives only, so it must
+        # stand down and keep the negative-slack seat routing.
+        accounts = [_account("a"), _account("b")]
+        rows = [self._with_fable(_claude_row("a", used5h=10.0, used7d=95.0), 95.0),
+                self._with_fable(_claude_row("b", used5h=10.0, used7d=60.0), 20.0)]
+        snapshot = {"generated": time.time(), "accounts": rows}
+        with mock.patch.object(route.registry, "ordered_for",
+                               return_value=accounts), \
+                mock.patch.object(route.registry, "reserve_percent",
+                                  return_value=10.0):
+            ranked = route.candidates("opus", snapshot)
+        by_name = {a["name"]: r for a, r in ranked}
+        self.assertIn("reserve", by_name["a"])
+        self.assertIsNone(by_name["b"])
+
+    def test_run_guard_demotions_stand_down_after_midrun_cooldown(self):
+        # cmd_run must RE-DERIVE candidates after cooling a seat: once the
+        # only positive-slack seat caps out mid-run, the fable guard's
+        # demotion of the negative-slack seat is stale — the guard stands
+        # down and the run lands there instead of dying with exit 2 on a
+        # still-usable fleet.
+        accounts = [_account("a"), _account("b")]
+        rows = [self._with_fable(_claude_row("a", used5h=10.0, used7d=10.0), 95.0),
+                self._with_fable(_claude_row("b", used5h=10.0, used7d=60.0), 20.0)]
+        snapshot = {"generated": time.time(), "accounts": rows}
+        with mock.patch.object(route, "ensure_fresh_snapshot",
+                               return_value=snapshot), \
+                mock.patch.object(route.registry, "ordered_for",
+                                  return_value=accounts), \
+                mock.patch.object(route.registry, "reserve_percent",
+                                  return_value=0.0), \
+                mock.patch.object(
+                    route.subprocess, "run",
+                    side_effect=[FakeProcess(returncode=1,
+                                             stderr="usage limit reached"),
+                                 FakeProcess(returncode=0)]) as child, \
+                redirect_stdout(io.StringIO()), \
+                redirect_stderr(io.StringIO()):
+            code = route.cmd_run("opus", ["claude", "-p", "task"])
+        self.assertEqual(code, 0)
+        self.assertEqual(child.call_count, 2)  # b took the work after all
+        self.assertIn("a:*", route.cooldowns())  # a really was cooled mid-run
 
     def test_claude_readable_fable_outranks_a_seat_with_no_reading(self):
         # a has no Fable reading (unknown), b has one -> b (proven capacity)

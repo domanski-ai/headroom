@@ -82,6 +82,16 @@ afterwards:
   family is still switchable. An account with no readable scoped reading ranks
   last among the eligible ones (never prefer an unknown over proven capacity),
   and the order accounts appear in `config.json` breaks ties.
+- An explicitly **non-Fable Claude** launch (`opus`/`sonnet`/`haiku`) ranks by
+  descending *slack* instead — the % of the account-wide weekly window left
+  over after what the Fable pool still needs (`maximize.py`). Non-Fable usage
+  drains only the account-wide window, so pointing it at the account with the
+  most Fable left is how a Fable week gets stranded behind a 7-day wall. The
+  *fable guard* goes one step further: an eligible account whose slack is
+  provably negative is demoted to blocked (with a named reason) whenever some
+  account with positive slack can take the work; when every readable account
+  is negative the guard stands down and the fleet routes least-harm-first.
+  `headroom fable` prints the same numbers as a per-account calculator.
 - **Codex** accounts keep config order.
 - Blocked accounts always sort after eligible ones, so `headroom status` reads
   top-down as "what you can use, then what you cannot and why".

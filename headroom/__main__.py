@@ -10,6 +10,10 @@ usage:
   headroom remove <slot> [--yes]   unregister one non-final slot; keeps its home
   headroom collect                  read usage for every account (no tokens spent)
   headroom status [model]           who has headroom right now (default: claude)
+  headroom fable [--json] [--days N]  Fable-maximization calculator: per-seat
+                                    usable/stranded/at-risk Fable week + the
+                                    non-Fable slack the router steers by
+                                    (exit 1 when any Fable capacity is at risk)
   headroom pick <model>             print the best account name (exit 2 if none)
   headroom env <model>              print the export line for the best account
   headroom claude [args...]         launch Claude; supervise opted-in auto-handoff
@@ -461,6 +465,9 @@ def _dispatch(argv):
     if command == "status":
         from . import route
         return route.cmd_status(registry.family(args[0] if args else "claude"))
+    if command == "fable":
+        from . import maximize
+        return maximize.cmd_fable(args)
     if command == "pick":
         from . import route
         account = route.pick(registry.family(args[0] if args else "claude"))

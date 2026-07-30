@@ -23,7 +23,7 @@ import sys
 import time
 
 from . import collect as collector
-from . import locks, notify, paths, registry
+from . import locks, maximize, notify, paths, registry
 
 
 SNAPSHOT_MAX_AGE = paths.env_int("HEADROOM_SNAPSHOT_MAX_AGE", 900)
@@ -869,12 +869,20 @@ def candidates(fam, snapshot=_UNSET):
     reserve = registry.reserve_percent()
     # Claude selection ranks eligible seats by remaining FABLE headroom first,
     # superseding the older pure registry-order sticky primary: a new session
-    # must land where Fable is still usable — even one running Opus — so the
-    # operator can always switch to Fable. Codex keeps registry order. This
-    # reorders only FRESH picks; a session that already exported its
-    # CLAUDE_CONFIG_DIR stays put via env_pinned_account, so live work is
-    # never hopped mid-flight.
+    # must land where Fable is still usable, so the operator can always switch
+    # to Fable. An explicitly NON-Fable launch (opus/sonnet/haiku) is the
+    # exact opposite case: its burn draws the account-wide 7d window only, so
+    # landing it on the seat with the most Fable room is how a Fable week gets
+    # stranded behind a 7d wall (see maximize's post-mortem). Those launches
+    # rank by descending non-Fable SLACK instead, and maximize.fable_guard
+    # demotes proven-negative-slack seats whenever a positive-slack seat is
+    # eligible to take the work. Codex keeps registry order. This reorders
+    # only FRESH picks; a session that already exported its CLAUDE_CONFIG_DIR
+    # stays put via env_pinned_account, so live work is never hopped
+    # mid-flight.
     prefer_fable = registry.family_provider(fam) == "claude"
+    guarded_fam = prefer_fable and fam in maximize.NONFABLE_GUARDED
+    ratio = maximize.pool_ratio() if guarded_fam else None
     ranked = []
     for index, account in enumerate(registry.ordered_for(fam)):
         if snapshot is None:
@@ -882,16 +890,24 @@ def candidates(fam, snapshot=_UNSET):
         else:
             reason = block_reason(account, fam, rows.get(account["name"]),
                                   cool, now, reserve=reserve)
-        room = _fable_room(rows.get(account["name"])) \
-            if (reason is None and prefer_fable) else None
+        if reason is not None or not prefer_fable:
+            room = None
+        elif guarded_fam:
+            room = maximize.slack_for(rows.get(account["name"]), ratio)
+        else:
+            room = _fable_room(rows.get(account["name"]))
         ranked.append((account, reason, index, room))
-    # Eligible before blocked; then (Claude) most Fable headroom first, a seat
-    # with no readable Fable reading last among the eligible; registry order
-    # breaks ties and orders every non-Fable case (Codex, or Claude lacking a
-    # Fable reading). Ordering never overrides eligibility — block_reason
-    # already decided that.
+    if guarded_fam:
+        ranked = maximize.fable_guard(ranked, fam, rows, ratio)
+    # Eligible before blocked; then (Claude) most Fable headroom — or, for a
+    # guarded non-Fable family, most slack — first, a seat with no readable
+    # scoped reading last among the eligible; registry order breaks ties and
+    # orders every unranked case (Codex, or Claude lacking a reading).
+    # Ordering never overrides eligibility — block_reason (and the guard's
+    # demotions) already decided that.
     ranked.sort(key=lambda entry: (entry[1] is not None,
-                                    1.0 if entry[3] is None else -entry[3],
+                                    math.inf if entry[3] is None
+                                    else -entry[3],
                                     entry[2]))
     return [(account, reason) for account, reason, _, _ in ranked]
 
@@ -1162,16 +1178,42 @@ def cmd_status(fam):
         if reason is None and chosen is None:
             chosen = account["name"]
     print(f"-> chosen: {chosen or 'NONE — no account has proven headroom'}")
+    if registry.family_provider(fam) == "claude":
+        # one-line Fable-waste tripwire: stranded Fable is capacity paid for
+        # and lost silently, so every status glance must surface it
+        _, totals = maximize.fleet_report(snapshot, maximize.pool_ratio())
+        if totals["at_risk"] > maximize.TOLERANCE:
+            print(f"!! fable: {totals['at_risk']:.0f} Fable-% stranded/at-risk"
+                  f" ({totals['stranded_now']:.0f} already at a 7d wall) — "
+                  f"run `headroom fable`")
     return 0 if chosen else 2
 
 
 def cmd_run(fam, command):
     snapshot = ensure_fresh_snapshot()
     rows = _snapshot_accounts(snapshot)
-    for account, reason in candidates(fam, snapshot):
-        if reason:
-            print(f"[headroom] skip {account['name']}: {reason}", file=sys.stderr)
-            continue
+    tried, skips_shown = set(), set()
+    while True:
+        # Re-derive the candidate list on EVERY pass, not once up front: a
+        # cooldown recorded mid-run changes OTHER seats' eligibility — most
+        # acutely the fable guard, whose demotions must stand down the moment
+        # the last positive-slack seat cools. A one-shot list would keep
+        # refusing a still-usable fleet on its stale demotion reasons.
+        account = None
+        for candidate, reason in candidates(fam, snapshot):
+            if candidate["name"] in tried:
+                continue
+            if reason:
+                if (candidate["name"], reason) not in skips_shown:
+                    skips_shown.add((candidate["name"], reason))
+                    print(f"[headroom] skip {candidate['name']}: {reason}",
+                          file=sys.stderr)
+                continue
+            account = candidate
+            break
+        if account is None:
+            break
+        tried.add(account["name"])
         # re-check against the LATEST cooldown ledger immediately before launch:
         # another process may have cooled this account since candidates() ran.
         fresh_reason = block_reason(account, fam, rows.get(account["name"]),

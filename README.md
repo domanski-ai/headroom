@@ -46,15 +46,31 @@ headroom fixes all three problems:
 3. **Rotate** — `headroom claude` launches on the highest-ranked account with
    *proven* headroom. Claude accounts are ranked by how much of the `fable`
    model-scoped weekly window they have left, so a fresh session lands where
-   you can still switch model family — even a session you start on Opus. The
-   order accounts appear in your config breaks ties, and an account with no
-   readable scoped reading ranks last among the eligible ones; Codex accounts
-   keep config order. Ranking never overrides eligibility: an account without
-   proven headroom is skipped whatever it is ranked. When a limit hits,
-   `headroom rotate` (or the `/rotator` skill inside Claude Code) cools that
-   login down until its window resets and hands you the next one. Set a
-   **reserve** (e.g. 10%) and it skips any account already below that much
-   headroom, so a session starts fresh instead of hitting a wall mid-task.
+   you can still switch model family. An explicitly **non-Fable** launch
+   (`opus`/`sonnet`/`haiku`) is ranked the opposite way — toward the account
+   whose Fable week needs the least protecting — because non-Fable usage
+   drains only the account-wide weekly window, and burning that window on the
+   wrong account leaves Fable capacity stranded behind a 7-day wall (see
+   `headroom fable` below). The order accounts appear in your config breaks
+   ties, and an account with no readable scoped reading ranks last among the
+   eligible ones; Codex accounts keep config order. Ranking never overrides
+   eligibility: an account without proven headroom is skipped whatever it is
+   ranked. When a limit hits, `headroom rotate` (or the `/rotator` skill
+   inside Claude Code) cools that login down until its window resets and hands
+   you the next one. Set a **reserve** (e.g. 10%) and it skips any account
+   already below that much headroom, so a session starts fresh instead of
+   hitting a wall mid-task.
+4. **Maximize** — `headroom fable` is the scoped-pool calculator: per account
+   it reports how much of the Fable weekly pool is still *reachable* through
+   the account-wide 7-day window, how much is stranded or at risk, and how
+   much non-Fable **slack** each account has. The router enforces it: a
+   non-Fable launch that would strand Fable capacity is demoted whenever an
+   account with positive slack can take the work instead (never when the
+   whole fleet is negative — a degraded fleet still routes, least harm
+   first). Tune the pool-size assumption with `routing.fable_pool_ratio`
+   (default 1.0, deliberately pessimistic); `headroom fable` also shows a
+   history-calibrated estimate per account when your usage history supports
+   one.
 
 ## New in v0.2: automatic Claude conversation handoff
 
