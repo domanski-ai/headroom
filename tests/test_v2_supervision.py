@@ -5664,5 +5664,97 @@ class ContextBackstop(TempDirCase):
         cycle.assert_called_once()
 
 
+
+# --------------------------------------------------------------------------
+# A cap that lands while supervision is off must be LOUD, never swallowed
+# --------------------------------------------------------------------------
+class UnhandledCapIsAnnounced(TempDirCase):
+    """Live failure, 2026-07-31: the Fable weekly pool ran out mid-session.
+    The StopFailure hook fired and journaled with the account's own "out of
+    usage credits" wording, the binding was correct — and nothing happened,
+    because automation had already been turned off earlier in the run. No
+    rotation, and worse, no reason: the operator learned about the wall from
+    the model's reply, not from headroom. Acting is still wrong here (an
+    unsupervised child is not ours to rotate), so the contract is to SAY so."""
+
+    SID = "11111111-1111-1111-1111-111111111111"
+
+    def _child(self, account, automation):
+        binding = supervisor.Binding(self.SID, "/t.jsonl", "/cwd", "fable",
+                                     "1", account["home"], epoch=1)
+        return supervisor.Child(
+            process=mock.Mock(), account=account, generation=1,
+            event_path="/dev/null", settings_path="", launched_at=0.0,
+            automation=automation, binding=binding, session_epoch=1)
+
+    def _event(self, message):
+        return {
+            "schema": "headroom_hook_event@1", "received_at": 1000.0,
+            "supervisor_id": "22222222-2222-2222-2222-222222222222",
+            "generation": 1, "source_slot": "a", "config_dir": "/home/a",
+            "matcher": "rate_limit",
+            "payload": {"hook_event_name": "StopFailure", "session_id": self.SID,
+                        "transcript_path": "/t.jsonl", "cwd": "/cwd",
+                        "error": "rate_limit", "last_assistant_message": message},
+        }
+
+    def _run(self, message, automation=False):
+        account = self.account()
+        runner = supervisor.Supervisor("fable", [], account, popen=mock.Mock())
+        child = self._child(account, automation)
+        with mock.patch.object(supervisor, "_read_events",
+                               return_value=[self._event(message)]), \
+                mock.patch.object(supervisor, "_namespace_matches",
+                                  return_value=True), \
+                mock.patch.object(supervisor, "_validated_event",
+                                  return_value=(supervisor.Binding(
+                                      self.SID, "/t.jsonl", "/cwd", "fable",
+                                      "1", account["home"], epoch=1), "/cwd")), \
+                mock.patch.object(supervisor, "_event_epoch", return_value=1), \
+                mock.patch.object(supervisor, "_accept_event_order"), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as errors:
+            runner._handle_events(child, "")
+        return errors.getvalue(), [call.args[0] for call in emit.call_args_list]
+
+    def test_credits_cap_with_automation_off_is_announced(self):
+        errors, events = self._run(
+            "You're out of usage credits. Run /usage-credits to keep using "
+            "Fable 5 or /model to switch models.")
+        self.assertIn("hit a subscription cap", errors)
+        self.assertIn("NO automatic handoff", errors)
+        self.assertIn("supervision is off", errors)
+        self.assertIn("/model opus", errors)      # the manual remedy, in place
+        self.assertEqual([event["event"] for event in events],
+                         ["cap_unhandled"])
+
+    def test_a_non_cap_stop_failure_stays_quiet(self):
+        # a transient 429 is NOT a cap; announcing it would train the operator
+        # to ignore the message that matters
+        errors, events = self._run(
+            "429 rate_limit_error: please try again later")
+        self.assertEqual(errors, "")
+        self.assertEqual(events, [])
+
+    def test_armed_children_still_take_the_normal_cap_path(self):
+        # the announcement must not shadow the real handler
+        account = self.account()
+        runner = supervisor.Supervisor("fable", [], account, popen=mock.Mock())
+        child = self._child(account, automation=True)
+        with mock.patch.object(supervisor, "_read_events",
+                               return_value=[self._event("out of usage credits")]), \
+                mock.patch.object(supervisor, "_namespace_matches",
+                                  return_value=True), \
+                mock.patch.object(supervisor, "_validated_event",
+                                  return_value=(child.binding, "/cwd")), \
+                mock.patch.object(supervisor, "_event_epoch", return_value=1), \
+                mock.patch.object(supervisor, "_accept_event_order"), \
+                mock.patch.object(runner, "_attempt_cap") as attempt, \
+                redirect_stderr(io.StringIO()) as errors:
+            runner._handle_events(child, "")
+        attempt.assert_called_once()
+        self.assertNotIn("NO automatic handoff", errors.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

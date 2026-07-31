@@ -3836,6 +3836,29 @@ class Supervisor:
                 saw_stop_failure = True
                 proof = None
                 if not same_session or not child.automation:
+                    # A cap arriving here is the ONE thing this supervisor
+                    # exists to act on, and dropping it in silence is how a
+                    # session sits at a wall with no rotation and no reason
+                    # given (observed live 2026-07-31: the Fable pool ran out,
+                    # the hook fired and journaled, automation was already off,
+                    # and nothing was printed — the operator learned about it
+                    # from the model's own "out of usage credits" line). It is
+                    # still not safe to ACT (an unsupervised or foreign session
+                    # is not ours to rotate), so say so instead: the human in
+                    # this pane gets the wall, the reason, and the manual
+                    # remedy, and an observer gets a structured event.
+                    if cap_message(record, child):
+                        why = ("supervision is off for this child"
+                               if not child.automation
+                               else "the event is from another session")
+                        print(f"[headroom] {child.account['name']} hit a "
+                              f"subscription cap but NO automatic handoff will "
+                              f"run: {why}. Switch model (/model opus) or hand "
+                              f"off manually: headroom handoff --to <slot>",
+                              file=sys.stderr)
+                        notify.emit({"event": "cap_unhandled",
+                                     "account": child.account.get("name", ""),
+                                     "reason": why})
                     continue
                 proof = self._attempt_cap(child, record, announce_non_cap=True)
         if not saw_stop_failure and child.pending_cap is not None \
