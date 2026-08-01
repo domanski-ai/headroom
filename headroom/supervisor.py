@@ -1329,6 +1329,17 @@ def _cap_text(record, *, absent=""):
     return text if CAP_RE.search(text) else ""
 
 
+def _subagent_attributed(record):
+    """Whether this hook event is attributed to a background subagent.
+
+    Payload-only, no transcript. The field names are provider-controlled, so
+    a rename reverts to the old behaviour rather than to something worse."""
+    payload = record.get("payload") if isinstance(record, dict) else None
+    payload = payload if isinstance(payload, dict) else {}
+    return bool(str(payload.get("agent_id") or "").strip()
+                or str(payload.get("agent_type") or "").strip())
+
+
 def cap_message(record, child):
     """Return the narrow cap message, or empty when any binding proof fails."""
     binding = child.binding
@@ -2471,6 +2482,39 @@ class Supervisor:
             child.pending_cap = None
             return None
         binding = child.binding
+        if _subagent_attributed(record) \
+                and record["payload"].get("session_id") == binding.session_id \
+                and _last_transcript_cap_evidence(
+                    binding.transcript_path) is None:
+            # Attributed to a background subagent yet naming THIS parent —
+            # 27 of 35 live StopFailure records look exactly like this. The
+            # refusal is real, but it is not evidence the PARENT session is
+            # walled, and the parent transcript will never contain it
+            # (subagents write to <session>/subagents/agent-*.jsonl). So the
+            # cap-time model lookup below can only come back empty, spend its
+            # retries and raise PendingCapTimeout, which _attempt_cap turns
+            # into a permanent _lose_supervision. Measured on the real
+            # 2026-07-27 timeline: disarmed at +39.5s, and the parent's own
+            # genuine cap arrived at +79.5s to find automation already gone.
+            #
+            # The transcript check is what keeps this from being a new way to
+            # lose a real wall: if the PARENT itself refused, that is
+            # independent evidence this session is capped and it rotates,
+            # whatever the hook was tagged with. Suppression fires only in the
+            # case that used to time out — a healthy newest main-chain turn.
+            # Say it out loud either way; a suppressed cap is never silent.
+            child.pending_cap = None
+            why = ("the cap was refused for a background subagent, not this "
+                   "session")
+            print(f"[headroom] {child.account['name']} hit a subscription cap "
+                  f"but NO automatic handoff will run: {why}.",
+                  file=sys.stderr)
+            notify.emit({"event": "cap_unhandled",
+                         "account": child.account.get("name", ""),
+                         "reason": why, "bound": True,
+                         "agent_id": (record["payload"].get("agent_id")
+                                      or record["payload"].get("agent_type"))})
+            return None
         received_at = record["received_at"]
         pending = child.pending_cap
         if pending is None or (

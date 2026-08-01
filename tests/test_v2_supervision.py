@@ -3065,6 +3065,242 @@ class BackgroundSubagents(TempDirCase):
                                                    time.time(), 60.0))
 
 
+class ASubagentsCapIsNotTheParentsCap(TempDirCase):
+    """Replays the real 2026-07-27 disarm of session 82d739e6.
+
+    27 of 35 StopFailure records in the live journals carry `agent_id` /
+    `agent_type` ("workflow-subagent") while naming the PARENT session_id and
+    transcript_path, with the cap text in `last_assistant_message`. Nothing
+    in the cap path ever looked at those fields, so cap_message's
+    direct-payload branch returned non-empty and _prove_cap opened a
+    PendingCap against the parent.
+
+    _prove_cap then resolves the cap-time model from the PARENT transcript,
+    which skips sidechain records (deliberate, pinned elsewhere) and requires
+    the newest MAIN-CHAIN assistant record to BE the cap. Background
+    subagents write to <session>/subagents/agent-*.jsonl, so the refusal is
+    simply absent from the parent file: evidence is None, the pending cap is
+    re-driven every poll, and after CAP_MODEL_RETRIES+1 windows (~18s) it
+    raises PendingCapTimeout — which _attempt_cap turns into a PERMANENT
+    _lose_supervision. Measured on the real timeline: disarm at +39.5s, and
+    the parent's OWN genuine cap arrived at +79.5s to find automation already
+    gone and the announce-only path waiting for it.
+
+    A subagent's refusal is real, but it is not evidence the parent session
+    is walled. It must never open a proof against the parent transcript."""
+
+    SID = "82d73900-0000-4000-8000-000000000001"
+    # verbatim from a live record (agent_id 'addb74a7cd4302728')
+    LIVE_CAP = "You've hit your session limit · resets 3pm (UTC)"
+
+    def setUp(self):
+        super().setUp()
+        self.clock = {"t": 1_000_000.0}
+        self.account_ = self.account("source")
+        self.project = os.path.join(self.account_["home"], "projects", "slug")
+        os.makedirs(self.project)
+        self.transcript = os.path.join(self.project, self.SID + ".jsonl")
+        self.healthy_parent()
+        self.cwd = os.path.join(self.temp.name, "work")
+        os.makedirs(self.cwd)
+        self.binding = supervisor.Binding(
+            self.SID, self.transcript, self.cwd, "Fable", "2.1",
+            self.account_["home"], epoch=1)
+
+    def healthy_parent(self):
+        """The parent transcript as it really looks while a subagent caps:
+        the newest main-chain assistant record is a perfectly healthy turn.
+        The refusal is in <session>/subagents/, which this file never sees."""
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "go"}]}}) + "\n")
+            out.write(json.dumps({"type": "assistant", "message": {
+                "model": "claude-fable-5-20260701",
+                "content": [{"type": "text", "text": "started it"}]}}) + "\n")
+        old = self.clock["t"] - 3600
+        os.utime(self.transcript, (old, old))
+
+    def capped_parent(self):
+        """...and the same transcript once the PARENT itself refuses."""
+        with open(self.transcript, "a", encoding="utf-8") as out:
+            out.write(json.dumps({
+                "type": "assistant", "isApiErrorMessage": True,
+                "error": "rate_limit", "apiErrorStatus": 429,
+                "message": {"model": "<synthetic>", "content": [
+                    {"type": "text", "text": self.LIVE_CAP}]}}) + "\n")
+        old = self.clock["t"] - 3600
+        os.utime(self.transcript, (old, old))
+
+    def child(self):
+        return supervisor.Child(
+            mock.Mock(pid=os.getpid()), self.account_, 1,
+            os.path.join(self.temp.name, "no-events.jsonl"), "",
+            0.0, True, binding=self.binding, session_epoch=1)
+
+    def runner(self):
+        return supervisor.Supervisor(
+            "fable", [], self.account_, popen=mock.Mock(),
+            now=lambda: self.clock["t"],
+            sleep=lambda s: self.clock.__setitem__("t", self.clock["t"] + s))
+
+    def record(self, when, agent=True, session_id=None):
+        payload = {"hook_event_name": "StopFailure",
+                   "session_id": session_id or self.SID,
+                   "transcript_path": self.transcript, "cwd": self.cwd,
+                   "error": "rate_limit",
+                   "last_assistant_message": self.LIVE_CAP}
+        if agent:
+            # the live field pair, verbatim
+            payload["agent_id"] = "addb74a7cd4302728"
+            payload["agent_type"] = "workflow-subagent"
+        return {"schema": "headroom_hook_event@1", "received_at": when,
+                "supervisor_id": "no-events", "generation": 1,
+                "source_slot": self.account_["name"],
+                "config_dir": self.account_["home"], "matcher": "rate_limit",
+                "payload": payload}
+
+    @contextlib.contextmanager
+    def wired(self):
+        """_validated_event stubbed exactly as every other cap test does it;
+        everything below it — _prove_cap, the transcript lookup, _attempt_cap
+        and the disarm — is the real code."""
+        with mock.patch.object(supervisor, "_validated_event",
+                               return_value=(self.binding, self.cwd)), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as errors:
+            yield emit, errors
+
+    def replay(self, offsets, until=60.0, agent=True):
+        """Drive the hooks at `offsets`, then poll the pending cap the way
+        _monitor does (re-driving child.pending_cap.event every poll) across
+        `until` seconds of simulated time."""
+        runner, child = self.runner(), self.child()
+        start, results = self.clock["t"], []
+        pending = sorted(offsets)
+        with self.wired() as (emit, errors):
+            while self.clock["t"] - start <= until:
+                if pending and self.clock["t"] - start >= pending[0]:
+                    when = start + pending.pop(0)
+                    results.append(runner._attempt_cap(
+                        child, self.record(when, agent=agent),
+                        announce_non_cap=True))
+                elif child.pending_cap is not None and child.automation:
+                    results.append(
+                        runner._attempt_cap(child, child.pending_cap.event))
+                self.clock["t"] += 1.0
+            events = [call.args[0] for call in emit.call_args_list]
+        return child, results, events, errors.getvalue()
+
+    # -- the replay --------------------------------------------------------
+
+    def test_the_2026_07_27_timeline_no_longer_disarms_the_parent(self):
+        """(a) The real thing: subagent caps at t, +11.6s, +21.4s, then a
+        22.3s quiet gap. HEAD disarms at +39.5s, permanently, on a seat the
+        parent had not even refused on yet."""
+        child, _results, events, errors = self.replay([0.0, 11.6, 21.4])
+        self.assertTrue(child.automation,
+                        "a background subagent's cap disarmed the parent")
+        self.assertNotIn("supervision_lost", [e["event"] for e in events])
+        unhandled = [e for e in events if e["event"] == "cap_unhandled"]
+        self.assertTrue(unhandled)
+        self.assertIn("background subagent", unhandled[0]["reason"])
+        self.assertIn("background subagent", errors)
+        # the refusal is named, never silently swallowed
+        self.assertEqual(unhandled[0]["agent_id"], "addb74a7cd4302728")
+
+    def test_the_2026_07_31_shape_still_does_not_disarm(self):
+        """(e) The other live timeline — max gap 8.69s, which never reached
+        the timeout even on HEAD. It must not start failing now."""
+        child, _results, events, _errors = self.replay(
+            [0.0, 4.2, 8.7, 13.0, 21.5], until=30.0)
+        self.assertTrue(child.automation)
+        self.assertNotIn("supervision_lost", [e["event"] for e in events])
+
+    def test_a_subagent_cap_never_opens_a_pending_cap_at_all(self):
+        """The mechanism, stated directly: no PendingCap, so no deadline, so
+        no timeout, so no disarm. The old path could only ever end one way."""
+        runner, child = self.runner(), self.child()
+        with self.wired():
+            with mock.patch.object(supervisor, "PendingCap",
+                                   wraps=supervisor.PendingCap) as pending:
+                self.assertIsNone(runner._prove_cap(
+                    child, self.record(self.clock["t"])))
+        self.assertEqual(pending.call_count, 0)
+        self.assertIsNone(child.pending_cap)
+        self.assertTrue(child.automation)
+
+    # -- and it must not suppress anything real ----------------------------
+
+    def test_the_parents_own_cap_still_proves_and_rotates(self):
+        """(b) The +79.5s event in the real timeline: no agent attribution,
+        the parent transcript's newest main-chain record IS the cap. This is
+        the rotation the whole supervisor exists for and it is untouched."""
+        self.capped_parent()
+        runner, child = self.runner(), self.child()
+        with self.wired():
+            proof = runner._attempt_cap(
+                child, self.record(self.clock["t"], agent=False))
+        self.assertIsInstance(proof, supervisor.CapProof)
+        self.assertEqual(proof.family, "fable")
+        self.assertTrue(child.automation)
+
+    def test_an_agent_tagged_cap_the_PARENT_transcript_corroborates_wins(self):
+        """(d) THE fence on this patch, and the reason the suppression is
+        conditional rather than absolute.
+
+        Suppressing on the hook's agent attribution ALONE would mean that the
+        day the harness starts tagging parent caps with an agent field, every
+        genuine wall goes unrotated — trading a permanent disarm for a
+        permanent refusal to act, which is no better. So the suppression asks
+        the parent transcript first: if the parent itself refused, that is
+        independent evidence this session is walled, and it rotates whatever
+        the hook was tagged with. The suppression fires only in the case that
+        used to time out and disarm — the parent transcript showing a
+        perfectly healthy newest turn."""
+        self.capped_parent()
+        runner, child = self.runner(), self.child()
+        with self.wired():
+            proof = runner._attempt_cap(child, self.record(self.clock["t"]))
+        self.assertIsInstance(proof, supervisor.CapProof)
+        self.assertTrue(child.automation)
+
+    def test_a_foreign_session_id_is_not_this_childs_business(self):
+        """(c) Both conditions are required. A subagent record naming another
+        session never matched this child anyway; cap_message's own binding
+        check refuses it, exactly as before."""
+        runner, child = self.runner(), self.child()
+        other = "99999999-9999-4999-8999-999999999999"
+        record = self.record(self.clock["t"], session_id=other)
+        with mock.patch.object(
+                supervisor, "_validated_event",
+                side_effect=supervisor.SupervisorError(
+                    "hook event belongs to a different session epoch")), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            self.assertIsNone(runner._prove_cap(child, record))
+        self.assertEqual([call.args[0]["event"]
+                          for call in emit.call_args_list], [])
+        self.assertTrue(child.automation)
+
+    def test_the_attribution_test_is_payload_only_and_reverts_safely(self):
+        """(f) The field names are provider-controlled — the same fragility
+        class as the scoped-pool key. Pinned against the observed shapes, and
+        a rename reverts to the old behaviour rather than to something
+        worse."""
+        self.assertTrue(supervisor._subagent_attributed(
+            self.record(0.0)))
+        self.assertFalse(supervisor._subagent_attributed(
+            self.record(0.0, agent=False)))
+        for field in ("agent_id", "agent_type"):
+            record = self.record(0.0, agent=False)
+            record["payload"][field] = "addb74a7cd4302728"
+            self.assertTrue(supervisor._subagent_attributed(record), field)
+            # blank and whitespace are not an attribution
+            record["payload"][field] = "  "
+            self.assertFalse(supervisor._subagent_attributed(record), field)
+        self.assertFalse(supervisor._subagent_attributed({}))
+
+
 class BackgroundAgentLedger(TempDirCase):
     """The parent transcript's own record of what it started — the strongest
     signal, because it does not depend on the agent writing anything. Record
