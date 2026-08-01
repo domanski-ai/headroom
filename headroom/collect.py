@@ -1343,6 +1343,13 @@ def run_collect(quiet=False):
     """Full collect run: lock, read, write both snapshots. Returns snapshot."""
     with collection_lock(blocking=False) as locked:
         if not locked:
+            # A SKIP, returned as the previous run's snapshot: no exception and
+            # no sentinel, so a caller that needs a reading NEWER than some
+            # event cannot tell this apart from a successful run except by
+            # `run_started`. supervisor._fresh_collect infers exactly that and
+            # retries; keep `run_started` in the snapshot, or that inference
+            # silently degrades. (It degrades SAFE — every read looks contended
+            # and the cap path holds instead of disarming — but it degrades.)
             if not quiet:
                 print("collector already running; skipped")
             return paths.load_json(paths.private_snapshot_path())

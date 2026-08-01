@@ -3658,15 +3658,54 @@ class CapWaitsForCapacity(TempDirCase):
             # and the proof it is holding is untouched
             self.assertEqual(child.cap_scope_window, "5h", bad)
 
-    def test_the_same_unreadable_window_still_disarms_on_a_first_look(self):
-        # the hold is for a cap already corroborated once; with nothing
-        # corroborated there is nothing to wait on, and the fail-closed
-        # first look is unchanged
-        runner = self.runner(
-            [({"used_percent": 100.0, "freshness": "expired_observation"},
-              5.0)])
+    UNREADABLE_5H = {"used_percent": 100.0, "freshness": "expired_observation"}
+
+    def test_the_same_unreadable_window_HOLDS_on_a_first_look_too(self):
+        # SUPERSEDED CONTRACT, deliberately (P7). This used to disarm, on the
+        # reasoning "the hold is for a cap already corroborated once; with
+        # nothing corroborated there is nothing to wait on". But an
+        # unreadable snapshot corroborates nothing and REFUTES nothing — it
+        # is the absence of evidence, which is why route.reading_unavailable
+        # exists as its own class. The escape written for exactly these
+        # strings was gated on `held`, and `held` is structurally False on
+        # every first look (cap_scope_key is only assigned further down, in
+        # the `if not held:` branch), so the guard had never once run and
+        # every such first look disarmed a live session permanently.
+        #
+        # What still disarms on a first look is the CONTRADICTION — fresh
+        # usage that READS, and reads below 99 — pinned right below by
+        # ..._below_99_still_disarms_on_a_first_look. Nothing about trust or
+        # identity moved either (..._trust_refusal_still_disarms...).
+        runner = self.runner([(self.UNREADABLE_5H, 5.0)])
         child = self.child()
-        outcome, events, _err = self.monitor(runner, child, self.proof())
+        outcome, events, err = self.monitor(runner, child, self.proof())
+        self.assertEqual(outcome, 0)
+        self.assertTrue(child.automation)
+        self.assertEqual([event["event"] for event in events], ["cap_held"])
+        self.assertIn("holding the proof rather than", err.getvalue())
+
+    def test_an_unreadable_first_look_still_ends_in_a_truthful_disarm(self):
+        # A hold is a delay, never a promise. A collector that is broken for
+        # good costs the full cap-hold budget and then disarms exactly as it
+        # always did — but on a reason that is TRUE ("no seat came free"
+        # after a real wait), not on a stale snapshot dressed up as evidence.
+        runner = self.runner([(self.UNREADABLE_5H, 5.0)])
+        child = self.child()
+        outcome, events, err = self.monitor(
+            runner, child, self.proof(), polls=40)
+        self.assertEqual(outcome, 0)
+        self.assertFalse(child.automation)
+        self.assertEqual([event["event"] for event in events],
+                         ["cap_held", "supervision_lost"])
+        self.assertIn("no seat came free", err.getvalue())
+
+    def test_zero_budget_restores_the_immediate_first_look_disarm(self):
+        # and the documented kill switch still means what it says: with no
+        # budget to spend there is no hold to take, unreadable or not
+        with mock.patch.object(supervisor, "CAP_HOLD_MAX", 0):
+            runner = self.runner([(self.UNREADABLE_5H, 5.0)])
+            child = self.child()
+            outcome, events, _err = self.monitor(runner, child, self.proof())
         self.assertEqual(outcome, 0)
         self.assertFalse(child.automation)
         self.assertEqual([event["event"] for event in events],
@@ -3882,6 +3921,152 @@ class CapWaitsForCapacity(TempDirCase):
         runner._cap_hold_sync(child, later)
         self.assertEqual(child.cap_hold_attempts, 0)
         self.assertEqual(child.cap_scope_window, "")
+
+    # -- a collector that never RAN is not a collector that refuted us -------
+    #
+    # collect.run_collect takes the collection lock nonblocking and, on
+    # contention, prints "collector already running; skipped" and returns the
+    # PREVIOUS snapshot from disk — no exception, no sentinel. _fresh_collect
+    # only ever caught exceptions, so a skip read as success, the stale
+    # run_started produced "collect did not start after the cap event", and
+    # that walked into _lose_supervision: automation off, permanently, on a
+    # capped seat, because a second collector happened to be mid-run. Three
+    # serve daemons and ~7 supervisors drive run_collect on this box, so the
+    # window is open several seconds out of every minute.
+
+    def hold_collect_lock(self):
+        """Hold `collect.lock` the way a second, live collector does."""
+        path = paths.collect_lock_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        handle = open(path, "a+")
+        self.addCleanup(handle.close)
+        self.assertTrue(collect.locks.exclusive(handle, blocking=False))
+        self.addCleanup(collect.locks.unlock, handle)
+        return handle
+
+    def stale_on_disk(self):
+        """The previous run's snapshot, which is exactly what a skipped
+        run_collect hands back."""
+        old = int(self.clock["t"]) - 3600
+        snapshot = self.snapshot(100.0, 5.0)
+        snapshot["run_started"] = snapshot["generated"] = old
+        paths.write_json_atomic(paths.private_snapshot_path(), snapshot)
+        return snapshot
+
+    def test_a_contended_collect_holds_the_proof_instead_of_disarming(self):
+        """(a) The live case, through the REAL collector.
+
+        A healthy seat is sitting right there (target at 5%), so the only
+        thing between this session and its rotation is a lock another
+        collector holds."""
+        self.hold_collect_lock()
+        self.stale_on_disk()
+        runner, child = self.runner([(100.0, 5.0)]), self.child()
+        runner.collect_fn = collect.run_collect       # the real one
+        with self.assertRaises(supervisor.CapacityHold) as caught:
+            runner._preflight(child, self.proof(), held=False)
+        self.assertIn("skipped", str(caught.exception))
+        self.assertTrue(child.automation)
+
+    def test_a_contended_collect_keeps_the_child_armed_through_monitor(self):
+        """...and the disarm this closes lived in _monitor, so drive it."""
+        self.hold_collect_lock()
+        self.stale_on_disk()
+        runner, child = self.runner([(100.0, 5.0)]), self.child()
+        runner.collect_fn = collect.run_collect
+        outcome, events, err = self.monitor(runner, child, self.proof())
+        self.assertEqual(outcome, 0)
+        self.assertTrue(child.automation)
+        self.assertEqual([event["event"] for event in events], ["cap_held"])
+        self.assertNotIn("collect did not start", err.getvalue())
+
+    def test_a_skipped_collect_is_retried_and_the_fresh_one_wins(self):
+        """(b) The skip is INFERRED from run_started — run_collect has no
+        sentinel and changing its return contract would touch every caller.
+        So pin the inference at both ends: N stale reads then a fresh one
+        must cost N+1 calls and return the FRESH snapshot."""
+        stale = self.snapshot(100.0, 5.0)
+        stale["run_started"] = stale["generated"] = int(self.clock["t"]) - 3600
+        calls = {"n": 0}
+
+        def collect_fn(quiet=True):
+            calls["n"] += 1
+            return stale if calls["n"] <= 2 else self.snapshot(100.0, 5.0)
+
+        runner = self.runner([(100.0, 5.0)])
+        runner.collect_fn = collect_fn
+        snapshot, started = runner._fresh_collect(self.clock["t"] - 30)
+        self.assertEqual(calls["n"], 3)
+        self.assertGreaterEqual(snapshot["run_started"], int(started))
+
+    def test_a_collector_that_never_frees_the_lock_holds_after_its_budget(self):
+        """(b) continued: the retries are bounded, and what they end in is a
+        HOLD — the child keeps running and keeps its automation."""
+        stale = self.snapshot(100.0, 5.0)
+        stale["run_started"] = stale["generated"] = int(self.clock["t"]) - 3600
+        calls = {"n": 0}
+
+        def collect_fn(quiet=True):
+            calls["n"] += 1
+            return stale
+
+        runner = self.runner([(100.0, 5.0)])
+        runner.collect_fn = collect_fn
+        with self.assertRaises(supervisor.CapacityHold) as caught:
+            runner._fresh_collect(self.clock["t"] - 30)
+        self.assertIn("skipped", str(caught.exception))
+        self.assertEqual(calls["n"],
+                         supervisor.COLLECT_CONTENTION_RETRIES + 1)
+
+    def test_a_readable_snapshot_below_99_still_disarms_on_a_first_look(self):
+        """(c) THE regression. Ungating the hold escape from `held` must move
+        the UNREADABLE class and nothing else: a fresh, readable snapshot
+        that says 4% is a contradiction of the hook, not an absence of
+        evidence, and a proof nobody can corroborate still disarms."""
+        runner, child = self.runner([(4.0, 4.0)]), self.child()
+        with self.assertRaises(supervisor.SupervisorError) as caught:
+            runner._preflight(child, self.proof(), held=False)
+        self.assertNotIsInstance(caught.exception, supervisor.CapacityHold)
+        self.assertIn("below 99%", str(caught.exception))
+
+    def test_a_trust_refusal_still_disarms_on_a_first_look(self):
+        """(d) An identity that moved under us is not something waiting
+        fixes, and it is deliberately outside _source_reading_unavailable.
+        Ungating the escape must not widen that list by accident."""
+        runner, child = self.runner([(100.0, 5.0)]), self.child()
+        base = runner.collect_fn
+
+        def moved_identity(quiet=True):
+            snapshot = base(quiet=quiet)
+            snapshot["accounts"][0]["identity"] = dict(
+                IDENTITY, account_fingerprint="MOVED")
+            return snapshot
+
+        runner.collect_fn = moved_identity
+        with self.assertRaises(supervisor.SupervisorError) as caught:
+            runner._preflight(child, self.proof(), held=False)
+        self.assertNotIsInstance(caught.exception, supervisor.CapacityHold)
+        self.assertEqual(str(caught.exception),
+                         "slot identity changed since snapshot — recollect")
+
+    def test_the_hold_announcement_fires_once_per_distinct_reason(self):
+        """(e) A hold that now fires on the FIRST look must not turn into a
+        per-poll siren: one voice per distinct reason, and a new reason is a
+        new voice."""
+        runner, child = self.runner([(100.0, 5.0)]), self.child()
+        with mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as err:
+            for _ in range(3):
+                self.assertTrue(runner._cap_hold(
+                    child, supervisor.CapacityHold("lock is held")))
+        self.assertEqual([call.args[0]["event"] for call in emit.call_args_list],
+                         ["cap_held"])
+        self.assertEqual(err.getvalue().count("waiting for capacity"), 1)
+        child.cap_hold_attempts = 0
+        with mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            runner._cap_hold(child, supervisor.CapacityHold("no seat at all"))
+        self.assertEqual(len(emit.call_args_list), 1)
 
 
 class PreemptiveRotation(TempDirCase):

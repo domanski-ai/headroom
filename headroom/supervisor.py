@@ -111,6 +111,16 @@ CAP_ROTATE_AT_WALL = os.environ.get("HEADROOM_CAP_ROTATE_AT_WALL", "1") != "0"
 # not a contradicted proof, and 6s is a short window to bet a session on.
 # HEADROOM_CAP_MODEL_RETRIES=0 restores the single-window behaviour.
 CAP_MODEL_RETRIES = max(0, paths.env_int("HEADROOM_CAP_MODEL_RETRIES", 2))
+# How many extra collects the cap path may spend waiting out ANOTHER
+# collector. `collect.run_collect` takes the collection lock nonblocking and,
+# on contention, returns the PREVIOUS snapshot from disk with no exception and
+# no sentinel — so a skip reads as success, and its stale `run_started` then
+# reads as "collect did not start after the cap event" and disarms a live
+# session. Three serve daemons and every resident supervisor on a busy box
+# drive run_collect, and one run spans several seconds, so the window is open
+# a real fraction of every minute.
+# HEADROOM_COLLECT_RETRIES=0 restores the single-attempt behaviour.
+COLLECT_CONTENTION_RETRIES = max(0, paths.env_int("HEADROOM_COLLECT_RETRIES", 4))
 # What a CAPPED session may be moved onto. The routing gate rejects a seat at
 # 100%, critical, under reserve or unreadable — and nothing else, so a seat
 # reading 99% was a legal destination for a real cap: a handoff, a restart and
@@ -2367,7 +2377,7 @@ class Supervisor:
                      event_path(self.supervisor_id), settings, launched_at,
                      automatic, spawn_args=tuple(args))
 
-    def _fresh_collect(self, event_time):
+    def _collect_once(self, event_time):
         # Provider snapshots use whole-second timestamps.  Crossing the next
         # second before starting removes the historical same-second ambiguity.
         boundary = math.floor(event_time) + 1
@@ -2386,6 +2396,33 @@ class Supervisor:
             raise CapacityHold(
                 f"fresh usage collect failed: {error}") from error
         return snapshot, started
+
+    def _fresh_collect(self, event_time):
+        # A SKIPPED collect is not a failed collect, and it is not a fresh one
+        # either. run_collect returns the previous snapshot from disk on lock
+        # contention (collect.py, `if not locked:`) with no exception and no
+        # sentinel, so a skip reads as success here and the stale run_started
+        # then disarms a live session — permanently, because a capped child
+        # emits no further hook events and nothing ever retries.
+        #
+        # The skip is INFERRED from run_started rather than reported, because
+        # the alternative — a new return contract on run_collect — touches
+        # every caller. The inference is commented at both ends; if the
+        # snapshot ever stops carrying run_started, this degrades to "always
+        # contended", which holds the child armed rather than disarming it.
+        for attempt in range(COLLECT_CONTENTION_RETRIES + 1):
+            snapshot, started = self._collect_once(
+                event_time if attempt == 0 else self.now())
+            run_started = snapshot.get("run_started") \
+                if isinstance(snapshot, dict) else None
+            if isinstance(run_started, (int, float)) \
+                    and not isinstance(run_started, bool) \
+                    and run_started >= math.floor(started):
+                return snapshot, started
+            if attempt < COLLECT_CONTENTION_RETRIES:
+                self.sleep(POLL_SECONDS)
+        raise CapacityHold(
+            "fresh usage collect was skipped: another collector holds the lock")
 
     def _prove_cap(self, child, record):
         message = cap_message(record, child)
@@ -2554,7 +2591,16 @@ class Supervisor:
                 # _lose_supervision, on the dead seat, exactly like the bug
                 # the wait replaced. Trust, identity and policy refusals are
                 # NOT in this class and disarm as they always did.
-                if held and _source_reading_unavailable(reason, proof.family):
+                #
+                # NOT gated on `held`: cap_scope_key is assigned only in the
+                # `if not held:` branch BELOW this gate, and _cap_hold_clear
+                # zeroes it per proof, so the only call site's
+                # `held=bool(child.cap_scope_key)` is structurally False on
+                # every first look — this branch, written for exactly this
+                # case, could never once run. Absence of evidence holds on the
+                # first look too. The first-look "a contradiction disarms"
+                # rule belongs to `scope is None` below and is untouched.
+                if _source_reading_unavailable(reason, proof.family):
                     raise CapacityHold(
                         f"{reason} — holding the proof rather than disarming "
                         "on a snapshot that proves nothing")
