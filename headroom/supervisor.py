@@ -1283,15 +1283,35 @@ def parse_session_start(record, child):
         record["received_at"])
 
 
-def cap_message(record, child):
-    """Return the narrow cap message, or empty when any binding proof fails."""
-    binding = child.binding
-    if binding is None:
-        return ""
-    try:
-        _validated_event(record, child, binding)
-    except SupervisorError:
-        return ""
+def _cap_text(record, *, absent=""):
+    """The cap phrase from a record's OWN payload, or "".
+
+    The binding-free half of cap_message. It reads only the payload and never
+    touches a transcript, so it can speak for a child that never bound a
+    session — which is the whole point. It deliberately does NOT run
+    _validated_event: validating an event requires a binding, and a child
+    without one still deserves to have its wall announced. ACTING still needs
+    cap_message's full proof; SAYING SO does not.
+
+    `absent` is returned for EXACTLY ONE of the ways this can come back
+    empty: an in-class record whose payload says nothing about itself
+    (neither last_assistant_message nor error_details). The three cap-CLASS
+    gates below — wrong hook, wrong matcher, wrong error type — and a payload
+    that speaks but is not a cap always return "", because those records are
+    not rate-limit refusals and NO transcript may be allowed to speak for
+    them. cap_message passes absent=None so it can tell that one case apart
+    and fall back to the transcript exactly where it always did; every
+    announce-only caller takes the default and sees a single falsy answer.
+
+    Do not turn `absent` into a positional argument, and do not widen which
+    branch returns it. Collapsing these five empty answers into one and then
+    reconstructing which happened from the payload can only distinguish
+    "self-described" from "said nothing" — so a record that failed the
+    MATCHER or ERROR-TYPE gate carrying no payload text becomes
+    indistinguishable from an in-class silent one, reads the transcript, and
+    returns a stale cap left there earlier in the session. That is a rotation
+    off a non-cap, on the live acting path.
+    `CapClassIsNotDelegatedToTheTranscript` is the only test that catches it."""
     payload = record["payload"]
     if payload.get("hook_event_name") != "StopFailure":
         return ""
@@ -1303,10 +1323,31 @@ def cap_message(record, child):
     direct = payload.get("last_assistant_message")
     if direct is None:
         direct = payload.get("error_details")
-    if direct is not None:
-        text = "\n".join(_strings(direct))
-        return text if CAP_RE.search(text) else ""
-    return _last_transcript_cap(binding.transcript_path)
+    if direct is None:
+        return absent
+    text = "\n".join(_strings(direct))
+    return text if CAP_RE.search(text) else ""
+
+
+def cap_message(record, child):
+    """Return the narrow cap message, or empty when any binding proof fails."""
+    binding = child.binding
+    if binding is None:
+        return ""
+    try:
+        _validated_event(record, child, binding)
+    except SupervisorError:
+        return ""
+    text = _cap_text(record, absent=None)
+    if text is None:
+        # The ONE case that may reach the transcript: a record that IS a
+        # rate-limit StopFailure but whose payload carries no
+        # self-description. Every other empty answer — not a StopFailure, not
+        # the rate_limit matcher, a non-rate_limit error type, or text that is
+        # present and is not a cap — is a decision that this record CANNOT be
+        # a cap, and the transcript must not get a second vote.
+        return _last_transcript_cap(binding.transcript_path)
+    return text
 
 
 def _read_events(child):
@@ -4142,10 +4183,22 @@ class Supervisor:
                     # is not ours to rotate), so say so instead: the human in
                     # this pane gets the wall, the reason, and the manual
                     # remedy, and an observer gets a structured event.
-                    if cap_message(record, child):
-                        why = ("supervision is off for this child"
+                    # The PAYLOAD's own text, not cap_message: cap_message
+                    # returns "" on its binding gate before it ever looks at
+                    # the record, so an unbound child — the state any
+                    # SessionStart binding failure leaves a live child in for
+                    # the whole 30s BIND_TIMEOUT and beyond — announced
+                    # nothing at all. No stderr, no notify, no record of the
+                    # decision; and _binding_key(None) is None, so the
+                    # post-loop "session ended" line stayed quiet too.
+                    if _cap_text(record):
+                        why = ("this child never bound a session (the "
+                               "SessionStart hook did not arrive)"
+                               if child.binding is None
+                               else "supervision is off for this child"
                                if not child.automation
-                               else "the event is from another session")
+                               else "the event does not match this child's "
+                                    "live session")
                         print(f"[headroom] {child.account['name']} hit a "
                               f"subscription cap but NO automatic handoff will "
                               f"run: {why}. Switch model (/model opus) or hand "
@@ -4153,6 +4206,7 @@ class Supervisor:
                               file=sys.stderr)
                         notify.emit({"event": "cap_unhandled",
                                      "account": child.account.get("name", ""),
+                                     "bound": child.binding is not None,
                                      "reason": why})
                     continue
                 proof = self._attempt_cap(child, record, announce_non_cap=True)

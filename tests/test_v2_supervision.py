@@ -6140,6 +6140,313 @@ class UnhandledCapIsAnnounced(TempDirCase):
         attempt.assert_called_once()
         self.assertNotIn("NO automatic handoff", errors.getvalue())
 
+    # -- the child that never bound a session ------------------------------
+    #
+    # cap_message returns "" on its BINDING gate before it ever looks at the
+    # record, so for an unbound child the announce branch found nothing to
+    # say and hit its bare `continue`: no stderr, no notify, no record of the
+    # decision anywhere. _binding_key(None) is None, so the post-loop "session
+    # ended without a replacement SessionStart" line does not fire either.
+    # Totally dark — and BIND_TIMEOUT is 30s, so a SessionStart that fails to
+    # bind leaves a live child in exactly this state.
+
+    def _unbound_run(self, message, automation=False, matcher="rate_limit",
+                     error="rate_limit"):
+        """The same drive as _run, but with NO binding on the child — so
+        nothing here may be routed through _validated_event, which needs one."""
+        account = self.account()
+        runner = supervisor.Supervisor("fable", [], account, popen=mock.Mock())
+        child = supervisor.Child(
+            process=mock.Mock(), account=account, generation=1,
+            event_path="/dev/null", settings_path="", launched_at=0.0,
+            automation=automation, binding=None, session_epoch=1)
+        event = self._event(message)
+        event["matcher"] = matcher
+        event["payload"]["error"] = error
+        if message is None:
+            event["payload"].pop("last_assistant_message")
+        with mock.patch.object(supervisor, "_read_events",
+                               return_value=[event]), \
+                mock.patch.object(supervisor, "_namespace_matches",
+                                  return_value=True), \
+                mock.patch.object(supervisor, "_validated_event",
+                                  return_value=(supervisor.Binding(
+                                      self.SID, "/t.jsonl", "/cwd", "fable",
+                                      "1", account["home"], epoch=1), "/cwd")), \
+                mock.patch.object(supervisor, "_event_epoch", return_value=1), \
+                mock.patch.object(supervisor, "_accept_event_order"), \
+                mock.patch.object(runner, "_attempt_cap") as attempt, \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as errors:
+            runner._handle_events(child, "")
+        return (errors.getvalue(),
+                [call.args[0] for call in emit.call_args_list],
+                attempt, child)
+
+    def test_an_unbound_childs_cap_is_announced_not_swallowed(self):
+        """(a) The dark case. 27 of 35 real StopFailure records carry the cap
+        text in their own payload, so the announcement does not need a
+        binding — only ACTING does."""
+        errors, events, attempt, child = self._unbound_run(
+            "You're out of usage credits. Run /usage-credits to keep using "
+            "Fable 5 or /model to switch models.")
+        self.assertIn("hit a subscription cap", errors)
+        self.assertIn("never bound a session", errors)
+        self.assertIn("/model opus", errors)
+        self.assertEqual([event["event"] for event in events],
+                         ["cap_unhandled"])
+        self.assertIs(events[0]["bound"], False)
+        # SAYING is not ACTING: an unbound child is not ours to rotate
+        attempt.assert_not_called()
+        self.assertTrue(child.automation is False)
+
+    def test_the_bound_child_still_reports_bound_true(self):
+        """(4) The two dark shapes must be tellable apart by an observer."""
+        _errors, events = self._run(
+            "You're out of usage credits. Run /usage-credits to keep using "
+            "Fable 5.")
+        self.assertIs(events[0]["bound"], True)
+
+    def test_a_foreign_session_finally_reaches_its_own_reason(self):
+        """(c) The branch d24a613 shipped DEAD.
+
+        "the event is from another session" needed automation True and
+        same_session False — but _validated_event raises "hook event belongs
+        to a different session epoch" for exactly that pair, before
+        cap_message could return any text, so the branch could never run.
+        Reached now via the payload-only path, which never validates."""
+        account = self.account()
+        runner = supervisor.Supervisor("fable", [], account, popen=mock.Mock())
+        child = self._child(account, automation=True)
+        foreign = "99999999-9999-4999-8999-999999999999"
+        event = self._event("You're out of usage credits, Fable 5")
+        event["payload"]["session_id"] = foreign
+
+        def validated(_record, _child, binding=None):
+            # Modelled exactly as the real one behaves for this record: the
+            # LOOP's binding-free call succeeds (namespace, slot, paths are
+            # all fine), and cap_message's BINDING-scoped call is the one that
+            # raises. That raise is precisely why the third `why` branch could
+            # never run — cap_message returned "" before it could be reached.
+            if binding is not None:
+                raise supervisor.SupervisorError(
+                    "hook event belongs to a different session epoch")
+            return (supervisor.Binding(foreign, "/t.jsonl", "/cwd", "fable",
+                                       "1", account["home"], epoch=1), "/cwd")
+
+        with mock.patch.object(supervisor, "_read_events",
+                               return_value=[event]), \
+                mock.patch.object(supervisor, "_namespace_matches",
+                                  return_value=True), \
+                mock.patch.object(supervisor, "_validated_event",
+                                  side_effect=validated), \
+                mock.patch.object(supervisor, "_event_epoch", return_value=1), \
+                mock.patch.object(supervisor, "_accept_event_order"), \
+                mock.patch.object(runner, "_attempt_cap") as attempt, \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as errors:
+            runner._handle_events(child, "")
+        self.assertIn("does not match this child's live session",
+                      errors.getvalue())
+        self.assertEqual([call.args[0]["event"]
+                          for call in emit.call_args_list], ["cap_unhandled"])
+        attempt.assert_not_called()
+
+    def test_an_unbound_non_cap_stop_failure_is_still_quiet(self):
+        """(d) The new path must not become chatty. A transient 429 is not a
+        cap, and announcing it trains the operator to ignore the one that
+        matters."""
+        errors, events, _attempt, _child = self._unbound_run(
+            "429 rate_limit_error: please try again later")
+        self.assertEqual(errors, "")
+        self.assertEqual(events, [])
+
+    def test_an_unbound_child_with_nothing_to_read_stays_silent(self):
+        """...and a payload that says nothing about itself has no transcript
+        to fall back on — there is no binding to read one through. Stated in
+        the docstring rather than papered over."""
+        errors, events, _attempt, _child = self._unbound_run(None)
+        self.assertEqual(errors, "")
+        self.assertEqual(events, [])
+
+    def test_cap_message_still_falls_back_to_the_transcript(self):
+        """(e) One direction of the sentinel. A record that IS an in-class
+        rate-limit StopFailure but describes nothing about itself is the ONE
+        empty answer that may reach the transcript. If `absent=None` is ever
+        dropped at the call site, this is what fails — and it fails toward a
+        MISSED cap, never a fabricated one."""
+        account = self.account()
+        child = self._child(account, automation=True)
+        event = self._event(None)
+        event["payload"].pop("last_assistant_message")
+        with mock.patch.object(supervisor, "_validated_event",
+                               return_value=(child.binding, "/cwd")), \
+                mock.patch.object(supervisor, "_last_transcript_cap",
+                                  return_value="You've hit your weekly limit"
+                                  ) as fallback:
+            self.assertEqual(supervisor.cap_message(event, child),
+                             "You've hit your weekly limit")
+        fallback.assert_called_once_with("/t.jsonl")
+
+    def test_a_payload_that_says_NOT_a_cap_never_opens_the_transcript(self):
+        """(e) The other direction, and the one that matters: a record that
+        speaks for itself and is not a cap is a DECISION, not an absence. The
+        transcript gets no second vote — asserted on the read count, not just
+        on the return value."""
+        account = self.account()
+        child = self._child(account, automation=True)
+        event = self._event("429 rate_limit_error: please try again later")
+        with mock.patch.object(supervisor, "_validated_event",
+                               return_value=(child.binding, "/cwd")), \
+                mock.patch.object(supervisor, "_last_transcript_cap",
+                                  return_value="You've hit your weekly limit"
+                                  ) as fallback:
+            self.assertEqual(supervisor.cap_message(event, child), "")
+        fallback.assert_not_called()
+
+
+class CapClassIsNotDelegatedToTheTranscript(TempDirCase):
+    """(g) THE DISCRIMINATING TEST for the P5 extraction, on the ACTING path.
+
+    `cap_message` produces "" for five distinct reasons and they are NOT
+    interchangeable. Three are cap-CLASS gates — not a StopFailure, not the
+    `rate_limit` matcher, an error type that is not `rate_limit` — and each
+    means THIS RECORD IS NOT A RATE-LIMIT REFUSAL AT ALL. HEAD answers all
+    three without ever opening the transcript. The other two are about what
+    an in-class record SAID, and only one of those (payload silent) may fall
+    through to `_last_transcript_cap`.
+
+    A refactor that collapses the five into one falsy answer and then
+    reconstructs which one happened by re-reading the payload can only tell
+    "self-described" from "said nothing". So a record that failed the MATCHER
+    or ERROR-TYPE gate and carries no payload text becomes indistinguishable
+    from an in-class silent one: it reads the transcript, finds a cap left
+    there earlier in the session still sitting as the newest main-chain
+    assistant record, and returns a STALE CAP.
+
+    That is on the live acting path, not a hypothetical. `_read_events` only
+    requires `matcher` to be a str; the hook writes
+    `environ.get("HEADROOM_HOOK_MATCHER", "")`, so `matcher == ""` is routine,
+    and `error == "api_error"` is another ordinary shape. `_handle_events`
+    hands exactly such a record to `_attempt_cap`, which reaches `cap_message`
+    through `_prove_cap` — and a non-empty return there opens a PendingCap and
+    can drive a ROTATION OFF A NON-CAP.
+
+    This test passes on HEAD and on the sentinel form, and fails on the
+    collapsed form. The rest of the suite does not discriminate between them
+    at all, which is the entire reason it exists."""
+
+    SID = "33333333-3333-4333-8333-333333333333"
+
+    def setUp(self):
+        super().setUp()
+        self.account_ = self.account()
+        directory = os.path.join(self.account_["home"], "projects", "p")
+        os.makedirs(directory, exist_ok=True)
+        self.transcript = os.path.join(directory, self.SID + ".jsonl")
+        # A REAL transcript whose newest main-chain assistant record IS a cap
+        # — exactly what _last_transcript_cap is built to return. Nothing
+        # below may be allowed to reach it.
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({
+                "type": "assistant", "message": {
+                    "model": "claude-fable-5-20260701",
+                    "content": [{"type": "text", "text": "real turn"}]}}) + "\n")
+            out.write(json.dumps({
+                "type": "assistant", "isApiErrorMessage": True,
+                "error": "rate_limit", "apiErrorStatus": 429,
+                "message": {"model": "<synthetic>", "content": [
+                    {"type": "text",
+                     "text": "You've hit your weekly limit · resets 3pm"}]}
+            }) + "\n")
+        when = time.time() - 600
+        os.utime(self.transcript, (when, when))
+        self.binding = supervisor.Binding(
+            self.SID, self.transcript, "/cwd", "Fable", "1",
+            self.account_["home"], epoch=1)
+
+    def child(self):
+        return supervisor.Child(
+            process=mock.Mock(), account=self.account_, generation=1,
+            event_path=os.path.join(self.temp.name, "no-events.jsonl"),
+            settings_path="", launched_at=0.0, automation=True,
+            binding=self.binding, session_epoch=1)
+
+    def record(self, matcher="rate_limit", error="rate_limit"):
+        """An in-session StopFailure that says NOTHING about itself: no
+        last_assistant_message, no error_details."""
+        return {
+            "schema": "headroom_hook_event@1", "received_at": 1000.0,
+            "supervisor_id": "no-events", "generation": 1,
+            "source_slot": self.account_["name"],
+            "config_dir": self.account_["home"], "matcher": matcher,
+            "payload": {"hook_event_name": "StopFailure",
+                        "session_id": self.SID,
+                        "transcript_path": self.transcript,
+                        "cwd": "/cwd", "error": error},
+        }
+
+    def drive(self, record):
+        """The real acting path: same_session true, automation on, so
+        _handle_events reaches _attempt_cap -> _prove_cap -> cap_message."""
+        runner = supervisor.Supervisor(
+            "fable", [], self.account_, popen=mock.Mock())
+        child = self.child()
+        reads = {"n": 0}
+        real_last = supervisor._last_transcript_cap
+
+        def counting(path):
+            reads["n"] += 1
+            return real_last(path)
+
+        with mock.patch.object(supervisor, "_read_events",
+                               return_value=[record]), \
+                mock.patch.object(supervisor, "_namespace_matches",
+                                  return_value=True), \
+                mock.patch.object(supervisor, "_validated_event",
+                                  return_value=(self.binding, "/cwd")), \
+                mock.patch.object(supervisor, "_event_epoch", return_value=1), \
+                mock.patch.object(supervisor, "_accept_event_order"), \
+                mock.patch.object(supervisor, "_last_transcript_cap",
+                                  side_effect=counting), \
+                mock.patch.object(supervisor, "PendingCap",
+                                  wraps=supervisor.PendingCap) as pending, \
+                redirect_stderr(io.StringIO()) as errors:
+            proof = runner._handle_events(child, "")
+            direct = supervisor.cap_message(record, child)
+        return proof, direct, reads["n"], pending.call_count, errors.getvalue()
+
+    def test_an_empty_matcher_is_out_of_class_not_merely_silent(self):
+        """(g1) `matcher == ""` — the shape the hook writes whenever no
+        matcher was supplied. Out of class: the transcript may not speak."""
+        proof, direct, reads, pendings, errors = self.drive(
+            self.record(matcher=""))
+        self.assertEqual(direct, "")
+        self.assertEqual(reads, 0, "the transcript got a vote it must not have")
+        self.assertEqual(pendings, 0, "a non-cap opened a PendingCap")
+        self.assertIsNone(proof, "a non-cap produced a CapProof")
+        self.assertIn("was not a subscription cap", errors)
+
+    def test_an_api_error_type_is_out_of_class_not_merely_silent(self):
+        """(g2) `payload["error"] == "api_error"` — an ordinary non-cap
+        failure shape. Same rule."""
+        proof, direct, reads, pendings, errors = self.drive(
+            self.record(error="api_error"))
+        self.assertEqual(direct, "")
+        self.assertEqual(reads, 0, "the transcript got a vote it must not have")
+        self.assertEqual(pendings, 0, "a non-cap opened a PendingCap")
+        self.assertIsNone(proof, "a non-cap produced a CapProof")
+        self.assertIn("was not a subscription cap", errors)
+
+    def test_the_control_an_IN_CLASS_silent_record_DOES_read_it(self):
+        """The control, without which the two above prove nothing: the same
+        fixture, in class, still falls through to the transcript and still
+        finds the cap. If only the two above pass, the fallback is simply
+        dead and the extraction broke something else."""
+        proof, direct, reads, _pendings, _errors = self.drive(self.record())
+        self.assertIn("You've hit your weekly limit", direct)
+        self.assertGreaterEqual(reads, 1)
+        self.assertIsNotNone(proof)
 
 
 # --------------------------------------------------------------------------
