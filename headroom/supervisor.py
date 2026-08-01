@@ -4081,10 +4081,49 @@ class Supervisor:
                 child, f"handoff failed after Claude exited: {error}")
             return self._source_relaunch(plan, model=self.stopped_child_model)
 
+    def _announce_tail_caps(self, child, remaining):
+        """Speak for caps in a batch this handler is about to abandon.
+
+        `_read_events` advanced the cursor for the WHOLE batch before
+        returning, so these bytes are gone from the journal whether or not we
+        look at them — and every early `return None` below used to drop them
+        silently. A cap that shared a batch with one racy or malformed record
+        was simply destroyed.
+
+        ANNOUNCE-ONLY. The child is being disarmed on these paths for reasons
+        that are still valid, and ACTING on a cap found after a malformed
+        event in the same batch would be acting on a journal we have just
+        declared untrustworthy.
+
+        `remaining` is the tail in RECEIVED_AT order — `_read_events` sorts
+        the batch at the end — which is the order the loop would have
+        processed. That is the right definition; do not "fix" it back to
+        file order."""
+        seen = set()
+        for record in remaining:
+            received = record.get("received_at")
+            if received in seen or not _cap_text(record):
+                continue
+            seen.add(received)
+            why = ("the hook batch was abandoned after an earlier "
+                   "malformed event")
+            print(f"[headroom] {child.account['name']} hit a subscription cap "
+                  f"but NO automatic handoff will run: {why}. Switch model "
+                  f"(/model opus) or hand off manually: "
+                  f"headroom handoff --to <slot>", file=sys.stderr)
+            notify.emit({"event": "cap_unhandled",
+                         "account": child.account.get("name", ""),
+                         "bound": child.binding is not None,
+                         "reason": why})
+
     def _handle_events(self, child, pending_handoff_id, proof=None):
         try:
             records = _read_events(child)
         except SupervisorError as error:
+            # NO tail drain here, and that is not an omission: _read_events
+            # raised, so nothing was parsed and the cursor never advanced
+            # (it moves only after the parse loop). Every record is still in
+            # the journal — there is no abandoned tail to speak for.
             print(f"[headroom] {error}; automatic handoff disabled for this child",
                   file=sys.stderr)
             _lose_supervision(child, f"hook event journal unreadable: {error}")
@@ -4092,7 +4131,7 @@ class Supervisor:
             return None
         _remember_binding(child)
         saw_stop_failure = False
-        for record in records:
+        for index, record in enumerate(records):
             if not _namespace_matches(record, child):
                 continue
             try:
@@ -4116,6 +4155,7 @@ class Supervisor:
                       "handoff disabled for this child", file=sys.stderr)
                 _lose_supervision(child, f"malformed hook event: {error}")
                 child.pending_cap = None
+                self._announce_tail_caps(child, records[index + 1:])
                 return None
             if hook_name == "SessionStart":
                 try:
@@ -4141,6 +4181,7 @@ class Supervisor:
                     _lose_supervision(child, f"session binding failed: {error}")
                     print(f"[headroom] {error}; automatic handoff disabled for "
                           "this child", file=sys.stderr)
+                    self._announce_tail_caps(child, records[index + 1:])
                     return None
                 continue
             current = child.binding
@@ -4158,6 +4199,7 @@ class Supervisor:
                     print("[headroom] SessionEnd has no known session epoch; "
                           "automatic handoff disabled for this child",
                           file=sys.stderr)
+                    self._announce_tail_caps(child, records[index + 1:])
                     return None
                 child.dead_sessions.add(session_key)
                 if same_session:
@@ -4221,6 +4263,10 @@ class Supervisor:
             _lose_supervision(
                 child, "current session ended without a replacement "
                 "SessionStart")
+            # `records` is fully processed by here, so this drains nothing —
+            # kept so all four early returns have one uniform shape and a
+            # future `break` inside the loop cannot reintroduce the loss.
+            self._announce_tail_caps(child, [])
             return None
         return proof
 

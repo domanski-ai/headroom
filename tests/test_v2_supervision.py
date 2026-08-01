@@ -5083,6 +5083,128 @@ class LoudDisarms(TempDirCase):
         self.assertEqual(lost[0]["reason"], "shutdown signal received")
 
 
+class AnAbandonedBatchStillSpeaksItsCaps(LoudDisarms):
+    """_read_events advances the cursor for the WHOLE batch and then sorts by
+    received_at; _handle_events has four early `return None` paths that
+    abandon every record after the one that tripped them. Those bytes are
+    already consumed from the journal and are never re-read, so a cap sharing
+    a batch with one racy or malformed record is DESTROYED — the exact "the
+    cap fired and nothing happened" shape this supervisor exists to prevent.
+
+    Making the cursor per-record is not the fix: _events_pending and
+    _event_stop_guard both prove "no newer hook event arrived" by comparing
+    the journal's on-disk size against event_offset, so an unconsumed tail
+    would make every later cap preflight fail with "cap proof expired after a
+    newer hook event". So drain the tail for the one thing that must never be
+    lost, and disarm exactly as before.
+
+    ANNOUNCE-ONLY, deliberately. The child is being disarmed on these paths
+    for reasons that are still valid, and ACTING on a cap found after a
+    malformed event in the same batch would be acting on a journal we just
+    declared untrustworthy."""
+
+    CAP = ("You're out of usage credits. Run /usage-credits to keep using "
+           "Fable 5 or /model to switch models.")
+    ABANDONED = "the hook batch was abandoned after an earlier malformed event"
+
+    def cap_record(self, when):
+        return self.record(
+            matcher="rate_limit", received_at=when,
+            payload={"hook_event_name": "StopFailure", "error": "rate_limit",
+                     "last_assistant_message": self.CAP})
+
+    def unhandled(self, events):
+        return [event for event in events if event["event"] == "cap_unhandled"]
+
+    def test_a_cap_behind_a_malformed_event_is_announced_not_destroyed(self):
+        """(a) The live shape: one impostor record in the batch and the cap
+        that followed it is gone forever."""
+        now = time.time()
+        events, err = self.disarm([
+            self.record(source_slot="impostor", received_at=now),
+            self.cap_record(now + 1)])
+        # the disarm itself is completely unchanged
+        self.assertFalse(self.child.automation)
+        self.assertIn("malformed hook event", err)
+        self.assertIn("supervision_lost", [e["event"] for e in events])
+        # ...and the cap in the abandoned tail now has a voice
+        self.assertIn("hit a subscription cap", err)
+        self.assertIn(self.ABANDONED, err)
+        self.assertIn("/model opus", err)
+        unhandled = self.unhandled(events)
+        self.assertEqual(len(unhandled), 1)
+        self.assertEqual(unhandled[0]["reason"], self.ABANDONED)
+        self.assertIs(unhandled[0]["bound"], True)
+
+    def test_a_cap_behind_an_unknown_epoch_session_end_is_announced_too(self):
+        """(b) The same loss through a different early return."""
+        now = time.time()
+        other = "55555555-5555-4555-8555-555555555555"
+        path = os.path.join(os.path.dirname(self.transcript), other + ".jsonl")
+        with open(path, "w", encoding="utf-8") as out:
+            out.write("{}\n")
+        events, err = self.disarm([
+            self.record(received_at=now, payload={
+                "session_id": other, "transcript_path": path}),
+            self.cap_record(now + 1)])
+        self.assertFalse(self.child.automation)
+        self.assertIn("SessionEnd has no known session epoch", err)
+        self.assertEqual([e["reason"] for e in self.unhandled(events)],
+                         [self.ABANDONED])
+
+    def test_a_cap_that_sorts_BEFORE_the_bad_record_is_not_double_announced(self):
+        """(c) ORDERING. `records[index + 1:]` is the tail in received_at
+        order, which is the order the loop would have processed — NOT file
+        order. A cap ahead of the malformed record was already handled on its
+        own terms and must not be announced a second time with the wrong
+        reason."""
+        now = time.time()
+        self.child.automation = False        # so the cap takes the announce path
+        events, err = self.disarm([
+            self.cap_record(now),
+            self.record(source_slot="impostor", received_at=now + 1)])
+        unhandled = self.unhandled(events)
+        self.assertEqual(len(unhandled), 1)
+        self.assertEqual(unhandled[0]["reason"],
+                         "supervision is off for this child")
+        self.assertNotIn(self.ABANDONED, err)
+
+    def test_a_tail_with_no_cap_in_it_adds_nothing(self):
+        """(d) The drain speaks only for caps."""
+        now = time.time()
+        events, err = self.disarm([
+            self.record(source_slot="impostor", received_at=now),
+            self.record(matcher="rate_limit", received_at=now + 1, payload={
+                "hook_event_name": "StopFailure", "error": "rate_limit",
+                "last_assistant_message": "429 rate_limit_error: try later"})])
+        self.assertEqual(self.unhandled(events), [])
+        self.assertNotIn("hit a subscription cap", err)
+
+    def test_one_cap_repeated_in_the_tail_is_announced_once(self):
+        """Volume on a badly corrupted journal is bounded by the batch, and
+        the same event redelivered is still one wall."""
+        now = time.time()
+        events, _err = self.disarm([
+            self.record(source_slot="impostor", received_at=now),
+            self.cap_record(now + 1), self.cap_record(now + 1)])
+        self.assertEqual(len(self.unhandled(events)), 1)
+
+    def test_the_unreadable_journal_path_drains_nothing(self):
+        """(e) Unchanged, and deliberately so: _read_events raised, so no
+        bytes were parsed and the cursor never advanced. There is no tail to
+        drain — the records are all still in the journal."""
+        with mock.patch.object(
+                supervisor, "_read_events",
+                side_effect=supervisor.SupervisorError("journal is unreadable")), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as err:
+            self.runner._handle_events(self.child, "")
+        events = [call.args[0] for call in emit.call_args_list]
+        self.assertEqual(self.unhandled(events), [])
+        self.assertNotIn("hit a subscription cap", err.getvalue())
+        self.assertFalse(self.child.automation)
+
+
 # --------------------------------------------------------------------------
 # Context backstop: measurement, window fit, and the forced rotation
 # --------------------------------------------------------------------------
