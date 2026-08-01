@@ -58,6 +58,18 @@ WEEKLY_RE = re.compile(r"week", re.I)
 # The families that HAVE a per-model weekly pool. Named once: three copies of
 # this tuple were deciding three different things about the same seat.
 SCOPED_FAMILIES = ("opus", "sonnet", "haiku", "fable")
+# A cooldown ledger key (see `mark`) does NOT record which window wrote it:
+# `name:*` takes a 7d write from `run`'s limit handler and a 5h write from the
+# refusal path; `name:<fam>` takes a 7d write from handoff.commit_handoff and a
+# 5h write from `headroom mark`. So a per-window ceiling may bound only the
+# value THIS call carries. A value already IN the ledger can only be judged
+# against the largest ceiling any window can produce. Same lesson as the
+# supervisor's cap_scope_window, which exists because both account-wide
+# windows share `source:*`.
+WINDOW_COOLDOWN_CEILING = {"7d": 9 * 86400, "5h": 12 * 3600}
+# DERIVED, never written out: a future window with a longer ceiling widens the
+# absolute bound automatically instead of silently falling outside it.
+MAX_COOLDOWN_SECONDS = max(WINDOW_COOLDOWN_CEILING.values())
 # The credits wording is not just another way to say "capped": it NAMES the
 # model-scoped weekly pool ("Run /usage-credits to keep using Fable 5"). That
 # makes it the one cap phrase that decides a different cooldown scope and a
@@ -1020,8 +1032,20 @@ def mark(name, fam, epoch=None, account_wide=False, window="5h"):
     now = time.time()
     floor = now + (6 * 3600 if window == "7d" else 15 * 60)
     default = now + (7 * 86400 if window == "7d" else 5 * 3600)
-    epoch = default if epoch is None else max(float(epoch), floor)
     key = f"{name}:{'*' if account_wide else fam}"
+    ceiling = now + WINDOW_COOLDOWN_CEILING["7d" if window == "7d" else "5h"]
+    if epoch is None:
+        epoch = default
+    else:
+        requested = float(epoch)
+        # Bound only the value THIS call carries: it is, by construction, the
+        # reset of the window this call NAMES, so the window's own ceiling is
+        # the right bound for it — and only for it.
+        epoch = min(ceiling, max(requested, floor))
+        if epoch < requested:          # narrowed DOWN: never silently
+            print(f"[headroom] {key}: a {window} cooldown until "
+                  f"{tfmt(requested)} is longer than any {window} window can "
+                  f"produce — clamped to {tfmt(epoch)}", file=sys.stderr)
     with _cooldown_lock():
         cool = _read_cooldowns()
         if cool is None:
@@ -1031,6 +1055,24 @@ def mark(name, fam, epoch=None, account_wide=False, window="5h"):
         if previous is not None and not _number(previous):
             raise RuntimeError(
                 "cooldown entry unreadable — inspect state/cooldowns.json")
+        if previous is not None and previous > now + MAX_COOLDOWN_SECONDS:
+            # Judged against MAX, never against THIS call's window — the key
+            # does not say which window wrote it. CLAMP, do not discard: a
+            # millisecond-valued reset does not sit BESIDE a legitimate
+            # cooldown, it OVERWRITES one (the store below is max()), so the
+            # real wall is unrecoverable from this file. Replacing the poison
+            # with this call's epoch would reopen a seat the provider walled
+            # for days. Clamping is fail-safe and DECAYS: the repaired value
+            # is never again > a LATER now + MAX, so this branch fires once
+            # and the entry ages out on its own.
+            repaired = now + MAX_COOLDOWN_SECONDS
+            print(f"[headroom] {key} held a cooldown until {tfmt(previous)}, "
+                  f"which no window can produce — clamping it to "
+                  f"{tfmt(repaired)}; `headroom clear {key}` drops it outright",
+                  file=sys.stderr)
+            notify.emit({"event": "cooldown_corrupt_repaired", "account": name,
+                         "key": key, "was": previous, "now": repaired})
+            previous = repaired
         cool[key] = max(epoch, previous) if previous is not None else epoch
         save_cooldowns(cool)
     return cool[key]

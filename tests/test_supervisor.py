@@ -183,6 +183,157 @@ class ConfigAndScope(unittest.TestCase):
             self.assertEqual(route.cooldowns()["a:sonnet"], later)
 
 
+class CooldownCeiling(unittest.TestCase):
+    """`route.mark` clamps UP to a floor and stores `max(epoch, previous)`, so
+    a cooldown could only ever GROW. A millisecond-valued reset therefore
+    parked a seat ~56,000 years out and nothing said so.
+
+    The subtlety that decides the shape of the fix: the ledger key
+    (`name:*` / `name:<fam>`) does NOT record which window wrote it — BOTH key
+    shapes take both a 7d write and a 5h write. So a ceiling derived from the
+    CURRENT call's window may bound only the value that call carries; a value
+    already in the ledger can only be judged against the largest ceiling any
+    window can produce. Getting that wrong collapses a live 7-day wall to 12
+    hours and reopens a provider-walled seat about six days early."""
+
+    def setUp(self):
+        self.root = tempfile.TemporaryDirectory()
+        self.addCleanup(self.root.cleanup)
+        env = mock.patch.dict(os.environ, {"HEADROOM_DIR": self.root.name})
+        env.start()
+        self.addCleanup(env.stop)
+        self.now = time.time()
+
+    def seed(self, ledger):
+        path = paths.cooldowns_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as out:
+            json.dump(ledger, out)
+
+    def mark(self, *args, **kwargs):
+        """`route.mark`, returning (result, stderr)."""
+        err = io.StringIO()
+        with redirect_stderr(err):
+            result = route.mark(*args, **kwargs)
+        return result, err.getvalue()
+
+    # ---- the key does not record the window -------------------------------
+
+    def test_a_5h_mark_may_not_collapse_a_7d_wall_account_wide(self):
+        """The `route.py:1292` writer (window="7d") and the `route.py:1516`
+        writer (no window= argument at all) share the key `a:*`."""
+        seven = self.now + 7 * 86400
+        route.mark("a", "fable", seven, account_wide=True, window="7d")
+        route.mark("a", "fable", self.now + 5 * 3600, account_wide=True)
+        self.assertEqual(route.cooldowns()["a:*"], seven,
+                         "a 5h mark collapsed a live 7-day wall")
+
+    def test_a_5h_mark_may_not_collapse_a_7d_wall_on_the_scoped_key(self):
+        """The same collision on the other key shape: `handoff.py` writes
+        `a:fable` with window="7d", `__main__.py mark` writes it with 5h."""
+        seven = self.now + 7 * 86400
+        route.mark("a", "fable", seven, window="7d")
+        route.mark("a", "fable", self.now + 3600)
+        self.assertEqual(route.cooldowns()["a:fable"], seven)
+
+    # ---- the incoming value ------------------------------------------------
+
+    def test_an_incoming_millisecond_reset_is_bounded_by_its_own_window(self):
+        result, _ = self.mark("a", "sonnet", self.now * 1000)
+        self.assertAlmostEqual(result, self.now + 12 * 3600, delta=5)
+        self.assertGreater(result, self.now)
+        route.clear()
+        result, _ = self.mark("a", "sonnet", self.now * 1000, window="7d")
+        self.assertAlmostEqual(result, self.now + 9 * 86400, delta=5)
+        self.assertGreater(result, self.now)
+
+    def test_narrowing_an_incoming_value_is_never_silent(self):
+        """`headroom mark <name> <model> <epoch>` always uses the default 5h
+        window, so an operator-supplied epoch days out is now clamped. A
+        user-visible narrowing that happens quietly is a trap."""
+        result, err = self.mark("a", "fable", self.now + 3 * 86400)
+        self.assertAlmostEqual(result, self.now + 12 * 3600, delta=5)
+        self.assertIn("clamped", err)
+        self.assertIn("a:fable", err)
+        route.clear()
+        result, err = self.mark("a", "fable", self.now + 3 * 86400,
+                                window="7d")
+        self.assertAlmostEqual(result, self.now + 3 * 86400, delta=5)
+        self.assertEqual(err, "", "a 7d value inside the 7d ceiling is not "
+                                  "narrowed and must say nothing")
+
+    # ---- the value already in the ledger -----------------------------------
+
+    def test_a_poisoned_stored_value_is_clamped_announced_and_decays(self):
+        self.seed({"a:*": self.now * 1000})
+        emitted = []
+        with mock.patch.object(notify, "emit", emitted.append):
+            result, err = self.mark("a", "fable", self.now + 5 * 3600,
+                                    account_wide=True)
+        self.assertAlmostEqual(result, self.now + 9 * 86400, delta=5)
+        # the discriminating assertion: repaired, NOT replaced by this call
+        self.assertNotAlmostEqual(result, self.now + 5 * 3600, delta=60)
+        self.assertIn("headroom clear a:*", err)
+        self.assertEqual([event["event"] for event in emitted],
+                         ["cooldown_corrupt_repaired"])
+        self.assertEqual(emitted[0]["was"], self.now * 1000)
+        self.assertAlmostEqual(emitted[0]["now"], self.now + 9 * 86400,
+                               delta=5)
+        # ...and it DECAYS: an hour later the repaired value is not re-clamped
+        repaired = result
+        emitted.clear()
+        later = self.now + 3600
+        with mock.patch.object(time, "time", lambda: later), \
+                mock.patch.object(notify, "emit", emitted.append):
+            second, err = self.mark("a", "fable", later + 5 * 3600,
+                                    account_wide=True)
+        self.assertEqual(second, repaired)
+        self.assertEqual(emitted, [])
+        self.assertEqual(err, "")
+
+    def test_a_legitimate_long_entry_is_never_touched_by_a_short_mark(self):
+        """Eight days out — inside MAX, far outside the 5h ceiling. This is
+        the value the rejected per-call-window ceiling would have destroyed."""
+        eight = self.now + 8 * 86400
+        self.seed({"a:*": eight})
+        emitted = []
+        with mock.patch.object(notify, "emit", emitted.append):
+            result, err = self.mark("a", "fable", self.now + 5 * 3600,
+                                    account_wide=True)
+        self.assertEqual(result, eight)
+        self.assertEqual(err, "")
+        self.assertEqual(emitted, [])
+
+    def test_a_poisoned_key_does_not_reopen_a_seat_inside_its_real_wall(self):
+        """The fail-open guard, and the reason the repair CLAMPS rather than
+        discards. A millisecond mark does not sit BESIDE the legitimate wall
+        it landed on — the store is max(), so it OVERWROTE it and the real
+        reset is unrecoverable from this file. Replacing the poison with the
+        current call's epoch would reopen the seat ~6.75 days early."""
+        route.mark("a", "fable", self.now + 6.958 * 86400,
+                   account_wide=True, window="7d")
+        self.seed({"a:*": self.now * 1000})       # the poison overwrites it
+        with mock.patch.object(notify, "emit", lambda event: None):
+            result, _ = self.mark("a", "fable", self.now + 5 * 3600,
+                                  account_wide=True)
+        self.assertGreaterEqual(result, self.now + 7 * 86400,
+                                "the seat was reopened inside its 7d wall")
+
+    # ---- the invariant the table has to keep -------------------------------
+
+    def test_no_window_ceiling_may_exceed_the_absolute_bound(self):
+        """MAX is DERIVED from the table, so a future window with a longer
+        ceiling widens the absolute bound automatically instead of silently
+        falling outside it. A ceiling below its own floor, or a table whose
+        max is not MAX, fails here rather than shipping."""
+        table = route.WINDOW_COOLDOWN_CEILING
+        self.assertEqual(route.MAX_COOLDOWN_SECONDS, max(table.values()))
+        for window, ceiling in table.items():
+            floor = 6 * 3600 if window == "7d" else 15 * 60
+            self.assertLess(floor, ceiling, window)
+            self.assertLessEqual(ceiling, route.MAX_COOLDOWN_SECONDS, window)
+
+
 class RealCollectorBinding(unittest.TestCase):
     def test_real_local_identity_and_collect_lock_fixture(self):
         with tempfile.TemporaryDirectory() as root, \
