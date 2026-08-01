@@ -149,17 +149,32 @@ def main():
     with open(os.path.join(state, "active-slot"), "w", encoding="utf-8") as out:
         out.write(slot)
 
+    def goodbye():
+        """What a real CLI does on its way out: run the SessionEnd hook
+        BEFORE the process goes, so the supervisor's journal records that the
+        session said goodbye.
+
+        Only `missing-end` skips it, and that scenario exists precisely to
+        model the child that does not. Without this the ordinary resumed child
+        is impersonating an external kill, which _monitor now classifies (P11)
+        — it kept the journal, and the handoff tests that assert cleanup
+        caught it."""
+        hook(settings, "SessionEnd",
+             dict(common, hook_event_name="SessionEnd", reason="other"))
+
     cap_slots = set(filter(None, os.environ.get("FAKE_CAP_SLOTS", "source").split(",")))
     is_resume = "--resume" in args
     if scenario in ("handoff", "delayed-flush", "idle",
                     "idle-cap-on-stop") and is_resume:
         time.sleep(0.35)
+        goodbye()
         return 0
     if scenario == "missing-end" and is_resume:
         time.sleep(0.35)
         return 0
     if slot not in cap_slots and scenario == "loop":
         time.sleep(0.35)
+        goodbye()
         return 0
 
     # "idle": a bound, quiescent session that never caps — the child the

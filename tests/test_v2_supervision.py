@@ -761,9 +761,16 @@ class NotifyWiring(TempDirCase):
             outcome = runner._monitor(child)
         self.assertEqual(outcome, 0)
         events = [call.args[0] for call in emit.call_args_list]
+        # child_died_unrequested joins the list on purpose (P11): this child
+        # never sent SessionStart and never sent SessionEnd, so at the moment
+        # it vanished headroom had no evidence that anyone asked it to. That
+        # is the honest reading, and the row it writes carries session "" —
+        # which is itself the finding, not a mislabel.
         self.assertEqual([event["event"] for event in events],
-                         ["launch", "supervision_lost"])
+                         ["launch", "supervision_lost",
+                          "child_died_unrequested"])
         self.assertIn("SessionStart hook never bound", events[1]["reason"])
+        self.assertEqual(events[2]["session"], "")
         self.assertFalse(child.automation)
 
 
@@ -1964,11 +1971,14 @@ class R2FailedRotationReleasesTarget(TempDirCase):
             child.process.poll.side_effect = lambda: next(poll_seq)
             plan = mock.Mock()
             plan.target = target
-            events = iter([object(), None])   # a proof, then nothing
+            # a proof, then nothing — and then nothing for as long as it is
+            # asked, because _monitor drains the journal once more on the way
+            # out (P11) and a finite iterator would raise StopIteration there
+            events = iter([object()])
 
             with mock.patch.object(
                     runner, "_handle_events",
-                    side_effect=lambda c, p, pr=None: next(events)), \
+                    side_effect=lambda c, p, pr=None: next(events, None)), \
                     mock.patch.object(runner, "_preflight",
                                       return_value=plan), \
                     mock.patch.object(runner, "_stop_and_commit",
@@ -2207,6 +2217,292 @@ class R3ShutdownSignalNotifiesLoss(TempDirCase):
                 if call.args[0]["event"] == "supervision_lost"]
         self.assertEqual(len(lost), 1)  # exactly once, not per poll
         self.assertEqual(lost[0]["reason"], "shutdown signal received")
+
+
+# --------------------------------------------------------------------------
+# P11: a death nobody asked for leaves evidence behind
+# --------------------------------------------------------------------------
+class UnrequestedDeath(TempDirCase):
+    """2026-08-01 07:30:42Z: two supervised lanes were SIGTERMed from outside.
+    run() treated that exactly like a user typing /exit, so _cleanup_files
+    unlinked the hook journal AND the settings file — the only two records of
+    what those children had been doing — and nothing anywhere said a supervised
+    lane had died. Attributing it cost a forensic dispatch.
+
+    SessionEnd-ABSENCE is the sole discriminator, settled empirically on the
+    live box rather than guessed: across 39 journals, 30 real closures all
+    emitted SessionEnd and every journal without one belonged to a session that
+    was still alive. The exit code is REPORTED (stderr, notify, ledger) and
+    never classified on — see test (c) and test (h)."""
+
+    SID = "77777777-7777-4777-8777-777777777777"
+
+    def setUp(self):
+        super().setUp()
+        self.clock = {"t": 1000.0}
+        self.account_ = self.account("acct-a")
+        os.makedirs(self.account_["home"], exist_ok=True)
+        self.cwd = os.path.join(self.temp.name, "work")
+        os.makedirs(self.cwd)
+        self.transcript = os.path.join(self.temp.name, self.SID + ".jsonl")
+        with open(self.transcript, "w", encoding="utf-8"):
+            pass
+        self.binding = supervisor.Binding(
+            self.SID, self.transcript, self.cwd, "claude-fable-5", "2.1",
+            self.account_["home"], epoch=1)
+
+    def runner(self):
+        return supervisor.Supervisor(
+            "fable", [], self.account_, popen=mock.Mock(),
+            now=lambda: self.clock["t"],
+            sleep=lambda seconds: self.clock.__setitem__(
+                "t", self.clock["t"] + seconds))
+
+    def journal(self, runner, child, hook_name, when):
+        record = {"schema": "headroom_hook_event@1", "received_at": when,
+                  "supervisor_id": runner.supervisor_id,
+                  "generation": child.generation,
+                  "source_slot": self.account_["name"],
+                  "config_dir": self.account_["home"], "matcher": "",
+                  "payload": {"hook_event_name": hook_name,
+                              "session_id": self.SID,
+                              "transcript_path": self.transcript,
+                              "cwd": self.cwd, "reason": "clear"}}
+        with open(child.event_path, "a", encoding="utf-8",
+                  newline="\n") as out:
+            out.write(json.dumps(record) + "\n")
+
+    def rows(self):
+        path = handoff._ledger_path()
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as source:
+            return [json.loads(line) for line in source if line.strip()]
+
+    def drive(self, polls, seed=(), guard=None, before_exit=None):
+        """The real run() -> real _monitor -> real _handle_events over a real
+        journal and a real settings file. Only _spawn and the child process are
+        faked, because a death nobody asked for is exactly what a real child
+        cannot be made to perform on demand."""
+        runner = self.runner()
+        settings = runner._settings_file(1, self.account_)
+        events_path = supervisor.event_path(runner.supervisor_id)
+        with open(events_path, "a", encoding="utf-8"):
+            pass
+        process = mock.Mock(pid=4242)
+        child = supervisor.Child(
+            process, self.account_, 1, events_path, settings, self.clock["t"],
+            True, binding=self.binding, session_epoch=1)
+        for hook_name, when in seed:
+            self.journal(runner, child, hook_name, when)
+        sequence = iter(list(polls))
+
+        def poll():
+            value = next(sequence)
+            if value is not None and before_exit is not None:
+                before_exit(runner, child)
+            return value
+        process.poll.side_effect = poll
+        if guard is not None:
+            runner._signals = guard
+        with mock.patch.object(supervisor, "_validated_event",
+                               return_value=(self.binding, self.cwd)), \
+                mock.patch.object(runner, "_spawn", return_value=child), \
+                mock.patch.object(runner, "_reconcile_leases"), \
+                mock.patch.object(runner, "_preemptive_due",
+                                  return_value=False), \
+                mock.patch.object(runner, "_context_backstop_due",
+                                  return_value=False), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as errors:
+            code = runner.run()
+        events = [call.args[0] for call in emit.call_args_list]
+        return runner, child, code, events, errors.getvalue()
+
+    # -- (a) the incident ---------------------------------------------------
+
+    def test_an_external_kill_keeps_the_journal_and_says_so(self):
+        runner, child, code, events, errors = self.drive([143])
+        self.assertEqual(code, 143)
+        # THE forensic half: both records survive the exit
+        self.assertTrue(os.path.exists(child.event_path))
+        self.assertTrue(os.path.exists(child.settings_path))
+        self.assertEqual(runner.unrequested_death, (143, self.clock["t"]))
+        # ...and something OUTSIDE this process learns about it
+        deaths = [event for event in events
+                  if event["event"] == "child_died_unrequested"]
+        self.assertEqual(len(deaths), 1)
+        self.assertEqual(deaths[0]["exit"], 143)
+        self.assertEqual(deaths[0]["account"], "acct-a")
+        self.assertEqual(deaths[0]["session"], self.SID)
+        rows = [row for row in self.rows()
+                if row.get("action") == "child_died_unrequested"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["exit"], 143)
+        self.assertEqual(rows[0]["source_slot"], "acct-a")
+        self.assertEqual(rows[0]["old_session_id"], self.SID)
+        self.assertEqual(rows[0]["child_generation"], 1)
+        # P8's shape, for P8's reason: a row carrying an `automatic` key would
+        # make an OLDER headroom raise on the whole ledger and disable every
+        # automatic handoff on a mixed-version fleet.
+        self.assertNotIn("automatic", rows[0])
+        handoff._validated_automatic_rows(self.rows())
+        # and the human in the pane gets the one command that brings it back
+        self.assertIn("--resume", errors)
+        self.assertIn(self.SID, errors)
+        self.assertIn(self.account_["home"], errors)
+
+    # -- (b) the false-positive guard on the commonest exit there is --------
+
+    def test_a_normal_exit_still_cleans_up_and_writes_nothing(self):
+        _runner, child, code, events, _errors = self.drive(
+            [0], seed=[("SessionEnd", 1001.0)])
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.exists(child.event_path))
+        self.assertFalse(os.path.exists(child.settings_path))
+        self.assertEqual([event for event in events
+                          if event["event"] == "child_died_unrequested"], [])
+        self.assertEqual(self.rows(), [])
+
+    # -- (c) the empirical decision, tested directly ------------------------
+
+    def test_the_exit_code_does_not_classify(self):
+        # 143 is SIGTERM's exit code and the incident's own code, but a
+        # SessionEnd means the session said goodbye — Claude exiting 143 on a
+        # clean shutdown must not be logged as an unrequested death.
+        _runner, child, code, events, _errors = self.drive(
+            [143], seed=[("SessionEnd", 1001.0)])
+        self.assertEqual(code, 143)
+        self.assertFalse(os.path.exists(child.event_path))
+        self.assertEqual([event for event in events
+                          if event["event"] == "child_died_unrequested"], [])
+
+    # -- (d) the poll gap ---------------------------------------------------
+
+    def test_a_session_end_landing_in_the_final_poll_gap_is_seen(self):
+        # SessionEnd is written AFTER the last _handle_events and BEFORE the
+        # exit is observed. With one discriminator and no final drain, the
+        # commonest exit in the world would be misfiled as a killing.
+        def late(runner, child):
+            self.journal(runner, child, "SessionEnd", 1001.0)
+        _runner, child, code, events, _errors = self.drive(
+            [0], before_exit=late)
+        self.assertEqual(code, 0)
+        self.assertTrue(child.session_ended)
+        self.assertFalse(os.path.exists(child.event_path))
+        self.assertEqual([event for event in events
+                          if event["event"] == "child_died_unrequested"], [])
+
+    # -- (e) a stop headroom asked for is not a death nobody asked for ------
+
+    def test_a_requested_stop_is_never_classified(self):
+        # COUNTERFACTUAL FENCE, not a reproduction: the two real stop paths
+        # are proven to set _requested_stop_at by tests in PreemptiveRotation
+        # and ContextBackstop. This pins what _monitor does once it is set,
+        # and it is set from INSIDE the monitored window because that is the
+        # only place a deliberate stop is ever sent from.
+        runner = self.runner()
+        settings = runner._settings_file(1, self.account_)
+        events_path = supervisor.event_path(runner.supervisor_id)
+        with open(events_path, "a", encoding="utf-8"):
+            pass
+        process = mock.Mock(pid=4242)
+        process.poll.side_effect = [143]
+        child = supervisor.Child(
+            process, self.account_, 1, events_path, settings, self.clock["t"],
+            True, binding=self.binding, session_epoch=1)
+
+        def stop_it(_child, _pending, proof=None):
+            runner._requested_stop_at = runner.now()   # as os.kill's site does
+            return proof
+
+        with mock.patch.object(runner, "_handle_events",
+                               side_effect=stop_it), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(runner._monitor(child), 143)
+        self.assertIsNone(runner.unrequested_death)
+        self.assertEqual([call.args[0] for call in emit.call_args_list], [])
+
+    def test_a_previous_generations_stop_does_not_cover_this_childs_death(self):
+        # run() supervises several children in a row, and a rotation stamps
+        # _requested_stop_at on its way out. If that stamp survived into the
+        # SUCCESSOR's _monitor, every externally killed post-rotation child
+        # would be filed as "headroom asked for this" — the incident's own
+        # failure, reintroduced one generation later.
+        runner = self.runner()
+        runner._requested_stop_at = self.clock["t"] - 60   # generation 1 stop
+        settings = runner._settings_file(2, self.account_)
+        events_path = supervisor.event_path(runner.supervisor_id)
+        with open(events_path, "a", encoding="utf-8"):
+            pass
+        process = mock.Mock(pid=4242)
+        process.poll.side_effect = [143]
+        child = supervisor.Child(
+            process, self.account_, 2, events_path, settings, self.clock["t"],
+            True, binding=self.binding, session_epoch=1)
+        with mock.patch.object(notify, "emit"), redirect_stderr(io.StringIO()):
+            self.assertEqual(runner._monitor(child), 143)
+        self.assertEqual(runner.unrequested_death, (143, self.clock["t"]))
+
+    # -- (f) our own shutdown signal ----------------------------------------
+
+    def test_a_shutdown_signal_to_the_supervisor_is_not_a_killing(self):
+        class LatchedGuard:
+            shutdown_signal = 15
+            forwarded = True
+
+            def install(self):
+                pass
+
+            def restore(self):
+                pass
+
+            def poll(self, process):
+                pass
+
+        runner, child, code, events, _errors = self.drive(
+            [143], guard=LatchedGuard())
+        self.assertEqual(code, 143)
+        self.assertIsNone(runner.unrequested_death)
+        self.assertEqual([event for event in events
+                          if event["event"] == "child_died_unrequested"], [])
+        # the child is gone and the tmux pane is closing with it, so cleanup
+        # is right here — this is a death the whole process tree asked for
+        self.assertFalse(os.path.exists(child.event_path))
+
+    # -- (g) the drain reads the tail, not the whole file -------------------
+
+    def test_the_final_drain_does_not_reprocess_consumed_events(self):
+        # COUNTERFACTUAL FENCE on the new drain: _read_events advances a
+        # cursor, and re-feeding a consumed record to _accept_event_order
+        # raises "hook event order is ambiguous" and disarms the child. That
+        # would turn evidence-gathering into a disarm on every exit.
+        runner, child, code, events, _errors = self.drive(
+            [None, 143], seed=[("CwdChanged", 1001.0)])
+        self.assertEqual(code, 143)
+        self.assertTrue(child.automation)
+        self.assertEqual([event for event in events
+                          if event["event"] == "supervision_lost"], [])
+        self.assertIsNotNone(runner.unrequested_death)
+
+    # -- (h) the wrapper's own exit code ------------------------------------
+
+    def test_exit_241_classifies_through_session_end_not_its_code(self):
+        # `bin/headroom` turns a forwarded SIGTERM into SystemExit(-15) -> 241.
+        runner, _child, code, events, _errors = self.drive([241])
+        self.assertEqual(code, 241)
+        self.assertEqual(runner.unrequested_death, (241, self.clock["t"]))
+        deaths = [event for event in events
+                  if event["event"] == "child_died_unrequested"]
+        self.assertEqual(deaths[0]["exit"], 241)
+        # ...and the SAME code with a SessionEnd is clean, which is what makes
+        # the line above a SessionEnd test rather than an exit-code test
+        clean, _child, _code, events, _errors = self.drive(
+            [241], seed=[("SessionEnd", 1001.0)])
+        self.assertIsNone(clean.unrequested_death)
+        self.assertEqual([event for event in events
+                          if event["event"] == "child_died_unrequested"], [])
 
 
 class R3CrudeBareArgvValueAware(TempDirCase):
@@ -3743,7 +4039,19 @@ class CapWaitsForCapacity(TempDirCase):
         whatever proof it was handed (so a proof the loop discards stays
         discarded — nothing re-delivers it)."""
         codes = [None] * (polls - 1) + [0]
-        child.process.poll.side_effect = lambda: codes.pop(0)
+
+        def poll():
+            code = codes.pop(0)
+            if code is not None:
+                # A real CLI runs its SessionEnd hook BEFORE the process goes,
+                # so by the time poll() sees an exit the goodbye is already
+                # journaled. Modelled here because _monitor now classifies an
+                # exit with no SessionEnd as a death nobody asked for (P11) —
+                # without this the fake child is impersonating an external
+                # kill in ten tests that are about capacity, not death.
+                child.session_ended = True
+            return code
+        child.process.poll.side_effect = poll
         delivered = {"done": False}
 
         def handle_events(_child, _pending_id, current=None):
@@ -5004,6 +5312,40 @@ class PreemptiveRotation(TempDirCase):
         self.assertNotIn("context_window_fit",
                          [event["event"] for event in self.events(emit)])
 
+    def test_a_committed_stop_records_that_headroom_asked_for_it(self):
+        # P11 wiring proof (counterfactual fence, not a defect reproduction):
+        # _monitor tells "I stopped it" from "something else did" by reading
+        # _requested_stop_at, so every path that signals a child has to stamp
+        # it. This is the rotation leg, driven through the REAL caller —
+        # _stop_and_commit belongs to another workstream and is not edited, so
+        # the stamp lives at the call site and only the call site proves it.
+        # ContextBackstop pins the backstop leg beside its own os.kill.
+        runner = self.runner()
+        self.assertEqual(runner._requested_stop_at, 0.0)
+        with mock.patch.object(runner, "_stop_and_commit",
+                               return_value=None) as stop, \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            runner._preemptive_cycle(self.child)
+        stop.assert_called_once()
+        # a stop whose commit returned nothing is still a stop WE sent: the
+        # child is on its way out and _monitor must not file it as a killing
+        self.assertEqual(runner._requested_stop_at, self.clock["t"])
+
+    def test_a_stop_that_never_signalled_leaves_the_death_attributable(self):
+        # the other half: _stop_and_commit raises ONLY before its SIGTERM, so
+        # a raise means the child was never touched — and a later external
+        # kill of that same child must still be recorded.
+        runner = self.runner()
+        with mock.patch.object(
+                runner, "_stop_and_commit",
+                side_effect=supervisor.SupervisorError("refused on the edge")), \
+                mock.patch.object(runner, "_failure"), \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            runner._preemptive_cycle(self.child)
+        self.assertEqual(runner._requested_stop_at, 0.0)
+
     def test_aborted_rotation_recovers_the_source_with_supervision_on(self):
         runner = self.runner()
         plan, proof = self.stopped_plan(runner)
@@ -5976,6 +6318,17 @@ class ContextBackstop(TempDirCase):
         self.assertEqual(runner.context_hold_until,
                          self.clock["t"] + supervisor.PREEMPT_BACKOFF_SECONDS)
         self.assertFalse(runner._context_backstop_due(self.child, None))
+
+    def test_the_backstop_stop_records_that_headroom_asked_for_it(self):
+        # P11 wiring proof (counterfactual fence, not a defect reproduction):
+        # this path SIGTERMs a live child on purpose, so it must stamp
+        # _requested_stop_at or _monitor would file its own rotation as a
+        # death nobody asked for and refuse to clean up after it.
+        runner = self.runner()
+        self.assertEqual(runner._requested_stop_at, 0.0)
+        outcome, _killed, _events = self.cycle(runner)
+        self.assertIsNotNone(outcome)
+        self.assertEqual(runner._requested_stop_at, self.clock["t"])
 
     def test_the_cooperative_zone_is_never_preempted(self):
         # 30% -> 10% belongs to the session's own baton handoff

@@ -214,10 +214,19 @@ The local session and handoff JSONL journals are append-only and unbounded in
 v0.2; protect the private state directory and compact them manually if needed.
 
 Per-run injected settings files and the supervisor event journal are removed
-best-effort when the supervisor exits cleanly. A hard crash, `SIGKILL`, power
-loss, or filesystem error can leave those private files under
-`state/supervisors/`; they contain hook metadata but no credentials and may be
-deleted once no matching supervisor is running. Handoff publication recovery
+best-effort when the supervisor exits cleanly — with one deliberate exception.
+If the child exits and headroom neither signalled it nor received a shutdown
+signal, and the session never journaled a `SessionEnd`, headroom treats the
+death as unrequested: it writes a `child_died_unrequested` row to the handoff
+ledger, emits the matching notify event, prints the resume command, and **keeps
+the journal and settings files**, because they are the only record of what the
+child was doing. Nothing prunes them automatically; delete them once no
+matching supervisor is running, or have your own housekeeping do it.
+
+A hard crash, `SIGKILL`, power loss, or filesystem error can also leave those
+private files under `state/supervisors/`; they contain hook metadata but no
+credentials and may be deleted once no matching supervisor is running.
+Handoff publication recovery
 markers are different: headroom reconciles those under the global handoff lock
 on the next handoff operation.
 

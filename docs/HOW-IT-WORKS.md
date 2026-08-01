@@ -272,7 +272,7 @@ picked on unproven capacity.
 | `~/.headroom/state/provider-backoff.json` | 0600 | usage-endpoint 429 backoff |
 | `~/.headroom/state/handoffs.jsonl` | 0600 | append-only handoff ledger (manual and automatic) |
 | `~/.headroom/state/session-journal/` | 0700 | one marker per session id, written by `headroom statusline`, so handoff can identify the current conversation |
-| `~/.headroom/state/supervisors/` | 0700 | per-run injected settings + hook event journals; removed on a clean supervisor exit |
+| `~/.headroom/state/supervisors/` | 0700 | per-run injected settings + hook event journals; removed on a clean supervisor exit, but KEPT when the child died and headroom never asked it to |
 | `~/.headroom/state/leases/` | 0700 | per-account `flock` files, only with `HEADROOM_SLOT_LEASE=1` |
 
 Directory modes are re-asserted on every tick, and by default that is

@@ -2262,6 +2262,17 @@ class Supervisor:
         # BEFORE the spawn window and reused by _monitor, so no instant after a
         # child exists is ever unguarded (P1, r7)
         self._signals = None
+        # Stamped with self.now() immediately before every DELIBERATE signal
+        # this supervisor sends, so _monitor can tell "I stopped it" from
+        # "something else did". The THIRD deliberate signal — the shutdown
+        # forward inside _SignalGuard — deliberately does NOT write here: a
+        # signal handler may do os.kill and int reads only, and the guard
+        # already latches shutdown_signal, which is the int _monitor reads.
+        self._requested_stop_at = 0.0
+        # (returncode, observed_at) once a death nobody asked for is seen.
+        # It survives the child, because run()'s cleanup asks it whether the
+        # forensics are still needed.
+        self.unrequested_death = None
 
     def _settings_file(self, generation, account, automatic=True):
         directory = paths.ensure_private(_supervisors_dir())
@@ -3315,6 +3326,14 @@ class Supervisor:
         relaunch = None
         try:
             relaunch = self._stop_and_commit(child, plan, proof)
+            # A RETURN of any kind means the SIGTERM went out: _stop_and_commit
+            # raises only BEFORE it (the invariant the except below records).
+            # So this is where a rotation says "that death was mine" — without
+            # it, a stop whose commit then failed leaves _monitor polling a
+            # child WE killed, and the next poll would file it as a killing by
+            # somebody else. Stamped at the call site rather than beside the
+            # os.kill because _stop_and_commit belongs to another workstream.
+            self._requested_stop_at = self.now()
         except Exception as error:  # noqa: BLE001 — a refusal must never disarm
             # every raise out of _stop_and_commit happens BEFORE the SIGTERM,
             # so the child is untouched and cap handoff stays armed
@@ -3581,6 +3600,9 @@ class Supervisor:
                     "used": proof.used, "window": proof.window,
                     "remaining_percent": proof.remaining_percent})
                 stop_sent_at = self.now()
+                # BEFORE the signal, like the row above: _monitor classifies
+                # an exit it did not ask for, and this rotation is one it did
+                self._requested_stop_at = self.now()
                 os.kill(child.process.pid, signal.SIGTERM)
                 signal_sent = True
             returncode = self._wait_stopped(child, proof, stop_sent_at)
@@ -4355,6 +4377,56 @@ class Supervisor:
             return None
         return proof
 
+    def _record_unrequested_death(self, child, returncode):
+        """The child is gone and this supervisor never asked for it.
+
+        Records; deliberately does NOT restart. Resuming a session a human
+        killed on purpose can double-run it, and that is a policy switch of
+        its own — this exists so the next operator has something to read.
+
+        Everything here runs AFTER the child is already dead, so there is no
+        "refuse" left on any of it: each leg is independent and a failure in
+        one must not cost the others. self.unrequested_death is set FIRST and
+        unconditionally, because run()'s cleanup gate reads it and the
+        forensics are worth more than any of the announcements."""
+        self.unrequested_death = (returncode, self.now())
+        account = str(child.account.get("name") or "")
+        binding = child.binding
+        session = str(getattr(binding, "session_id", "") or "")
+        try:
+            # NO `automatic` key, for P8's reason: _validated_automatic_rows
+            # treats a row carrying one as safety-relevant and raises on any
+            # action outside _AUTOMATIC_ACTIONS, so an OLDER headroom reading
+            # a NEW ledger would disable every automatic handoff on the box.
+            # A row without the key is skipped by every version.
+            handoff.append_ledger({
+                "schema": handoff.SCHEMA, "ts": self.now(),
+                "action": "child_died_unrequested", "source_slot": account,
+                "old_session_id": session,
+                "child_generation": child.generation,
+                # REPORTED, never classified on: the exit code is the one
+                # thing the follow-up needs and the one thing 39 journals of
+                # evidence could not justify deciding by.
+                "exit": returncode})
+        except Exception as error:  # noqa: BLE001 — the child is already gone
+            print(f"[headroom] could not record the unrequested death of "
+                  f"{account} in the handoff ledger ({error})",
+                  file=sys.stderr)
+        print(f"[headroom] {account}: the child exited {returncode} and "
+              f"headroom never asked it to stop — keeping its hook journal "
+              f"and settings file for whoever has to explain this",
+              file=sys.stderr)
+        if session:
+            # the SIMPLE resume, rendered by Recovery so the quoting and the
+            # redaction are the same ones every other printed argv gets
+            recovery = Recovery(child.account, ["--resume", session],
+                                str(getattr(binding, "cwd", "") or ""),
+                                session, reason="unrequested_death")
+            print(f"[headroom] to bring that conversation back, run:\n"
+                  f"{recovery.command()}", file=sys.stderr)
+        notify.emit({"event": "child_died_unrequested", "account": account,
+                     "exit": returncode, "session": session})
+
     def _monitor(self, child, pending_handoff_id=""):
         # REUSE the guard _spawn installed+attached before/around the spawn
         # window, so there is no unguarded instant between spawn-success and
@@ -4365,6 +4437,13 @@ class Supervisor:
             signals = _SignalGuard(child.process)
             signals.install()
             self._signals = signals
+        # PER CHILD, not per supervisor: every deliberate stop is sent from
+        # inside this loop and observed by this loop, so a stamp left by the
+        # generation we just rotated away from would answer for the successor
+        # — and the successor is exactly the child a post-rotation external
+        # kill lands on. Clearing it here is what keeps the death of every
+        # generation after the first visible.
+        self._requested_stop_at = 0.0
         proof = None
         try:
             while True:
@@ -4395,6 +4474,22 @@ class Supervisor:
                     child, pending_handoff_id, proof)
                 returncode = child.process.poll()
                 if returncode is not None:
+                    # Drain the journal ONCE more before classifying. With
+                    # SessionEnd-absence as the sole discriminator, a clean
+                    # /exit whose SessionEnd landed between the read above and
+                    # this poll would otherwise read as a killing — and that
+                    # is the commonest exit there is. _read_events advances a
+                    # cursor, so this reads the tail, never a replay.
+                    try:
+                        self._handle_events(child, pending_handoff_id, proof)
+                    except SupervisorError:
+                        # gathering evidence must never be what turns a child
+                        # exit into a supervisor traceback
+                        pass
+                    if (self._requested_stop_at == 0.0
+                            and signals.shutdown_signal is None
+                            and not child.session_ended):
+                        self._record_unrequested_death(child, returncode)
                     return returncode
                 if child.automation and child.binding is None \
                         and self.now() - child.launched_at >= BIND_TIMEOUT:
@@ -4476,6 +4571,9 @@ class Supervisor:
                         relaunch = None
                         try:
                             relaunch = self._stop_and_commit(child, plan, proof)
+                            # the SIGTERM went out — see _preemptive_cycle for
+                            # why a return, not the kill site, is the signal
+                            self._requested_stop_at = self.now()
                         except Exception as error:
                             self._failure(plan, "pre_stop_failed: " + str(error))
                             print(f"[headroom] automatic handoff held: {error}; "
@@ -4723,7 +4821,15 @@ class Supervisor:
             for name in route.held_lease_names():
                 if name != self._ambiguous_account:
                     route.release_slot_lease(name)
-            if clean_exit:
+            # Forensics outlive a death nobody asked for. _cleanup_files
+            # unlinks the hook journal and the settings file, which together
+            # are the ONLY record of what the child was doing — and on
+            # 2026-08-01 at 07:30:42Z an external SIGTERM took this branch, so
+            # the two killed lanes matched no journal at all and attributing
+            # the incident cost a forensic dispatch. Bounded outside this
+            # repo: bin/headroom-reaper.sh prunes a journal only when no live
+            # process carries its supervisor id AND it has been idle >7d.
+            if clean_exit and self.unrequested_death is None:
                 self._cleanup_files()
 
 

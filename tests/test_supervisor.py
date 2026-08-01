@@ -2603,7 +2603,14 @@ class PreemptiveIntegration(unittest.TestCase):
         events = [call.args[0]["event"] for call in emit.call_args_list]
         self.assertIn("preemptive_scheduled", events)
         self.assertIn("preemptive_handoff", events)
-        self.assertNotIn("supervision_lost", events)
+        # THE ROTATION cost no supervision. Narrowed from a blanket
+        # assertNotIn because the resumed child now fires SessionEnd on its
+        # way out like a real CLI (tests/fake_claude.py goodbye()), and
+        # _handle_events has always disarmed on a session that ends with no
+        # replacement SessionStart — that trailing event is the conversation
+        # closing, not the rotation losing anything.
+        self.assertNotIn("supervision_lost",
+                         events[:events.index("preemptive_handoff") + 1])
 
     def test_seat_below_threshold_is_left_alone(self):
         runner = supervisor.Supervisor("sonnet", [], self.accounts[0],
@@ -2612,9 +2619,15 @@ class PreemptiveIntegration(unittest.TestCase):
             self.assertEqual(runner.run(), 0)
         self.assertFalse(os.path.exists(
             os.path.join(self.fake_state, "sigterm-source")))
-        self.assertEqual(self.ledger_rows(), [])
+        # NOT rotated, which is what this test is about — no handoff row of
+        # any kind. The one row present is P11's: tests/fake_claude.py's idle
+        # child runs out its lifetime and returns 0 WITHOUT firing SessionEnd,
+        # so from the supervisor's side it vanished with no goodbye and
+        # nothing that asked it to. Recording that is the new contract.
+        self.assertEqual([row.get("action") for row in self.ledger_rows()],
+                         ["child_died_unrequested"])
         events = [call.args[0]["event"] for call in emit.call_args_list]
-        self.assertEqual(events, ["launch"])
+        self.assertEqual(events, ["launch", "child_died_unrequested"])
 
     def test_cap_landing_during_the_preemptive_stop_is_absorbed(self):
         # the race the rotation was trying to beat: the seat caps AFTER the
@@ -2635,7 +2648,11 @@ class PreemptiveIntegration(unittest.TestCase):
         self.assertIn("resume_bound", actions)
         events = [call.args[0]["event"] for call in emit.call_args_list]
         self.assertIn("preemptive_handoff", events)
-        self.assertNotIn("supervision_lost", events)
+        # never aborted into an unsupervised source; see
+        # test_idle_child_over_threshold_rotates_before_the_wall for why this
+        # is bounded at the handoff rather than over the whole run
+        self.assertNotIn("supervision_lost",
+                         events[:events.index("preemptive_handoff") + 1])
         with open(os.path.join(self.fake_state, "launches.jsonl"),
                   encoding="utf-8") as source:
             launches = [json.loads(line) for line in source]
@@ -2662,7 +2679,10 @@ class PreemptiveIntegration(unittest.TestCase):
             self.assertEqual(runner.run(), 0)
         self.assertFalse(os.path.exists(
             os.path.join(self.fake_state, "sigterm-source")))
-        self.assertEqual(self.ledger_rows(), [])
+        # no rotation row; see test_seat_below_threshold_is_left_alone for why
+        # the fake idle child's own exit contributes a P11 row here
+        self.assertEqual([row.get("action") for row in self.ledger_rows()],
+                         ["child_died_unrequested"])
         held = [call.args[0] for call in emit.call_args_list
                 if call.args[0]["event"] == "preemptive_held"]
         self.assertTrue(held)
