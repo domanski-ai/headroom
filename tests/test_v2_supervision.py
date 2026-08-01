@@ -3470,6 +3470,35 @@ class CapWaitsForCapacity(TempDirCase):
                 runner._preflight(child, self.proof())
         self.assertIn("target (scoped:fable at 99.5%)", str(caught.exception))
 
+    def test_a_huge_transcript_is_gated_on_opus_through_the_REAL_preflight(self):
+        """_preflight must hand _cap_target the transcript path.
+
+        Every other test of the fit bound calls `_cap_target` directly, and
+        every test that goes through `_preflight` uses a transcript small
+        enough for the bound to be a no-op — so the one argument that carries
+        the invariant across the seam (`proof.transcript_path`) was pinned by
+        nothing. Drop it and this fleet gates a FABLE seat while the successor
+        launches opus[1m] on it: one pool checked, another spent.
+
+        Note the fleet here is HEALTHY for Fable — the target's Fable pool is
+        fine. Fable is refused purely because a 500k conversation cannot live
+        there, which is what makes this test discriminate."""
+        with open(self.transcript, "a", encoding="utf-8") as out:
+            out.write(json.dumps(usage_record(500_000)) + "\n")
+        when = time.time() - 600          # quiet again after the append
+        os.utime(self.transcript, (when, when))
+        runner, child = self.runner([(100.0, 10.0)]), self.child()
+        with redirect_stderr(io.StringIO()) as errors:
+            plan = runner._preflight(child, self.proof())
+        self.assertEqual(plan.target["name"], "target")
+        self.assertEqual((plan.family, plan.resume_family), ("fable", "opus"))
+        self.assertIn("only fits the 1M window", errors.getvalue())
+        # and the successor really is launched on that gated family
+        argv, forced = supervisor._resume_argv_for(plan, "")
+        self.assertEqual(forced, "opus[1m]")
+        self.assertEqual(supervisor._family_or_blank(
+            supervisor._model_flag(argv)), plan.resume_family)
+
     def test_a_spent_scoped_seat_is_still_a_destination_for_another_family(self):
         # the same fleet with the ladder ON: Fable is walled on the only other
         # seat, so the session moves there on OPUS rather than sitting still
@@ -4413,6 +4442,15 @@ class PreemptiveRotation(TempDirCase):
         self.assertEqual(len(fit), 1)
         self.assertEqual(fit[0]["model"], "opus[1m]")
         self.assertEqual(fit[0]["account"], "target")
+        # and the LEDGER carries the same model. If the supervisor dies
+        # between commit and spawn, this row is the only thing left telling
+        # the operator how to get the conversation back — and `--model opus`
+        # cannot load a transcript that needs opus[1m].
+        with open(handoff._ledger_path(), encoding="utf-8") as source:
+            rows = [json.loads(line) for line in source if line.strip()]
+        staged = [row for row in rows if row.get("action") == "staged"]
+        self.assertTrue(staged)
+        self.assertIn("--model 'opus[1m]'", staged[-1]["resume_command"])
 
     def test_a_normal_rotation_resumes_exactly_as_before(self):
         runner = self.runner()
@@ -5943,16 +5981,24 @@ class TranscriptBirthRace(TempDirCase):
         account = self.account()
         child = mock.Mock(account=account)
         calls = {"n": 0}
+        # The clock ADVANCES even though this case must not loop at all. A
+        # frozen clock makes the regression this test exists to catch (losing
+        # the substring guard) spin forever instead of failing: mock's
+        # call_args_list grows until the runner is OOM-killed, which on this
+        # box means eating memory next to live lanes. A test that catches a
+        # mutation must catch it as an assertion, in milliseconds.
+        clock = {"t": 0.0}
 
         def fake_source(*a, **kw):
             calls["n"] += 1
+            clock["t"] += 1.0
             raise handoff.HandoffError("source transcript is a symlink")
 
         with mock.patch.object(handoff, "_source", side_effect=fake_source):
             with self.assertRaises(handoff.HandoffError):
                 supervisor._source_once_written(
                     "/x.jsonl", "X", child, account["home"],
-                    sleep=lambda s: None, now=lambda: 0.0)
+                    sleep=lambda s: None, now=lambda: clock["t"])
         self.assertEqual(calls["n"], 1)
 
     def test_an_unreadable_transcript_is_not_a_missing_one(self):
@@ -5970,6 +6016,49 @@ class TranscriptBirthRace(TempDirCase):
                 self.account())
         self.assertNotIn("no longer exists", str(caught.exception))
         self.assertIn("cannot be read", str(caught.exception))
+
+    def test_the_grace_is_actually_WIRED_INTO_the_identity_check(self):
+        """The three tests above prove `_source_once_written` waits. None of
+        them prove `_validated_event` CALLS it — and that one line is the
+        whole first half of this fix. Reverted, a SessionStart that beats its
+        own transcript to disk raises PermanentSupervisorError, _handle_events
+        disarms the child, and the estate-wide 2026-07-31 failure is back,
+        with the suite still green."""
+        account = self.account()
+        os.makedirs(os.path.join(account["home"], "projects", "p"),
+                    exist_ok=True)
+        path = os.path.join(account["home"], "projects", "p",
+                            self.SID + ".jsonl")
+        with open(path, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "hi"}]}}) + "\n")
+        cwd = os.path.join(self.temp.name, "work")
+        os.makedirs(cwd, exist_ok=True)
+        child = mock.Mock(account=account, binding=None,
+                          launched_at=time.time() - 60)
+        record = {"source_slot": account["name"],
+                  "config_dir": account["home"],
+                  "received_at": time.time(),
+                  "payload": {"session_id": self.SID,
+                              "transcript_path": path, "cwd": cwd}}
+        real = handoff._source
+        calls = {"n": 0}
+
+        def born_late(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:        # the hook won the race, as it does live
+                raise handoff.HandoffError(
+                    f"session {self.SID} transcript no longer exists")
+            return real(*a, **kw)
+
+        with mock.patch.object(supervisor, "_namespace_matches",
+                               return_value=True), \
+                mock.patch.object(handoff, "_source", side_effect=born_late), \
+                mock.patch.object(supervisor, "TRANSCRIPT_GRACE_STEP", 0.0):
+            validated = supervisor._validated_event(record, child)
+        source = validated[0] if isinstance(validated, tuple) else validated
+        self.assertEqual(source.session_id, self.SID)
+        self.assertGreater(calls["n"], 1)   # it really did retry, not luck
 
     def test_the_grace_window_is_tolerant_and_finite(self):
         # the project's numeric-env convention: junk must not crash import,
@@ -6047,6 +6136,24 @@ class CapFamilyDowngrade(TempDirCase):
                                side_effect=supervisor.CapacityHold("walled")):
             with self.assertRaises(supervisor.CapacityHold):
                 run._cap_target(mock.Mock(account={"name": "a"}), "fable", {})
+
+    def test_the_hold_names_the_family_that_capped_not_the_last_one_tried(self):
+        # the hold reason reaches the operator's terminal and the cap_held
+        # ledger reason. `first_hold or hold` keeps the FIRST refusal; taking
+        # the last would report "for the haiku family" on a Fable cap — a 3am
+        # diagnostic pointing at a model the session never ran.
+        run = self.runner()
+        child = mock.Mock(account={"name": "a"}, spawn_args=[])
+
+        def per_family(_child, family, _snapshot):
+            raise supervisor.CapacityHold(f"nothing free for {family}")
+
+        with mock.patch.object(supervisor.Supervisor, "_cap_target_in_family",
+                               side_effect=per_family):
+            with self.assertRaises(supervisor.CapacityHold) as caught:
+                run._cap_target(child, "fable", {})
+        self.assertIn("fable", str(caught.exception))
+        self.assertNotIn("haiku", str(caught.exception))
 
     # -- the ladder is bounded by where a huge conversation can LOAD --------
 

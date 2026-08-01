@@ -2070,6 +2070,77 @@ class SupervisorIntegration(unittest.TestCase):
             f"CLAUDE_CONFIG_DIR={self.accounts[0]['home']} claude --resume "
             f"{source_sid}", errors.getvalue())
 
+    def test_failed_recovery_of_a_huge_session_prints_a_model_that_can_load_it(self):
+        """The same branch, but with a conversation that outgrew the standard
+        window. Both printed lines must name a 1M model — a bare `--resume`
+        here hands the operator a command that dies on its first prompt, and
+        this is the path that runs when BOTH spawns have already failed.
+
+        The two `model=` arguments feeding these lines were threaded in but
+        pinned by nothing: the original fixture's child has no `--model` and
+        its transcript carries no usage records, so the window-fit code was
+        unreachable from the integration layer entirely."""
+        os.environ["FAKE_CONTEXT_TOKENS"] = "500000"
+        self.addCleanup(os.environ.pop, "FAKE_CONTEXT_TOKENS", None)
+        real_spawn = supervisor.Supervisor._spawn
+        calls = {"n": 0}
+
+        def spawn(runner, account, args, cwd, automatic, plan=None):
+            calls["n"] += 1
+            if calls["n"] in (2, 3):    # target + source recovery both fail
+                raise supervisor.SupervisorError(
+                    "`claude` not found on PATH; nothing was started")
+            return real_spawn(runner, account, args, cwd, automatic, plan)
+
+        errors = io.StringIO()
+        with redirect_stderr(errors), \
+                mock.patch.object(supervisor.Supervisor, "_spawn", spawn):
+            result = supervisor.Supervisor(
+                "sonnet", ["--model", "sonnet[1m]"], self.accounts[0],
+                collect_fn=self.snapshot).run()
+        self.assertEqual(result, 127)
+        printed = [line for line in errors.getvalue().splitlines()
+                   if line.startswith("CLAUDE_CONFIG_DIR=")]
+        self.assertEqual(len(printed), 2, errors.getvalue())
+        for line in printed:
+            # sonnet[1m] SPECIFICALLY, not merely "some 1M model": the whole
+            # job of the threaded `model=` is to keep the conversation on the
+            # family it was already running. Asserting only "[1m]" passes even
+            # when the model is dropped, because an over-limit transcript then
+            # falls back to opus[1m) — a family this seat was never gated on.
+            self.assertIn("sonnet[1m]", line, line)
+
+    def test_source_recovery_of_a_huge_session_keeps_its_own_1m_model(self):
+        """The sibling of the test above on the path where recovery SUCCEEDS.
+
+        Only the TARGET spawn fails, so the source is recovered for real and
+        the fake records the argv it was started with. Without the threaded
+        `model=` at this call site the recovered session is re-modelled onto
+        the default fit model — a different family, on the seat it never
+        left."""
+        os.environ["FAKE_CONTEXT_TOKENS"] = "500000"
+        self.addCleanup(os.environ.pop, "FAKE_CONTEXT_TOKENS", None)
+        real_spawn = supervisor.Supervisor._spawn
+        calls = {"n": 0}
+
+        def spawn(runner, account, args, cwd, automatic, plan=None):
+            calls["n"] += 1
+            if calls["n"] == 2:         # only the TARGET spawn fails
+                raise supervisor.SupervisorError(
+                    "`claude` not found on PATH; nothing was started")
+            return real_spawn(runner, account, args, cwd, automatic, plan)
+
+        with redirect_stderr(io.StringIO()), \
+                mock.patch.object(supervisor.Supervisor, "_spawn", spawn):
+            supervisor.Supervisor(
+                "sonnet", ["--model", "sonnet[1m]"], self.accounts[0],
+                collect_fn=self.snapshot).run()
+        with open(os.path.join(self.fake_state, "recovered"),
+                  encoding="utf-8") as source:
+            recovered = source.read()
+        self.assertIn("--resume", recovered)
+        self.assertIn("sonnet[1m]", recovered)
+
     def test_target_relogin_after_stop_recovers_source_without_publication(self):
         original_commit = handoff.commit_handoff
 

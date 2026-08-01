@@ -103,9 +103,25 @@ def main():
         else:
             out.write(json.dumps({"type": "user", "message": {
                 "content": [{"type": "text", "text": "hello"}]}}) + "\n")
-            out.write(json.dumps({"type": "assistant", "message": {
+            # FAKE_CONTEXT_TOKENS makes this transcript MEASURABLE, so an
+            # integration test can reach the window-fit code at all. Without
+            # it _context_used() is None everywhere and every fit decision
+            # short-circuits — which is why the whole window-fit surface was
+            # invisible to the integration layer. Opt-in, so no existing
+            # test's behaviour moves.
+            usage = {}
+            tokens = os.environ.get("FAKE_CONTEXT_TOKENS", "")
+            if tokens.isdigit():
+                total = int(tokens)
+                read = max(total - 1001, 0)
+                usage = {"usage": {
+                    "input_tokens": 1,
+                    "cache_creation_input_tokens": total - read - 1,
+                    "cache_read_input_tokens": read, "output_tokens": 405}}
+            out.write(json.dumps({"type": "assistant", "message": dict({
                 "model": model_id, "content": [
-                    {"type": "text", "text": "real assistant turn"}]}}) + "\n")
+                    {"type": "text", "text": "real assistant turn"}]},
+                **usage)}) + "\n")
             out.flush()
             os.fsync(out.fileno())
     common = {"session_id": sid, "transcript_path": transcript,
