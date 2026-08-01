@@ -5856,11 +5856,15 @@ class ContextBackstop(TempDirCase):
         self.assertEqual(events[1]["window"], 200_000)
         self.assertEqual(events[1]["model"], "opus[1m]")
         self.assertIs(events[1]["forked"], True)
-        # nothing was disarmed and nothing was reserved or cooled
+        # nothing was disarmed and nothing was reserved or cooled. The ledger
+        # now carries the ATTRIBUTION pair and nothing else — no cap_confirmed,
+        # no reservation: a same-seat rotation still spends none of the cap
+        # path's budget (pinned by
+        # ..._rows_do_not_consume_the_automatic_budget in test_supervisor).
         self.assertTrue(self.child.automation)
         self.assertFalse(self.child.supervision_loss_notified)
-        self.assertFalse(os.path.exists(
-            os.path.join(paths.state_dir(), "handoffs.jsonl")))
+        self.assertEqual([row["action"] for row in self.ledger()],
+                         ["context_stop_sent", "context_stopped"])
         # the successor is not immediately rotated again
         self.assertEqual(runner.context_hold_until,
                          self.clock["t"] + supervisor.PREEMPT_BACKOFF_SECONDS)
@@ -6135,6 +6139,138 @@ class ContextBackstop(TempDirCase):
         killed.assert_not_called()
         self.assertIn("newer hook event",
                       [event.get("reason", "") for event in events][-1])
+
+    # -- attribution: headroom's own kills are never anonymous --------------
+
+    def ledger(self):
+        path = os.path.join(paths.state_dir(), "handoffs.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as source:
+            return [json.loads(line) for line in source if line.strip()]
+
+    def test_the_stop_row_is_durable_BEFORE_the_signal(self):
+        # The discipline _stop_and_commit's stop_sent already has: a crash can
+        # never hide a stop, and an external kill must never be
+        # indistinguishable from ours. Read the ledger AT THE MOMENT OF THE
+        # SIGNAL rather than after — writing the row afterwards would satisfy
+        # every other assertion here and still leave the 07:30Z signature.
+        runner = self.runner()
+        at_signal = []
+
+        def kill(_pid, _signum):
+            at_signal.extend(self.ledger())
+
+        wait = self.stopping(runner)[1]
+        with mock.patch.object(supervisor.os, "kill", side_effect=kill), wait, \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            outcome = runner._context_backstop_cycle(self.child)
+        self.assertIsNotNone(outcome)
+        self.assertEqual([row["action"] for row in at_signal],
+                         ["context_stop_sent"])
+        row = at_signal[0]
+        self.assertEqual(row["schema"], handoff.SCHEMA)
+        self.assertEqual(row["source_slot"], "source")
+        self.assertEqual(row["old_session_id"], self.SID)
+        self.assertEqual(row["child_generation"], 1)
+        self.assertEqual(row["used"], 190_000)
+        self.assertEqual(row["window"], 200_000)
+        self.assertEqual(row["remaining_percent"], 5.0)
+        self.assertTrue(handoff._valid_uuid(row["handoff_id"]))
+        # the mixed-version contract: no `automatic` key, so an OLDER headroom
+        # skips the row entirely instead of refusing the whole ledger
+        self.assertNotIn("automatic", row)
+
+    def test_a_stopped_row_records_the_exit_code_and_the_fork(self):
+        runner = self.runner()
+        outcome, _killed, _events = self.cycle(runner)
+        self.assertIsNotNone(outcome)
+        rows = self.ledger()
+        self.assertEqual([row["action"] for row in rows],
+                         ["context_stop_sent", "context_stopped"])
+        # one rotation, one id, so the pair is joinable
+        self.assertEqual(rows[0]["handoff_id"], rows[1]["handoff_id"])
+        self.assertEqual(rows[1]["source_slot"], "source")
+        self.assertEqual(rows[1]["old_session_id"], self.SID)
+        self.assertEqual(rows[1]["child_generation"], 1)
+        self.assertEqual(rows[1]["child_exit_code"], 0)
+        self.assertIs(rows[1]["session_end"], True)
+        self.assertEqual(rows[1]["degraded"], "")
+        self.assertIs(rows[1]["forked"], True)
+        self.assertNotIn("automatic", rows[1])
+
+    def test_a_degraded_rotation_is_recorded_as_degraded(self):
+        # the flags must match the branch actually taken, not the intent
+        runner = self.runner()
+        with mock.patch.object(supervisor.os, "kill"), \
+                mock.patch.object(runner, "_wait_stopped", return_value=0), \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            outcome = runner._context_backstop_cycle(self.child)
+        self.assertEqual(outcome.reason, "context_backstop_recovered")
+        row = self.ledger()[-1]
+        self.assertEqual(row["action"], "context_stopped")
+        self.assertEqual(row["degraded"], "SessionEnd proof is missing")
+        self.assertIs(row["forked"], False)
+
+    def test_a_ledger_failure_before_the_signal_defers_instead_of_killing(self):
+        # the row is on the ABORT side of the kill: a ledger it cannot write
+        # can only cost a rotation, never orphan a session
+        runner = self.runner()
+        wait = self.stopping(runner)[1]
+        with mock.patch.object(supervisor.os, "kill") as killed, wait, \
+                mock.patch.object(
+                    handoff, "append_ledger",
+                    side_effect=handoff.HandoffError("disk full")), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            outcome = runner._context_backstop_cycle(self.child)
+        self.assertIsNone(outcome)
+        killed.assert_not_called()
+        self.assertTrue(self.child.automation)
+        self.assertFalse(self.child.supervision_loss_notified)
+        self.assertIn("disk full", [event.get("reason", "")
+                                    for event in self.events(emit)][-1])
+        self.assertEqual(self.child.context_next_check,
+                         self.clock["t"] + supervisor.PREEMPT_BACKOFF_SECONDS)
+
+    def test_a_ledger_failure_after_the_signal_still_returns_the_relaunch(self):
+        # after the signal there is no "refuse" left — the session MUST come
+        # back, so the second row's failure is printed and swallowed
+        runner = self.runner()
+        real = handoff.append_ledger
+
+        def append(record):
+            if record.get("action") == "context_stopped":
+                raise handoff.HandoffError("disk full")
+            return real(record)
+
+        kill, wait = self.stopping(runner)
+        with kill as killed, wait, \
+                mock.patch.object(handoff, "append_ledger", side_effect=append), \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()) as err:
+            outcome = runner._context_backstop_cycle(self.child)
+        killed.assert_called_once()
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.reason, "context_backstop")
+        self.assertIn("could not record the context stop", err.getvalue())
+
+    def test_the_backstop_rows_are_inert_to_every_automatic_reader(self):
+        runner = self.runner()
+        self.assertIsNotNone(self.cycle(runner)[0])
+        rows = handoff._read_jsonl(handoff._ledger_path(), "handoff ledger")
+        self.assertEqual(len(rows), 2)
+        # _validated_automatic_rows (handoff.py:1117): no `automatic` key and
+        # not cap_confirmed, so never safety-relevant. This is the assertion an
+        # OLDER headroom's read of a NEWER ledger reduces to — widening
+        # _AUTOMATIC_ACTIONS instead would have made that read RAISE and
+        # disabled every automatic handoff on the fleet.
+        self.assertEqual(handoff._validated_automatic_rows(rows), rows)
+        # _previous_handoff (588) filters action == 'staged'
+        self.assertIsNone(handoff._previous_handoff(self.SID, "sha"))
+        handoff.guard_not_duplicate(self.SID, "sha")
 
     # -- the session must survive the rotation itself -----------------------
 

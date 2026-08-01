@@ -600,6 +600,29 @@ class TranscriptAndTransaction(unittest.TestCase):
         with self.assertRaisesRegex(handoff.HandoffError, "loop guard"):
             handoff.reserve_automatic(self.automatic_plan())
 
+    def test_context_backstop_rows_do_not_consume_the_automatic_budget(self):
+        # The context backstop is layered ON TOP of the cap-reactive
+        # guarantee, so its attribution rows must cost the cap path nothing.
+        # Three rotations inside the window, then a real cap: it must still be
+        # admitted, or writing the ledger would have disarmed the very thing
+        # the ledger exists to explain.
+        for _ in range(3):
+            rotation = str(__import__("uuid").uuid4())
+            handoff.append_ledger({
+                "schema": handoff.SCHEMA, "ts": time.time(),
+                "handoff_id": rotation, "action": "context_stop_sent",
+                "source_slot": "source", "old_session_id": self.SID,
+                "child_generation": 1, "used": 190_000, "window": 200_000,
+                "remaining_percent": 5.0})
+            handoff.append_ledger({
+                "schema": handoff.SCHEMA, "ts": time.time(),
+                "handoff_id": rotation, "action": "context_stopped",
+                "source_slot": "source", "old_session_id": self.SID,
+                "child_generation": 1, "child_exit_code": 0,
+                "session_end": True, "degraded": "", "forked": True})
+        record = handoff.reserve_automatic(self.automatic_plan())
+        self.assertEqual(record["action"], "cap_confirmed")
+
     def test_malformed_automatic_ledger_row_holds_admission(self):
         handoff.append_ledger({
             "ts": "recent", "handoff_id": str(__import__("uuid").uuid4()),

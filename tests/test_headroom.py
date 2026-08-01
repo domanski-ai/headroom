@@ -2632,6 +2632,28 @@ class HandoffSafety(unittest.TestCase):
         with self.assertRaisesRegex(handoff.HandoffError, "already handed off"):
             handoff.guard_not_duplicate(self.SID, digest)
 
+    def test_a_context_stop_row_disambiguates_source_the_same_way(self):
+        # resolve_source's multi-match tiebreak (handoff.py:330-339) is the ONE
+        # reader the context-backstop rows are not inert to: it takes the
+        # newest row matching old_session_id and trusts its source_slot. The
+        # backstop rows carry a TRUE source_slot — the seat the session was
+        # stopped on and resumed on — so they must resolve the collision to
+        # exactly the slot the old code resolved it to.
+        target = self._transcript(self.target_home, self.SID)
+        with open(target, "wb") as handle:
+            handle.write(self.bytes)
+        handoff.append_ledger({
+            "schema": handoff.SCHEMA, "ts": 100,
+            "handoff_id": "6f1c9d2e-5b3a-4c8d-9e7f-0a1b2c3d4e5f",
+            "action": "context_stop_sent", "source_slot": "source",
+            "old_session_id": self.SID, "child_generation": 1,
+            "used": 190_000, "window": 200_000, "remaining_percent": 5.0})
+
+        source = handoff.resolve_source(self.SID, self.accounts, self.cwd)
+
+        self.assertEqual(source.transcript_path, self.transcript)
+        self.assertEqual(source.account["name"], "source")
+
     def test_copy_hash_permissions_and_source_untouched(self):
         destination = handoff.destination_path(self.target_home, self.transcript,
                                                self.SID)

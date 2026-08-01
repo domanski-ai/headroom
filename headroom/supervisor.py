@@ -3529,6 +3529,7 @@ class Supervisor:
             raise SupervisorError("source transcript changed before stop")
         if proof.deadline <= self.now():
             raise SupervisorError("context decision window elapsed before stop")
+        rotation_id = str(uuid.uuid4())
         print(f"[headroom] {proof.message}; forcing a lossless rotation of "
               f"this session on {child.account['name']}", file=sys.stderr)
         self.stopped_child_model = _model_flag(child.spawn_args)
@@ -3544,6 +3545,25 @@ class Supervisor:
                 # last-instant idleness, one stat syscall before the kill
                 self._idle_stop_edge(child, proof, proof.transcript_stat,
                                      label="context backstop")
+                # Durable BEFORE the signal, the same discipline as
+                # _stop_and_commit's stop_sent: a crash can never hide a stop,
+                # and an external kill must never be indistinguishable from
+                # ours. Without this row headroom can terminate a live session
+                # and leave a signature identical to somebody else's kill —
+                # which is what made the 2026-08-01 07:30:42Z stop cost a
+                # forensic dispatch to attribute. append_ledger takes the
+                # handoff lock and fsyncs.
+                #
+                # A raise here is BEFORE the signal, so it propagates: the
+                # cycle's except defers and the child is untouched.
+                handoff.append_ledger({
+                    "schema": handoff.SCHEMA, "ts": self.now(),
+                    "handoff_id": rotation_id, "action": "context_stop_sent",
+                    "source_slot": child.account["name"],
+                    "old_session_id": proof.session_id,
+                    "child_generation": child.generation,
+                    "used": proof.used, "window": proof.window,
+                    "remaining_percent": proof.remaining_percent})
                 stop_sent_at = self.now()
                 os.kill(child.process.pid, signal.SIGTERM)
                 signal_sent = True
@@ -3578,6 +3598,20 @@ class Supervisor:
                                            allow_dangling=False)
             except (handoff.HandoffError, OSError, ValueError) as error:
                 degraded = str(error)
+        try:
+            handoff.append_ledger({
+                "schema": handoff.SCHEMA, "ts": self.now(),
+                "handoff_id": rotation_id, "action": "context_stopped",
+                "source_slot": child.account["name"],
+                "old_session_id": proof.session_id,
+                "child_generation": child.generation,
+                "child_exit_code": returncode,
+                "session_end": child.session_ended,
+                "degraded": degraded, "forked": not degraded})
+        except handoff.HandoffError as error:
+            # after the signal: the session MUST still come back
+            print(f"[headroom] could not record the context stop: {error}",
+                  file=sys.stderr)
         if degraded:
             # never fork a conversation we cannot prove finished — resume the
             # session itself instead, and say so
