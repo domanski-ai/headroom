@@ -2041,10 +2041,12 @@ def _source_row_is_bound(account, family, snapshot, collect_started):
                 if isinstance(item, dict) and item.get("name") == account["name"]),
                None)
     reason = route.block_reason(account, family, row, {}, time.time(), reserve=0)
-    capacity_reasons = {"5h at 100%", "7d at 100%",
-                        f"{family} weekly cap at 100%",
-                        "5h critical", "7d critical"}
-    if reason is not None and reason not in capacity_reasons:
+    # One vocabulary, one owner. This was a second copy of _capacity_reasons
+    # that had lost `<family> weekly cap critical`, so a scoped cap in the
+    # [99,100) band read as a TRUST failure and disarmed supervision — the
+    # exact band route.py's scoped-critical gate exists to rotate off.
+    # _preemptive_row_bound already reads the helper; so does this.
+    if reason is not None and reason not in _capacity_reasons(family):
         return reason
     captured = row.get("captured_at") if isinstance(row, dict) else None
     if not isinstance(captured, (int, float)) or isinstance(captured, bool) \

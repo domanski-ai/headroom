@@ -983,6 +983,117 @@ class TheSupervisorsOwnUnreadableStrings(unittest.TestCase):
                 f"{reason!r} must never be waited out")
 
 
+class TheCapacityVocabularyHasOneOwner(unittest.TestCase):
+    """`_capacity_reasons` names the block reasons that mean "this seat is
+    SPENT" — the trigger a rotation exists to serve — as opposed to "this
+    reading cannot be trusted", which must hold instead.
+
+    `_source_row_is_bound` used to carry a SECOND, inline copy of that set,
+    and the copy had lost `<family> weekly cap critical`. A scoped weekly cap
+    flagged critical-and-active in the [99, 100) band therefore read as a
+    trust failure: `_source_row_is_bound` returned the reason, `_preflight`
+    raised, and `_monitor` disarmed supervision permanently — in exactly the
+    band `route.py`'s scoped-critical gate was written to rotate off. One
+    vocabulary, one owner; these cases fence it."""
+
+    def setUp(self):
+        self.now = time.time()
+        orig = collect.local_binding
+        collect.local_binding = lambda provider, home: ("AAAA", "BBBB")
+        self.addCleanup(setattr, collect, "local_binding", orig)
+
+    def row(self, scoped=None, **over):
+        row = _claude_row(**over)
+        row["captured_at"] = self.now - 1
+        if scoped is not None:
+            row["windows"]["scoped:Fable"] = dict(
+                {"used_percent": 10.0, "resets_at": self.now + 6 * 86400,
+                 "window_minutes": 10080}, **scoped)
+        return row
+
+    def reason(self, row, fam="fable"):
+        return route.block_reason(_account(), fam, row, {}, self.now, reserve=0)
+
+    def bound(self, row, fam="fable"):
+        snapshot = {"run_started": self.now - 5, "generated": self.now - 1,
+                    "accounts": [row]}
+        return supervisor._source_row_is_bound(
+            _account(), fam, snapshot, self.now - 10)
+
+    def test_a_scoped_cap_critical_below_100_rotates_instead_of_disarming(self):
+        """The live defect: 99.5%, critical, active. `route.block_reason`
+        calls it spent; the supervisor has to agree or the seat goes dark."""
+        row = self.row(scoped={"used_percent": 99.5, "severity": "critical",
+                               "is_active": True})
+        self.assertEqual(self.reason(row), "fable weekly cap critical")
+        self.assertEqual(self.bound(row), "",
+                         "a scoped cap in the [99,100) band must rotate, "
+                         "not disarm supervision")
+
+    def test_the_same_seat_at_a_hard_100_percent_still_rotates(self):
+        """The control: 100% was always admitted. If only this passes, the
+        band is still closed and the fix did nothing."""
+        row = self.row(scoped={"used_percent": 100.0, "severity": "critical",
+                               "is_active": True})
+        self.assertEqual(self.reason(row), "fable weekly cap at 100%")
+        self.assertEqual(self.bound(row), "")
+
+    def test_every_spent_shape_block_reason_can_emit_is_admitted(self):
+        """Exhaustive over the reasons a SPENT claude seat produces. A reword
+        in route.py that this set does not follow fails here instead of
+        silently disarming a live session."""
+        spent = {
+            "5h at 100%": self.row(used5h=100.0),
+            "7d at 100%": self.row(used7d=100.0),
+            "5h critical": self.row(
+                windows=dict(_claude_row()["windows"], **{
+                    "5h": {"used_percent": 99.5, "resets_at": self.now + 3600,
+                           "window_minutes": 300, "severity": "critical",
+                           "is_active": True}})),
+            "7d critical": self.row(
+                windows=dict(_claude_row()["windows"], **{
+                    "7d": {"used_percent": 99.5,
+                           "resets_at": self.now + 8 * 86400,
+                           "window_minutes": 10080, "severity": "critical",
+                           "is_active": True}})),
+            "fable weekly cap at 100%": self.row(
+                scoped={"used_percent": 100.0}),
+            "fable weekly cap critical": self.row(
+                scoped={"used_percent": 99.5, "severity": "critical",
+                        "is_active": True}),
+        }
+        for expected, row in sorted(spent.items()):
+            self.assertEqual(self.reason(row), expected)
+            self.assertIn(expected, supervisor._capacity_reasons("fable"),
+                          f"{expected!r} is a spent seat, not an unusable one")
+            self.assertEqual(self.bound(row), "",
+                             f"{expected!r} must rotate, not disarm")
+
+    def test_the_two_readers_of_the_vocabulary_agree(self):
+        """`_preemptive_row_bound` and `_source_row_is_bound` decide the same
+        question about the same string; they may not answer it differently."""
+        for row in (self.row(scoped={"used_percent": 99.5,
+                                     "severity": "critical",
+                                     "is_active": True}),
+                    self.row(used5h=100.0),
+                    self.row(ok=True, routable=False)):
+            self.assertEqual(
+                self.bound(row) == "",
+                supervisor._preemptive_row_bound(
+                    _account(), "fable", row, self.now) == "",
+                f"the two row-bound checks disagree about {self.reason(row)!r}")
+
+    def test_a_trust_refusal_still_disarms(self):
+        """The fix widens the SPENT set by exactly one string. Nothing that
+        means "this reading cannot be trusted" may leak through with it."""
+        collect.local_binding = lambda provider, home: ("ZZZZ", "BBBB")
+        row = self.row()
+        self.assertEqual(self.reason(row),
+                         "slot identity changed since snapshot — recollect")
+        self.assertEqual(self.bound(row),
+                         "slot identity changed since snapshot — recollect")
+
+
 class ReservePercent(unittest.TestCase):
     """`reserve_percent` skips accounts with less than N% headroom left so a
     session starts fresh instead of hitting a wall mid-task."""
