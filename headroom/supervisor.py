@@ -2263,9 +2263,25 @@ class Supervisor:
         # child exists is ever unguarded (P1, r7)
         self._signals = None
 
-    def _settings_file(self, generation, automatic=True):
+    def _settings_file(self, generation, account, automatic=True):
         directory = paths.ensure_private(_supervisors_dir())
-        filename = f"{self.supervisor_id}-{generation}.settings.json"
+        # The slot name goes in the filename because the filename is the ONLY
+        # thing a live lane says about itself in `ps`. On 2026-08-01 at
+        # 07:30:37Z an operator read `<uuid>-1.settings.json`, concluded
+        # "stale supervisor scaffolding", and killed two live lanes; both
+        # panes then sat dark overnight.
+        #
+        # APPENDED, never prefixed, and never a subdirectory: ops_status
+        # (_is_supervised_child) matches `supervisor_id + "-"` at the start
+        # and `.settings.json` at the end, and the estate's kill-hygiene glob
+        # `supervisors/*.settings.json` matches on the same two anchors. Both
+        # still hold, so a pre-upgrade child stays in the census.
+        #
+        # The account name is CONFIG-controlled, i.e. untrusted input to a
+        # path: sanitise before joining.
+        slot = re.sub(r"[^A-Za-z0-9_.-]", "_",
+                      str(account.get("name") or "lane"))
+        filename = f"{self.supervisor_id}-{generation}.{slot}.settings.json"
         destination = os.path.join(directory, filename)
         if automatic:
             # one file, supervisor keys on top; identical to hook_settings()
@@ -2315,7 +2331,7 @@ class Supervisor:
         # (an unsupervised child and no user settings) the argv is unchanged.
         settings = ""
         if automatic or self.user_settings:
-            settings = self._settings_file(self.generation, automatic)
+            settings = self._settings_file(self.generation, account, automatic)
         argv = ["claude"]
         if settings:
             argv.extend(["--settings", settings])

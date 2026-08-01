@@ -420,14 +420,32 @@ class Discovery(OpsStatusCase):
         transcript = self.transcript(SID_A, [assistant()])
         self.journal(SUP_A, [(self.now - 60, 1, "SessionStart", SID_A,
                               transcript)])
-        self.supervised(4001, ["node", "/opt/cli.js", "--settings",
-                               f"/state/supervisors/{SUP_A}-1.settings.json"])
+        self.supervised(
+            4001, ["node", "/opt/cli.js", "--settings",
+                   f"/state/supervisors/{SUP_A}-1.acct-a.settings.json"])
         report, _ok = self.snapshot(panes={})
         self.assertEqual([row["pid"] for row in report["sessions"]], [4001])
 
+    def test_the_census_still_finds_a_pre_upgrade_child(self):
+        # ROLLING UPGRADE. The slot name went into the settings filename, but
+        # a child spawned by a PRE-patch supervisor is still running with the
+        # old `<uuid>-<gen>.settings.json` shape. If the census stopped
+        # recognising it, that live lane would vanish from
+        # `headroom ops-status` — which is the exact answer kill-hygiene is
+        # now told to trust. Both shapes must be accepted.
+        for argv in (["node", "/opt/cli.js", "--settings",
+                      f"/state/supervisors/{SUP_A}-1.settings.json"],
+                     ["node", "/opt/cli.js", "--settings",
+                      f"/state/supervisors/{SUP_A}-1.acct-a.settings.json"],
+                     ["node", "/opt/cli.js",
+                      f"--settings=/state/supervisors/{SUP_A}-2.acct-a"
+                      ".settings.json"]):
+            self.assertTrue(ops_status._is_supervised_child(argv, SUP_A), argv)
+
     def test_a_foreign_settings_file_is_not_a_session(self):
-        self.supervised(4001, ["node", "/opt/cli.js", "--settings",
-                               f"/state/supervisors/{SUP_B}-1.settings.json"])
+        self.supervised(
+            4001, ["node", "/opt/cli.js", "--settings",
+                   f"/state/supervisors/{SUP_B}-1.acct-a.settings.json"])
         report, _ok = self.snapshot(panes={})
         self.assertEqual(report["sessions"], [])
 
@@ -959,7 +977,7 @@ class SupervisorContract(OpsStatusCase):
         runner = supervisor.Supervisor(
             "fable", ["--settings", given, "--model", "fable"], account,
             supervisor_id=SUP_A)
-        settings = runner._settings_file(1)
+        settings = runner._settings_file(1, account)
         transcript = self.transcript(SID_A, [user(), assistant()])
         self.journal(SUP_A, [(self.now - 60, 1, "SessionStart", SID_A,
                               transcript)])

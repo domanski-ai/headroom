@@ -659,6 +659,15 @@ nowhere else; if you publish a usage feed of your own, point
 `HEADROOM_OPS_FALLBACK_USAGE` at it and the command reads it when that
 snapshot is unreadable.
 
+It is also the right way to answer **"is this process safe to kill?"**. A
+supervised child appears in `ps` as `claude --settings
+<state>/supervisors/<supervisor-id>-<generation>.<slot>.settings.json`; the
+slot name is in that path on purpose, because it is the only thing a live lane
+says about itself in the process table. A long `etime` is what a healthy
+supervised session looks like, not a leak. Check the pid against
+`ops-status`'s `sessions` before reaping anything — see
+[docs/KNOWN-LIMITS.md](docs/KNOWN-LIMITS.md).
+
 ## Hand off a capped session
 
 **EXPERIMENTAL.** With automatic handoff off, after Claude reaches its cap run `/exit`, then run

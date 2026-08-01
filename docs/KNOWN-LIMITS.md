@@ -277,6 +277,31 @@ about on the machine it runs on. If you publish a usage feed of your own
 snapshot is unreadable. Anything that can write that file can set the numbers
 an ops layer sees, so keep it somewhere you own.
 
+## A supervised lane looks like scaffolding in `ps` — ask, don't guess
+
+A supervised child runs as
+`claude --settings <state>/supervisors/<supervisor-id>-<generation>.<slot>.settings.json`.
+The slot name is in there deliberately: the settings path is the only thing a
+live lane says about itself in the process table, and a uuid, a digit and a
+directory that reads like scratch space have already been mistaken for debris.
+On 2026-08-01 an operator doing memory triage saw two such processes with
+multi-day `etime`, read them as stale supervisor scaffolding, killed both, and
+took down two live sessions whose panes then sat dark overnight.
+
+**A long `etime` is the normal state of a healthy lane, not evidence of a
+leak** — the whole point of supervision is that the child outlives individual
+turns. Never decide from the argv alone. `headroom ops-status --json` is the
+machine-readable answer to "is this pid a live session?": its `sessions` array
+is a `/proc` census of every supervised child on the machine, with the pid,
+slot, session id and container for each. If a pid is in there, it is a live
+lane. (Linux only — see above.)
+
+Two consequences worth knowing if you automate around this. The slot is a
+filename *infix*, so anything globbing `supervisors/*.settings.json` keeps
+matching. And a child spawned by an older headroom still carries the previous
+`<supervisor-id>-<generation>.settings.json` name; the census accepts both
+shapes, so a rolling upgrade never makes a running lane disappear from it.
+
 ## Claude usage binding is trust-on-first-use
 
 The Anthropic usage endpoint identifies its organization in a response

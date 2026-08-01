@@ -1384,11 +1384,78 @@ class UserSettingsAreMergedNotObeyed(TempDirCase):
         runner = supervisor.Supervisor(
             "sonnet", ["--settings", path], self.account())
         for generation in (1, 2, 3):
-            with open(runner._settings_file(generation),
+            with open(runner._settings_file(generation, self.account()),
                       encoding="utf-8") as handle:
                 document = json.load(handle)
             self.assertTrue(document["ultracode"])
             self.assertIn("StopFailure", document["hooks"])
+
+    def test_the_child_names_its_slot_in_its_own_argv(self):
+        # On 2026-08-01 07:30:37Z an operator read
+        # `claude --settings .../<uuid>-1.settings.json` in `ps`, concluded
+        # "stale supervisor scaffolding", and killed two LIVE lanes. The
+        # filename is the only thing a supervised lane says about itself in
+        # the process table, so it says the seat.
+        spawned = []
+        account = self.account("domanski-ai")
+        runner = supervisor.Supervisor(
+            "sonnet", ["--model", "sonnet"], account,
+            popen=lambda argv, **kw: spawned.append(argv) or mock.Mock())
+        child = runner._spawn(account, runner.initial_args,
+                              self.temp.name, True)
+        argv = spawned[0]
+        self.assertEqual(argv[:2], ["claude", "--settings"])
+        settings = argv[2]
+        self.assertEqual(settings, child.settings_path)
+        name = os.path.basename(settings)
+        self.assertIn("domanski-ai", name)
+        self.assertEqual(
+            name, f"{runner.supervisor_id}-1.domanski-ai.settings.json")
+        # the slot is a filename INFIX, never a subdirectory: the estate glob
+        # `supervisors/*.settings.json` must keep matching
+        self.assertEqual(os.path.dirname(settings),
+                         supervisor._supervisors_dir())
+        self.assertTrue(name.endswith(".settings.json"))
+
+    def test_the_spawned_slot_is_the_one_spawned_ONTO(self):
+        # a handoff spawns onto the TARGET account, not the supervisor's own,
+        # so the argv must name where the child actually runs
+        spawned = []
+        runner = supervisor.Supervisor(
+            "sonnet", ["--model", "sonnet"], self.account("source"),
+            popen=lambda argv, **kw: spawned.append(argv) or mock.Mock())
+        runner._spawn(self.account("target"), runner.initial_args,
+                      self.temp.name, True)
+        self.assertIn("target", os.path.basename(spawned[0][2]))
+        self.assertNotIn("source", os.path.basename(spawned[0][2]))
+
+    def test_a_hostile_slot_name_cannot_escape_the_supervisors_directory(self):
+        # the account name is CONFIG-controlled, so it is untrusted input to a
+        # path: sanitise it rather than trusting the registry
+        runner = supervisor.Supervisor("sonnet", [], self.account())
+        for name, expected in (("../../etc/pwn", ".._.._etc_pwn"),
+                               ("a b", "a_b"),
+                               ("s/l", "s_l"),
+                               ("", "lane")):
+            account = dict(self.account(), name=name)
+            path = runner._settings_file(1, account)
+            self.assertEqual(os.path.dirname(path),
+                             supervisor._supervisors_dir())
+            self.assertEqual(os.path.basename(path),
+                             f"{runner.supervisor_id}-1.{expected}"
+                             ".settings.json")
+            self.assertTrue(os.path.exists(path))
+
+    def test_cleanup_removes_the_slot_named_file(self):
+        # _cleanup_files iterates the paths it RECORDED and never globs, so
+        # the rename must not strand a file — assert the name really moved
+        runner = supervisor.Supervisor("sonnet", [], self.account())
+        path = runner._settings_file(1, self.account("domanski-ai"))
+        self.assertIn("domanski-ai", os.path.basename(path))
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(runner.settings_files, [path])
+        runner._cleanup_files()
+        self.assertFalse(os.path.exists(path))
 
     def test_a_boolean_or_optional_flag_never_hides_the_settings(self):
         # `--ide` (boolean) and `--resume` (optional value) used to consume
@@ -1749,7 +1816,8 @@ class UserSettingsAreMergedNotObeyed(TempDirCase):
             "sonnet", ["--settings", path], self.account())
         with open(path, "w") as handle:
             json.dump({"disableAllHooks": True}, handle)
-        with open(runner._settings_file(2), encoding="utf-8") as handle:
+        with open(runner._settings_file(2, self.account()),
+                  encoding="utf-8") as handle:
             document = json.load(handle)
         self.assertTrue(document["ultracode"])
         self.assertNotIn("disableAllHooks", document)
