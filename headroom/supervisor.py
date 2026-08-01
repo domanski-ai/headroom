@@ -2676,16 +2676,7 @@ class Supervisor:
                 # _lose_supervision, on the dead seat, exactly like the bug
                 # the wait replaced. Trust, identity and policy refusals are
                 # NOT in this class and disarm as they always did.
-                #
-                # NOT gated on `held`: cap_scope_key is assigned only in the
-                # `if not held:` branch BELOW this gate, and _cap_hold_clear
-                # zeroes it per proof, so the only call site's
-                # `held=bool(child.cap_scope_key)` is structurally False on
-                # every first look — this branch, written for exactly this
-                # case, could never once run. Absence of evidence holds on the
-                # first look too. The first-look "a contradiction disarms"
-                # rule belongs to `scope is None` below and is untouched.
-                if _source_reading_unavailable(reason, proof.family):
+                if held and _source_reading_unavailable(reason, proof.family):
                     raise CapacityHold(
                         f"{reason} — holding the proof rather than disarming "
                         "on a snapshot that proves nothing")
