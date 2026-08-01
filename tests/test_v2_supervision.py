@@ -202,6 +202,45 @@ class NotifyDelivery(TempDirCase):
         self.assertLess(elapsed, 5.0)
         self.assertIn("killed", errors.getvalue())
 
+    def test_the_timeout_kills_the_group_we_MADE_not_one_we_looked_up(self):
+        # start_new_session already made the observer a process-group LEADER,
+        # so the group we are entitled to kill IS process.pid. Re-deriving it
+        # with getpgid at kill time asks "what group is that pid in NOW" —
+        # a different question, whose answer an observer that re-grouped
+        # itself (setsid/setpgid) has moved, and which after the pid is gone
+        # can name an unrelated group. SIGKILL is not a signal to aim by
+        # inference.
+        #
+        # killpg is stubbed to record and then refuse, so the test never
+        # signals a group it invented; the ProcessLookupError drives the
+        # existing pid fallback and the real child is still cleaned up.
+        killed = []
+        spawned = []
+        real_popen = notify.subprocess.Popen
+
+        def popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            spawned.append(process.pid)
+            return process
+
+        def killpg(pgid, _sig):
+            killed.append(pgid)
+            raise ProcessLookupError("stubbed")
+
+        with mock.patch.dict(os.environ, {
+                "HEADROOM_NOTIFY_CMD": "/bin/sh -c 'sleep 30'",
+                "HEADROOM_NOTIFY_TIMEOUT": "0.2"}), \
+                mock.patch.object(notify.subprocess, "Popen",
+                                  side_effect=popen), \
+                mock.patch.object(notify.os, "getpgid",
+                                  return_value=-424242) as looked_up, \
+                mock.patch.object(notify.os, "killpg", side_effect=killpg), \
+                redirect_stderr(io.StringIO()):
+            self.assertFalse(notify.emit({"event": "launch"}))
+        self.assertEqual(killed, spawned)
+        self.assertNotIn(-424242, killed)
+        looked_up.assert_not_called()
+
     def test_timeout_kills_the_whole_process_group_not_just_the_shell(self):
         # P1-7: a shell that backgrounds a worker and waits must not leak the
         # worker. The worker writes its pid, then sleeps; after the timeout

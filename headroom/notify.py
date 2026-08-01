@@ -90,7 +90,14 @@ def emit(event):
                 process.kill()
             else:
                 try:
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    # The group IS process.pid: start_new_session made this
+                    # child a group leader. Re-deriving it with getpgid asks
+                    # a different question — what group that pid is in NOW —
+                    # and the answer can name a group we never created and are
+                    # not entitled to SIGKILL, whether because the observer
+                    # re-grouped itself or because the pid no longer means
+                    # what it did. Kill the group we made.
+                    os.killpg(process.pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError, OSError):
                     process.kill()  # group gone/unavailable — use the pid
             try:
