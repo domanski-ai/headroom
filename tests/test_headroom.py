@@ -28,8 +28,8 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from headroom import (  # noqa: E402
-    __main__, collect, connect, dashboard, handoff, history, paths, registry,
-    locks, route, statusline, supervisor, tokens,
+    __main__, collect, connect, dashboard, handoff, history, maximize, paths,
+    registry, locks, route, statusline, supervisor, tokens,
 )
 
 
@@ -1092,6 +1092,241 @@ class TheCapacityVocabularyHasOneOwner(unittest.TestCase):
                          "slot identity changed since snapshot — recollect")
         self.assertEqual(self.bound(row),
                          "slot identity changed since snapshot — recollect")
+
+
+class UnmappedScopedPoolIsMissingEvidence(unittest.TestCase):
+    """A scoped pool whose NAME we can no longer map.
+
+    `collect` keys the per-model weekly window `scoped:<display_name>` and
+    every consumer recovers it by substring — `fam in key.lower()`. Drop the
+    family token from that display name, or merely OMIT `display_name` (the
+    collector's own `or "Scoped"` fallback mints a permanently non-matching
+    `scoped:Scoped` today, with no provider rename at all), and FIVE
+    independent protections switch off at once, silently:
+
+      1. block_reason's scoped eligibility gate — a 100% pool stays routable;
+      2. `_fable_room` ranking — 0.0 becomes None;
+      3. maximize's Fable-waste guard — stands down entirely;
+      4. `cap_scope` returns None, which the supervisor turns into
+         "fresh usage is below 99% or the cap scope is ambiguous" and
+         DISARMS a live session that hit the scoped wall;
+      5. `cooldown_scope_for` flips (False,'7d') to (True,'5h') — a correct
+         7-day family cooldown becomes a 5-hour account one, and the next
+         launch re-picks the spent family.
+
+    `validate_required_windows` never requires a scoped window, so the row
+    still collects `ok:true` and the status tripwire reports nothing at risk.
+    Silent in every surface.
+
+    The call this makes: absence of EVERY scoped window is normal and stays
+    silent, but a scoped window present under a name nothing maps is the
+    provider telling us about a pool whose identity we lost — MISSING
+    EVIDENCE, the same adjudication this codebase already made for
+    `codex_capacity_unrecognized`."""
+
+    UNMAPPED = "fable weekly cap not recognised in this snapshot — recollect"
+
+    def setUp(self):
+        self.now = time.time()
+        orig = collect.local_binding
+        collect.local_binding = lambda provider, home: ("AAAA", "BBBB")
+        self.addCleanup(setattr, collect, "local_binding", orig)
+
+    def row(self, key=None, used=10.0, **over):
+        row = _claude_row(**over)
+        row["captured_at"] = self.now - 1
+        if key is not None:
+            row["windows"][key] = {
+                "used_percent": used, "resets_at": self.now + 6 * 86400,
+                "window_minutes": 10080}
+        return row
+
+    def reason(self, row, fam="fable"):
+        return route.block_reason(_account(), fam, row, {}, self.now, reserve=0)
+
+    def test_a_renamed_pool_holds_where_it_used_to_route(self):
+        """(a) The whole defect in one assertion: a seat carrying a scoped
+        pool we cannot name used to be indistinguishable from a seat with no
+        scoped pool at all, and routed."""
+        self.assertEqual(self.reason(self.row("scoped:Frontier")),
+                         self.UNMAPPED)
+
+    def test_the_unmapped_reason_is_waited_out_not_disarmed_on(self):
+        """(b) THE load-bearing half. A cap already corroborated once must
+        HOLD on this string, bounded by the cap-hold budget, rather than
+        disarming — otherwise the patch trades a silent fail-open for a
+        louder version of the same permanent disarm."""
+        self.assertTrue(route.reading_unavailable(self.UNMAPPED, "fable"))
+
+    def test_a_seat_with_no_scoped_pool_at_all_is_still_silent(self):
+        """(d) The test that stops this from holding the entire fleet.
+        Absence of every scoped window says NOTHING — plenty of legitimate
+        fleets report none — and must stay a bare None."""
+        self.assertIsNone(self.reason(self.row()))
+        self.assertFalse(route.unmapped_scoped("fable",
+                                               self.row()["windows"]))
+
+    def test_an_ordinary_version_rename_still_maps(self):
+        """(e) The substring recovery is the feature, not the bug: the
+        provider renames this pool every model generation and those renames
+        must keep mapping."""
+        for key in ("scoped:Fable", "scoped:Claude Fable 5",
+                    "scoped:claude-fable-5-20260701"):
+            self.assertIsNone(self.reason(self.row(key)), key)
+            self.assertFalse(route.unmapped_scoped(
+                "fable", self.row(key)["windows"]), key)
+
+    def test_the_collectors_own_fallback_key_is_detected(self):
+        """(f) No rename required. A payload that merely omits
+        `display_name` takes collect's `or "Scoped"` fallback and mints
+        `scoped:Scoped`, which matches no family and never has."""
+        self.assertEqual(self.reason(self.row("scoped:Scoped")), self.UNMAPPED)
+
+    def test_it_only_speaks_for_families_that_HAVE_a_scoped_pool(self):
+        """The narrow risk, fenced: a generic `claude` route must not hold on
+        a pool it never spends, and neither may a family outside
+        SCOPED_FAMILIES."""
+        windows = self.row("scoped:Frontier")["windows"]
+        self.assertFalse(route.unmapped_scoped("claude", windows))
+        self.assertIsNone(route.block_reason(
+            _account(), "claude", self.row("scoped:Frontier"), {}, self.now,
+            reserve=0))
+
+    def test_ANOTHER_familys_pool_is_recognised_not_unmapped(self):
+        """THE case that decides whether this patch is landable at all.
+
+        The provider emits one `weekly_scoped` limit per model that HAS a
+        scoped pool, so `scoped:Fable` alone is the normal, healthy shape of
+        every seat in this fleet — and opus, sonnet and haiku genuinely have
+        no scoped pool on it. The first cut of this predicate asked "does any
+        key map to fam?", which made that ordinary row unmapped for three of
+        the four scoped families: it would have held the entire Claude fleet
+        for every non-Fable launch the moment it landed, not on some future
+        day the provider renames something.
+
+        The signal is a key that maps to NO family at all. A key that names
+        ANOTHER family is recognised — it is simply not ours, and it says
+        nothing about a pool we do not have."""
+        for fam in ("opus", "sonnet", "haiku"):
+            self.assertIsNone(self.reason(self.row("scoped:Fable"), fam=fam),
+                              f"a healthy Fable seat must still route {fam}")
+            self.assertFalse(route.unmapped_scoped(
+                fam, self.row("scoped:Fable")["windows"]), fam)
+        # and the reverse direction, so the rule is not one-sided
+        self.assertIsNone(self.reason(self.row("scoped:Opus")))
+        self.assertIsNone(self.reason(self.row("scoped:Opus"), fam="opus"))
+
+    def test_an_unmappable_key_is_caught_even_beside_a_mappable_one(self):
+        """The narrowing must not become a loophole: one recognisable pool
+        on the row does not vouch for a second one nobody can name."""
+        row = self.row("scoped:Opus")
+        row["windows"]["scoped:Frontier"] = {
+            "used_percent": 10.0, "resets_at": self.now + 6 * 86400,
+            "window_minutes": 10080}
+        self.assertEqual(self.reason(row), self.UNMAPPED)
+
+    def test_VOCABULARY_DUTY_the_new_string_arrives_classified(self):
+        """(h) P1 exists because this vocabulary drifted once — a reason was
+        added on one side and not classified on the other, and a scoped cap
+        in [99,100) disarmed a live session as a result. So a new string
+        arrives with both answers already given: `reading_unavailable` says
+        WAIT, `_capacity_reasons` says this is not a spent seat, and
+        `_source_row_is_bound` really does reach the hold path with it."""
+        for family in route.SCOPED_FAMILIES:
+            reason = (f"{family} weekly cap not recognised in this "
+                      "snapshot — recollect")
+            self.assertTrue(route.reading_unavailable(reason, family), family)
+            self.assertNotIn(reason, supervisor._capacity_reasons(family),
+                             f"{reason!r} is missing evidence, not a spent seat")
+            self.assertTrue(
+                supervisor._source_reading_unavailable(reason, family),
+                f"{reason!r} must be waited out, not disarmed on")
+        snapshot = {"run_started": self.now - 5, "generated": self.now - 1,
+                    "accounts": [self.row("scoped:Frontier")]}
+        bound = supervisor._source_row_is_bound(
+            _account(), "fable", snapshot, self.now - 10)
+        self.assertEqual(bound, self.UNMAPPED)
+        self.assertTrue(supervisor._source_reading_unavailable(bound, "fable"))
+
+
+class TheUnmappedPoolHasAVoice(unittest.TestCase):
+    """(g) A fleet-wide hold with no voice is worse than the fail-open it
+    replaces.
+
+    Converting a silent degradation into a hold means that on the day the
+    provider renames the pool, routing stops. An operator glancing at
+    `headroom status` or running `headroom fable` has to be told WHY in one
+    line, and both must exit non-zero — `headroom fable` especially, because
+    its own calculator scores an unmapped seat as NO READING and would
+    otherwise report a serene, empty fleet."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        env = mock.patch.dict(os.environ, {"HEADROOM_DIR": self.temp.name})
+        env.start()
+        self.addCleanup(env.stop)
+        binding = mock.patch.object(collect, "local_binding",
+                                    return_value=("AAAA", "BBBB"))
+        binding.start()
+        self.addCleanup(binding.stop)
+
+    def snapshot(self, key):
+        # 7d 20% used, Fable 50% used: a seat with nothing stranded, so the
+        # ONLY thing these tests can be reacting to is the unmapped key.
+        row = _claude_row("a", used7d=20.0)
+        row["captured_at"] = time.time() - 1
+        row["windows"][key] = {"used_percent": 50.0,
+                               "resets_at": time.time() + 6 * 86400,
+                               "window_minutes": 10080}
+        return {"generated": time.time(), "accounts": [row]}
+
+    def status(self, key):
+        snapshot = self.snapshot(key)
+        out = io.StringIO()
+        with mock.patch.object(route, "ensure_fresh_snapshot",
+                               return_value=snapshot), \
+                mock.patch.object(route.registry, "ordered_for",
+                                  return_value=[_account("a")]), \
+                mock.patch.object(route.registry, "reserve_percent",
+                                  return_value=0.0), \
+                redirect_stdout(out):
+            code = route.cmd_status("fable")
+        return code, out.getvalue()
+
+    def fable(self, key):
+        snapshot = self.snapshot(key)
+        out = io.StringIO()
+        with mock.patch.object(route, "ensure_fresh_snapshot",
+                               return_value=snapshot), \
+                mock.patch.object(maximize.registry, "ordered_for",
+                                  return_value=[_account("a")]), \
+                mock.patch.object(maximize.registry, "accounts",
+                                  return_value=[_account("a")]), \
+                redirect_stdout(out):
+            code = maximize.cmd_fable([])
+        return code, out.getvalue()
+
+    def test_status_names_the_seat_and_exits_non_zero(self):
+        code, text = self.status("scoped:Frontier")
+        self.assertNotEqual(code, 0)
+        self.assertIn("UNMAPPED", text)
+        self.assertIn("a", text)
+
+    def test_status_is_silent_when_the_pool_maps(self):
+        code, text = self.status("scoped:Fable")
+        self.assertEqual(code, 0)
+        self.assertNotIn("UNMAPPED", text)
+
+    def test_fable_exits_non_zero_instead_of_reporting_a_serene_fleet(self):
+        code, text = self.fable("scoped:Frontier")
+        self.assertNotEqual(code, 0)
+        self.assertIn("UNMAPPED", text)
+
+    def test_fable_is_silent_and_clean_when_the_pool_maps(self):
+        code, text = self.fable("scoped:Fable")
+        self.assertEqual(code, 0)
+        self.assertNotIn("UNMAPPED", text)
 
 
 class ReservePercent(unittest.TestCase):

@@ -306,6 +306,11 @@ def cmd_fable(args):
     calibrations = {name: calibrated_ratio(points) for name, points
                     in calibration_points(series).items()}
     report, totals = fleet_report(snapshot, ratio, calibrations)
+    # A seat whose scoped pool is present but UNMAPPED scores as NO READING
+    # here — so this calculator, the one surface built to notice wasted Fable,
+    # would report a serene and entirely empty fleet on the exact day the
+    # guard went blind. Name the seats and exit non-zero.
+    unmapped = route.unmapped_scoped_seats(snapshot, RANKED_FAMILY)
 
     if as_json:
         print(json.dumps({
@@ -315,8 +320,9 @@ def cmd_fable(args):
                        **(metrics or {"verdict": "NO READING"})}
                       for name, metrics, calibration in report],
             "totals": totals,
+            "unmapped_scoped": unmapped,
         }, sort_keys=True))
-        return 1 if totals["at_risk"] > TOLERANCE else 0
+        return 1 if unmapped or totals["at_risk"] > TOLERANCE else 0
 
     print(f"fable calculator — pool ratio {ratio:g} "
           f"(config routing.fable_pool_ratio; batteries: % LEFT)")
@@ -360,4 +366,9 @@ def cmd_fable(args):
         print("  never non-Fable on → " + ", ".join(
             f"{name} (would strand {metrics['at_risk']:.0f}%)"
             for name, metrics in unsafe) + "   [fable guard enforces this]")
-    return 1 if totals["at_risk"] > TOLERANCE else 0
+    if unmapped:
+        print("!! scoped pool present but UNMAPPED on " + ", ".join(unmapped)
+              + " — the provider renamed it; this calculator, the fable "
+                "guard and every scoped cap are blind on those seats until "
+                "the key maps again (see collect display_name)")
+    return 1 if unmapped or totals["at_risk"] > TOLERANCE else 0

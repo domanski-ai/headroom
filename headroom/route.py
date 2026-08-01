@@ -498,6 +498,60 @@ def scoped_window_for(fam, windows):
     return None
 
 
+def unmapped_scoped(fam, windows):
+    """A scoped cap EXISTS in this row but under a name we cannot map.
+
+    `collect` keys these `scoped:<display_name>` and every consumer above
+    recovers them by substring. Absence of ALL scoped windows is normal and
+    says nothing — plenty of legitimate fleets report none. A scoped window
+    PRESENT under an unrecognised name is the provider telling us about a
+    pool whose identity we lost, and reading that as "no scoped cap here"
+    switches off the eligibility gate, the ranking, the Fable-waste guard,
+    the supervisor's cap scope and the cooldown's scope, all at once and all
+    in silence. It takes no provider rename at all: a payload that merely
+    omits `display_name` takes collect's `or "Scoped"` fallback and mints
+    `scoped:Scoped`, which matches no family.
+
+    So classify it as MISSING EVIDENCE — the same call already adjudicated
+    for `codex_capacity_unrecognized`.
+
+    UNRECOGNISABLE, not merely "not mine". The provider emits one
+    `weekly_scoped` limit per model that HAS a scoped pool, so a row
+    carrying `scoped:Fable` and nothing else is the normal, healthy shape of
+    every Claude seat in a Fable fleet — and opus, sonnet and haiku
+    genuinely have no scoped pool on it. Treating "no key maps to fam" as
+    the signal would hold three of the four scoped families on every seat,
+    permanently, starting the moment this lands. The signal is a key that
+    maps to NO family at all: `scoped:Scoped`, `scoped:Frontier`, a rename
+    that dropped the token. A key naming another family is recognised — it
+    is simply somebody else's pool, and says nothing about ours."""
+    if fam not in SCOPED_FAMILIES:
+        return False
+    windows = windows if isinstance(windows, dict) else {}
+    if scoped_window_for(fam, windows) is not None:
+        return False
+    return any(str(key).startswith("scoped:")
+               and not any(other in str(key).lower()
+                           for other in SCOPED_FAMILIES)
+               for key in windows)
+
+
+def unmapped_scoped_seats(snapshot, fam):
+    """The Claude seats in `snapshot` whose scoped pool does not map to
+    `fam` — the VOICE for :func:`unmapped_scoped`.
+
+    That predicate converts a silent fail-open into a fleet-wide hold, and a
+    hold nobody can explain is worse than the fail-open it replaces. Every
+    surface an operator glances at has to be able to name the seats."""
+    names = []
+    for row in (snapshot or {}).get("accounts") or []:
+        if not isinstance(row, dict) or row.get("provider") != "claude":
+            continue
+        if unmapped_scoped(fam, row.get("windows")):
+            names.append(str(row.get("name") or "?"))
+    return names
+
+
 def _fable_room(row):
     """Remaining Fable weekly headroom (0-100, higher = more capacity), or None
     when there is no readable Fable reading.
@@ -637,6 +691,11 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     # an Opus cap would wrongly hold Sonnet/Haiku work.
     scoped = scoped_window_for(fam, windows) \
         if fam in SCOPED_FAMILIES else None
+    if scoped is None and unmapped_scoped(fam, windows):
+        # a pool we cannot NAME is not a pool we have read; hold like every
+        # other unreadable scoped window rather than routing an exhausted
+        # family because its key changed shape
+        return f"{fam} weekly cap not recognised in this snapshot — recollect"
     if scoped is not None:
         # fail CLOSED like 5h/7d: a scoped cap that is unreadable or expired
         # must hold, not silently route an exhausted model family
@@ -768,7 +827,9 @@ def reading_unavailable(reason, fam):
                       f"{key} reading expired — no current capacity proof"):
             return True
     return reason in (f"{fam} weekly cap reading invalid",
-                      f"{fam} weekly cap reading expired — no current proof")
+                      f"{fam} weekly cap reading expired — no current proof",
+                      f"{fam} weekly cap not recognised in this snapshot "
+                      f"— recollect")
 
 
 def _at_wall(window):
@@ -1230,7 +1291,22 @@ def cmd_status(fam):
         if reason is None and chosen is None:
             chosen = account["name"]
     print(f"-> chosen: {chosen or 'NONE — no account has proven headroom'}")
+    unmapped = []
     if registry.family_provider(fam) == "claude":
+        # one-line UNMAPPED-POOL tripwire. `unmapped_scoped` turns a silent
+        # degradation into a hold, so on the day the provider renames the
+        # pool an operator must be told why on the same glance — and the
+        # RANKED family is checked too, because a generic `claude` status
+        # gates on nothing scoped yet still loses its Fable-waste guard.
+        unmapped = sorted(set(unmapped_scoped_seats(snapshot, fam))
+                          | set(unmapped_scoped_seats(
+                              snapshot, maximize.RANKED_FAMILY)))
+        if unmapped:
+            print("!! scoped pool present but UNMAPPED on "
+                  + ", ".join(unmapped)
+                  + " — the provider renamed it; scoped caps, the fable "
+                    "guard and cap-scoped handoff are all blind until the "
+                    "key maps again (see collect display_name)")
         # one-line Fable-waste tripwire: stranded Fable is capacity paid for
         # and lost silently, so every status glance must surface it
         _, totals = maximize.fleet_report(snapshot, maximize.pool_ratio())
@@ -1238,7 +1314,7 @@ def cmd_status(fam):
             print(f"!! fable: {totals['at_risk']:.0f} Fable-% stranded/at-risk"
                   f" ({totals['stranded_now']:.0f} already at a 7d wall) — "
                   f"run `headroom fable`")
-    return 0 if chosen else 2
+    return 0 if chosen and not unmapped else 2
 
 
 def cmd_run(fam, command):

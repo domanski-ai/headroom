@@ -4049,6 +4049,37 @@ class CapWaitsForCapacity(TempDirCase):
         self.assertEqual(str(caught.exception),
                          "slot identity changed since snapshot — recollect")
 
+    def test_a_pool_renamed_mid_hold_holds_instead_of_disarming(self):
+        """P4 case (c) — the disarm that patch closes, at this end.
+
+        A held cap whose scoped pool comes back under a name nothing maps
+        used to reach `route.cap_scope() is None` and, before that, a
+        block_reason of None that let the row look perfectly healthy. Now the
+        row itself says "not recognised", which is missing evidence, so the
+        proof holds and the child keeps its automation."""
+        runner, child = self.runner([(10.0, 100.0, 10.0, 100.0, 100.0)]), \
+            self.child()
+        base = runner.collect_fn
+
+        def renamed(quiet=True):
+            snapshot = base(quiet=quiet)
+            for row in snapshot["accounts"]:
+                windows = row["windows"]
+                if "scoped:Fable" in windows:
+                    windows["scoped:Frontier"] = windows.pop("scoped:Fable")
+            return snapshot
+
+        proof = self.proof(self.CREDITS)
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(supervisor.CapacityHold):
+                runner._preflight(child, proof)
+            self.assertEqual(child.cap_scope_window, "scoped:fable")
+            runner.collect_fn = renamed
+            with self.assertRaises(supervisor.CapacityHold) as caught:
+                runner._preflight(child, proof, held=child.cap_scope_window)
+        self.assertIn("not recognised", str(caught.exception))
+        self.assertTrue(child.automation)
+
     def test_the_hold_announcement_fires_once_per_distinct_reason(self):
         """(e) A hold that now fires on the FIRST look must not turn into a
         per-poll siren: one voice per distinct reason, and a new reason is a
