@@ -73,8 +73,14 @@ class ProviderThrottleError(RuntimeError):
 def iso_ep(value):
     if value is None:
         return None
-    if isinstance(value, (int, float)):
-        return int(value)
+    # Same unit ambiguity as the oauth expiresAt below, and the same
+    # threshold, so the two live as ONE decision rather than two coincidences:
+    # 1e11 seconds is the year 5138 and 1e11 milliseconds is 1973, so no real
+    # epoch-seconds value can exceed it for ~3000 years and no real
+    # epoch-milliseconds value since 1973 can fall below it. `bool` is an int
+    # subclass — a flag must not mint a valid-looking 1970 timestamp.
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value / 1000.0) if value > 1e11 else int(value)
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if parsed.tzinfo is None:

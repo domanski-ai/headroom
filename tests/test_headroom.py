@@ -1304,6 +1304,82 @@ class ClaudeLimits(unittest.TestCase):
                 collect.claude_limits("/h", None, opener=opener)
 
 
+class ResetTimestampUnits(unittest.TestCase):
+    """`iso_ep` is the one door every provider timestamp enters through, and
+    it used to return `int(value)` for any number at all.
+
+    The SAME provider already ships `expiresAt` in milliseconds — collect.py
+    special-cases it 690 lines below with a comment saying so. A
+    millisecond-valued `resets_at` was accepted verbatim and became a seconds
+    epoch ~56,000 years out, which then flows into `route.window_reset`,
+    `route.cap_scope`'s `max(resets)` and `route.mark` — where it is stored as
+    a cooldown no human would think to look for. One unit ambiguity, one
+    threshold, one decision."""
+
+    def test_a_millisecond_value_is_normalised_to_seconds(self):
+        self.assertEqual(collect.iso_ep(1785830400000), 1785830400)
+
+    def test_a_plain_seconds_value_is_untouched(self):
+        """The case that proves the threshold does not move real values."""
+        self.assertEqual(collect.iso_ep(1785830400), 1785830400)
+        self.assertEqual(collect.iso_ep(1785830400.7), 1785830400)
+
+    def test_the_threshold_itself(self):
+        """1e11 seconds is the year 5138; 1e11 milliseconds is 1973. No real
+        epoch-seconds value can exceed it for ~3000 years and no real
+        epoch-milliseconds value since 1973 can fall below it."""
+        self.assertEqual(collect.iso_ep(int(1e11) - 1), int(1e11) - 1)
+        self.assertEqual(collect.iso_ep(int(1e11) + 1000),
+                         int((1e11 + 1000) / 1000.0))
+
+    def test_iso_strings_and_none_are_unchanged(self):
+        self.assertEqual(collect.iso_ep("2026-08-01T12:00:00Z"), 1785585600)
+        self.assertEqual(collect.iso_ep("2026-08-01T12:00:00+00:00"),
+                         1785585600)
+        self.assertEqual(collect.iso_ep("2026-08-01T12:00:00"), 1785585600)
+        self.assertIsNone(collect.iso_ep(None))
+        self.assertIsNone(collect.iso_ep("not a time"))
+
+    def test_a_boolean_never_mints_a_1970_timestamp(self):
+        """`bool` is an `int` subclass, so a flag used to become a valid-
+        looking epoch of 1 or 0 rather than "no reading"."""
+        self.assertIsNone(collect.iso_ep(True))
+        self.assertIsNone(collect.iso_ep(False))
+
+    def test_end_to_end_a_millisecond_scoped_reset_reaches_routing_in_seconds(self):
+        """The shape that actually reaches `route`: a weekly_scoped limit
+        whose `resets_at` the provider ships in milliseconds."""
+        reset_ms = 1785830400000
+        payload = {"limits": [
+            {"kind": "session", "percent": 10.0, "resets_at": reset_ms},
+            {"kind": "weekly_all", "percent": 20.0, "resets_at": reset_ms},
+            {"kind": "weekly_scoped", "percent": 30.0, "resets_at": reset_ms,
+             "scope": {"model": {"display_name": "Fable"}}},
+        ]}
+
+        class _Response:
+            headers = {"anthropic-organization-id": "org-1"}
+            def __enter__(self):
+                return self
+            def __exit__(self, *_exc):
+                return False
+            def read(self, *args):
+                return json.dumps(payload).encode()
+
+        with mock.patch.object(collect, "claude_oauth",
+                               return_value={"accessToken": "tok"}):
+            reading = collect.claude_limits(
+                "/h", None, opener=lambda *a, **k: _Response())
+        for key in ("5h", "7d", "scoped:Fable"):
+            self.assertEqual(reading["windows"][key]["resets_at"],
+                             reset_ms // 1000,
+                             f"{key} reset is not in seconds")
+        # what `route.cap_scope`'s max(resets) and `route.mark` would see
+        self.assertLess(reading["windows"]["scoped:Fable"]["resets_at"],
+                        time.time() + 400 * 86400,
+                        "a reset a geological age out reached routing")
+
+
 class ThrottleCarryover(unittest.TestCase):
     """A rate-limited USAGE CHECK is not evidence of missing capacity: the
     last verified reading is carried forward (age-bounded) instead of holding
