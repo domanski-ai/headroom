@@ -79,11 +79,36 @@ class HandoffPlan:
     # plan carries no cooldown_scope, so it cools nothing, and it is planned
     # with allow_dangling off — a mid-tool-call session is never moved early.
     preemptive: bool = False
+    # The family the SUCCESSOR launches on when it differs from `family`.
+    # `family` stays the family this handoff is ABOUT — the pool that capped —
+    # because it is what `commit_handoff` cools and what the ledger records;
+    # cooling opus because a spent Fable week forced an opus successor would
+    # leave the exhausted pool routable. Empty means "same as family", which
+    # is every handoff that did not have to change model tier.
+    resume_family: str = ""
+    # The exact model the successor is launched with, stamped just before
+    # commit (see Supervisor._post_stop_plan). `resume_family` alone is not
+    # enough for the ledger's last-resort command: an over-limit transcript
+    # needs `opus[1m]`, and `--model opus` cannot load it. Empty means the
+    # successor takes the child's default, which is the pre-existing case.
+    resume_model: str = ""
     # provider adapter fields: "claude" plans behave exactly as before; a
     # "codex" plan publishes to relative_destination (a validated
     # slash-separated path under the target home) instead of projects/<slug>.
     provider: str = "claude"
     relative_destination: str = ""
+
+    @property
+    def target_family(self):
+        """The family the TARGET is gated on and the successor launches with.
+
+        Identical to `family` for every handoff that kept its model tier.
+        When a cap forced a downgrade they differ, and the distinction is
+        load-bearing in both directions: `family` names the pool being moved
+        AWAY from, so gating the destination on it would refuse the very seat
+        the downgrade exists to reach, while gating the SOURCE cooldown on
+        this one would cool a pool that never capped."""
+        return self.resume_family or self.family
 
 
 @dataclass(frozen=True)
@@ -180,9 +205,17 @@ def _contained_transcript(path, session_id, account):
             f"session {session_id} transcript basename does not match its id")
     try:
         metadata = os.lstat(absolute)
-    except OSError as error:
+    except FileNotFoundError as error:
+        # ONLY a genuinely absent file says "no longer exists": the supervisor
+        # treats that one phrase as "may still be being written" and waits a
+        # bounded moment for it. A permission or ENOTDIR failure is a real,
+        # unfixable identity failure and must keep saying so.
         raise HandoffError(
             f"session {session_id} transcript no longer exists") from error
+    except OSError as error:
+        raise HandoffError(
+            f"session {session_id} transcript cannot be read "
+            f"({error.strerror or error})") from error
     if stat.S_ISLNK(metadata.st_mode):
         raise HandoffError("source transcript is a symlink — refusing to copy")
     canonical = os.path.realpath(absolute)
@@ -610,11 +643,14 @@ def _target_home_stat(target):
 
 
 def plan_handoff(source, family, target, snapshot, cap_proof, cwd, *,
-                 cooldown_scope=None,
+                 cooldown_scope=None, resume_family=None,
                  automatic=False, child_generation=0, force=False,
                  require_executable=True, preemptive=False):
     """Build a complete, non-mutating handoff plan."""
     family = resolve_model_family(source, family)
+    if resume_family:
+        resume_family = resolve_model_family(source, resume_family)
+    resume_family = "" if resume_family in (None, family) else resume_family
     if target.get("provider") != "claude":
         raise HandoffError("handoff target must be a Claude account")
     source = _source(source.transcript_path, source.session_id, [source.account],
@@ -641,7 +677,7 @@ def plan_handoff(source, family, target, snapshot, cap_proof, cwd, *,
         target_identity=_target_snapshot_identity(snapshot, target),
         target_home_stat=_target_home_stat(target), automatic=bool(automatic),
         child_generation=int(child_generation or 0), force=bool(force),
-        preemptive=bool(preemptive))
+        preemptive=bool(preemptive), resume_family=resume_family)
 
 
 @contextlib.contextmanager
@@ -1113,7 +1149,7 @@ def _verify_target_unlocked(plan, now=None):
     verify_target_binding(plan)
     cool = route.preflight_cooldowns()
     row = _snapshot_rows(plan.snapshot).get(plan.target["name"])
-    reason = route.block_reason(plan.target, plan.family, row, cool,
+    reason = route.block_reason(plan.target, plan.target_family, row, cool,
                                 time.time() if now is None else now)
     if reason is not None:
         raise HandoffError(
@@ -1231,9 +1267,19 @@ def _snapshot_rows(snapshot):
             if isinstance(row, dict) and row.get("name")}
 
 
-def resume_command(target_home, session_id):
+def resume_command(target_home, session_id, model=""):
+    """The command that gets this conversation back BY HAND.
+
+    `model` matters for exactly the cases the automatic argv already handles:
+    a resume names no model, so a session that had to change tier (or that
+    outgrew the standard window) would come back on the child's default —
+    which is the model or the window it just proved it cannot use. The
+    operator reading this line after a failed spawn has no other source of
+    that fact, and the ledger row is the only record left if the process is
+    gone, so both carry it."""
+    model_flag = f" --model {shlex.quote(model)}" if model else ""
     return (f"CLAUDE_CONFIG_DIR={shlex.quote(target_home)} claude --resume "
-            f"{shlex.quote(session_id)} --fork-session")
+            f"{shlex.quote(session_id)} --fork-session{model_flag}")
 
 
 def resume_argv(result):
@@ -1307,7 +1353,8 @@ def commit_handoff(plan):
                         plan.target["home"], plan.source.session_id)
             else:
                 record["resume_command"] = resume_command(
-                    plan.target["home"], plan.source.session_id)
+                    plan.target["home"], plan.source.session_id,
+                    plan.resume_model or plan.resume_family)
             try:
                 _append_ledger_unlocked(record)
             except Exception:

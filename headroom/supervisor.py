@@ -127,6 +127,15 @@ CAP_MODEL_RETRIES = max(0, paths.env_int("HEADROOM_CAP_MODEL_RETRIES", 2))
 # HEADROOM_CAP_TARGET_WEEKLY=100 restores the routing gate's own bar.
 CAP_TARGET_WEEKLY_PERCENT = min(100.0, max(0.0, float(
     paths.env_int("HEADROOM_CAP_TARGET_WEEKLY", 99))))
+# THE TRAIN KEEPS MOVING (Paul's rule, 2026-07-31). When every seat is walled
+# for the family a session was running, holding the conversation until the
+# window resets is the wrong answer: a WEAKER family on a healthy seat keeps
+# the work alive, and the operator can move back up later. Strongest first;
+# the walk starts one past the capped family, so a cap can only ever move a
+# session DOWN the ladder, never promote it onto capacity it just exhausted.
+# Set HEADROOM_FAMILY_FALLBACK=0 to restore hold-instead-of-downgrade.
+FAMILY_LADDER = ("fable", "opus", "sonnet", "haiku")
+FAMILY_FALLBACK_ENABLED = os.environ.get("HEADROOM_FAMILY_FALLBACK", "1") != "0"
 # how much of a transcript's END the poll parses (see _transcript_records)
 TRANSCRIPT_TAIL_BYTES = max(64 * 1024, paths.env_int(
     "HEADROOM_TRANSCRIPT_TAIL_BYTES", 256 * 1024))
@@ -1162,6 +1171,54 @@ def _record_matches(record, child, binding=None):
     return True
 
 
+# A brand-new session fires SessionStart BEFORE its transcript file exists on
+# disk. The identity check below reads that file, so a hook that wins the race
+# used to look exactly like a forged event: "transcript no longer exists" ->
+# PermanentSupervisorError -> supervision disarmed for the whole run. Every
+# lane on this estate booted disarmed because of it, which is why a cap could
+# not rotate anything (2026-07-31). The file appears in milliseconds; waiting
+# a bounded moment for it is the difference between a supervised lane and an
+# unprotected one. A transcript still missing at the deadline is a real
+# failure and still fails closed.
+def _grace_seconds(raw, default=3.0, ceiling=30.0):
+    """A tolerant, FINITE grace window (the project's numeric-env convention).
+
+    A malformed value must not crash import, and `inf` must not turn the
+    bounded wait into a permanent one — this poll also drives cap detection
+    and exit handling, so its upper bound is a real budget."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value):
+        return default
+    return min(ceiling, max(0.0, value))
+
+
+TRANSCRIPT_GRACE_SECONDS = _grace_seconds(
+    os.environ.get("HEADROOM_TRANSCRIPT_GRACE"))
+TRANSCRIPT_GRACE_STEP = 0.1
+
+
+def _source_once_written(transcript, session_id, child, config_dir,
+                         sleep=time.sleep, now=time.time):
+    """`handoff._source`, tolerant of a transcript that is still being born.
+
+    Retries ONLY the not-yet-written case — every other HandoffError (wrong
+    basename, symlink, foreign home) is a genuine identity failure and is
+    raised on the first look, unchanged."""
+    deadline = now() + max(0.0, TRANSCRIPT_GRACE_SECONDS)
+    while True:
+        try:
+            return handoff._source(transcript, session_id, [child.account],
+                                   config_dir=config_dir)
+        except handoff.HandoffError as error:
+            if "transcript no longer exists" not in str(error) \
+                    or now() >= deadline:
+                raise
+            sleep(TRANSCRIPT_GRACE_STEP)
+
+
 def _validated_event(record, child, binding=None):
     if not _namespace_matches(record, child):
         raise SupervisorError("hook event does not match this child")
@@ -1189,8 +1246,7 @@ def _validated_event(record, child, binding=None):
             or os.path.abspath(os.path.expanduser(transcript)) != transcript:
         raise PermanentSupervisorError("hook event transcript path is not canonical")
     try:
-        source = handoff._source(transcript, session_id, [child.account],
-                                 config_dir=config_dir)
+        source = _source_once_written(transcript, session_id, child, config_dir)
     except handoff.HandoffError as error:
         raise PermanentSupervisorError(str(error)) from error
     if source.transcript_path != transcript:
@@ -1552,7 +1608,52 @@ def _with_model(args, model):
     return cleaned + ["--model", model] + tail
 
 
-def _window_fit_argv(args, transcript_path, used=None, model=""):
+def _family_or_blank(model):
+    """`registry.family`, but an unrecognised model is simply unknown here.
+
+    Model naming is the registry's problem; a fit decision must never raise
+    over one, and "" compares unequal to every real family, which is the
+    conservative answer at both call sites."""
+    try:
+        return registry.family(model)
+    except registry.RegistryError:
+        return ""
+
+
+def _plan_family(plan, attribute):
+    """A plan's family field as a STRING, "" when absent or not one.
+
+    Plans reach here from several vintages (a ledger recovery predating
+    `resume_family`, a test double), and only a family name means anything to
+    the argv builder — anything else must read as "unset", never as truthy."""
+    value = getattr(plan, attribute, "")
+    return value if isinstance(value, str) else ""
+
+
+def _resume_argv_for(plan, model=""):
+    """``(argv, forced)`` — how a successor of `plan` resumes on the TARGET.
+
+    One definition for both the automatic relaunch and the manual command
+    printed when that relaunch cannot start; they were allowed to drift once
+    and the operator got the wrong model out of it. `model` is what the
+    stopped child was RUNNING, and `forced` is the window-fit model when the
+    transcript demanded one (a tier downgrade alone does not set it — that is
+    a routing fact, and it has its own announcement)."""
+    resume_family = _plan_family(plan, "resume_family")
+    # The window fit is bounded by the family the SEAT was gated on, which is
+    # target_family whether or not a downgrade happened. `resume_family` alone
+    # was not enough: a child spawned `--model sonnet[1m]` whose session had
+    # since moved to Opus would have carried sonnet[1m] onto an Opus-gated
+    # seat — checked one pool, spent another, with no downgrade in sight.
+    gate = _plan_family(plan, "target_family") or resume_family
+    argv = ["--resume", plan.source.session_id, "--fork-session"]
+    if resume_family:
+        argv = _with_model(argv, resume_family)
+    return _window_fit_argv(argv, plan.source.transcript_path,
+                            model=model, family=gate)
+
+
+def _window_fit_argv(args, transcript_path, used=None, model="", family=""):
     """``(argv, forced model)`` — make a resume argv FIT the transcript it
     resumes.
 
@@ -1570,6 +1671,12 @@ def _window_fit_argv(args, transcript_path, used=None, model=""):
     (CONTEXT_KEEP_LARGE_PERCENT), so a small session on a big model still
     follows normal family routing.
 
+    `family` is the family the successor has been ROUTED to, set only when a
+    cap forced it down a tier. It bounds this function the way it bounds the
+    ladder: the child's own 1M model is only worth keeping when it belongs to
+    that family, because carrying a `fable[1m]` model onto a seat chosen for
+    Opus would re-cap the conversation on the very pool that just walled it.
+
     Unknown usage changes nothing: an unmeasurable transcript resumes exactly
     as it would have before."""
     args = list(args)
@@ -1578,6 +1685,8 @@ def _window_fit_argv(args, transcript_path, used=None, model=""):
     if used is None:
         return args, ""
     large = "[1m]" in str(model or "").lower()
+    if large and family and _family_or_blank(model) != family:
+        large = False
     needed = used > CONTEXT_WINDOW_FIT_LIMIT
     if not needed and large:
         standard = _context_remaining(used, CONTEXT_WINDOW_STANDARD)
@@ -2534,7 +2643,8 @@ class Supervisor:
                         "fresh cap reset is missing or ambiguous — holding "
                         "the proof rather than disarming on it")
                 raise SupervisorError("fresh cap reset is missing or ambiguous")
-            target = self._cap_target(child, proof.family, snapshot)
+            target, target_family = self._cap_target(
+                child, proof.family, snapshot, proof.transcript_path)
             binding = child.binding
             source = handoff.SourceSession(
                 proof.session_id, proof.transcript_path, child.account,
@@ -2544,14 +2654,21 @@ class Supervisor:
                 "event_received_at": proof.event["received_at"],
                 "session_id": proof.session_id, "epoch": proof.epoch,
             }
+            # The plan's family is the family that CAPPED: `commit_handoff`
+            # cools that pool and the ledger records it, so naming the
+            # downgraded family here would cool Opus over a spent Fable week
+            # and leave the exhausted pool routable. `resume_family` carries
+            # the tier the successor actually launches on — the seat below is
+            # gated on THAT, not on the pool we are moving away from.
             plan = handoff.plan_handoff(
                 source, proof.family, target, snapshot, cap_proof,
                 binding.cwd, cooldown_scope=scope, automatic=True,
+                resume_family=target_family,
                 child_generation=child.generation)
             route.preflight_cooldowns()
             try:
                 handoff.select_target(
-                    child.account["name"], snapshot, proof.family,
+                    child.account["name"], snapshot, target_family,
                     requested=target["name"])
             except handoff.NoHeadroomError as error:
                 raise CapacityHold(str(error)) from error
@@ -2609,8 +2726,118 @@ class Supervisor:
                 return f"{key} at {used:g}%"
         return ""
 
-    def _cap_target(self, child, family, snapshot):
-        """The best routable seat that is not itself at a wall.
+    def _cap_target(self, child, family, snapshot, transcript_path=""):
+        """``(target, family)`` — where this capped conversation goes next.
+
+        Tries the family the session was running first. If every seat is
+        walled for it, walks DOWN the ladder (fable -> opus -> sonnet ->
+        haiku) and takes the first family some healthy seat can serve, so a
+        spent weekly pool costs the session its model tier rather than its
+        life. Only a fleet with no room for ANY family still raises
+        CapacityHold, and the hold reports the family that got closest.
+
+        A transcript that needs the 1M window REPLACES the walk rather than
+        trimming it: such a session is re-modelled by _window_fit_argv
+        whatever this decides, so the only honest destinations are the
+        families that model belongs to (see _fit_bounded). That constraint is
+        not a tier preference and is not subject to FAMILY_FALLBACK_ENABLED —
+        it is the difference between checking the pool a successor will spend
+        and checking a different one."""
+        attempts = [family]
+        if FAMILY_FALLBACK_ENABLED and family in FAMILY_LADDER:
+            attempts += list(FAMILY_LADDER[FAMILY_LADDER.index(family) + 1:])
+        attempts = self._fit_bounded(attempts, child, transcript_path)
+        # The move is window-fit-driven only when the bound REMOVED the capped
+        # family. If that family survived and simply had no seat, the cause is
+        # exhausted capacity and saying otherwise would blame the transcript
+        # for a full pool.
+        fitted = family not in attempts
+        first_hold = None
+        for attempt in attempts:
+            try:
+                target = self._cap_target_in_family(child, attempt, snapshot)
+            except CapacityHold as hold:
+                first_hold = first_hold or hold
+                continue
+            if attempt != family:
+                why = (f"this transcript only fits the 1M window, which {family} "
+                       f"cannot serve" if fitted
+                       else f"no seat can serve {family}")
+                print(f"[headroom] {why}; moving this session to {attempt} on "
+                      f"{target['name']} rather than stopping it",
+                      file=sys.stderr)
+                notify.emit({"event": "family_downgrade",
+                             "account": target["name"],
+                             "from": family, "to": attempt,
+                             "reason": "window_fit" if fitted else "capacity"})
+            return target, attempt
+        raise first_hold if first_hold is not None else CapacityHold(
+            f"no seat has headroom worth moving to for the {family} family")
+
+    @staticmethod
+    def _fit_bounded(attempts, child, transcript_path):
+        """The families an OVER-LIMIT transcript can actually live in.
+
+        A transcript past the fit limit WILL be re-modelled onto a 1M model by
+        _window_fit_argv: the successor cannot load otherwise. So the seat has
+        to be gated on THAT model's family, or the gate and the launch name
+        two different things — checked for Fable, started on Opus — and the
+        rotation spends a pool nobody looked at. Its homes are the child's own
+        1M model (which _window_fit_argv keeps when the routed family matches)
+        and the configured fit model, in that order.
+
+        This deliberately REPLACES the walk instead of trimming it, and it
+        never falls back to the capped family:
+
+        - a home ABOVE the capped family is still a home. That is not the
+          ladder promoting — a cap may not do that — it is the gate finally
+          naming the model the window fit already forced. Checking the pool
+          the successor will spend beats checking one it will not.
+        - when NO home is a family this ladder knows (an operator override of
+          HEADROOM_CONTEXT_FIT_MODEL to something generic or unrecognised)
+          there is nothing safe to gate on, so the cap holds and says why.
+          Routing blind is how a "successful" rotation re-caps on its first
+          prompt.
+
+        A transcript that FITS is unbounded: no re-modelling will happen, so
+        routing is free."""
+        if not transcript_path:
+            return attempts
+        used = _context_used(transcript_path)
+        if used is None or used <= CONTEXT_WINDOW_FIT_LIMIT:
+            return attempts
+        # A home must be BOTH a 1M model (or it cannot hold the transcript at
+        # all) and a family this ladder can gate a seat on. A recognised but
+        # standard-window override — HEADROOM_CONTEXT_FIT_MODEL=sonnet — is
+        # neither one thing nor the other: it names a routable pool and then
+        # resumes into a 200k window, so it is not a home.
+        candidates = [_model_flag(child.spawn_args), CONTEXT_FIT_MODEL]
+        homes = [fam for fam in dict.fromkeys(
+            _family_or_blank(name) for name in candidates
+            if "[1m]" in str(name or "").lower()) if fam in FAMILY_LADDER]
+        if not homes:
+            raise CapacityHold(
+                f"this transcript needs the 1M window and the fit model "
+                f"({CONTEXT_FIT_MODEL}) is not a 1M model on a routable "
+                f"family — no seat can be gated on what this session would "
+                f"run (set HEADROOM_CONTEXT_FIT_MODEL to something like "
+                f"opus[1m])")
+        ordered = [fam for fam in attempts if fam in homes]
+        if not ordered:
+            # NOTHING the walk offered can hold this conversation. Reaching
+            # past the walk here is the physical constraint speaking, not a
+            # tier preference, so HEADROOM_FAMILY_FALLBACK does not gate it:
+            # the alternative is gating a pool the successor will not spend.
+            return list(homes)
+        if FAMILY_FALLBACK_ENABLED:
+            # extra homes beyond the first are ordinary alternatives, and
+            # taking one IS a voluntary tier change — so the switch governs it
+            ordered += [fam for fam in homes if fam not in ordered]
+        return ordered
+
+    def _cap_target_in_family(self, child, family, snapshot):
+        """The best routable seat, within ONE family, that is not itself at a
+        wall.
 
         `select_target` alone is not enough here: its gate is the ROUTING
         gate, which is about whether a seat may be used at all, not about
@@ -3466,7 +3693,7 @@ class Supervisor:
             child.session_ended = True
             child.session_end_received_at = record["received_at"]
 
-    def _post_stop_plan(self, plan):
+    def _post_stop_plan(self, plan, model=""):
         deadline = self.now() + QUIET_SECONDS + 1.0
         while True:
             signature = handoff._transcript_stat(plan.source.transcript_path)
@@ -3487,7 +3714,14 @@ class Supervisor:
         final_stat = handoff._transcript_stat(plan.source.transcript_path)
         if final_stat[:2] != plan.source_stat[:2] or final_stat != signature:
             raise SupervisorError("final transcript identity or stat changed")
-        return replace(plan, inspected=inspected, source_stat=final_stat)
+        plan = replace(plan, inspected=inspected, source_stat=final_stat)
+        # Stamp the EXACT model the successor launches with, measured on the
+        # FINAL transcript, so the ledger's last-resort command is the command
+        # that actually works. The family alone is not enough: `--model opus`
+        # cannot load a conversation that needs `opus[1m]`, and after a crash
+        # here that ledger row is all the operator has left.
+        argv, _forced = _resume_argv_for(plan, model)
+        return replace(plan, resume_model=_model_flag(argv))
 
     def _failure(self, plan, reason, **fields):
         try:
@@ -3508,7 +3742,7 @@ class Supervisor:
         with the source still running AND still leased. No-op unless
         HEADROOM_SLOT_LEASE=1. (P0-2)"""
         try:
-            if not route.acquire_slot_lease(plan.target, plan.family):
+            if not route.acquire_slot_lease(plan.target, plan.target_family):
                 raise SupervisorError(
                     "target slot is leased by another live launch")
         except route.LeaseError as error:
@@ -3539,15 +3773,23 @@ class Supervisor:
         return Relaunch(plan.source.account, argv, plan.cwd, False)
 
     @staticmethod
-    def _print_manual_recovery(plan):
+    def _print_manual_recovery(plan, model=""):
+        # These two lines are the LAST thing between the user and a lost
+        # conversation, so they have to be the commands headroom itself would
+        # have run — same model, same window fit. A bare `--resume` here would
+        # send the operator back to the child's default model, which after a
+        # downgrade is the tier that just capped and after a context rotation
+        # is a window the transcript no longer fits.
         print("headroom: automatic recovery could not start Claude; run one of:",
               file=sys.stderr)
-        print(handoff.resume_command(
-            plan.target["home"], plan.source.session_id), file=sys.stderr)
-        source_argv = shlex.join(
-            ["claude", "--resume", plan.source.session_id])
+        target_argv, _forced = _resume_argv_for(plan, model)
+        print(f"CLAUDE_CONFIG_DIR={shlex.quote(plan.target['home'])} "
+              f"{shlex.join(['claude'] + target_argv)}", file=sys.stderr)
+        source_argv, _forced = _window_fit_argv(
+            ["--resume", plan.source.session_id],
+            plan.source.transcript_path, model=model)
         print(f"CLAUDE_CONFIG_DIR={shlex.quote(plan.source.account['home'])} "
-              f"{source_argv}", file=sys.stderr)
+              f"{shlex.join(['claude'] + source_argv)}", file=sys.stderr)
 
     def _idle_stop_edge(self, child, proof, expected_stat, label="preemptive"):
         """Last-instant idleness proof, immediately before SIGTERM.
@@ -3697,18 +3939,23 @@ class Supervisor:
             if not child.session_ended \
                     or child.session_end_received_at < stop_sent_at:
                 raise SupervisorError("SessionEnd proof is missing")
-            plan = self._post_stop_plan(plan)
+            plan = self._post_stop_plan(plan, _model_flag(child.spawn_args))
             result = handoff.commit_handoff(plan)
             if plan.inspected["unresolved_tool_ids"]:
                 print("[headroom] note: the interrupted tool call may re-run on "
                       "resume", file=sys.stderr)
-            # The conversation only survives if the target can actually LOAD
-            # it: a transcript past the fit limit resumed under the standard
-            # window dies on its first prompt. Measure the staged conversation
-            # itself, not the seat it came from.
-            argv, forced = _window_fit_argv(
-                handoff.resume_argv(result)[1:], plan.source.transcript_path,
-                model=_model_flag(child.spawn_args))
+            # A resume argv names only --resume/--fork-session, so the
+            # successor would come back on the child's DEFAULT model. That is
+            # right until a cap forced a tier change: a Fable session routed
+            # to an Opus seat would resume as Fable on a seat with no Fable
+            # left and re-cap on its first prompt, spending loop budget to
+            # change nothing. And the conversation only survives if the target
+            # can actually LOAD it: a transcript past the fit limit resumed
+            # under the standard window dies on its first prompt. Both facts
+            # live in _resume_argv_for, which the manual recovery command
+            # prints from too.
+            argv, forced = _resume_argv_for(
+                plan, _model_flag(child.spawn_args))
             if forced:
                 print(f"[headroom] this transcript no longer fits a "
                       f"{CONTEXT_WINDOW_STANDARD:,}-token window — resuming it "
@@ -4154,7 +4401,8 @@ class Supervisor:
                         continue
                     print(f"headroom: {error}", file=sys.stderr)
                     if recovery_plan is not None:
-                        self._print_manual_recovery(recovery_plan)
+                        self._print_manual_recovery(
+                            recovery_plan, self.stopped_child_model)
                     elif manual_resume:
                         # the recovery above could not start either: leave the
                         # user the one command that gets their conversation back

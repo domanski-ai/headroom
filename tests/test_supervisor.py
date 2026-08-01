@@ -1844,11 +1844,55 @@ class SupervisorIntegration(unittest.TestCase):
                 "used_percent": 100, "resets_at": time.time() + 86400}
             return snapshot
 
-        result = supervisor.Supervisor(
-            "sonnet", [], self.accounts[0], collect_fn=fable_snapshot).run()
+        # ladder off: this pins the FABLE gate itself — a seat with no Fable
+        # left is not a Fable destination. What the ladder then does with that
+        # refusal is the next test's subject.
+        with mock.patch.object(supervisor, "FAMILY_FALLBACK_ENABLED", False):
+            result = supervisor.Supervisor(
+                "sonnet", [], self.accounts[0], collect_fn=fable_snapshot).run()
         self.assertEqual(result, 0)
         self.assertFalse(os.path.exists(
             os.path.join(self.fake_state, "sigterm-source")))
+
+    def test_cap_time_fable_capped_target_still_takes_the_session_on_opus(self):
+        """Paul's rule, end to end: a spent Fable week costs the session its
+        model tier, not its life. Same fleet as the test above — the only
+        other seat has no Fable left — but with the ladder on, the session
+        stops and moves rather than sitting on the capped account."""
+        os.environ["FAKE_CAP_MODEL"] = "claude-fable-5-20260701"
+
+        def fable_snapshot(quiet=True):
+            snapshot = self.snapshot(quiet)
+            target = next(row for row in snapshot["accounts"]
+                          if row["name"] == "target")
+            target["windows"]["scoped:Fable"] = {
+                "used_percent": 100, "resets_at": time.time() + 86400}
+            return snapshot
+
+        result = supervisor.Supervisor(
+            "sonnet", [], self.accounts[0], collect_fn=fable_snapshot).run()
+        self.assertEqual(result, 0)
+        self.assertTrue(os.path.exists(
+            os.path.join(self.fake_state, "sigterm-source")))
+        with open(os.path.join(self.fake_state, "launches.jsonl"),
+                  encoding="utf-8") as source:
+            launches = [json.loads(line) for line in source]
+        # THE point of the downgrade, and the part a mocked test cannot see:
+        # a resume argv names no model, so without this the successor comes
+        # back on its default (Fable) — on the seat that has no Fable left —
+        # and re-caps on its first prompt. It has to SAY opus.
+        self.assertEqual(launches[1]["config_dir"], self.accounts[1]["home"])
+        self.assertIn("--model", launches[1]["args"])
+        self.assertEqual(
+            launches[1]["args"][launches[1]["args"].index("--model") + 1],
+            "opus")
+        # and the ledger's last-resort command names the same model, because
+        # after a crash between commit and spawn that row is all there is
+        with open(handoff._ledger_path(), encoding="utf-8") as source:
+            rows = [json.loads(line) for line in source if line.strip()]
+        staged = [row for row in rows if row.get("action") == "staged"]
+        self.assertTrue(staged)
+        self.assertIn("--model opus", staged[-1]["resume_command"])
 
     def test_clear_and_resume_transitions_never_use_stale_cap_proof(self):
         for scenario in ("clear", "resume-transition"):

@@ -988,8 +988,11 @@ class LeaseFollowsActiveAccount(TempDirCase):
     def plan(self):
         source = mock.Mock()
         source.account = self.source()
+        # target_family mirrors HandoffPlan's property: the family the TARGET
+        # is gated on, which is `family` unless a cap forced a downgrade
         return type("P", (), {"target": self.target(), "family": "sonnet",
-                              "source": source})()
+                              "target_family": "sonnet",
+                              "resume_family": "", "source": source})()
 
     def test_lease_target_acquires_the_target_account(self):
         runner = supervisor.Supervisor("sonnet", [], self.source())
@@ -3456,10 +3459,28 @@ class CapWaitsForCapacity(TempDirCase):
         self.assertIn("target (7d at 99.5%)", str(caught.exception))
 
     def test_a_spent_scoped_weekly_seat_is_not_a_destination_either(self):
+        # The ladder is off here so the FABLE gate is the only thing speaking:
+        # a seat whose Fable pool is spent must never be picked to run Fable,
+        # whatever the fallback later does with that refusal. What happens
+        # with the ladder ON is CapFamilyDowngrade's subject, and it depends
+        # on this refusal being real.
         runner, child = self.runner([(100.0, 10.0, 10.0, 99.5)]), self.child()
-        with self.assertRaises(supervisor.CapacityHold) as caught:
-            runner._preflight(child, self.proof())
+        with mock.patch.object(supervisor, "FAMILY_FALLBACK_ENABLED", False):
+            with self.assertRaises(supervisor.CapacityHold) as caught:
+                runner._preflight(child, self.proof())
         self.assertIn("target (scoped:fable at 99.5%)", str(caught.exception))
+
+    def test_a_spent_scoped_seat_is_still_a_destination_for_another_family(self):
+        # the same fleet with the ladder ON: Fable is walled on the only other
+        # seat, so the session moves there on OPUS rather than sitting still
+        runner, child = self.runner([(100.0, 10.0, 10.0, 99.5)]), self.child()
+        with redirect_stderr(io.StringIO()) as errors:
+            plan = runner._preflight(child, self.proof())
+        self.assertEqual(plan.target["name"], "target")
+        self.assertEqual((plan.family, plan.resume_family), ("fable", "opus"))
+        # the cooldown still cools the pool that CAPPED, not the one it moved to
+        self.assertEqual(plan.cooldown_scope.get("key"), "source:*")
+        self.assertIn("moving this session to opus", errors.getvalue())
 
     # -- the hold itself ----------------------------------------------------
 
@@ -3553,8 +3574,15 @@ class CapWaitsForCapacity(TempDirCase):
 
     def scoped_hold(self, second):
         """A held SCOPED weekly cap, then one more snapshot. Returns the
-        second attempt's outcome."""
-        runner = self.runner([(10.0, 10.0, 10.0, 100.0, 100.0), second])
+        second attempt's outcome.
+
+        The first snapshot walls the target ACCOUNT-WIDE (5h at 100%), not
+        just its Fable pool: these tests are about the hold-and-recheck
+        reasoning, and a target with only its Fable pool spent is no longer a
+        hold at all — the ladder downgrades to it (CapFamilyDowngrade). An
+        account-wide wall is the fleet state that genuinely has nowhere to
+        go, which is the state each of these tests means to start from."""
+        runner = self.runner([(10.0, 100.0, 10.0, 100.0, 100.0), second])
         child, proof = self.child(), self.proof(self.CREDITS)
         with redirect_stderr(io.StringIO()):
             with self.assertRaises(supervisor.CapacityHold):
@@ -4974,6 +5002,109 @@ class WindowFitOnResume(TempDirCase):
         self.assertEqual(forced, "claude-sonnet-5[1m]")
         self.assertEqual(argv[-1], "claude-sonnet-5[1m]")
 
+    def test_a_downgrade_does_not_carry_a_foreign_1m_model_across(self):
+        # a capped Fable session routed to an Opus seat: keeping its own
+        # `fable[1m]` would re-cap it on the very pool that just walled it,
+        # and the seat was never checked for Fable in the first place
+        argv, forced = supervisor._window_fit_argv(
+            ["--resume", "sid", "--model", "opus"], self.transcript(500_000),
+            model="fable[1m]", family="opus")
+        self.assertEqual(forced, "opus[1m]")
+        self.assertEqual(argv, ["--resume", "sid", "--model", "opus[1m]"])
+
+    def test_a_downgrade_keeps_a_1m_model_that_is_its_own_family(self):
+        argv, forced = supervisor._window_fit_argv(
+            ["--resume", "sid"], self.transcript(150_000),
+            model="claude-opus-5[1m]", family="opus")
+        self.assertEqual(forced, "claude-opus-5[1m]")
+        self.assertEqual(argv[-1], "claude-opus-5[1m]")
+
+    def test_an_unroutable_model_name_does_not_raise_here(self):
+        # model naming is the registry's problem; a fit decision must never
+        # crash the one path that is saving a capped conversation
+        argv, forced = supervisor._window_fit_argv(
+            ["--resume", "sid"], self.transcript(500_000),
+            model="wat-9000[1m]", family="opus")
+        self.assertEqual((argv[-1], forced), ("opus[1m]", "opus[1m]"))
+
+    def plan(self, total, resume_family=""):
+        plan = mock.Mock(cwd="/work", resume_family=resume_family)
+        plan.source.session_id = "sid"
+        plan.source.transcript_path = self.transcript(total)
+        plan.source.account = {"name": "source", "home": "/h/source"}
+        plan.target = {"name": "target", "home": "/h/target"}
+        return plan
+
+    def test_the_manual_recovery_command_is_the_command_headroom_would_run(self):
+        # the LAST thing between the user and a lost conversation: a bare
+        # --resume here sends them back to the model that just capped (after a
+        # downgrade) or to a window the transcript no longer fits
+        for total, family, expected in (
+                (50_000, "opus", ["--model", "opus"]),
+                (500_000, "opus", ["--model", "opus[1m]"]),
+                (500_000, "", ["--model", "opus[1m]"]),
+                (50_000, "", [])):
+            plan = self.plan(total, family)
+            argv, _forced = supervisor._resume_argv_for(plan)
+            self.assertEqual(
+                argv, ["--resume", "sid", "--fork-session"] + expected,
+                (total, family))
+            with redirect_stderr(io.StringIO()) as errors:
+                supervisor.Supervisor._print_manual_recovery(plan)
+            self.assertIn(shlex.join(["claude"] + argv), errors.getvalue())
+            # and the source line is the same command _source_relaunch builds
+            self.assertIn(shlex.join(
+                ["claude"] + supervisor.Supervisor._source_relaunch(plan).argv),
+                errors.getvalue())
+
+    def test_the_ledger_command_carries_the_model_not_just_the_family(self):
+        # after a crash between commit and spawn, this row is all the operator
+        # has. `--model opus` cannot load a transcript that needs `opus[1m]`,
+        # so _post_stop_plan stamps the EXACT model the launch will use and
+        # the row renders that.
+        stamped = supervisor._model_flag(
+            supervisor._resume_argv_for(self.plan(500_000, "opus"))[0])
+        self.assertEqual(stamped, "opus[1m]")
+        self.assertEqual(
+            handoff.resume_command("/h/target", "sid", stamped),
+            "CLAUDE_CONFIG_DIR=/h/target claude --resume sid --fork-session "
+            "--model 'opus[1m]'")
+        # and the family alone — what the row used to get — would not load it
+        self.assertNotIn("[1m]", handoff.resume_command(
+            "/h/target", "sid", "opus"))
+
+    def test_a_downgrade_is_not_announced_as_a_window_fit(self):
+        # `forced` drives the "no longer fits a 200k window" message; a tier
+        # change is a routing fact and has its own announcement
+        _argv, forced = supervisor._resume_argv_for(self.plan(50_000, "opus"))
+        self.assertEqual(forced, "")
+
+    def test_a_plan_without_a_family_field_is_treated_as_unset(self):
+        # plans reach here from several vintages; a Mock's auto-attribute and
+        # a legacy plan with no field at all must both read as "no family",
+        # never as a truthy one that lands in the argv
+        for plan in (mock.Mock(cwd="/w"), type("Old", (), {})()):
+            plan.source = mock.Mock()
+            plan.source.session_id = "sid"
+            plan.source.transcript_path = self.transcript(50_000)
+            argv, forced = supervisor._resume_argv_for(plan)
+            self.assertEqual(argv, ["--resume", "sid", "--fork-session"])
+            self.assertEqual(forced, "")
+
+    def test_the_seats_gated_family_bounds_the_fit_even_without_a_downgrade(self):
+        # a child spawned `--model sonnet[1m]` whose session had since moved
+        # to Opus: no downgrade, but carrying sonnet[1m] onto the Opus-gated
+        # seat checks one pool and spends another
+        plan = self.plan(500_000)
+        plan.target_family = "opus"
+        argv, forced = supervisor._resume_argv_for(plan, "sonnet[1m]")
+        self.assertEqual(forced, "opus[1m]")
+        self.assertEqual(argv[-1], "opus[1m]")
+        # and the same child on a SONNET-gated seat keeps its own model
+        plan.target_family = "sonnet"
+        _argv, forced = supervisor._resume_argv_for(plan, "sonnet[1m]")
+        self.assertEqual(forced, "sonnet[1m]")
+
     def test_a_small_conversation_on_a_big_model_still_routes_normally(self):
         for total in (1_000, 100_000, 139_000):
             self.assertEqual(
@@ -5754,6 +5885,342 @@ class UnhandledCapIsAnnounced(TempDirCase):
             runner._handle_events(child, "")
         attempt.assert_called_once()
         self.assertNotIn("NO automatic handoff", errors.getvalue())
+
+
+
+# --------------------------------------------------------------------------
+# THE TRAIN KEEPS MOVING: birth race must not disarm, caps must downgrade
+# --------------------------------------------------------------------------
+class TranscriptBirthRace(TempDirCase):
+    """Live failure, 2026-07-31: Claude fires SessionStart BEFORE writing the
+    transcript. The identity check reads that file, so every lane on the
+    estate booted with 'malformed hook event (transcript no longer exists);
+    automatic handoff disabled'. Disarmed lanes cannot rotate, so each one
+    later died at its first cap with capacity sitting unused on other seats."""
+
+    SID = "11111111-1111-1111-1111-111111111111"
+
+    def test_a_transcript_being_born_is_waited_for_not_rejected(self):
+        path = os.path.join(self.temp.name, self.SID + ".jsonl")
+        account = self.account()
+        child = mock.Mock(account=account)
+        calls = {"n": 0}
+
+        def fake_source(transcript, session_id, accounts, **kw):
+            calls["n"] += 1
+            if calls["n"] < 3:      # the file lands on the third look
+                raise handoff.HandoffError(
+                    f"session {session_id} transcript no longer exists")
+            return "SOURCE"
+
+        with mock.patch.object(handoff, "_source", side_effect=fake_source), \
+                mock.patch.object(supervisor, "TRANSCRIPT_GRACE_SECONDS", 5.0):
+            result = supervisor._source_once_written(
+                path, self.SID, child, account["home"], sleep=lambda s: None,
+                now=lambda: 0.0)
+        self.assertEqual(result, "SOURCE")
+        self.assertEqual(calls["n"], 3)
+
+    def test_a_transcript_that_never_arrives_still_fails_closed(self):
+        account = self.account()
+        child = mock.Mock(account=account)
+        clock = {"t": 0.0}
+
+        def fake_source(*a, **kw):
+            clock["t"] += 1.0
+            raise handoff.HandoffError("session X transcript no longer exists")
+
+        with mock.patch.object(handoff, "_source", side_effect=fake_source), \
+                mock.patch.object(supervisor, "TRANSCRIPT_GRACE_SECONDS", 2.0):
+            with self.assertRaises(handoff.HandoffError):
+                supervisor._source_once_written(
+                    "/x.jsonl", "X", child, account["home"],
+                    sleep=lambda s: None, now=lambda: clock["t"])
+
+    def test_a_real_identity_failure_is_not_retried(self):
+        # a symlinked/foreign transcript must fail on the FIRST look — the
+        # grace window exists for birth, never for a forged event
+        account = self.account()
+        child = mock.Mock(account=account)
+        calls = {"n": 0}
+
+        def fake_source(*a, **kw):
+            calls["n"] += 1
+            raise handoff.HandoffError("source transcript is a symlink")
+
+        with mock.patch.object(handoff, "_source", side_effect=fake_source):
+            with self.assertRaises(handoff.HandoffError):
+                supervisor._source_once_written(
+                    "/x.jsonl", "X", child, account["home"],
+                    sleep=lambda s: None, now=lambda: 0.0)
+        self.assertEqual(calls["n"], 1)
+
+    def test_an_unreadable_transcript_is_not_a_missing_one(self):
+        # _contained_transcript used to fold EVERY lstat error into "no longer
+        # exists", which would put a permission or ENOTDIR failure — neither
+        # of which heals — into the birth-race retry.
+        directory = os.path.join(self.temp.name, "projects", "p")
+        os.makedirs(directory, exist_ok=True)
+        not_a_dir = os.path.join(directory, "file")
+        with open(not_a_dir, "w", encoding="utf-8"):
+            pass
+        with self.assertRaises(handoff.HandoffError) as caught:
+            handoff._contained_transcript(
+                os.path.join(not_a_dir, self.SID + ".jsonl"), self.SID,
+                self.account())
+        self.assertNotIn("no longer exists", str(caught.exception))
+        self.assertIn("cannot be read", str(caught.exception))
+
+    def test_the_grace_window_is_tolerant_and_finite(self):
+        # the project's numeric-env convention: junk must not crash import,
+        # and `inf` must not turn a bounded wait into a permanent one — this
+        # poll also drives cap detection and exit handling
+        for raw in (None, "", "bad", "inf", "nan", "-inf"):
+            self.assertEqual(supervisor._grace_seconds(raw), 3.0, raw)
+        self.assertEqual(supervisor._grace_seconds("0"), 0.0)
+        self.assertEqual(supervisor._grace_seconds("1.5"), 1.5)
+        self.assertEqual(supervisor._grace_seconds("-5"), 0.0)
+        self.assertEqual(supervisor._grace_seconds("9999"), 30.0)
+
+
+class CapFamilyDowngrade(TempDirCase):
+    """Paul's rule: a spent weekly pool costs a session its model tier, not
+    its life. When no seat can serve the capped family, the cap handoff walks
+    DOWN the ladder rather than holding the conversation until reset."""
+
+    def runner(self):
+        return supervisor.Supervisor("fable", [], self.account(),
+                                     popen=mock.Mock())
+
+    def test_downgrades_to_the_next_family_a_seat_can_serve(self):
+        run = self.runner()
+        child = mock.Mock(account={"name": "a"})
+        served = {"opus": {"name": "b"}}
+
+        def in_family(_child, family, _snapshot):
+            if family in served:
+                return served[family]
+            raise supervisor.CapacityHold(f"no seat for {family}")
+
+        with mock.patch.object(supervisor.Supervisor, "_cap_target_in_family",
+                               side_effect=in_family), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as errors:
+            target, family = run._cap_target(child, "fable", {})
+        self.assertEqual((target["name"], family), ("b", "opus"))
+        self.assertIn("moving this session to opus", errors.getvalue())
+        self.assertEqual([e["event"] for e in
+                          [call.args[0] for call in emit.call_args_list]],
+                         ["family_downgrade"])
+
+    def test_never_promotes_above_the_capped_family(self):
+        # capped on sonnet: fable/opus are ABOVE it and must never be tried,
+        # or a cap would hand the session more capacity than it just spent
+        run = self.runner()
+        tried = []
+
+        def in_family(_child, family, _snapshot):
+            tried.append(family)
+            raise supervisor.CapacityHold("none")
+
+        with mock.patch.object(supervisor.Supervisor, "_cap_target_in_family",
+                               side_effect=in_family):
+            with self.assertRaises(supervisor.CapacityHold):
+                run._cap_target(mock.Mock(account={"name": "a"}), "sonnet", {})
+        self.assertEqual(tried, ["sonnet", "haiku"])
+
+    def test_same_family_still_wins_when_a_seat_has_room(self):
+        run = self.runner()
+        with mock.patch.object(supervisor.Supervisor, "_cap_target_in_family",
+                               return_value={"name": "b"}), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as errors:
+            target, family = run._cap_target(
+                mock.Mock(account={"name": "a"}), "fable", {})
+        self.assertEqual((target["name"], family), ("b", "fable"))
+        self.assertEqual(errors.getvalue(), "")   # no downgrade announcement
+        emit.assert_not_called()
+
+    def test_a_fleet_with_no_room_anywhere_still_holds(self):
+        run = self.runner()
+        with mock.patch.object(supervisor.Supervisor, "_cap_target_in_family",
+                               side_effect=supervisor.CapacityHold("walled")):
+            with self.assertRaises(supervisor.CapacityHold):
+                run._cap_target(mock.Mock(account={"name": "a"}), "fable", {})
+
+    # -- the ladder is bounded by where a huge conversation can LOAD --------
+
+    def transcript(self, total):
+        path = os.path.join(self.temp.name, "big.jsonl")
+        with open(path, "w", encoding="utf-8") as out:
+            out.write(json.dumps(usage_record(total)) + "\n")
+        return path
+
+    def walk(self, total, spawn_args=(), fit=None, family="fable",
+             serves=None, fallback=True):
+        """`(families tried, chosen family, model the successor launches)`.
+
+        `serves` is the family whose seat has room — set it so the walk
+        SUCCEEDS, because a walk where every attempt fails cannot show which
+        family was gated against which model actually starts. That gap is the
+        whole defect class this bounding exists for. Anything the walk says on
+        stderr lands in `self.errors` for the announcement tests."""
+        self.errors = io.StringIO()
+        run, tried = self.runner(), []
+        child = mock.Mock(account={"name": "a"}, spawn_args=list(spawn_args))
+        path = (self.transcript(total) if total
+                else os.path.join(self.temp.name, "gone.jsonl"))
+
+        def in_family(_child, attempt, _snapshot):
+            tried.append(attempt)
+            if serves is not None and attempt == serves:
+                return {"name": "b"}
+            raise supervisor.CapacityHold("walled")
+
+        with mock.patch.object(supervisor.Supervisor, "_cap_target_in_family",
+                               side_effect=in_family), \
+                mock.patch.object(supervisor, "FAMILY_FALLBACK_ENABLED",
+                                  fallback), \
+                mock.patch.object(supervisor, "CONTEXT_FIT_MODEL",
+                                  fit or supervisor.CONTEXT_FIT_MODEL), \
+                redirect_stderr(self.errors):
+            if serves is None:
+                with self.assertRaises(supervisor.CapacityHold) as caught:
+                    run._cap_target(child, family, {}, path)
+                return tried, caught.exception, ""
+            _target, chosen = run._cap_target(child, family, {}, path)
+        # exactly what _preflight would build from that decision
+        plan = mock.Mock(resume_family="" if chosen == family else chosen)
+        plan.source.session_id = "sid"
+        plan.source.transcript_path = path
+        with mock.patch.object(supervisor, "CONTEXT_FIT_MODEL",
+                               fit or supervisor.CONTEXT_FIT_MODEL):
+            argv, _forced = supervisor._resume_argv_for(
+                plan, supervisor._model_flag(list(spawn_args)))
+        return tried, chosen, supervisor._model_flag(argv)
+
+    def assert_gate_matches_launch(self, *args, **kw):
+        """THE invariant: the family the seat was CHECKED for is the family
+        the successor SPENDS. Every mismatch review found was a rotation that
+        gated one pool and started another, and re-capped on its first prompt.
+
+        An argv with no `--model` is not a free pass — it means the child
+        keeps its default, so the gate must have stayed on the capped family.
+        """
+        capped = kw.get("family", args[2] if len(args) > 2 else "fable")
+        tried, chosen, model = self.walk(*args, **kw)
+        if model:
+            self.assertEqual(supervisor._family_or_blank(model), chosen,
+                             (tried, chosen, model))
+        else:
+            self.assertEqual(chosen, capped, (tried, chosen, model))
+        return tried, chosen, model
+
+    def test_an_over_limit_transcript_is_gated_on_the_family_it_will_run(self):
+        # A 500k transcript WILL be re-modelled onto opus[1m] — it cannot load
+        # otherwise. So Opus is the only honest destination: gating the seat
+        # on Fable and then starting Opus on it checks one pool and spends
+        # another.
+        tried, chosen, model = self.assert_gate_matches_launch(
+            500_000, serves="opus")
+        self.assertEqual((tried, chosen, model), (["opus"], "opus", "opus[1m]"))
+
+    def test_a_transcript_that_fits_still_walks_the_whole_ladder(self):
+        tried, chosen, model = self.walk(50_000, serves="haiku")
+        self.assertEqual(tried, ["fable", "opus", "sonnet", "haiku"])
+        self.assertEqual((chosen, model), ("haiku", "haiku"))
+
+    def test_an_unmeasurable_transcript_does_not_bound_the_ladder(self):
+        # measurement failure must cost a session options, not create them
+        tried, chosen, _model = self.walk(None, serves="haiku")
+        self.assertEqual((tried, chosen),
+                         (["fable", "opus", "sonnet", "haiku"], "haiku"))
+
+    def test_a_child_on_its_own_1m_model_may_stay_on_that_family(self):
+        # keeping `fable[1m]` is the existing doctrine, so Fable stays a
+        # destination — with Opus behind it, because opus[1m] holds it too
+        self.assertEqual(
+            self.assert_gate_matches_launch(
+                500_000, ["--model", "fable[1m]"], serves="fable"),
+            (["fable"], "fable", "fable[1m]"))
+        self.assertEqual(
+            self.assert_gate_matches_launch(
+                500_000, ["--model", "fable[1m]"], serves="opus"),
+            (["fable", "opus"], "opus", "opus[1m]"))
+
+    def test_an_overridden_fit_model_gates_the_family_it_names(self):
+        # the override decides what the successor RUNS, so it has to decide
+        # what the seat is checked for; anything else gates Opus and starts
+        # Sonnet
+        self.assertEqual(
+            self.assert_gate_matches_launch(
+                500_000, fit="sonnet[1m]", serves="sonnet"),
+            (["sonnet"], "sonnet", "sonnet[1m]"))
+
+    def test_a_fit_family_above_the_capped_one_is_still_gated_honestly(self):
+        # capped Sonnet, 500k transcript: opus[1m] is the only model that can
+        # load it, so Opus is what gets checked. This is not the ladder
+        # promoting — it is the gate naming the pool the window fit already
+        # chose. Gating Sonnet here spends Opus unchecked.
+        self.assertEqual(
+            self.assert_gate_matches_launch(
+                500_000, family="sonnet", serves="opus"),
+            (["opus"], "opus", "opus[1m]"))
+
+    def test_the_fit_bound_applies_even_with_the_ladder_switched_off(self):
+        # HEADROOM_FAMILY_FALLBACK governs VOLUNTARY tier changes; it cannot
+        # license gating one pool and spending another. Fable is not a home
+        # for a 500k transcript at all, so Opus is the only honest gate.
+        self.assertEqual(
+            self.assert_gate_matches_launch(
+                500_000, serves="opus", fallback=False),
+            (["opus"], "opus", "opus[1m]"))
+
+    def test_the_ladder_off_still_refuses_a_VOLUNTARY_tier_change(self):
+        # the other side of the same switch: here Fable IS a home (the child
+        # runs fable[1m]), so moving to Opus would be a choice, not a
+        # necessity — and the switch forbids choices
+        tried, error, _ = self.walk(
+            500_000, ["--model", "fable[1m]"], fallback=False)
+        self.assertEqual(tried, ["fable"])
+        self.assertIsInstance(error, supervisor.CapacityHold)
+
+    def announcement(self, **kw):
+        """The reason `_cap_target` actually emits, from the real site."""
+        with mock.patch.object(notify, "emit") as emit:
+            self.walk(**kw)
+        events = [call.args[0] for call in emit.call_args_list]
+        return (events[0] if events else {}), self.errors.getvalue()
+
+    def test_a_capacity_move_is_not_blamed_on_the_transcript(self):
+        # the capped family was a perfectly good home for this conversation —
+        # it just had no seat. Reporting that as a window fit tells the
+        # operator the transcript outgrew a model it did not.
+        event, err = self.announcement(
+            total=500_000, spawn_args=["--model", "fable[1m]"], serves="opus")
+        self.assertEqual((event.get("event"), event.get("reason")),
+                         ("family_downgrade", "capacity"))
+        self.assertIn("no seat can serve fable", err)
+        self.assertNotIn("only fits the 1M window", err)
+
+    def test_a_window_fit_move_says_so(self):
+        # here Fable genuinely cannot hold the conversation
+        event, err = self.announcement(total=500_000, serves="opus")
+        self.assertEqual((event.get("event"), event.get("reason")),
+                         ("family_downgrade", "window_fit"))
+        self.assertIn("only fits the 1M window", err)
+
+    def test_an_unreasonable_fit_model_holds_instead_of_routing_blind(self):
+        # An override is only a home when it is BOTH a 1M model and a family a
+        # seat can be gated on. `sonnet` is the subtle one: perfectly routable,
+        # and it resumes a 500k transcript into a 200k window that kills it.
+        # `serves` is None because the hold lands BEFORE any seat is tried —
+        # assert exactly that, so this cannot pass by every target failing.
+        for fit in ("claude[1m]", "mystery[1m]", "[1m]", "sonnet", "opus"):
+            tried, error, _ = self.walk(500_000, fit=fit, serves=None)
+            self.assertEqual(tried, [], fit)
+            self.assertIn("not a 1M model on a routable family",
+                          str(error), fit)
 
 
 if __name__ == "__main__":
