@@ -1139,6 +1139,138 @@ class ReservePercent(unittest.TestCase):
         self.assertIsNone(self.reason(row, fam="claude", reserve=10))
 
 
+class GenericSpendFamilyCooldown(unittest.TestCase):
+    """A `--model`-less `headroom claude` gets `fam == "claude"`, and the
+    cooldown loop only ever consulted `name:claude` and `name:*`. So
+    `name:fable` — a cooldown HEADROOM ITSELF wrote after a Fable cap — was
+    structurally unreachable from the default launch path: the seat headroom
+    had just walled read as eligible again immediately.
+
+    Which scoped family a generic launch actually spends is a property of the
+    INSTALL (the CLI picks it from its own settings), not something routing
+    may infer, so it is DECLARED. Absent a declaration nothing changes at all
+    — that is what makes this the safe half to land."""
+
+    def setUp(self):
+        self.now = time.time()
+        orig = collect.local_binding
+        collect.local_binding = lambda provider, home: ("AAAA", "BBBB")
+        self.addCleanup(setattr, collect, "local_binding", orig)
+
+    def cfg(self, **routing):
+        return {"schema_version": 1, "accounts": [
+            {"name": "a", "provider": "claude", "home": "/tmp/hr-t/a"}],
+            "routing": routing}
+
+    def reason(self, fam, cool, config=None, row=None):
+        config = self.cfg(generic_spend_family="fable") if config is None \
+            else config
+        with mock.patch.object(registry, "load", return_value=config):
+            return route.block_reason(_account(), fam,
+                                      _claude_row() if row is None else row,
+                                      cool, self.now)
+
+    # ---- the reproduction --------------------------------------------------
+
+    def test_a_generic_launch_now_sees_the_cooldown_it_wrote_itself(self):
+        cool = {"a:fable": self.now + 70 * 3600}
+        self.assertIsNone(
+            self.reason("claude", cool, config=self.cfg()),
+            "control: with nothing declared this seat is eligible — the "
+            "defect exactly as it stands on HEAD")
+        self.assertEqual(self.reason("claude", cool)[:14], "cooldown until")
+
+    def test_declaring_nothing_is_byte_identical_to_before(self):
+        cool = {"a:fable": self.now + 70 * 3600}
+        for config in (self.cfg(),                      # no key
+                       self.cfg(generic_spend_family=""),
+                       {"schema_version": 1, "accounts": [], "routing": "x"},
+                       {"schema_version": 1, "accounts": []}):
+            self.assertIsNone(self.reason("claude", cool, config=config),
+                              config)
+        # and an unreadable config must not raise or gate either
+        with mock.patch.object(registry, "load",
+                               side_effect=registry.RegistryError("broken")):
+            self.assertIsNone(route.block_reason(
+                _account(), "claude", _claude_row(), cool, self.now,
+                reserve=0))
+
+    def test_a_fable_cooldown_still_does_not_gate_the_other_families(self):
+        """The Opus-blocks-Sonnet regression route.py warns about must not
+        reappear through the cooldown door."""
+        cool = {"a:fable": self.now + 70 * 3600}
+        for fam in ("opus", "sonnet", "haiku"):
+            self.assertIsNone(self.reason(fam, cool), fam)
+        self.assertIsNotNone(self.reason("fable", cool))
+
+    def test_adding_a_key_cannot_change_which_reason_an_old_fixture_reports(self):
+        """Order stability: `name:fam` first, then the declared spend key,
+        then `name:*`. The existing two keys still bind exactly as before."""
+        first = self.now + 10 * 3600
+        second = self.now + 70 * 3600
+        third = self.now + 90 * 3600
+        self.assertIn(route.tfmt(first), self.reason(
+            "claude", {"a:claude": first, "a:fable": second, "a:*": third}))
+        self.assertIn(route.tfmt(second), self.reason(
+            "claude", {"a:fable": second, "a:*": third}))
+        self.assertIn(route.tfmt(third), self.reason(
+            "claude", {"a:*": third}))
+
+    def test_the_ranked_pick_no_longer_offers_the_cooled_seat(self):
+        snapshot = {"generated": self.now, "accounts": [_claude_row()]}
+        config = self.cfg(generic_spend_family="fable")
+        with mock.patch.object(registry, "load", return_value=config), \
+                mock.patch.object(route, "cooldowns",
+                                  return_value={"a:fable": self.now + 70*3600}):
+            ranked = route.candidates("claude", snapshot)
+        self.assertTrue(ranked, "fixture produced no candidates at all")
+        self.assertTrue(all(reason is not None for _account_, reason in ranked),
+                        f"a cooled seat is still eligible: {ranked}")
+
+    # ---- the declaration itself -------------------------------------------
+
+    def test_the_declaration_never_raises_and_accepts_only_a_scoped_family(self):
+        """Same never-raise contract `reserve_percent` is pinned for."""
+        self.assertEqual(
+            registry.generic_spend_family(self.cfg(generic_spend_family="fable")),
+            "fable")
+        self.assertEqual(
+            registry.generic_spend_family(
+                self.cfg(generic_spend_family="  fable  ")), "fable")
+        for value in ("gpt", "codex", "claude", "nonsense", "", 7, None,
+                      True, [], {"a": 1}):
+            self.assertEqual(
+                registry.generic_spend_family(
+                    self.cfg(generic_spend_family=value)), "",
+                f"{value!r} must not be accepted as a spend family")
+        for config in ({"routing": "broken"}, {}, None, {"routing": None}):
+            self.assertEqual(registry.generic_spend_family(config), "")
+        with mock.patch.object(registry, "load",
+                               side_effect=registry.RegistryError("broken")):
+            self.assertEqual(registry.generic_spend_family(), "")
+
+    # ---- both launch paths -------------------------------------------------
+
+    def test_both_launch_paths_are_closed_not_just_the_ranked_one(self):
+        """`_initial_account` calls `block_reason` twice — once for an
+        env-pinned account and once for the ranked pick. A generic launch has
+        to be refused on both, or the pin is a way around the gate."""
+        snapshot = {"generated": self.now, "accounts": [_claude_row()]}
+        config = self.cfg(generic_spend_family="fable")
+        err = io.StringIO()
+        with mock.patch.object(registry, "load", return_value=config), \
+                mock.patch.object(route, "ensure_fresh_snapshot",
+                                  return_value=snapshot), \
+                mock.patch.object(route, "cooldowns",
+                                  return_value={"a:fable": self.now + 70*3600}), \
+                mock.patch.object(route, "env_pinned_account",
+                                  return_value=_account()), \
+                redirect_stderr(err):
+            self.assertIsNone(supervisor._initial_account("claude"))
+        self.assertIn("not routable", err.getvalue())
+        self.assertIn("cooldown until", err.getvalue())
+
+
 class ReserveConfig(unittest.TestCase):
     def cfg(self, value):
         return {"schema_version": 1, "accounts": [

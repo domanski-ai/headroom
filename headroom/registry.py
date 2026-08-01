@@ -389,6 +389,40 @@ def preemptive_thresholds(config=None):
                        PREEMPTIVE_OVERALL_PERCENT))
 
 
+# The family a --model-less `headroom claude` actually spends is a property of
+# the INSTALL (the CLI picks it from its own settings), not something routing
+# may infer. Declared or nothing happens: the default is the EMPTY STRING, so
+# an install that has not declared one behaves exactly as it did before.
+GENERIC_SPEND_FAMILY = ""
+
+
+def generic_spend_family(config=None):
+    """The scoped Claude family a generic `claude` launch spends, or "".
+
+    Read from ``config['routing']['generic_spend_family']``. Never raises — an
+    unreadable, absent or invalid config yields "" and routing is unchanged."""
+    try:
+        config = load() if config is None else config
+    except RegistryError:
+        return GENERIC_SPEND_FAMILY
+    routing = (config or {}).get("routing")
+    if not isinstance(routing, dict):
+        return GENERIC_SPEND_FAMILY
+    value = routing.get("generic_spend_family", GENERIC_SPEND_FAMILY)
+    if not isinstance(value, str) or isinstance(value, bool):
+        return GENERIC_SPEND_FAMILY
+    value = value.strip()
+    # Validation is local to registry and needs no import of route: accept only
+    # a scoped Claude family, spelled exactly.
+    try:
+        if value and family(value) == value \
+                and family_provider(value) == "claude" and value != "claude":
+            return value
+    except RegistryError:
+        return GENERIC_SPEND_FAMILY
+    return GENERIC_SPEND_FAMILY
+
+
 # The 5-hour window is a DIFFERENT kind of wall from the weekly ones, so it
 # gets its own, higher threshold rather than a share of theirs.  A weekly
 # window that fills is gone for days — leaving early is nearly free.  A 5h

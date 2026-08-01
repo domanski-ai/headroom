@@ -657,7 +657,17 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
         # spraying scoped-cap errors that never trip the 5h/7d handoff).
         if scoped.get("severity") == "critical" and scoped.get("is_active"):
             return f"{fam} weekly cap critical"
-    for key in (f"{account['name']}:{fam}", f"{account['name']}:*"):
+    # A generic `claude` launch spends SOME scoped family, and a cooldown
+    # headroom itself wrote after that family's cap is keyed `name:<fam>` —
+    # structurally unreachable from fam=="claude" until now. Nothing happens
+    # unless the install declares which family that is.
+    keys = [f"{account['name']}:{fam}"]
+    if fam == "claude":
+        spend = registry.generic_spend_family()
+        if spend:
+            keys.append(f"{account['name']}:{spend}")
+    keys.append(f"{account['name']}:*")
+    for key in keys:
         if key not in cool:
             continue
         cooldown = cool.get(key)
