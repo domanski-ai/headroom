@@ -18,8 +18,15 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install pytest
+      # test_ambient_channels.py audits every tests/test_*.py for the hermetic
+      # bootstrap and test_notify_hermetic.py measures the channel it protects,
+      # so both belong on this list: a file added without the bootstrap has to
+      # fail CI, not only a local run. The subprocess arms in
+      # test_notify_hermetic.py skip themselves on Windows (gated in the file,
+      # with the reason) -- the audit runs on every leg.
       - run: >-
           python -m pytest tests/test_tokens.py tests/test_history.py
           tests/test_headroom.py tests/test_maximize.py tests/test_widgets.py
           tests/test_supervisor.py tests/test_v2_supervision.py
-          tests/test_handoff_codex.py -q
+          tests/test_handoff_codex.py tests/test_ambient_channels.py
+          tests/test_notify_hermetic.py -q

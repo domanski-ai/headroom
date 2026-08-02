@@ -4,11 +4,16 @@ import io
 import json
 import os
 import stat
+import sys
 import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr
 from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import tests  # noqa: E402,F401 — hermetic bootstrap; see tests/__init__.py
 
 from headroom import collect, history, paths, registry
 

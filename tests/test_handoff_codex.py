@@ -28,6 +28,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import tests  # noqa: E402,F401 — hermetic bootstrap; see tests/__init__.py
+
 from headroom import (  # noqa: E402
     collect, handoff, handoff_codex, locks, paths, route, tokens,
 )

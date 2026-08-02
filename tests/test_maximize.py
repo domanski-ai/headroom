@@ -11,6 +11,8 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import tests  # noqa: E402,F401 — hermetic bootstrap; see tests/__init__.py
+
 from headroom import maximize  # noqa: E402
 
 

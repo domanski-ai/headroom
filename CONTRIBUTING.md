@@ -25,6 +25,22 @@ python3 -m unittest discover -s tests
 
 No pytest, no fixtures framework — plain `unittest`, no network.
 
+Every file in `tests/` starts with this, after its imports and before it
+touches `headroom` or `os.environ`:
+
+```python
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import tests  # noqa: E402,F401 — hermetic bootstrap; see tests/__init__.py
+```
+
+That import is what unsets the ambient `HEADROOM_NOTIFY_CMD` and points
+`HEADROOM_DIR` at a temp directory, so a test run cannot write launch events
+into a live watchdog feed or read your real `~/.headroom`. It lives in the file
+rather than in the runner because no runner hook fires under every form —
+`discover -p <one file>` and `python3 tests/<file>.py` import no package at
+all. `tests/test_ambient_channels.py` fails by name on any file that omits it.
+
 ## Handy while developing
 
 ```bash
