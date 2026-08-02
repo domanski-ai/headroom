@@ -8131,5 +8131,205 @@ class CapFamilyDowngrade(TempDirCase):
                           str(error), fit)
 
 
+# --------------------------------------------------------------------------
+# Two events, one clock reading: dedup, never a latch
+# --------------------------------------------------------------------------
+class OrderAmbiguityIsDedupedNotLatched(TempDirCase):
+    """`_accept_event_order` refuses `received_at <= last_received_at` with a
+    PermanentSupervisorError, and `_handle_events` turns every refusal out of
+    that layer into `malformed hook event: …` + a disarm for the child's whole
+    life.
+
+    That rejection is DETERMINISTIC — it re-tests two frozen numbers, so no
+    retry can ever heal it (Codex round, 2026-08-02). It is therefore
+    explicitly excluded from the transient allowlist and needs a rule of its
+    own instead.
+
+    Diagnosed on the live estate before writing this: 258 hook records across
+    32 supervisor journals contain ZERO duplicate `received_at` values and
+    ZERO non-monotonic pairs, so this is a latent hazard rather than an
+    observed one. It is reachable two ways, and only one of them is a
+    duplicate:
+
+      * THE SAME RECORD SEEN TWICE. The cursor is monotonic, so the journal
+        cannot re-serve one — but any in-memory replay can, and cycle 2's own
+        deferral is exactly such a replay. Dropping it must be harmless.
+      * TWO DISTINCT RECORDS SHARING ONE CLOCK READING. `write_hook_event`
+        stamps `time.time()` before it takes the append lock, so two hooks
+        firing together can carry the same reading. Losing supervision for
+        the life of a session over a clock-resolution tie is the failure
+        class this cycle exists to remove.
+
+    A record that is genuinely EARLIER than the frontier is neither, and is
+    deliberately left on the permanent path — see the last test."""
+
+    SUPERVISOR = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    SID = "33333333-3333-4333-8333-333333333333"
+
+    def setUp(self):
+        super().setUp()
+        self.account_row = self.account("source")
+        self.home = self.account_row["home"]
+        self.projects = os.path.join(self.home, "projects", "p")
+        os.makedirs(self.projects)
+        self.transcript = os.path.join(self.projects, self.SID + ".jsonl")
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "hi"}]}}) + "\n")
+        self.cwd = os.path.join(self.temp.name, "work")
+        os.makedirs(self.cwd)
+        self.launched_at = time.time() - 600.0
+        self.child = supervisor.Child(
+            mock.Mock(pid=os.getpid()), self.account_row, 1,
+            supervisor.event_path(self.SUPERVISOR), "", self.launched_at,
+            True)
+        self.runner = supervisor.Supervisor(
+            "sonnet", [], self.account_row, popen=mock.Mock())
+
+    def fire(self, hook_event_name, received_at, **payload):
+        """One record, through the REAL producer, at an exact clock reading."""
+        matcher = "rate_limit" if hook_event_name == "StopFailure" else ""
+        body = dict({"hook_event_name": hook_event_name,
+                     "session_id": self.SID,
+                     "transcript_path": self.transcript, "cwd": self.cwd,
+                     "model": {"display_name": "Sonnet"},
+                     "version": "2.1.fake"}, **payload)
+        environ = {"HEADROOM_SUPERVISOR_ID": self.SUPERVISOR,
+                   "HEADROOM_CHILD_GENERATION": "1",
+                   "HEADROOM_SOURCE_SLOT": self.account_row["name"],
+                   "HEADROOM_HOOK_MATCHER": matcher,
+                   "CLAUDE_CONFIG_DIR": self.home}
+        self.assertEqual(supervisor.write_hook_event(
+            io.StringIO(json.dumps(body)), environ, now=received_at), 0)
+
+    def handle(self):
+        with mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as err:
+            self.runner._handle_events(self.child, "")
+        return ([call.args[0] for call in emit.call_args_list],
+                err.getvalue())
+
+    def bind(self):
+        """Give the child a live binding the ordinary way, through a
+        SessionStart the real reader really parsed."""
+        self.fire("SessionStart", self.launched_at + 1.0, source="startup")
+        events, err = self.handle()
+        self.assertEqual(events, [])
+        self.assertIsNotNone(self.child.binding)
+        self.assertTrue(self.child.automation)
+
+    # -- direction 1: a true duplicate is dropped, harmlessly ---------------
+    def test_the_same_record_twice_is_dropped_not_a_disarm(self):
+        """The replay direction. Feeding one record to the ordering check
+        twice is what a cross-poll retry does by construction, and today it
+        costs the child its supervision for life."""
+        self.bind()
+        self.fire("CwdChanged", self.launched_at + 2.0)
+        record = supervisor._read_events(self.child)[0]
+        self.assertTrue(supervisor._accept_event_order(self.child, record),
+                        "a fresh record must be accepted")
+        self.assertIs(
+            supervisor._accept_event_order(self.child, record), False,
+            "the same record again is a duplicate, and dropping it is the "
+            "whole point — it must not raise")
+        self.assertTrue(self.child.automation)
+
+    def test_a_duplicated_record_does_not_disarm_through_handle_events(self):
+        """The same thing where it actually bites: the full handler, real
+        producer bytes, real reader. A dropped duplicate must leave NO trace —
+        no disarm, no supervision_lost, and the child still supervised."""
+        self.bind()
+        self.fire("CwdChanged", self.launched_at + 2.0, cwd=self.temp.name)
+        records = supervisor._read_events(self.child)
+        with mock.patch.object(supervisor, "_read_events",
+                               return_value=list(records) + list(records)), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as err:
+            self.runner._handle_events(self.child, "")
+        self.assertNotIn("malformed hook event", err.getvalue())
+        self.assertEqual([call.args[0]["event"]
+                          for call in emit.call_args_list], [])
+        self.assertTrue(self.child.automation)
+        # and the one copy that WAS processed still did its job
+        self.assertEqual(self.child.binding.cwd,
+                         os.path.realpath(self.temp.name))
+
+    # -- direction 2: a distinct event at the same reading is NOT lost ------
+    def test_two_distinct_events_at_one_clock_reading_both_land(self):
+        """`write_hook_event` stamps `time.time()` and only then takes the
+        append lock, so two hooks firing together can share a reading. Today
+        the second one disarms the child for life; it is a different event and
+        it must be processed."""
+        self.bind()
+        together = self.launched_at + 2.0
+        self.fire("CwdChanged", together, cwd=self.temp.name)
+        self.fire("SessionEnd", together, reason="other")
+        events, err = self.handle()
+        self.assertNotIn("malformed hook event", err)
+        self.assertNotIn("order is ambiguous", err)
+        # BOTH were processed: the cwd move landed on the binding AND the
+        # session was marked dead. Either assertion alone can pass on a
+        # handler that silently swallowed the other record.
+        self.assertEqual(self.child.binding.cwd,
+                         os.path.realpath(self.temp.name))
+        self.assertTrue(self.child.session_ended)
+        # Named exactly, so it cannot be mistaken for the failure under test:
+        # a SessionEnd on the live session with no replacement is the ORDINARY
+        # end-of-life disarm, and it firing here is itself proof that the
+        # tied SessionEnd was processed rather than swallowed.
+        self.assertEqual([event["reason"] for event in events],
+                         ["current session ended without a replacement "
+                          "SessionStart"])
+
+    def test_a_tie_is_not_a_licence_for_the_next_duplicate(self):
+        """The tie-breaker must not degrade into "anything at this reading is
+        fine": after two distinct records share a reading, a replay of either
+        one is still a duplicate and still dropped, and a THIRD distinct one
+        is still accepted."""
+        self.bind()
+        together = self.launched_at + 2.0
+        self.fire("CwdChanged", together, cwd=self.temp.name)
+        self.fire("CwdChanged", together, cwd=self.cwd)
+        first, second = supervisor._read_events(self.child)
+        self.assertTrue(supervisor._accept_event_order(self.child, first))
+        self.assertTrue(supervisor._accept_event_order(self.child, second))
+        self.assertIs(supervisor._accept_event_order(self.child, first), False)
+        self.assertIs(supervisor._accept_event_order(self.child, second), False)
+        self.fire("CwdChanged", together, cwd=self.projects)
+        third = supervisor._read_events(self.child)[0]
+        self.assertTrue(supervisor._accept_event_order(self.child, third))
+
+    # -- what deliberately does NOT change ---------------------------------
+    def test_a_genuinely_EARLIER_record_still_fails_closed(self):
+        """Deliberately unchanged, and the reason is on the record.
+
+        A record stamped BEFORE the frontier is not a duplicate: it is either
+        an out-of-order append (the stamp-then-lock window) or a replay of a
+        record older than the frontier, and nothing in the journal can tell
+        those apart. Accepting it would let a stale StopFailure act — a change
+        to when headroom STOPS a child, which is not this tranche's to make.
+        It stays a PermanentSupervisorError."""
+        self.bind()
+        self.fire("CwdChanged", self.launched_at + 5.0)
+        newer = supervisor._read_events(self.child)[0]
+        self.assertTrue(supervisor._accept_event_order(self.child, newer))
+        self.fire("CwdChanged", self.launched_at + 3.0, cwd=self.temp.name)
+        older = supervisor._read_events(self.child)[0]
+        with self.assertRaises(supervisor.PermanentSupervisorError) as caught:
+            supervisor._accept_event_order(self.child, older)
+        self.assertIn("order is ambiguous", str(caught.exception))
+
+    def test_the_frontier_still_advances_and_still_refuses_the_past(self):
+        # the plain monotonic contract, unchanged: each newer record moves the
+        # frontier, and the frontier is what the rule above is measured from
+        self.bind()
+        for offset in (2.0, 3.0, 4.0):
+            self.fire("CwdChanged", self.launched_at + offset)
+            record = supervisor._read_events(self.child)[0]
+            self.assertTrue(supervisor._accept_event_order(self.child, record))
+            self.assertEqual(self.child.last_received_at,
+                             self.launched_at + offset)
+
+
 if __name__ == "__main__":
     unittest.main()

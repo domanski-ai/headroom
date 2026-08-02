@@ -7,6 +7,7 @@ usage collect before every remaining pre-stop check succeeds.
 """
 import contextlib
 import copy
+import hashlib
 import json
 import math
 import os
@@ -514,6 +515,9 @@ class Child:
     dead_sessions: set = field(default_factory=set)
     session_epochs: dict = field(default_factory=dict)
     last_received_at: float = 0.0
+    # fingerprints of the records already accepted AT last_received_at, which
+    # is what tells a duplicate apart from a clock-resolution tie
+    last_received_ids: set = field(default_factory=set)
     pending_cap: PendingCap = None
     # a proven cap that has nowhere to go yet: how many times it has been
     # re-tried, when the next attempt is due, and the last reason announced
@@ -1436,12 +1440,62 @@ def _event_epoch(child, source):
         (source.session_id, source.transcript_path))
 
 
+def _event_identity(record):
+    """A stable fingerprint of one journaled record.
+
+    Canonical JSON of the record as the reader parsed it: same bytes in, same
+    fingerprint out, and two records that differ anywhere — including in the
+    payload alone — never collide."""
+    return hashlib.sha256(json.dumps(
+        record, sort_keys=True, separators=(",", ":"),
+        default=str).encode("utf-8")).hexdigest()
+
+
 def _accept_event_order(child, record):
+    """True = process this record, False = drop it, raise = fail closed.
+
+    A hook event stamped at or before the frontier used to be one thing —
+    "ambiguous" — and cost the child its supervision for the rest of its life.
+    It is really three, and only the last of them is ambiguous:
+
+      * THE SAME RECORD AGAIN. The journal cursor is monotonic so the file
+        cannot serve one twice, but any in-memory replay can — the exit drain
+        used to be the worry, and the cross-poll retry below is one by
+        construction. A duplicate carries no information; dropping it is
+        harmless, and disarming for it is a self-inflicted wound.
+      * A DISTINCT RECORD AT THE SAME CLOCK READING. `write_hook_event` reads
+        `time.time()` and only then takes the append lock, so two hooks firing
+        together can carry one reading. That is a clock-resolution tie, not
+        evidence of forgery: keep both, and hold the frontier where it is.
+      * A DISTINCT RECORD FROM BEFORE THE FRONTIER. Still fails closed. It is
+        either an out-of-order append or a replay of something older than this
+        frontier, and the journal cannot tell those apart — accepting it would
+        let a stale StopFailure act, which is a change to when headroom STOPS
+        a child.
+
+    `last_received_ids` holds the fingerprints accepted AT `last_received_at`,
+    so its size is bounded by one clock reading's worth of events and it needs
+    no eviction policy. It is not a general replay cache: an older duplicate
+    still meets the fail-closed branch, which is what it met before.
+
+    Measured on the live estate 2026-08-02 before this changed: 258 records
+    across 32 journals, zero duplicate readings and zero non-monotonic pairs.
+    This is a latent hazard, and the deterministic rejection it produces can
+    never heal by retry — which is why it is excluded from the transient
+    allowlist and given a rule instead."""
     received = record["received_at"]
-    if received <= child.last_received_at:
-        raise PermanentSupervisorError(
-            "hook event order is ambiguous for the current binding")
-    child.last_received_at = received
+    if received > child.last_received_at:
+        child.last_received_at = received
+        child.last_received_ids = {_event_identity(record)}
+        return True
+    identity = _event_identity(record)
+    if identity in child.last_received_ids:
+        return False
+    if received == child.last_received_at:
+        child.last_received_ids.add(identity)
+        return True
+    raise PermanentSupervisorError(
+        "hook event order is ambiguous for the current binding")
 
 
 @contextlib.contextmanager
@@ -3845,7 +3899,10 @@ class Supervisor:
             if hook_name == "StopFailure" \
                     and session_key in child.dead_sessions:
                 continue
-            _accept_event_order(child, record)
+            if not _accept_event_order(child, record):
+                # a record this transition has already seen says nothing new
+                # about it — and must not be read as a session transition
+                continue
             if session_key in child.dead_sessions:
                 if hook_name in ("SessionEnd", "StopFailure"):
                     continue
@@ -4270,7 +4327,11 @@ class Supervisor:
                         and session_key in child.dead_sessions:
                     proof = None
                     continue
-                _accept_event_order(child, record)
+                if not _accept_event_order(child, record):
+                    # a duplicate of a record already processed at this
+                    # frontier: it carries nothing new, and acting on it twice
+                    # is the harm. Dropped in silence, supervision untouched.
+                    continue
             except SupervisorError as error:
                 print(f"[headroom] malformed hook event ({error}); automatic "
                       "handoff disabled for this child", file=sys.stderr)
