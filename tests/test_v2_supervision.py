@@ -7676,13 +7676,32 @@ class EpochLossAfterALostSessionStart(TempDirCase):
 
     def lose_the_birth_race(self):
         """The 2026-07-31 failure: the hook lands, the file is not there yet,
-        the grace is spent. Grace 0.0 is the deadline having passed, not a
-        different bug — the live disarms all landed exactly at it."""
+        and the wait runs out. Grace 0.0 is the IN-LINE deadline having passed,
+        not a different bug — the live disarms all landed exactly at it.
+
+        FLIPPED BY FIX CYCLE 2, and the flip is named here rather than hidden:
+        one spent in-line grace no longer costs the child anything. The record
+        is HELD and retried across polls, and only a spent cross-poll budget
+        disarms — so losing the race now takes a clock jump as well. What this
+        class is about is unchanged (what a lost SessionStart costs, and that
+        nothing re-arms); only how it comes to be lost moved."""
         self.fire("SessionStart", source="startup")
-        with mock.patch.object(supervisor, "TRANSCRIPT_GRACE_SECONDS", 0.0):
-            events, err = self.handle()
+        clock = {"t": time.time()}
+        saved, self.runner.now = self.runner.now, lambda: clock["t"]
+        try:
+            with mock.patch.object(supervisor, "TRANSCRIPT_GRACE_SECONDS", 0.0):
+                self.handle()
+            self.assertTrue(self.child.automation,
+                            "a spent in-line grace is a deferral now")
+            self.assertEqual(len(self.child.deferred_events), 1)
+            clock["t"] += supervisor.BIND_TIMEOUT + 1.0
+            with mock.patch.object(supervisor, "TRANSCRIPT_GRACE_SECONDS", 0.0):
+                events, err = self.handle()
+        finally:
+            self.runner.now = saved
         self.assertIn("transcript no longer exists", err)
         self.assertFalse(self.child.automation)
+        self.assertEqual(self.child.deferred_events, [])
         return events, err
 
     # -- (a) -------------------------------------------------------------
@@ -8329,6 +8348,304 @@ class OrderAmbiguityIsDedupedNotLatched(TempDirCase):
             self.assertTrue(supervisor._accept_event_order(self.child, record))
             self.assertEqual(self.child.last_received_at,
                              self.launched_at + offset)
+
+
+# --------------------------------------------------------------------------
+# A refusal that a later look can heal must not be a life sentence
+# --------------------------------------------------------------------------
+class TransientRefusalsAreRetriedNotLatched(TempDirCase):
+    """`_handle_events` turned EVERY SupervisorError out of `_validated_event`
+    into `malformed hook event: …` and a disarm for the rest of the child's
+    life. That one handler carries two disjoint classes:
+
+    PERMANENT — a forged or malformed event (wrong slot, wrong config home, a
+    pre-launch timestamp, a non-canonical or symlinked transcript, a bad
+    session id). Nothing about a later look makes those safe.
+
+    TRANSIENT — a transcript that is still being born (measured on this box
+    2026-08-02 at 0.1s to 103.9s, bulk 6-8s) and a cwd that is not readable
+    yet. Both are true statements about a moment, not about the event.
+
+    THE TRAP, and the reason a naive fix ships green and does nothing:
+    `_read_events` advances `child.event_offset` past the WHOLE batch before
+    `_handle_events` validates anything, so the losing bytes are already gone
+    from the cursor. A "read it again next poll" design retries NOTHING. The
+    record has to be carried forward in memory, which is what
+    `child.deferred_events` is for."""
+
+    SUPERVISOR = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    SID = "44444444-4444-4444-8444-444444444444"
+    CAP = "You've hit your session limit · resets 12:20pm (UTC)"
+
+    def setUp(self):
+        super().setUp()
+        self.account_row = self.account("source")
+        self.home = self.account_row["home"]
+        self.projects = os.path.join(self.home, "projects", "p")
+        os.makedirs(self.projects)
+        self.transcript = os.path.join(self.projects, self.SID + ".jsonl")
+        self.cwd = os.path.join(self.temp.name, "work")
+        os.makedirs(self.cwd)
+        self.launched_at = time.time() - 600.0
+        self.clock = {"t": 10_000.0}
+        self.tick = 0
+        self.child = supervisor.Child(
+            mock.Mock(pid=os.getpid()), self.account_row, 1,
+            supervisor.event_path(self.SUPERVISOR), "", self.launched_at,
+            True)
+        self.runner = supervisor.Supervisor(
+            "sonnet", [], self.account_row, popen=mock.Mock(),
+            now=lambda: self.clock["t"])
+
+    def born(self):
+        """The transcript finally appears on disk."""
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "hi"}]}}) + "\n")
+
+    def fire(self, hook_event_name, received_at=None, **payload):
+        self.tick += 1
+        matcher = "rate_limit" if hook_event_name == "StopFailure" else ""
+        body = dict({"hook_event_name": hook_event_name,
+                     "session_id": self.SID,
+                     "transcript_path": self.transcript, "cwd": self.cwd,
+                     "model": {"display_name": "Sonnet"},
+                     "version": "2.1.fake"}, **payload)
+        environ = {"HEADROOM_SUPERVISOR_ID": self.SUPERVISOR,
+                   "HEADROOM_CHILD_GENERATION": "1",
+                   "HEADROOM_SOURCE_SLOT": self.account_row["name"],
+                   "HEADROOM_HOOK_MATCHER": matcher,
+                   "CLAUDE_CONFIG_DIR": self.home}
+        self.assertEqual(supervisor.write_hook_event(
+            io.StringIO(json.dumps(body)), environ,
+            now=(self.launched_at + self.tick if received_at is None
+                 else received_at)), 0)
+
+    def handle(self, grace=0.0):
+        """One poll. Grace 0.0 is the in-line deadline already spent, which is
+        exactly where every live disarm landed — the retry under test is the
+        one that happens BETWEEN polls."""
+        with mock.patch.object(supervisor, "TRANSCRIPT_GRACE_SECONDS", grace), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as err:
+            self.runner._handle_events(self.child, "")
+        return ([call.args[0] for call in emit.call_args_list],
+                err.getvalue())
+
+    # -- the transcript that is still being born ---------------------------
+    def test_a_transcript_still_being_born_is_deferred_not_a_disarm(self):
+        self.fire("SessionStart", source="startup")
+        events, err = self.handle()
+        self.assertEqual(events, [], "a deferral is not a supervision loss")
+        self.assertNotIn("automatic handoff disabled", err)
+        self.assertTrue(self.child.automation)
+        self.assertIsNone(self.child.binding)
+        self.assertEqual(len(self.child.deferred_events), 1)
+
+    def test_the_deferred_event_is_carried_forward_not_re_read(self):
+        """THE PROOF THE TRAP DEMANDS.
+
+        After the deferral NOTHING new is written to the journal, and the
+        cursor is already past the SessionStart — asserted here, not assumed.
+        So an implementation that only re-reads the journal has nothing to
+        retry and can never bind. This test fails against it."""
+        self.fire("SessionStart", source="startup")
+        self.handle()
+        self.assertEqual(supervisor._read_events(self.child), [],
+                         "the journal has nothing left to re-read — any bind "
+                         "after this point comes from the carried record")
+        self.born()
+        events, err = self.handle()
+        self.assertEqual(events, [])
+        self.assertEqual(err, "")
+        self.assertIsNotNone(self.child.binding)
+        self.assertEqual(self.child.binding.session_id, self.SID)
+        self.assertEqual(self.child.session_epochs,
+                         {(self.SID, self.transcript): 1})
+        self.assertTrue(self.child.automation)
+        self.assertEqual(self.child.deferred_events, [])
+
+    def test_the_retry_is_bounded_and_ends_exactly_where_it_used_to(self):
+        """A transient that never heals must still fail closed, with the same
+        reason string and the same disarm the estate reads today."""
+        self.fire("SessionStart", source="startup")
+        self.handle()
+        self.clock["t"] += supervisor.BIND_TIMEOUT / 2
+        events, err = self.handle()
+        self.assertEqual(events, [], "still inside the budget")
+        self.assertTrue(self.child.automation)
+        self.clock["t"] += supervisor.BIND_TIMEOUT
+        events, err = self.handle()
+        self.assertIn("malformed hook event", err)
+        self.assertIn("transcript no longer exists", err)
+        self.assertIn("automatic handoff disabled", err)
+        self.assertEqual([event["event"] for event in events],
+                         ["supervision_lost"])
+        self.assertIn("transcript no longer exists", events[0]["reason"])
+        self.assertFalse(self.child.automation)
+        self.assertEqual(self.child.deferred_events, [],
+                         "a spent budget must not hold the record forever")
+
+    def test_a_healed_deferral_gives_the_next_one_a_full_budget(self):
+        """The budget is per episode. Carrying a spent one forward would make
+        the second birth race of a long-lived child disarm instantly."""
+        self.fire("SessionStart", source="startup")
+        self.handle()
+        self.clock["t"] += supervisor.BIND_TIMEOUT - 1.0
+        self.born()
+        self.handle()
+        self.assertIsNotNone(self.child.binding)
+        os.remove(self.transcript)
+        self.fire("CwdChanged")
+        events, _err = self.handle()
+        self.assertEqual(events, [])
+        self.assertTrue(self.child.automation)
+        self.assertEqual(len(self.child.deferred_events), 1)
+
+    # -- the second allowlisted string -------------------------------------
+    def test_a_cwd_that_is_not_readable_yet_is_deferred_too(self):
+        """`hook event cwd is missing or unreadable` — a directory mid-
+        creation, an unmounted path, a directory being replaced. Same class,
+        same treatment."""
+        self.born()
+        moving = os.path.join(self.temp.name, "moving")
+        self.fire("SessionStart", source="startup", cwd=moving)
+        events, err = self.handle()
+        self.assertEqual(events, [])
+        self.assertNotIn("automatic handoff disabled", err)
+        self.assertTrue(self.child.automation)
+        self.assertEqual(len(self.child.deferred_events), 1)
+        os.makedirs(moving)
+        self.handle()
+        self.assertIsNotNone(self.child.binding)
+        self.assertEqual(self.child.binding.cwd, os.path.realpath(moving))
+
+    # -- the allowlist has an edge, and these are outside it ---------------
+    def test_a_forged_event_is_still_refused_on_the_FIRST_look(self):
+        """The risk this whole change carries: a retried record is a record
+        headroom did not refuse immediately. The allowlist is three strings
+        from handoff's own vocabulary, never a catch-all — everything else
+        keeps the first-look disarm it has today."""
+        self.born()
+        forgeries = {
+            "source slot": {"source_slot": "impostor"},
+            "config home": {"config_dir": os.path.join(self.temp.name, "x")},
+            "pre-launch timestamp": {"received_at": self.launched_at - 1.0},
+            "payload": {"payload": "not-a-dict"},
+        }
+        for name, over in forgeries.items():
+            child = supervisor.Child(
+                mock.Mock(pid=os.getpid()), self.account_row, 1,
+                supervisor.event_path(self.SUPERVISOR), "", self.launched_at,
+                True)
+            record = {"schema": "headroom_hook_event@1",
+                      "supervisor_id": self.SUPERVISOR, "generation": 1,
+                      "source_slot": self.account_row["name"],
+                      "config_dir": self.home, "matcher": "",
+                      "received_at": self.launched_at + 1.0,
+                      "payload": {"hook_event_name": "SessionStart",
+                                  "session_id": self.SID,
+                                  "transcript_path": self.transcript,
+                                  "cwd": self.cwd}}
+            record.update(over)
+            with mock.patch.object(supervisor, "_read_events",
+                                   return_value=[record]), \
+                    mock.patch.object(notify, "emit") as emit, \
+                    redirect_stderr(io.StringIO()) as err:
+                self.runner._handle_events(child, "")
+            self.assertFalse(child.automation, name)
+            self.assertEqual(child.deferred_events, [], name)
+            self.assertIn("malformed hook event", err.getvalue(), name)
+            self.assertEqual([call.args[0]["event"]
+                              for call in emit.call_args_list],
+                             ["supervision_lost"], name)
+
+    def test_a_symlinked_transcript_is_not_a_birth_and_is_not_retried(self):
+        """The nearest miss in the whole allowlist: an identity failure that
+        arrives through the same `handoff.HandoffError` channel as the birth
+        race. Only the birth phrase may defer."""
+        real = os.path.join(self.temp.name, "elsewhere.jsonl")
+        with open(real, "w", encoding="utf-8") as out:
+            out.write("{}\n")
+        os.symlink(real, self.transcript)
+        self.fire("SessionStart", source="startup")
+        events, err = self.handle()
+        self.assertFalse(self.child.automation)
+        self.assertEqual(self.child.deferred_events, [])
+        self.assertIn("malformed hook event", err)
+        self.assertEqual([event["event"] for event in events],
+                         ["supervision_lost"])
+
+    def test_order_ambiguity_is_EXCLUDED_from_the_allowlist(self):
+        """The Codex-round finding, pinned so a later cycle cannot pick it up
+        by pattern-matching on the word "transient".
+
+        `_accept_event_order` rejects a record because `received_at <=
+        last_received_at`. Retrying re-tests the same two frozen numbers and
+        can NEVER heal — it is deduped and tie-broken instead (see
+        OrderAmbiguityIsDedupedNotLatched), and what is left of it stays
+        permanent and stays out of the retry."""
+        self.born()
+        self.fire("SessionStart", source="startup")
+        self.handle()
+        self.assertIsNotNone(self.child.binding)
+        self.fire("CwdChanged", received_at=self.launched_at + 5.0)
+        self.handle()
+        self.fire("CwdChanged", received_at=self.launched_at + 3.0,
+                  cwd=self.temp.name)
+        events, err = self.handle()
+        self.assertIn("order is ambiguous", err)
+        self.assertIn("automatic handoff disabled", err)
+        self.assertFalse(self.child.automation)
+        self.assertEqual(self.child.deferred_events, [],
+                         "an ambiguity that no later look can resolve must "
+                         "never enter the retry queue")
+        self.assertEqual([event["event"] for event in events],
+                         ["supervision_lost"])
+        self.assertNotIsInstance(
+            supervisor.PermanentSupervisorError("x"),
+            supervisor.TransientSupervisorError,
+            "the two classes must not be relatives in the wrong direction")
+
+    # -- the batch the deferral rides with ---------------------------------
+    def test_the_tail_rides_with_the_deferral_instead_of_being_destroyed(self):
+        """A record deferred mid-batch cannot be replayed alone: the events
+        behind it are newer, and processing them first would advance
+        `last_received_at` past the record being held — which then comes back
+        as "order is ambiguous" and disarms the child anyway. The tail is held
+        with it, in order."""
+        self.fire("SessionStart", source="startup")
+        self.fire("CwdChanged", cwd=self.temp.name)
+        events, _err = self.handle()
+        self.assertEqual(events, [])
+        self.assertEqual(len(self.child.deferred_events), 2)
+        self.assertEqual(self.child.last_received_at, 0.0,
+                         "nothing behind the held record may advance the "
+                         "frontier past it")
+        self.born()
+        self.handle()
+        self.assertIsNotNone(self.child.binding)
+        self.assertEqual(self.child.binding.cwd,
+                         os.path.realpath(self.temp.name))
+        self.assertTrue(self.child.automation)
+
+    def test_when_the_budget_is_spent_the_tail_is_announced_as_before(self):
+        """The end state is today's end state, including the tail drain: the
+        bytes are gone from the journal either way, so a cap behind the held
+        record still gets a voice and still gets no action."""
+        self.fire("SessionStart", source="startup")
+        self.fire("StopFailure", error="rate_limit",
+                  last_assistant_message=self.CAP)
+        self.handle()
+        self.clock["t"] += supervisor.BIND_TIMEOUT + 1.0
+        events, err = self.handle()
+        self.assertFalse(self.child.automation)
+        self.assertIn("hit a subscription cap", err)
+        self.assertEqual([event["event"] for event in events],
+                         ["supervision_lost", "cap_unhandled"])
+        self.assertEqual(events[1]["reason"],
+                         "the hook batch was abandoned after an earlier "
+                         "malformed event")
 
 
 if __name__ == "__main__":

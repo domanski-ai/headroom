@@ -384,6 +384,33 @@ class PermanentSupervisorError(SupervisorError):
     """A child-local condition that cannot become safe on a later hook."""
 
 
+class TransientSupervisorError(SupervisorError):
+    """A refusal that is true about a MOMENT, not about the event.
+
+    Deliberately NOT a subclass of PermanentSupervisorError, and deliberately
+    raised from an explicit allowlist of two conditions rather than by
+    catching a category:
+
+      * `transcript no longer exists` — the birth race. Claude fires
+        SessionStart before the transcript is on disk; measured on this box
+        2026-08-02 at 0.1s to 103.9s, bulk 6-8s.
+      * `hook event cwd is missing or unreadable` — a cwd mid-creation, an
+        unmounted path, a directory being replaced.
+
+    Everything else out of `_validated_event` stays permanent, because
+    everything else is an identity or schema failure: a wrong source slot,
+    a foreign config home, a pre-launch timestamp, a malformed payload or
+    session id, a non-canonical or symlinked or foreign-home transcript.
+    A later look does not make a forgery safe.
+
+    EXPLICITLY EXCLUDED, and it is the one that looks transient and is not:
+    `hook event order is ambiguous for the current binding`. That rejection
+    compares two frozen numbers, so retrying it re-tests exactly the same
+    comparison for as long as the budget lasts and can never heal. It is
+    deduped and tie-broken in `_accept_event_order` instead, and what
+    survives that stays a PermanentSupervisorError."""
+
+
 class PendingCapTimeout(PermanentSupervisorError):
     """A payload-proven cap whose transcript model never became available."""
 
@@ -518,6 +545,14 @@ class Child:
     # fingerprints of the records already accepted AT last_received_at, which
     # is what tells a duplicate apart from a clock-resolution tie
     last_received_ids: set = field(default_factory=set)
+    # Records held for a later look after a TRANSIENT refusal, in received_at
+    # order, plus the wall clock at which that patience runs out and the
+    # reason it started. They are held IN MEMORY because `_read_events` has
+    # already advanced event_offset past them: nothing on disk can serve them
+    # again, so a retry that only re-reads the journal retries nothing.
+    deferred_events: list = field(default_factory=list)
+    deferred_deadline: float = 0.0
+    deferred_reason: str = ""
     pending_cap: PendingCap = None
     # a proven cap that has nowhere to go yet: how many times it has been
     # re-tried, when the next attempt is due, and the last reason announced
@@ -1276,12 +1311,24 @@ def _validated_event(record, child, binding=None):
     try:
         source = _source_once_written(transcript, session_id, child, config_dir)
     except handoff.HandoffError as error:
+        # THE ALLOWLIST, and it is one phrase long on this path. Every other
+        # HandoffError out of the identity check — a symlink, a foreign home,
+        # a basename that does not match its session, a transcript that
+        # cannot be read — is a statement about the EVENT and keeps its
+        # first-look refusal. `_contained_transcript` raises this one, and
+        # only this one, for a file that is simply not there yet.
+        if "transcript no longer exists" in str(error):
+            raise TransientSupervisorError(str(error)) from error
         raise PermanentSupervisorError(str(error)) from error
     if source.transcript_path != transcript:
         raise PermanentSupervisorError("hook event transcript path is not canonical")
-    if not isinstance(cwd, str) or not cwd \
-            or not os.path.isdir(os.path.realpath(cwd)):
+    if not isinstance(cwd, str) or not cwd:
         raise PermanentSupervisorError("hook event cwd is missing or unreadable")
+    if not os.path.isdir(os.path.realpath(cwd)):
+        # A path that is absent RIGHT NOW: mid-creation, mid-replacement, or
+        # on a mount that has not come back yet. The string is unchanged (the
+        # estate reads it), only its permanence is.
+        raise TransientSupervisorError("hook event cwd is missing or unreadable")
     if binding is not None and (session_id != binding.session_id
                                 or transcript != binding.transcript_path):
         raise SupervisorError("hook event belongs to a different session epoch")
@@ -4294,6 +4341,48 @@ class Supervisor:
                          "bound": child.binding is not None,
                          "reason": why})
 
+    def _defer_events(self, child, remaining, error):
+        """Hold a batch tail for a later look instead of disarming for life.
+
+        THE WHOLE TAIL, not just the failing record. The events behind it are
+        newer, and processing them first would advance `last_received_at` past
+        the record being held — which then comes back as "order is ambiguous"
+        and disarms the child anyway. Held in order, replayed in order.
+
+        The budget is BIND_TIMEOUT from the FIRST deferral of an episode, not
+        from each attempt: a per-attempt budget never expires. When it is
+        spent the child gets exactly the disarm it gets today, with the same
+        reason string and the same announce-only tail drain — this changes how
+        long headroom waits before refusing, never what refusing means.
+
+        `return None` for the same reason every other early return here does:
+        the unprocessed tail may contain the very SessionEnd or SessionStart
+        that invalidates a cap proof in flight, so no proof survives a
+        deferral."""
+        now = self.now()
+        if not child.deferred_deadline:
+            child.deferred_deadline = now + BIND_TIMEOUT
+            child.deferred_reason = str(error)
+            # ONE line per episode, and no notify event: this fires on the
+            # majority of launches on this box (13 of 17 measured births cross
+            # 3.0s), and a sink row per birth is noise that would train the
+            # reader to ignore the class.
+            print(f"[headroom] hook event not ready yet ({error}); holding it "
+                  f"for up to {BIND_TIMEOUT:g}s — supervision is unchanged",
+                  file=sys.stderr)
+        if now >= child.deferred_deadline:
+            print(f"[headroom] malformed hook event ({error}); automatic "
+                  "handoff disabled for this child", file=sys.stderr)
+            _lose_supervision(child, f"malformed hook event: {error}")
+            child.pending_cap = None
+            child.deferred_events = []
+            child.deferred_deadline = 0.0
+            child.deferred_reason = ""
+            self._announce_tail_caps(child, list(remaining)[1:])
+            return None
+        child.deferred_events = list(remaining)
+        return None
+
     def _handle_events(self, child, pending_handoff_id, proof=None):
         try:
             records = _read_events(child)
@@ -4307,6 +4396,14 @@ class Supervisor:
             _lose_supervision(child, f"hook event journal unreadable: {error}")
             child.pending_cap = None
             return None
+        if child.deferred_events:
+            # The carried records come FIRST and the whole thing is re-sorted,
+            # because a late append can be older than something already read.
+            # Python's sort is stable, so a held record keeps its place ahead
+            # of a new one that shares its clock reading.
+            held, child.deferred_events = child.deferred_events, []
+            records = sorted(held + records,
+                             key=lambda record: record["received_at"])
         _remember_binding(child)
         saw_stop_failure = False
         for index, record in enumerate(records):
@@ -4332,6 +4429,8 @@ class Supervisor:
                     # frontier: it carries nothing new, and acting on it twice
                     # is the harm. Dropped in silence, supervision untouched.
                     continue
+            except TransientSupervisorError as error:
+                return self._defer_events(child, records[index:], error)
             except SupervisorError as error:
                 print(f"[headroom] malformed hook event ({error}); automatic "
                       "handoff disabled for this child", file=sys.stderr)
@@ -4358,6 +4457,13 @@ class Supervisor:
                             transcript_path=child.binding.transcript_path,
                             child_generation=child.generation)
                         child.resume_bound = True
+                except TransientSupervisorError as error:
+                    # `parse_session_start` validates a second time, so the
+                    # file can in principle vanish between the two looks in
+                    # the same iteration. Same class, same treatment. The only
+                    # state already written here is `pending_cap = None`,
+                    # which a SessionStart clears on the successful path too.
+                    return self._defer_events(child, records[index:], error)
                 except (SupervisorError, handoff.HandoffError, RuntimeError,
                         OSError) as error:
                     _lose_supervision(child, f"session binding failed: {error}")
@@ -4476,6 +4582,12 @@ class Supervisor:
                                      "reason": why})
                     continue
                 proof = self._attempt_cap(child, record, announce_non_cap=True)
+        # The whole batch went through, so whatever was being waited for has
+        # arrived: the NEXT transient starts its own budget. Reset here rather
+        # than where the held records are picked up — resetting there would
+        # renew the budget on every poll and the wait would never end.
+        child.deferred_deadline = 0.0
+        child.deferred_reason = ""
         if not saw_stop_failure and child.pending_cap is not None \
                 and child.automation:
             proof = self._attempt_cap(child, child.pending_cap.event)
