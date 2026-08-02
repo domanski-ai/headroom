@@ -4412,12 +4412,17 @@ class Supervisor:
             _lose_supervision(child, f"hook event journal unreadable: {error}")
             child.pending_cap = None
             return None
+        waiting_for = None
         if child.deferred_events:
             # The carried records come FIRST and the whole thing is re-sorted,
             # because a late append can be older than something already read.
             # Python's sort is stable, so a held record keeps its place ahead
             # of a new one that shares its clock reading.
             held, child.deferred_events = child.deferred_events, []
+            # the record the episode is actually waiting on — the one that
+            # refused. Its own arrival is what ends the episode; a NEW record
+            # getting through says nothing about the one being held.
+            waiting_for = held[0]
             records = sorted(held + records,
                              key=lambda record: record["received_at"])
         _remember_binding(child)
@@ -4454,6 +4459,19 @@ class Supervisor:
                 child.pending_cap = None
                 self._announce_tail_caps(child, records[index + 1:])
                 return None
+            if record is waiting_for:
+                # The held record got through, so the episode is over and the
+                # NEXT transient starts a budget of its own. Cleared HERE
+                # rather than at the end of the loop: every early return below
+                # skipped that, and the unknown-epoch SessionEnd is one that
+                # deliberately does not disarm — a child could heal through it
+                # and carry a spent deadline into the next episode, disarming
+                # on the first look. Not cleared where the records are picked
+                # up either: that renews the budget on every poll and the wait
+                # never ends.
+                waiting_for = None
+                child.deferred_deadline = 0.0
+                child.deferred_reason = ""
             if hook_name == "SessionStart":
                 try:
                     child.pending_cap = None
@@ -4598,12 +4616,6 @@ class Supervisor:
                                      "reason": why})
                     continue
                 proof = self._attempt_cap(child, record, announce_non_cap=True)
-        # The whole batch went through, so whatever was being waited for has
-        # arrived: the NEXT transient starts its own budget. Reset here rather
-        # than where the held records are picked up — resetting there would
-        # renew the budget on every poll and the wait would never end.
-        child.deferred_deadline = 0.0
-        child.deferred_reason = ""
         if not saw_stop_failure and child.pending_cap is not None \
                 and child.automation:
             proof = self._attempt_cap(child, child.pending_cap.event)

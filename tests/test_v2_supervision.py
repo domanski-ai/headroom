@@ -8567,6 +8567,75 @@ class TransientRefusalsAreRetriedNotLatched(TempDirCase):
         self.assertTrue(self.child.automation)
         self.assertEqual(len(self.child.deferred_events), 1)
 
+    def test_a_budget_belongs_to_ONE_episode_even_past_an_early_return(self):
+        """Found by reading the landed code back, not by a failing lane.
+
+        The budget was cleared at the END of the record loop, so any early
+        return that is NOT a disarm skipped the clearing — the unknown-epoch
+        SessionEnd branch is exactly such a return, and cycle 1 made it a
+        non-disarming one on purpose. A child that healed one transient
+        through that branch then carried the SPENT deadline into the next
+        episode and disarmed on its first look, which is the whole failure
+        this cycle exists to remove, reintroduced by the fix for it."""
+        self.fire("SessionStart", source="startup")
+        self.handle()
+        self.assertEqual(len(self.child.deferred_events), 1)
+        # the birth lands, and in the SAME batch a SessionEnd nobody can place
+        # sends the handler out through its non-disarming early return
+        self.born()
+        other = "55555555-5555-4555-8555-555555555555"
+        path = os.path.join(self.projects, other + ".jsonl")
+        with open(path, "w", encoding="utf-8") as out:
+            out.write("{}\n")
+        self.fire("SessionEnd", reason="other", session_id=other,
+                  transcript_path=path)
+        self.clock["t"] += supervisor.BIND_TIMEOUT - 1.0
+        self.handle()
+        self.assertIsNotNone(self.child.binding, "the held record healed")
+        self.assertTrue(self.child.automation)
+        # a NEW transient now, 29 seconds into the OLD episode's budget
+        self.fire("CwdChanged", cwd=os.path.join(self.temp.name, "not-yet"))
+        self.handle()
+        self.assertTrue(self.child.automation)
+        self.clock["t"] += 2.0
+        events, err = self.handle()
+        self.assertNotIn("automatic handoff disabled", err)
+        self.assertEqual(events, [], "the second episode inherited a budget "
+                         "that was already spent")
+        self.assertTrue(self.child.automation)
+
+    def test_only_the_HELD_record_arriving_ends_its_episode(self):
+        """The other half of the same precision. Some OTHER record getting
+        through says nothing about the one being waited on — and if it renewed
+        the budget, a journal with any traffic in it would keep the patience
+        alive forever and the bounded wait would not be bounded."""
+        other = "55555555-5555-4555-8555-555555555555"
+        path = os.path.join(self.projects, other + ".jsonl")
+        with open(path, "w", encoding="utf-8") as out:
+            out.write("{}\n")
+        self.fire("SessionStart", received_at=self.launched_at + 5.0,
+                  source="startup")
+        self.handle()
+        self.assertEqual(len(self.child.deferred_events), 1)
+        # a late append, stamped EARLIER than the held record and readable —
+        # it sorts ahead of it and gets through while the birth is still in
+        # flight
+        self.clock["t"] += supervisor.BIND_TIMEOUT - 1.0
+        self.fire("CwdChanged", received_at=self.launched_at + 3.0,
+                  session_id=other, transcript_path=path)
+        self.handle()
+        self.assertTrue(self.child.automation)
+        self.assertEqual(len(self.child.deferred_events), 1,
+                         "the record that got through must not be re-held")
+        self.clock["t"] += 2.0
+        events, err = self.handle()
+        self.assertIn("transcript no longer exists", err)
+        self.assertFalse(self.child.automation,
+                         "the budget was renewed by a record the episode was "
+                         "never waiting for")
+        self.assertEqual([event["event"] for event in events],
+                         ["supervision_lost"])
+
     # -- the second allowlisted string -------------------------------------
     def test_a_cwd_that_is_not_readable_yet_is_deferred_too(self):
         """`hook event cwd is missing or unreadable` — a directory mid-
