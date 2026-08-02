@@ -7582,6 +7582,206 @@ class TranscriptBirthRace(TempDirCase):
                          supervisor.BIND_TIMEOUT)
 
 
+# --------------------------------------------------------------------------
+# What a lost SessionStart really costs: the epoch map, and the latch
+# --------------------------------------------------------------------------
+class EpochLossAfterALostSessionStart(TempDirCase):
+    """The live shape of "SessionEnd has no known session epoch", which had
+    no test at all.
+
+    Diagnosis 2026-08-02: every one of those rows on this estate belonged to
+    a supervisor that had already lost its SessionStart to the transcript
+    birth race hours earlier. With no binding the epoch map is empty, so the
+    child's OWN SessionEnd is unrecognisable and disarms an already disarmed
+    child a second time — which is why the class read as two independent
+    failures instead of one and its echo.
+
+    The one epoch test that existed (LoudDisarms) builds a child WITH a live
+    binding and feeds it a FOREIGN session's SessionEnd. That is a different
+    shape, and any change to this branch judged only by it is judged by a
+    test that does not describe the failure.
+
+    Fixtures go through the real producer, `supervisor.write_hook_event`, and
+    are read back by the real `_read_events`, so the bytes are the bytes
+    `headroom _hook-event` appends live.
+    """
+
+    SUPERVISOR = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    SID = "22222222-2222-4222-8222-222222222222"
+    CAP = "You've hit your session limit · resets 12:20pm (UTC)"
+
+    def setUp(self):
+        super().setUp()
+        self.account_row = self.account("source")
+        self.home = self.account_row["home"]
+        self.projects = os.path.join(self.home, "projects", "p")
+        os.makedirs(self.projects)
+        self.transcript = os.path.join(self.projects, self.SID + ".jsonl")
+        self.cwd = os.path.join(self.temp.name, "work")
+        os.makedirs(self.cwd)
+        self.launched_at = time.time() - 600.0
+        self.tick = 0
+        self.child = supervisor.Child(
+            mock.Mock(pid=os.getpid()), self.account_row, 1,
+            supervisor.event_path(self.SUPERVISOR), "", self.launched_at,
+            True)
+        self.runner = supervisor.Supervisor(
+            "sonnet", [], self.account_row, popen=mock.Mock())
+
+    def born(self, path=None):
+        """The transcript finally appears on disk."""
+        with open(path or self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "hi"}]}}) + "\n")
+
+    def fire(self, hook_event_name, **payload):
+        self.tick += 1
+        matcher = "rate_limit" if hook_event_name == "StopFailure" else ""
+        body = dict({"hook_event_name": hook_event_name,
+                     "session_id": self.SID,
+                     "transcript_path": self.transcript, "cwd": self.cwd,
+                     "model": {"display_name": "Sonnet"},
+                     "version": "2.1.fake"}, **payload)
+        environ = {"HEADROOM_SUPERVISOR_ID": self.SUPERVISOR,
+                   "HEADROOM_CHILD_GENERATION": "1",
+                   "HEADROOM_SOURCE_SLOT": self.account_row["name"],
+                   "HEADROOM_HOOK_MATCHER": matcher,
+                   "CLAUDE_CONFIG_DIR": self.home}
+        self.assertEqual(supervisor.write_hook_event(
+            io.StringIO(json.dumps(body)), environ,
+            now=self.launched_at + self.tick), 0)
+
+    def handle(self):
+        with mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as err:
+            self.runner._handle_events(self.child, "")
+        return ([call.args[0] for call in emit.call_args_list],
+                err.getvalue())
+
+    def lose_the_birth_race(self):
+        """The 2026-07-31 failure: the hook lands, the file is not there yet,
+        the grace is spent. Grace 0.0 is the deadline having passed, not a
+        different bug — the live disarms all landed exactly at it."""
+        self.fire("SessionStart", source="startup")
+        with mock.patch.object(supervisor, "TRANSCRIPT_GRACE_SECONDS", 0.0):
+            events, err = self.handle()
+        self.assertIn("transcript no longer exists", err)
+        self.assertFalse(self.child.automation)
+        return events, err
+
+    # -- (a) -------------------------------------------------------------
+    def test_a_lost_session_start_leaves_the_epoch_map_empty_for_life(self):
+        """PINS CURRENT BEHAVIOUR. The causal chain, end to end.
+
+        `session_epochs` is written in exactly two places, both downstream of
+        a successful parse_session_start. There is no persistence and no
+        reconstruction from the journal, so a SessionStart that never parses
+        leaves the map empty forever — and the child's own SessionEnd, hours
+        later, is then unrecognisable."""
+        self.lose_the_birth_race()
+        self.assertIsNone(self.child.binding)
+        self.assertEqual(self.child.session_epochs, {})
+
+        # hours of PERFECTLY VALID events on the same session change nothing:
+        # the transcript exists now, the identity checks out, the child proves
+        # itself repeatedly, and it stays disarmed with an empty map
+        self.born()
+        self.fire("CwdChanged")
+        self.fire("CwdChanged")
+        events, err = self.handle()
+        self.assertEqual(events, [])
+        self.assertEqual(err, "")
+        self.assertEqual(self.child.session_epochs, {})
+        self.assertFalse(self.child.automation)
+
+        # and now the child's OWN SessionEnd — same session id, same path
+        self.fire("SessionEnd", reason="other")
+        source = supervisor.handoff.SourceSession(
+            self.SID, self.transcript, self.account_row, "", 0)
+        self.assertIsNone(supervisor._event_epoch(self.child, source))
+        events, err = self.handle()
+        self.assertIn("SessionEnd has no known session epoch", err)
+        self.assertEqual([event["event"] for event in events],
+                         ["supervision_lost"])
+        self.assertIn("no known session epoch", events[0]["reason"])
+
+    # -- (b) -------------------------------------------------------------
+    def test_a_flawless_session_start_heals_the_map_but_never_re_arms(self):
+        """PINS CURRENT BEHAVIOUR, and it is a P0.
+
+        `automation` is assigned True in exactly one place — the Child
+        constructor, which only runs when a new child PROCESS is spawned. So
+        a supervisor that later obtains positive proof of the child's
+        identity heals its binding and its epoch map and stays disarmed for
+        the rest of the session's life, with cap-reactive handoff, preemptive
+        rotation and the context backstop all dead.
+
+        This row is the red-first evidence for the re-arm cycle: a change
+        that adds a re-arm path MUST break this test, deliberately, and
+        should not be able to land without noticing it."""
+        self.lose_the_birth_race()
+        self.born()
+        self.fire("SessionStart", source="startup")
+        events, err = self.handle()
+        self.assertEqual(events, [])
+        self.assertIsNotNone(self.child.binding)
+        self.assertEqual(self.child.binding.session_id, self.SID)
+        self.assertEqual(self.child.session_epochs,
+                         {(self.SID, self.transcript): 1})
+        self.assertFalse(self.child.automation)      # <- the whole defect
+
+        # what that costs: the cap this supervisor exists to act on is
+        # announce-only, on a session it has just re-proven
+        self.fire("StopFailure", error="rate_limit",
+                  last_assistant_message=self.CAP)
+        events, err = self.handle()
+        self.assertEqual([event["event"] for event in events],
+                         ["cap_unhandled"])
+        self.assertEqual(events[0]["reason"], "supervision is off for this child")
+        self.assertIs(events[0]["bound"], True)
+
+    # -- (c) -------------------------------------------------------------
+    def test_a_moved_transcript_path_makes_a_healthy_child_s_epoch_unknown(self):
+        """PINS CURRENT BEHAVIOUR. The latent provider-shaped hazard.
+
+        `session_epochs` is keyed by the PAIR (session_id, transcript_path),
+        and so is the binding comparison in `_event_epoch`. A SessionEnd that
+        names a different path for the SAME session — Claude relocating a
+        transcript, which is a project-directory-shaped decision, not a
+        session-shaped one — is therefore epoch-unknown against a child that
+        is alive, correctly bound and armed.
+
+        The KEYING half of this pin is the durable one. The CONSEQUENCE half
+        (what the supervisor does about it) is what the next commit changes,
+        and this row exists so that change is visible in the diff rather than
+        silent."""
+        self.born()
+        self.fire("SessionStart", source="startup")
+        self.handle()
+        self.assertTrue(self.child.automation)
+        self.assertEqual(self.child.session_epochs,
+                         {(self.SID, self.transcript): 1})
+
+        moved_dir = os.path.join(self.home, "projects", "q")
+        os.makedirs(moved_dir)
+        moved = os.path.join(moved_dir, self.SID + ".jsonl")
+        self.born(moved)
+        source = supervisor.handoff.SourceSession(
+            self.SID, moved, self.account_row, "", 0)
+        # the keying, stated directly: same session, different path, no epoch
+        self.assertIsNone(supervisor._event_epoch(self.child, source))
+
+        self.fire("SessionEnd", transcript_path=moved, reason="other")
+        events, err = self.handle()
+        self.assertIn("SessionEnd has no known session epoch", err)
+        self.assertEqual([event["event"] for event in events],
+                         ["supervision_lost"])
+        # a child that is alive, bound and armed loses supervision for the
+        # rest of its life because a file moved
+        self.assertFalse(self.child.automation)
+        self.assertIsNotNone(self.child.binding)
+
+
 class CapFamilyDowngrade(TempDirCase):
     """Paul's rule: a spent weekly pool costs a session its model tier, not
     its life. When no seat can serve the capped family, the cap handoff walks
