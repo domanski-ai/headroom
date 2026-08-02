@@ -1950,6 +1950,83 @@ class SupervisorIntegration(unittest.TestCase):
                             for path in runner.settings_files))
         self.assertFalse(os.path.exists(supervisor.event_path(
             runner.supervisor_id)))
+        # Pin the DEFAULT world every other integration test runs in. The
+        # fixture writes the transcript BEFORE SessionStart, which is the
+        # inverse of what Claude does; that inversion is what made the
+        # 2026-07-31 estate-wide birth-race disarm invisible to this layer.
+        # It stays the default so no existing test moves — but it is now
+        # stated out loud here, not left as an accident of line order.
+        self.assertLess(self.birth_order()["transcript_born"],
+                        self.birth_order()["session_start_fired"])
+
+    def birth_order(self):
+        with open(os.path.join(self.fake_state, "birth-order.json"),
+                  encoding="utf-8") as source:
+            return json.load(source)
+
+    def test_the_birth_delay_is_off_and_bounded_unless_a_test_asks(self):
+        """The knob's default IS the shipped fixture behaviour.
+
+        F1's lesson, applied to a fixture: a value only one test ever sets is
+        a value nobody pins. Unset/junk/negative must all be 0.0 (every
+        existing test keeps its world), and the wait must stay finite or one
+        typo hangs the whole suite next to live lanes."""
+        fake = os.path.join(os.path.dirname(__file__), "fake_claude.py")
+        module = {}
+        with open(fake, encoding="utf-8") as source:
+            exec(compile(source.read(), fake, "exec"), module)  # noqa: S102
+        for raw in (None, "", "bad", "-1", "inf", "nan", "-inf"):
+            with mock.patch.dict(os.environ,
+                                 {} if raw is None
+                                 else {"FAKE_TRANSCRIPT_BIRTH_DELAY": raw}):
+                if raw is None:
+                    os.environ.pop("FAKE_TRANSCRIPT_BIRTH_DELAY", None)
+                self.assertEqual(module["birth_delay"](), 0.0, raw)
+        for raw, expected in (("0.75", 0.75), ("2", 2.0), ("9999", 10.0)):
+            with mock.patch.dict(os.environ,
+                                 {"FAKE_TRANSCRIPT_BIRTH_DELAY": raw}):
+                self.assertEqual(module["birth_delay"](), expected, raw)
+
+    def test_a_transcript_born_after_session_start_still_arms_the_lane(self):
+        """The live birth race, against the real supervisor loop.
+
+        Every integration test in this suite ran in a world where this could
+        not happen: `fake_claude` wrote the transcript and fsynced it before
+        firing SessionStart, the exact inversion of what Claude does. So the
+        estate-wide 2026-07-31 disarm — SessionStart lands, the identity check
+        lstats a file that does not exist yet, `_lose_supervision` fires, and
+        the lane cannot rotate for the rest of its life — was invisible here,
+        and would be again.
+
+        Nothing patches TRANSCRIPT_GRACE_SECONDS: the point is that the
+        SHIPPED grace covers a birth in the measured live band. The delay is
+        1.0s rather than the measured 6-8s median only because the fixture's
+        whole world is scaled down; the shape is what is under test.
+
+        The proof that the race really happened is the birth-order marker —
+        without it this test passes green on the old fixture while exercising
+        nothing, which is exactly how a fix that does nothing ships."""
+        os.environ["FAKE_TRANSCRIPT_BIRTH_DELAY"] = "1.0"
+        self.assertGreater(supervisor.TRANSCRIPT_GRACE_SECONDS, 1.0,
+                           "the shipped grace must outlast the fixture birth")
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.accounts[0], collect_fn=self.snapshot)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(runner.run(), 0)
+        order = self.birth_order()
+        self.assertGreater(order["transcript_born"],
+                           order["session_start_fired"],
+                           "the fixture is still writing the transcript first")
+        # only an ARMED child rotates on a cap — this is the assertion the
+        # disarmed estate could not have satisfied
+        actions = [row.get("action") for row in self.ledger_actions()]
+        for action in ("cap_confirmed", "stop_sent", "resume_bound"):
+            self.assertIn(action, actions)
+        # named exactly: the end-of-life "session ended without a replacement"
+        # disarm is normal here and is NOT what this test is about
+        self.assertNotIn("malformed hook event", err.getvalue())
+        self.assertNotIn("transcript no longer exists", err.getvalue())
 
     def test_fake_child_handoffs_after_delayed_cap_transcript_flush(self):
         os.environ["FAKE_CLAUDE_SCENARIO"] = "delayed-flush"

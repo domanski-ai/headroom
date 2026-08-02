@@ -38,6 +38,30 @@ def append_event(path, event):
         os.fsync(out.fileno())
 
 
+def birth_delay():
+    """Seconds AFTER SessionStart before this fixture's transcript appears.
+
+    Claude fires SessionStart and writes the transcript afterwards — measured
+    on the production box 2026-08-02 at 0.1s to 103.9s, bulk 6-8s. This
+    fixture did the exact opposite (write, fsync, THEN fire), so every
+    integration test ran in a world where the birth race could not occur.
+    That is why the estate-wide 2026-07-31 disarm — 'malformed hook event
+    (transcript no longer exists); automatic handoff disabled' on every lane —
+    was invisible to the integration layer, and would have been again.
+
+    Default 0.0 keeps the old order, so no existing test's world moves. The
+    wait is CLAMPED: an unbounded fixture sleep hangs a suite that runs next
+    to live lanes, and a test that wants the race LOST patches the
+    supervisor's grace down instead of sleeping longer."""
+    try:
+        value = float(os.environ.get("FAKE_TRANSCRIPT_BIRTH_DELAY", ""))
+    except ValueError:
+        return 0.0
+    if not (0.0 < value < float("inf")):   # also rejects nan and -inf
+        return 0.0
+    return min(10.0, value)
+
+
 def main():
     args = sys.argv[1:]
     settings = ""
@@ -97,33 +121,41 @@ def main():
                  "message": {"model": "<synthetic>", "content": [
                  {"type": "text", "text":
                   "You've hit your session limit · resets 12:20pm (UTC)"}]}}
-    with open(transcript, "w", encoding="utf-8", newline="\n") as out:
-        if scenario == "corrupt":
-            out.write('{"type":')
-        else:
-            out.write(json.dumps({"type": "user", "message": {
-                "content": [{"type": "text", "text": "hello"}]}}) + "\n")
-            # FAKE_CONTEXT_TOKENS makes this transcript MEASURABLE, so an
-            # integration test can reach the window-fit code at all. Without
-            # it _context_used() is None everywhere and every fit decision
-            # short-circuits — which is why the whole window-fit surface was
-            # invisible to the integration layer. Opt-in, so no existing
-            # test's behaviour moves.
-            usage = {}
-            tokens = os.environ.get("FAKE_CONTEXT_TOKENS", "")
-            if tokens.isdigit():
-                total = int(tokens)
-                read = max(total - 1001, 0)
-                usage = {"usage": {
-                    "input_tokens": 1,
-                    "cache_creation_input_tokens": total - read - 1,
-                    "cache_read_input_tokens": read, "output_tokens": 405}}
-            out.write(json.dumps({"type": "assistant", "message": dict({
-                "model": model_id, "content": [
-                    {"type": "text", "text": "real assistant turn"}]},
-                **usage)}) + "\n")
-            out.flush()
-            os.fsync(out.fileno())
+    order = {}
+    delay = birth_delay()
+
+    def give_birth(path):
+        with open(path, "w", encoding="utf-8", newline="\n") as out:
+            if scenario == "corrupt":
+                out.write('{"type":')
+            else:
+                out.write(json.dumps({"type": "user", "message": {
+                    "content": [{"type": "text", "text": "hello"}]}}) + "\n")
+                # FAKE_CONTEXT_TOKENS makes this transcript MEASURABLE, so an
+                # integration test can reach the window-fit code at all.
+                # Without it _context_used() is None everywhere and every fit
+                # decision short-circuits — which is why the whole window-fit
+                # surface was invisible to the integration layer. Opt-in, so
+                # no existing test's behaviour moves.
+                usage = {}
+                tokens = os.environ.get("FAKE_CONTEXT_TOKENS", "")
+                if tokens.isdigit():
+                    total = int(tokens)
+                    read = max(total - 1001, 0)
+                    usage = {"usage": {
+                        "input_tokens": 1,
+                        "cache_creation_input_tokens": total - read - 1,
+                        "cache_read_input_tokens": read, "output_tokens": 405}}
+                out.write(json.dumps({"type": "assistant", "message": dict({
+                    "model": model_id, "content": [
+                        {"type": "text", "text": "real assistant turn"}]},
+                    **usage)}) + "\n")
+                out.flush()
+                os.fsync(out.fileno())
+        order.setdefault("transcript_born", time.time())
+
+    if not delay:
+        give_birth(transcript)
     common = {"session_id": sid, "transcript_path": transcript,
               "cwd": os.getcwd(), "model": {"display_name": "Sonnet"},
               "version": "2.1.fake"}
@@ -140,8 +172,19 @@ def main():
     # sigterm_flush and no SessionEnd. A real CLI has its handlers up before
     # it announces a session; the fake must too.
     signal.signal(signal.SIGTERM, on_term)
+    order["session_start_fired"] = time.time()
     hook(settings, "SessionStart",
          dict(common, hook_event_name="SessionStart", source="startup"))
+    if delay:
+        # The live order: the hook is already in the supervisor's journal and
+        # the transcript does not exist yet. The birth is JOINED here rather
+        # than left to a thread — everything below appends to this file, and
+        # an append would create it early and quietly cancel the race.
+        time.sleep(delay)
+        give_birth(transcript)
+    with open(os.path.join(state, "birth-order.json"), "w",
+              encoding="utf-8", newline="\n") as out:
+        out.write(json.dumps(order) + "\n")
     changed_cwd = os.environ.get("FAKE_CHANGED_CWD")
     if changed_cwd and slot == os.environ.get("FAKE_CHANGED_CWD_SLOT", "source"):
         hook(settings, "CwdChanged",
@@ -201,16 +244,29 @@ def main():
             reason="clear" if scenario == "clear" else "resume"))
         next_sid = session_id(slot, generation, scenario)
         next_transcript = os.path.join(directory, next_sid + ".jsonl")
-        with open(next_transcript, "w", encoding="utf-8", newline="\n") as out:
-            out.write(json.dumps({"type": "user", "message": {
-                "content": [{"type": "text", "text": "replacement"}]}}) + "\n")
-            out.flush()
-            os.fsync(out.fileno())
+
+        def give_next_birth():
+            with open(next_transcript, "w", encoding="utf-8",
+                      newline="\n") as out:
+                out.write(json.dumps({"type": "user", "message": {
+                    "content": [{"type": "text", "text": "replacement"}]}})
+                    + "\n")
+                out.flush()
+                os.fsync(out.fileno())
+
+        # A /clear or a resume transition is a BIRTH too, and it had the same
+        # inversion — the replacement transcript was on disk before its
+        # SessionStart fired. Same knob, same default.
+        if not delay:
+            give_next_birth()
         next_common = dict(common, session_id=next_sid,
                            transcript_path=next_transcript)
         hook(settings, "SessionStart", dict(
             next_common, hook_event_name="SessionStart",
             source="clear" if scenario == "clear" else "resume"))
+        if delay:
+            time.sleep(delay)
+            give_next_birth()
         time.sleep(0.5)
         return 0
     # the preemptive path has to poll usage, prove idleness, admit through the
