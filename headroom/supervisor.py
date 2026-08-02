@@ -4315,11 +4315,53 @@ class Supervisor:
                         child.pending_cap.session_id, child.pending_cap.epoch):
                     child.pending_cap = None
                 if epoch is None:
-                    _lose_supervision(
-                        child, "SessionEnd has no known session epoch")
+                    # LOUD, AND NOT A DISARM. Reaching here means no epoch was
+                    # ever recorded for this session, so there is nothing this
+                    # branch can protect: a SessionEnd's job is to mark a
+                    # session dead so a later StopFailure is not acted on, and
+                    # an unknown session has no proof to expire.
+                    #
+                    # Every child that reaches it is one of two things, and
+                    # disarming is wrong for both. Either it is ALREADY
+                    # disarmed — it lost its SessionStart to the transcript
+                    # birth race hours ago, so the epoch map is empty and this
+                    # is the child's own goodbye — in which case the disarm
+                    # was a no-op on the flag and a second, duplicate row in
+                    # the sink, which is precisely what made one failure read
+                    # as two independent ones (2026-08-02). Or it is alive,
+                    # correctly bound and ARMED, and the epoch went unknown
+                    # because the transcript PATH moved under a stable session
+                    # id — `session_epochs` is keyed by the pair — in which
+                    # case a Claude-side change in transcript placement would
+                    # silently disarm the whole fleet.
+                    #
+                    # "This child never bound at all" is the residual case,
+                    # and it keeps its own guard: the BIND_TIMEOUT disarm,
+                    # which is the better one because it waits the birth out
+                    # instead of racing it.
+                    #
+                    # `dead_sessions` is deliberately NOT written: the key
+                    # would have to be (session_id, None), and every lookup
+                    # against it computes `session_key` as a bare None when
+                    # the epoch is unknown, so the entry could never match —
+                    # while a literal None in that set makes _stop_transition
+                    # treat EVERY unknown-epoch event as an expired proof.
+                    #
+                    # The tail is still abandoned and still announce-only.
+                    # `_read_events` moved the cursor past the whole batch, so
+                    # those bytes are gone either way, and acting on them
+                    # would change when headroom STOPS a child. That is not
+                    # this change; this change is only about the latch.
                     print("[headroom] SessionEnd has no known session epoch; "
-                          "automatic handoff disabled for this child",
+                          "this child's supervision is unchanged",
                           file=sys.stderr)
+                    notify.emit({"event": "session_end_unknown_epoch",
+                                 "account": child.account.get("name", ""),
+                                 "session": source.session_id,
+                                 "armed": child.automation,
+                                 "bound": child.binding is not None,
+                                 "reason": "SessionEnd has no known session "
+                                           "epoch"})
                     self._announce_tail_caps(child, records[index + 1:])
                     return None
                 child.dead_sessions.add(session_key)

@@ -15,10 +15,19 @@ transitions with a single JSON argument describing the event:
     {"event": "preemptive_held", "account": ..., "reason": ...}
     {"event": "cap_held", "account": ..., "reason": ...}
     {"event": "cap_cleared", "account": ..., "reason": ...}
+    {"event": "session_end_unknown_epoch", "account": ..., "session": ...,
+     "armed": ..., "bound": ..., "reason": ...}
 
 ``supervision_lost`` fires for EVERY path that disarms a supervised child's
 automatic handoff, once per distinct reason — a dashboard should treat it as
 "this session is no longer protected".
+
+``session_end_unknown_epoch`` is the deliberate counter-example: something
+happened that is worth saying out loud, and supervision was NOT taken away
+for it. ``armed`` is the diagnostic that matters — False means this is the
+echo of an earlier disarm (the child lost its SessionStart), True means a
+live, correctly bound child saw a SessionEnd it cannot place, which on this
+provider means a transcript path moved under a stable session id.
 
 Delivery is best-effort and bounded: the command has a hard timeout (default
 10s, override with ``HEADROOM_NOTIFY_TIMEOUT``). Unix runs it in its own

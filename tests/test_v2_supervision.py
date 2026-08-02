@@ -5682,7 +5682,13 @@ class LoudDisarms(TempDirCase):
         self.assertIn("malformed hook event", events[0]["reason"])
         self.assertFalse(self.child.automation)
 
-    def test_session_end_without_a_known_epoch_emits_supervision_lost(self):
+    def test_session_end_without_a_known_epoch_says_so_without_disarming(self):
+        # This branch is the one disarm in the census that cannot be
+        # protecting anything: reaching it means no epoch was ever recorded
+        # for that session, so there is no proof to expire and no armed
+        # decision to unwind. It stays LOUD — a new event class, which the
+        # sentinel treats as unknown and alerts on — and stops taking
+        # supervision away from a child that is still alive and bound.
         other = "55555555-5555-4555-8555-555555555555"
         path = os.path.join(os.path.dirname(self.transcript), other + ".jsonl")
         with open(path, "w", encoding="utf-8") as out:
@@ -5690,10 +5696,11 @@ class LoudDisarms(TempDirCase):
         events, err = self.disarm([self.record(payload={
             "session_id": other, "transcript_path": path})])
         self.assertIn("SessionEnd has no known session epoch", err)
+        self.assertNotIn("automatic handoff disabled", err)
         self.assertEqual([event["event"] for event in events],
-                         ["supervision_lost"])
+                         ["session_end_unknown_epoch"])
         self.assertIn("no known session epoch", events[0]["reason"])
-        self.assertFalse(self.child.automation)
+        self.assertTrue(self.child.automation)
 
     def test_unreadable_hook_journal_emits_supervision_lost(self):
         with mock.patch.object(
@@ -5799,7 +5806,14 @@ class AnAbandonedBatchStillSpeaksItsCaps(LoudDisarms):
         self.assertIs(unhandled[0]["bound"], True)
 
     def test_a_cap_behind_an_unknown_epoch_session_end_is_announced_too(self):
-        """(b) The same loss through a different early return."""
+        """(b) The same loss through a different early return.
+
+        The early return is DELIBERATELY still here now that this branch no
+        longer disarms. `_read_events` advanced the cursor for the whole
+        batch, so the tail is gone from the journal either way, and ACTING on
+        those bytes is a change to when headroom stops a child — which is not
+        this tranche's to make. The child keeps its supervision and acts on
+        the NEXT cap through the ordinary path."""
         now = time.time()
         other = "55555555-5555-4555-8555-555555555555"
         path = os.path.join(os.path.dirname(self.transcript), other + ".jsonl")
@@ -5809,7 +5823,7 @@ class AnAbandonedBatchStillSpeaksItsCaps(LoudDisarms):
             self.record(received_at=now, payload={
                 "session_id": other, "transcript_path": path}),
             self.cap_record(now + 1)])
-        self.assertFalse(self.child.automation)
+        self.assertTrue(self.child.automation)
         self.assertIn("SessionEnd has no known session epoch", err)
         self.assertEqual([e["reason"] for e in self.unhandled(events)],
                          [self.ABANDONED])
@@ -7634,7 +7648,8 @@ class EpochLossAfterALostSessionStart(TempDirCase):
             out.write(json.dumps({"type": "user", "message": {
                 "content": [{"type": "text", "text": "hi"}]}}) + "\n")
 
-    def fire(self, hook_event_name, **payload):
+    def fire(self, hook_event_name, supervisor_id=None, received_at=None,
+             **payload):
         self.tick += 1
         matcher = "rate_limit" if hook_event_name == "StopFailure" else ""
         body = dict({"hook_event_name": hook_event_name,
@@ -7642,14 +7657,15 @@ class EpochLossAfterALostSessionStart(TempDirCase):
                      "transcript_path": self.transcript, "cwd": self.cwd,
                      "model": {"display_name": "Sonnet"},
                      "version": "2.1.fake"}, **payload)
-        environ = {"HEADROOM_SUPERVISOR_ID": self.SUPERVISOR,
+        environ = {"HEADROOM_SUPERVISOR_ID": supervisor_id or self.SUPERVISOR,
                    "HEADROOM_CHILD_GENERATION": "1",
                    "HEADROOM_SOURCE_SLOT": self.account_row["name"],
                    "HEADROOM_HOOK_MATCHER": matcher,
                    "CLAUDE_CONFIG_DIR": self.home}
         self.assertEqual(supervisor.write_hook_event(
             io.StringIO(json.dumps(body)), environ,
-            now=self.launched_at + self.tick), 0)
+            now=(self.launched_at + self.tick if received_at is None
+                 else received_at)), 0)
 
     def handle(self):
         with mock.patch.object(notify, "emit") as emit, \
@@ -7701,9 +7717,15 @@ class EpochLossAfterALostSessionStart(TempDirCase):
         self.assertIsNone(supervisor._event_epoch(self.child, source))
         events, err = self.handle()
         self.assertIn("SessionEnd has no known session epoch", err)
+        # SAFETY ARGUMENT, CASE (a): this child was disarmed by the birth race
+        # hours ago, so the disarm this branch used to perform was a no-op on
+        # the flag and a duplicate row in the sink — the duplicate that made
+        # one failure read as two. It says so now instead.
+        self.assertNotIn("automatic handoff disabled", err)
         self.assertEqual([event["event"] for event in events],
-                         ["supervision_lost"])
-        self.assertIn("no known session epoch", events[0]["reason"])
+                         ["session_end_unknown_epoch"])
+        self.assertIs(events[0]["armed"], False)
+        self.assertFalse(self.child.automation)
 
     # -- (b) -------------------------------------------------------------
     def test_a_flawless_session_start_heals_the_map_but_never_re_arms(self):
@@ -7741,8 +7763,9 @@ class EpochLossAfterALostSessionStart(TempDirCase):
         self.assertIs(events[0]["bound"], True)
 
     # -- (c) -------------------------------------------------------------
-    def test_a_moved_transcript_path_makes_a_healthy_child_s_epoch_unknown(self):
-        """PINS CURRENT BEHAVIOUR. The latent provider-shaped hazard.
+    def test_a_moved_transcript_path_no_longer_disarms_a_healthy_child(self):
+        """The latent provider-shaped hazard, and the branch that used to
+        turn it into a fleet-wide silent disarm.
 
         `session_epochs` is keyed by the PAIR (session_id, transcript_path),
         and so is the binding comparison in `_event_epoch`. A SessionEnd that
@@ -7751,10 +7774,8 @@ class EpochLossAfterALostSessionStart(TempDirCase):
         session-shaped one — is therefore epoch-unknown against a child that
         is alive, correctly bound and armed.
 
-        The KEYING half of this pin is the durable one. The CONSEQUENCE half
-        (what the supervisor does about it) is what the next commit changes,
-        and this row exists so that change is visible in the diff rather than
-        silent."""
+        The KEYING pin is unchanged and durable (re-keying the map is its own
+        cycle). What moved is the CONSEQUENCE."""
         self.born()
         self.fire("SessionStart", source="startup")
         self.handle()
@@ -7774,12 +7795,82 @@ class EpochLossAfterALostSessionStart(TempDirCase):
         self.fire("SessionEnd", transcript_path=moved, reason="other")
         events, err = self.handle()
         self.assertIn("SessionEnd has no known session epoch", err)
+        self.assertNotIn("automatic handoff disabled", err)
+        self.assertEqual([event["event"] for event in events],
+                         ["session_end_unknown_epoch"])
+        # SAFETY ARGUMENT, CASE (b): alive, bound, armed. A file moving must
+        # not cost this child cap handoff, preemptive rotation and the
+        # context backstop for the rest of its life.
+        self.assertIs(events[0]["armed"], True)
+        self.assertTrue(self.child.automation)
+        self.assertIsNotNone(self.child.binding)
+
+    # -- the other direction, pinned --------------------------------------
+    def test_a_known_epoch_session_end_still_behaves_exactly_as_before(self):
+        """Only the UNKNOWN-epoch branch moved.
+
+        A SessionEnd on the child's own live session still marks that session
+        dead, still records that it ended, and still lands in the 'ended
+        without a replacement SessionStart' disarm. That disarm is correct
+        and untouched; this row is what stops the change leaking into it."""
+        self.born()
+        self.fire("SessionStart", source="startup")
+        self.handle()
+        self.assertTrue(self.child.automation)
+
+        self.fire("SessionEnd", reason="other")
+        events, err = self.handle()
+        self.assertIn((self.SID, 1), self.child.dead_sessions)
+        self.assertTrue(self.child.session_ended)
         self.assertEqual([event["event"] for event in events],
                          ["supervision_lost"])
-        # a child that is alive, bound and armed loses supervision for the
-        # rest of its life because a file moved
+        self.assertIn("ended without a replacement SessionStart",
+                      events[0]["reason"])
         self.assertFalse(self.child.automation)
-        self.assertIsNotNone(self.child.binding)
+
+    def test_a_session_end_before_any_binding_leaves_the_bind_timeout_to_judge(self):
+        """The residual risk of not disarming, and the guard that covers it.
+
+        A child that has never bound is still ARMED — automation is set at
+        construction — so a SessionEnd arriving before any SessionStart now
+        leaves an unbound child armed where it used to be disarmed on the
+        spot. That is deliberate: 'this child never bound' already has a
+        correct, time-boxed guard, and it is the better one, because it waits
+        out the birth instead of racing it.
+
+        Executed through the real `_monitor` loop rather than argued: the
+        non-disarming event fires, and BIND_TIMEOUT still ends the child's
+        supervision on its own terms."""
+        polls = iter([None, None, 0])
+
+        class FakeProcess:
+            pid = os.getpid()
+
+            @staticmethod
+            def poll():
+                return next(polls)
+
+        clock = {"t": 1000.0}
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.account_row,
+            popen=lambda argv, env=None, cwd=None, **kw: FakeProcess(),
+            now=lambda: clock["t"], sleep=lambda seconds: None)
+        self.born()
+        with mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            child = runner._spawn(self.account_row, [], self.temp.name, True)
+            self.fire("SessionEnd", supervisor_id=runner.supervisor_id,
+                      received_at=1000.5, reason="other")
+            clock["t"] = 1000.0 + supervisor.BIND_TIMEOUT + 1
+            self.assertEqual(runner._monitor(child), 0)
+        events = [call.args[0] for call in emit.call_args_list]
+        self.assertEqual([event["event"] for event in events],
+                         ["launch", "session_end_unknown_epoch",
+                          "supervision_lost", "child_died_unrequested"])
+        self.assertIs(events[1]["bound"], False)
+        self.assertIs(events[1]["armed"], True)
+        self.assertIn("SessionStart hook never bound", events[2]["reason"])
+        self.assertFalse(child.automation)
 
 
 class CapFamilyDowngrade(TempDirCase):
