@@ -7443,40 +7443,45 @@ class TranscriptBirthRace(TempDirCase):
                     "/x.jsonl", "X", child, account["home"],
                     sleep=lambda s: None, now=lambda: clock["t"])
 
-    def test_the_default_grace_is_the_supervisor_s_own_binding_budget(self):
-        """The mechanism was right and the number was wrong.
+    def test_the_in_line_grace_is_at_most_ONE_poll_tick(self):
+        """FLIPPED BY FIX CYCLE 2. This row used to pin the opposite —
+        `TRANSCRIPT_GRACE_SECONDS >= BIND_TIMEOUT` — and it was right at the
+        time: with nowhere else to wait, the in-line wait had to outlast the
+        birth or the lane was disarmed for life.
 
-        Every other test in this class patches TRANSCRIPT_GRACE_SECONDS to a
-        value it chooses, so the default that actually ships was never once
-        exercised — which is how a window too small for this estate survived
-        the fix that introduced it.
+        The wait bought that coverage with 30 seconds of deafness.
+        `_source_once_written` sleeps INSIDE `_validated_event`, inside
+        `_handle_events`, inside the `_monitor` poll loop — so for the whole
+        window the supervisor cannot see the child exit, cannot act on a cap
+        and cannot process a shutdown signal. Measured against the real loop
+        with a 6.1s synthetic birth: 0 poll ticks inside the birth window and
+        a 6.18s gap between ticks; at the shipped 30s ceiling that is ~120
+        missed ticks.
 
-        Measured on the production box 2026-08-02, over all 45 SessionStart
-        hooks on disk (received_at vs the transcript's statx birth): births
-        are bimodal, a thin cluster under 2.7s and the bulk at 6-8s with a
-        tail to 104s. 18 of 39 measurable launches crossed 3.0s. 3.0 sat in
-        the trough between the two modes, so the fix turned a 100% disarm
-        into a ~76% one — worse than the open bug, because everyone believed
-        it was closed.
+        The budget now lives BETWEEN polls (`_defer_events`), so the in-line
+        wait is only a latency shortcut for a birth that lands within the
+        current tick — and its ceiling is the loop's own sleep, which makes
+        the worst case one extra tick instead of a hundred and twenty."""
+        self.assertLessEqual(
+            supervisor.TRANSCRIPT_GRACE_SECONDS, supervisor.POLL_SECONDS,
+            "an in-line wait longer than the poll interval is a supervisor "
+            "that has stopped watching its child")
+        self.assertEqual(supervisor.TRANSCRIPT_GRACE_CEILING,
+                         supervisor.POLL_SECONDS)
 
-        Tie it to BIND_TIMEOUT rather than to a fresh number: the supervisor
-        already grants a child that long to bind, and a transcript still
-        missing at the end of that budget is a genuine failure. Two budgets
-        for one wait is what let the smaller one go unnoticed.
-        """
-        self.assertGreaterEqual(
-            supervisor.TRANSCRIPT_GRACE_SECONDS, supervisor.BIND_TIMEOUT,
-            "a birth slower than the grace disarms the lane for its whole "
-            "life — headroom has no re-arm path")
+    def test_a_seven_second_birth_is_no_longer_waited_for_IN_LINE(self):
+        """FLIPPED BY FIX CYCLE 2, and this is the flip that matters most.
 
-    def test_a_seven_second_birth_is_survived_on_the_shipped_default(self):
-        """The measured median case on this box, with nothing patched.
+        This row used to prove the shipped default covered a 7.5s birth — the
+        measured median band on this box, and the band both live losses fell
+        in — by waiting for it in line. It now proves the opposite: the in-line
+        wait gives up almost immediately.
 
-        Deliberately does NOT patch TRANSCRIPT_GRACE_SECONDS: the clock is
-        faked instead, so the assertion is about the value the supervisor
-        really ships with. Both live losses (headroom 2026-08-01 17:41,
-        freelance 2026-08-02 06:4x) were births in exactly this range.
-        """
+        The GUARANTEE did not move, only the mechanism. Its successor is
+        `TransientRefusalsAreRetriedNotLatched.
+        test_a_seven_second_birth_is_survived_by_the_RETRY`, which drives the
+        same 7.5s birth through the real handler on the same shipped default
+        and binds."""
         account = self.account()
         child = mock.Mock(account=account)
         clock = {"t": 0.0}
@@ -7488,11 +7493,13 @@ class TranscriptBirthRace(TempDirCase):
             return "SOURCE"
 
         with mock.patch.object(handoff, "_source", side_effect=fake_source):
-            result = supervisor._source_once_written(
-                "/x.jsonl", self.SID, child, account["home"],
-                sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
-                now=lambda: clock["t"])
-        self.assertEqual(result, "SOURCE")
+            with self.assertRaises(handoff.HandoffError):
+                supervisor._source_once_written(
+                    "/x.jsonl", self.SID, child, account["home"],
+                    sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+                    now=lambda: clock["t"])
+        self.assertLessEqual(clock["t"], supervisor.POLL_SECONDS,
+                             "the loop was held for longer than one tick")
 
     def test_a_real_identity_failure_is_not_retried(self):
         # a symlinked/foreign transcript must fail on the FIRST look — the
@@ -7584,16 +7591,21 @@ class TranscriptBirthRace(TempDirCase):
         # and `inf` must not turn a bounded wait into a permanent one — this
         # poll also drives cap detection and exit handling
         # Named, never spelled as a literal: the fallback and the ceiling are
-        # BIND_TIMEOUT, and a copy of the number here is exactly what let the
-        # old 3.0 default drift out of step with what it had to outlast.
+        # TRANSCRIPT_GRACE_CEILING, and a copy of the number here is exactly
+        # what let the old 3.0 default drift out of step with what it had to
+        # outlast. The name is what moved in cycle 2; the contract did not.
         for raw in (None, "", "bad", "inf", "nan", "-inf"):
             self.assertEqual(supervisor._grace_seconds(raw),
-                             supervisor.BIND_TIMEOUT, raw)
+                             supervisor.TRANSCRIPT_GRACE_CEILING, raw)
         self.assertEqual(supervisor._grace_seconds("0"), 0.0)
-        self.assertEqual(supervisor._grace_seconds("1.5"), 1.5)
+        self.assertEqual(supervisor._grace_seconds("0.1"), 0.1)
         self.assertEqual(supervisor._grace_seconds("-5"), 0.0)
+        # an operator can shorten the in-line wait; they can no longer buy
+        # deafness with it, whatever they set
         self.assertEqual(supervisor._grace_seconds("9999"),
-                         supervisor.BIND_TIMEOUT)
+                         supervisor.TRANSCRIPT_GRACE_CEILING)
+        self.assertEqual(supervisor._grace_seconds("1.5"),
+                         supervisor.TRANSCRIPT_GRACE_CEILING)
 
 
 # --------------------------------------------------------------------------
@@ -8499,6 +8511,59 @@ class TransientRefusalsAreRetriedNotLatched(TempDirCase):
         self.fire("CwdChanged")
         events, _err = self.handle()
         self.assertEqual(events, [])
+        self.assertTrue(self.child.automation)
+        self.assertEqual(len(self.child.deferred_events), 1)
+
+    # -- where the seven-second birth is covered now -----------------------
+    def test_a_seven_second_birth_is_survived_by_the_RETRY(self):
+        """The successor to `TranscriptBirthRace.
+        test_a_seven_second_birth_is_survived_on_the_shipped_default`.
+
+        The measured median band on this box, and the band both live losses
+        fell in. NOTHING is patched on the supervisor side — the in-line grace
+        is the shipped one and is far too small for this birth on purpose. The
+        budget clock is injected, because the budget is the thing under test.
+
+        This is also the row that proves the retry is not a one-shot: the
+        record survives three polls, not one."""
+        self.fire("SessionStart", source="startup")
+        for elapsed in (0.0, 2.5, 5.0):
+            self.clock["t"] = 10_000.0 + elapsed
+            with mock.patch.object(notify, "emit") as emit, \
+                    redirect_stderr(io.StringIO()):
+                self.runner._handle_events(self.child, "")
+            self.assertEqual([call.args[0] for call in emit.call_args_list],
+                             [], f"disarmed at {elapsed}s")
+            self.assertTrue(self.child.automation, f"disarmed at {elapsed}s")
+            self.assertIsNone(self.child.binding)
+        self.clock["t"] = 10_000.0 + 7.5
+        self.born()
+        with mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as err:
+            self.runner._handle_events(self.child, "")
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual([call.args[0] for call in emit.call_args_list], [])
+        self.assertIsNotNone(self.child.binding)
+        self.assertTrue(self.child.automation)
+
+    def test_the_in_line_wait_never_holds_the_poll_loop_for_the_birth(self):
+        """The diagnosis's open gap: nothing asserted that the grace does not
+        block the loop, so a 30-second in-line wait shipped unnoticed.
+
+        Real wall clock, real `handoff._source`, shipped in-line grace, a
+        transcript that never appears. `_source_once_written` sleeps inside
+        `_validated_event`, inside `_handle_events`, inside `_monitor` — so
+        the duration of this call IS the time the supervisor spends unable to
+        see its child exit, act on a cap, or process a shutdown signal."""
+        self.fire("SessionStart", source="startup")
+        started = time.monotonic()
+        with mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            self.runner._handle_events(self.child, "")
+        blocked = time.monotonic() - started
+        self.assertLess(blocked, supervisor.POLL_SECONDS * 4,
+                        "the poll loop went deaf waiting for a file that the "
+                        "next poll could have looked for")
         self.assertTrue(self.child.automation)
         self.assertEqual(len(self.child.deferred_events), 1)
 

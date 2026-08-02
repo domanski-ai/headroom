@@ -1225,30 +1225,42 @@ def _record_matches(record, child, binding=None):
 # used to look exactly like a forged event: "transcript no longer exists" ->
 # PermanentSupervisorError -> supervision disarmed for the whole run. Every
 # lane on this estate booted disarmed because of it, which is why a cap could
-# not rotate anything (2026-07-31). The file appears in milliseconds; waiting
-# a bounded moment for it is the difference between a supervised lane and an
-# unprotected one. A transcript still missing at the deadline is a real
-# failure and still fails closed.
-def _grace_seconds(raw, default=BIND_TIMEOUT, ceiling=BIND_TIMEOUT):
-    """A tolerant, FINITE grace window (the project's numeric-env convention).
+# not rotate anything (2026-07-31).
+#
+# WHERE THAT WAIT LIVES NOW. The budget moved out of this function and into
+# `_defer_events`, which retries the record on later polls. What is left here
+# is a LATENCY shortcut for a birth that lands inside the current tick, and
+# its ceiling is the poll interval itself.
+TRANSCRIPT_GRACE_CEILING = POLL_SECONDS
+
+
+def _grace_seconds(raw, default=TRANSCRIPT_GRACE_CEILING,
+                   ceiling=TRANSCRIPT_GRACE_CEILING):
+    """A tolerant, FINITE in-line grace (the project's numeric-env convention).
 
     A malformed value must not crash import, and `inf` must not turn the
     bounded wait into a permanent one — this poll also drives cap detection
     and exit handling, so its upper bound is a real budget.
 
-    The default is BIND_TIMEOUT and not a number of its own. It was 3.0, and
-    3.0 was measured wrong: across all 45 SessionStart hooks on the
-    production box (2026-08-02) transcript births are bimodal — a thin
-    cluster under 2.7s, the bulk at 6-8s, a tail to 104s — so 3.0 sat in the
-    trough and 18 of 39 measurable launches crossed it. Losing this race
-    disarms automatic handoff for the child's entire life, and there is no
-    re-arm path, so the lane stays unsupervised until its pane restarts.
-    Two of two fresh launches lost it on 2026-08-01/02.
+    THE HISTORY, because both previous numbers were wrong in opposite
+    directions. It was 3.0, and 3.0 was measured wrong: across all 45
+    SessionStart hooks on the production box (2026-08-02) transcript births
+    are bimodal — a thin cluster under 2.7s, the bulk at 6-8s, a tail to 104s
+    — so 3.0 sat in the trough and 18 of 39 measurable launches crossed it.
+    It was then raised to BIND_TIMEOUT, which covered the births and bought
+    that coverage with 30 seconds of DEAFNESS: this wait happens inside
+    `_validated_event`, inside `_handle_events`, inside the `_monitor` poll
+    loop, so for its whole length the supervisor cannot see the child exit,
+    act on a cap, or process a shutdown signal. Measured against the real
+    loop with a 6.1s synthetic birth: zero poll ticks inside the birth window
+    and a 6.18s gap between consecutive ticks; at 30s that is ~120 missed
+    ticks.
 
-    One budget, not two: the supervisor already grants a child BIND_TIMEOUT
-    to bind, and a transcript still missing at the end of that is a real
-    failure that still fails closed. A second, smaller, undocumented window
-    is what let the wrong number go unnoticed."""
+    So the ceiling is now the poll interval — one tick, indistinguishable
+    from the loop's own cadence — and the patience that actually covers a
+    birth is `_defer_events`' cross-poll retry, which costs no deafness at
+    all. An operator can still shorten this with HEADROOM_TRANSCRIPT_GRACE;
+    they can no longer buy deafness with it, whatever they set."""
     try:
         value = float(raw)
     except (TypeError, ValueError):
@@ -1276,10 +1288,14 @@ def _source_once_written(transcript, session_id, child, config_dir,
             return handoff._source(transcript, session_id, [child.account],
                                    config_dir=config_dir)
         except handoff.HandoffError as error:
+            remaining = deadline - now()
             if "transcript no longer exists" not in str(error) \
-                    or now() >= deadline:
+                    or remaining <= 0:
                 raise
-            sleep(TRANSCRIPT_GRACE_STEP)
+            # clamped to what is LEFT of the window, not a fixed step: a step
+            # that overshoots its own deadline is a bound that does not hold,
+            # and this one is measured against the poll interval now
+            sleep(min(TRANSCRIPT_GRACE_STEP, remaining))
 
 
 def _validated_event(record, child, binding=None):

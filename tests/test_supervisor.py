@@ -1998,19 +1998,37 @@ class SupervisorIntegration(unittest.TestCase):
         the lane cannot rotate for the rest of its life — was invisible here,
         and would be again.
 
-        Nothing patches TRANSCRIPT_GRACE_SECONDS: the point is that the
-        SHIPPED grace covers a birth in the measured live band. The delay is
-        1.0s rather than the measured 6-8s median only because the fixture's
-        whole world is scaled down; the shape is what is under test.
+        Nothing patches TRANSCRIPT_GRACE_SECONDS. FLIPPED BY FIX CYCLE 2: the
+        precondition used to be that the SHIPPED IN-LINE grace outlasts the
+        fixture birth, and it is now the opposite — the in-line wait is
+        deliberately SHORTER than the birth, and the lane arms anyway because
+        the record is held and retried between polls. Same guarantee, new
+        mechanism, and the flip is the evidence that the mechanism really
+        carries it.
+
+        The delay is 1.0s rather than the measured 6-8s median only because
+        the fixture's whole world is scaled down; the shape is what is under
+        test.
 
         The proof that the race really happened is the birth-order marker —
         without it this test passes green on the old fixture while exercising
         nothing, which is exactly how a fix that does nothing ships."""
         os.environ["FAKE_TRANSCRIPT_BIRTH_DELAY"] = "1.0"
-        self.assertGreater(supervisor.TRANSCRIPT_GRACE_SECONDS, 1.0,
-                           "the shipped grace must outlast the fixture birth")
+        self.assertLess(supervisor.TRANSCRIPT_GRACE_SECONDS, 1.0,
+                        "the in-line wait must NOT be what covers this birth "
+                        "any more — that was 30 seconds of a deaf poll loop")
+        ticks = []
+        real_sleep = time.sleep
+
+        def counting_sleep(seconds):
+            # the loop sleeps once per iteration, so these timestamps ARE the
+            # poll cadence
+            ticks.append(time.time())
+            real_sleep(seconds)
+
         runner = supervisor.Supervisor(
-            "sonnet", [], self.accounts[0], collect_fn=self.snapshot)
+            "sonnet", [], self.accounts[0], collect_fn=self.snapshot,
+            sleep=counting_sleep)
         err = io.StringIO()
         with redirect_stderr(err):
             self.assertEqual(runner.run(), 0)
@@ -2023,10 +2041,23 @@ class SupervisorIntegration(unittest.TestCase):
         actions = [row.get("action") for row in self.ledger_actions()]
         for action in ("cap_confirmed", "stop_sent", "resume_bound"):
             self.assertIn(action, actions)
+        # THE POLL LOOP KEPT TICKING THROUGH THE BIRTH. Measured against this
+        # same loop before the change: 0 ticks inside a 6.1s birth window and
+        # a 6.18s gap between consecutive ticks, because the wait sat inside
+        # _handle_events. A supervisor that is asleep here cannot see its
+        # child exit, act on a cap, or process a shutdown signal.
+        inside = [tick for tick in ticks
+                  if order["session_start_fired"] <= tick
+                  <= order["transcript_born"]]
+        self.assertGreaterEqual(len(inside), 2, "the loop went deaf for the "
+                                "birth instead of retrying between polls")
         # named exactly: the end-of-life "session ended without a replacement"
         # disarm is normal here and is NOT what this test is about
         self.assertNotIn("malformed hook event", err.getvalue())
-        self.assertNotIn("transcript no longer exists", err.getvalue())
+        self.assertNotIn("automatic handoff disabled for this child",
+                         err.getvalue().split("session ended")[0])
+        # the birth race DID happen and was survived out loud, not silently
+        self.assertIn("hook event not ready yet", err.getvalue())
 
     def test_fake_child_handoffs_after_delayed_cap_transcript_flush(self):
         os.environ["FAKE_CLAUDE_SCENARIO"] = "delayed-flush"
