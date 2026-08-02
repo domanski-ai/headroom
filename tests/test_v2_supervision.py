@@ -7429,6 +7429,57 @@ class TranscriptBirthRace(TempDirCase):
                     "/x.jsonl", "X", child, account["home"],
                     sleep=lambda s: None, now=lambda: clock["t"])
 
+    def test_the_default_grace_is_the_supervisor_s_own_binding_budget(self):
+        """The mechanism was right and the number was wrong.
+
+        Every other test in this class patches TRANSCRIPT_GRACE_SECONDS to a
+        value it chooses, so the default that actually ships was never once
+        exercised — which is how a window too small for this estate survived
+        the fix that introduced it.
+
+        Measured on the production box 2026-08-02, over all 45 SessionStart
+        hooks on disk (received_at vs the transcript's statx birth): births
+        are bimodal, a thin cluster under 2.7s and the bulk at 6-8s with a
+        tail to 104s. 18 of 39 measurable launches crossed 3.0s. 3.0 sat in
+        the trough between the two modes, so the fix turned a 100% disarm
+        into a ~76% one — worse than the open bug, because everyone believed
+        it was closed.
+
+        Tie it to BIND_TIMEOUT rather than to a fresh number: the supervisor
+        already grants a child that long to bind, and a transcript still
+        missing at the end of that budget is a genuine failure. Two budgets
+        for one wait is what let the smaller one go unnoticed.
+        """
+        self.assertGreaterEqual(
+            supervisor.TRANSCRIPT_GRACE_SECONDS, supervisor.BIND_TIMEOUT,
+            "a birth slower than the grace disarms the lane for its whole "
+            "life — headroom has no re-arm path")
+
+    def test_a_seven_second_birth_is_survived_on_the_shipped_default(self):
+        """The measured median case on this box, with nothing patched.
+
+        Deliberately does NOT patch TRANSCRIPT_GRACE_SECONDS: the clock is
+        faked instead, so the assertion is about the value the supervisor
+        really ships with. Both live losses (headroom 2026-08-01 17:41,
+        freelance 2026-08-02 06:4x) were births in exactly this range.
+        """
+        account = self.account()
+        child = mock.Mock(account=account)
+        clock = {"t": 0.0}
+
+        def fake_source(transcript, session_id, accounts, **kw):
+            if clock["t"] < 7.5:        # the transcript lands at 7.5s
+                raise handoff.HandoffError(
+                    f"session {session_id} transcript no longer exists")
+            return "SOURCE"
+
+        with mock.patch.object(handoff, "_source", side_effect=fake_source):
+            result = supervisor._source_once_written(
+                "/x.jsonl", self.SID, child, account["home"],
+                sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+                now=lambda: clock["t"])
+        self.assertEqual(result, "SOURCE")
+
     def test_a_real_identity_failure_is_not_retried(self):
         # a symlinked/foreign transcript must fail on the FIRST look — the
         # grace window exists for birth, never for a forged event
@@ -7518,12 +7569,17 @@ class TranscriptBirthRace(TempDirCase):
         # the project's numeric-env convention: junk must not crash import,
         # and `inf` must not turn a bounded wait into a permanent one — this
         # poll also drives cap detection and exit handling
+        # Named, never spelled as a literal: the fallback and the ceiling are
+        # BIND_TIMEOUT, and a copy of the number here is exactly what let the
+        # old 3.0 default drift out of step with what it had to outlast.
         for raw in (None, "", "bad", "inf", "nan", "-inf"):
-            self.assertEqual(supervisor._grace_seconds(raw), 3.0, raw)
+            self.assertEqual(supervisor._grace_seconds(raw),
+                             supervisor.BIND_TIMEOUT, raw)
         self.assertEqual(supervisor._grace_seconds("0"), 0.0)
         self.assertEqual(supervisor._grace_seconds("1.5"), 1.5)
         self.assertEqual(supervisor._grace_seconds("-5"), 0.0)
-        self.assertEqual(supervisor._grace_seconds("9999"), 30.0)
+        self.assertEqual(supervisor._grace_seconds("9999"),
+                         supervisor.BIND_TIMEOUT)
 
 
 class CapFamilyDowngrade(TempDirCase):

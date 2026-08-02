@@ -1190,12 +1190,26 @@ def _record_matches(record, child, binding=None):
 # a bounded moment for it is the difference between a supervised lane and an
 # unprotected one. A transcript still missing at the deadline is a real
 # failure and still fails closed.
-def _grace_seconds(raw, default=3.0, ceiling=30.0):
+def _grace_seconds(raw, default=BIND_TIMEOUT, ceiling=BIND_TIMEOUT):
     """A tolerant, FINITE grace window (the project's numeric-env convention).
 
     A malformed value must not crash import, and `inf` must not turn the
     bounded wait into a permanent one — this poll also drives cap detection
-    and exit handling, so its upper bound is a real budget."""
+    and exit handling, so its upper bound is a real budget.
+
+    The default is BIND_TIMEOUT and not a number of its own. It was 3.0, and
+    3.0 was measured wrong: across all 45 SessionStart hooks on the
+    production box (2026-08-02) transcript births are bimodal — a thin
+    cluster under 2.7s, the bulk at 6-8s, a tail to 104s — so 3.0 sat in the
+    trough and 18 of 39 measurable launches crossed it. Losing this race
+    disarms automatic handoff for the child's entire life, and there is no
+    re-arm path, so the lane stays unsupervised until its pane restarts.
+    Two of two fresh launches lost it on 2026-08-01/02.
+
+    One budget, not two: the supervisor already grants a child BIND_TIMEOUT
+    to bind, and a transcript still missing at the end of that is a real
+    failure that still fails closed. A second, smaller, undocumented window
+    is what let the wrong number go unnoticed."""
     try:
         value = float(raw)
     except (TypeError, ValueError):
