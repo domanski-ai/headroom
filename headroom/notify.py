@@ -6,7 +6,9 @@ transitions with a single JSON argument describing the event:
     {"event": "launch", "mode": "supervised"|"exec",
      "account": ..., "model": ..., "note": ...}
     {"event": "downgrade", "account": ..., "reason": ...}
-    {"event": "supervision_lost", "account": ..., "reason": ...}
+    {"event": "supervision_lost", "account": ..., "reason": ...,
+     "supervisor_id": ..., "generation": ..., "session": ...,
+     "transient": ...}
     {"event": "fallback", "reason": ...}
     {"event": "preemptive_scheduled", "account": ..., "family": ...,
      "window": ..., "used_percent": ...}
@@ -16,18 +18,38 @@ transitions with a single JSON argument describing the event:
     {"event": "cap_held", "account": ..., "reason": ...}
     {"event": "cap_cleared", "account": ..., "reason": ...}
     {"event": "session_end_unknown_epoch", "account": ..., "session": ...,
-     "armed": ..., "bound": ..., "reason": ...}
+     "armed": ..., "bound": ..., "classification": ..., "expected": ...,
+     "resolution": ..., "supervisor_id": ..., "generation": ...,
+     "reason": ...}
+    {"event": "session_end_epoch_resolved", "account": ..., "session": ...,
+     "epoch": ..., "moved_from": ..., "moved_to": ...,
+     "supervisor_id": ..., "generation": ...}
 
 ``supervision_lost`` fires for EVERY path that disarms a supervised child's
 automatic handoff, once per distinct reason — a dashboard should treat it as
-"this session is no longer protected".
+"this session is no longer protected". ``transient`` is reserved vocabulary:
+today every disarm is permanent and every row carries ``transient: false``.
+A future heal cycle may add ``supervision_rearmed`` ("this session is
+protected again"); THE CONTRACT, stated now so no consumer keys on counting:
+per (``supervisor_id``, ``generation``), a child is unprotected iff the
+LATEST of {``supervision_lost``, ``supervision_rearmed``} is
+``supervision_lost``. Ordering, never counting — dedupe makes counts lie.
+Any consumer that latches ``supervision_lost`` (the estate watchdog does)
+must learn ``supervision_rearmed`` before that cycle lands.
 
 ``session_end_unknown_epoch`` is the deliberate counter-example: something
 happened that is worth saying out loud, and supervision was NOT taken away
-for it. ``armed`` is the diagnostic that matters — False means this is the
-echo of an earlier disarm (the child lost its SessionStart), True means a
-live, correctly bound child saw a SessionEnd it cannot place, which on this
-provider means a transcript path moved under a stable session id.
+for it. ``classification`` says what the branch established before speaking
+— ``never_bound`` (the session's SessionStart was journaled and never bound,
+so it minted no epoch; the receipt-grade echo of a lost birth),
+``expected_stop`` (unresolved during a stop this supervisor itself
+requested; ``expected`` is true), or ``unknown_origin`` (nothing live or
+journaled explains this end; ``resolution`` names exactly why not). The one
+alert-grade shape is ``unknown_origin`` with ``armed: true``.
+
+``session_end_epoch_resolved`` is receipt-grade: a SessionEnd named a moved
+transcript path for a session that minted its epoch live, and lineage over
+live state resolved it. Nothing is expired and supervision is unchanged.
 
 Delivery is best-effort and bounded: the command has a hard timeout (default
 10s, override with ``HEADROOM_NOTIFY_TIMEOUT``). Unix runs it in its own

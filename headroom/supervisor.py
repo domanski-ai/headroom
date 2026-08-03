@@ -646,15 +646,31 @@ def _lose_supervision(child, reason):
 
     Dedupe is per REASON, not per child: a disarm that repeats on every 250 ms
     poll (e.g. the bind timeout) notifies once, but a genuinely different
-    later disarm is never swallowed into silence by the first one."""
+    later disarm is never swallowed into silence by the first one.
+
+    The event names its child: concurrent supervisors run per account on this
+    estate, so `account` alone cannot key a dashboard. `supervisor_id` is
+    derived exactly as `_namespace_matches` derives it, `generation` is the
+    child's, `session` is the bound session id or "". The contract those keys
+    serve is stated in notify's docstring: per (supervisor_id, generation),
+    ordering — never counting — decides whether a child is protected.
+    `transient` is vocabulary for a future heal cycle; today every disarm is
+    permanent and every row says so."""
     child.automation = False
     reason = str(reason)
     if child.supervision_loss_notified == reason:
         return
     child.supervision_loss_notified = reason
+    binding = child.binding
+    event_path = child.event_path if isinstance(child.event_path, str) else ""
     notify.emit({"event": "supervision_lost",
                  "account": child.account.get("name", ""),
-                 "reason": reason})
+                 "reason": reason,
+                 "supervisor_id": os.path.splitext(
+                     os.path.basename(event_path))[0],
+                 "generation": child.generation,
+                 "session": str(getattr(binding, "session_id", "") or ""),
+                 "transient": False})
 
 
 def _supervisors_dir():
@@ -1501,6 +1517,136 @@ def _event_epoch(child, source):
         return binding.epoch
     return child.session_epochs.get(
         (source.session_id, source.transcript_path))
+
+
+def _lineage_epoch(child, source):
+    """The epoch this session minted LIVE, when the pair lookup missed.
+
+    Live-minted state only — the binding and `session_epochs`, keyed by
+    session id once the (session_id, transcript_path) pair has already
+    missed. Epochs are minted in exactly one place (`parse_session_start`
+    returns `child.session_epoch + 1`) and a re-mint overwrites its map
+    entry, so the LARGEST epoch a session id ever minted is the answer live
+    minting would give — max IS latest-wins here, by construction. Nothing
+    is replayed, reconstructed or backfilled: state the live path never
+    wrote cannot be resolved, only classified (`_journal_classification`).
+
+    Returns (epoch, transcript_path) for a hit — the path is the one the
+    epoch was minted under, which a receipt reports as `moved_from` — or
+    None."""
+    binding = child.binding
+    if binding is not None and source.session_id == binding.session_id:
+        # the pair lookup already missed, so the path differs: this is the
+        # BOUND session under a moved transcript path
+        return binding.epoch, binding.transcript_path
+    epochs = {path: epoch
+              for (sid, path), epoch in child.session_epochs.items()
+              if sid == source.session_id}
+    if epochs:
+        path = max(epochs, key=epochs.get)
+        return epochs[path], path
+    return None
+
+
+def _journal_classification(child, source):
+    """Advisory journal scan, CLASSIFICATION ONLY — it never returns an epoch.
+
+    One question: was a SessionStart carrying this session id ever journaled
+    in this child's namespace? "Yes" means the session is a known loss — its
+    start was journaled and never bound, so it minted no epoch and there is
+    no proof to expire. "No" means the end is of unknown origin. Nothing this
+    scan returns can be written into `session_epochs` or `dead_sessions`,
+    which is what keeps a mislabeled receipt the worst case.
+
+    The journal is opened FRESH from byte 0, never through the live cursor
+    or `child.event_offset` — the records this scan exists for are exactly
+    the ones the cursor is already past. Unparseable lines are counted and
+    skipped, not raised: the live path already crossed those bytes, and an
+    ADVISORY scan must not brick on them. Unlike `_read_events`' unreadable-
+    journal path, a scan failure never disarms — it returns ("scan_failed",
+    detail) and the verdict falls through to unknown origin with the failure
+    named in the receipt.
+
+    Returns ("never_bound" | "absent", counters) or ("scan_failed",
+    {"detail": …})."""
+    counters = {"records_scanned": 0, "session_starts_seen": 0,
+                "skipped_lines": 0}
+    try:
+        with open(child.event_path, "rb") as handle:
+            locks.shared(handle)
+            data = handle.read()
+            locks.unlock(handle)
+    except OSError as error:
+        return "scan_failed", {"detail": str(error)}
+    found = False
+    for line in data.splitlines():
+        try:
+            record = json.loads(line.decode("utf-8"))
+        except (UnicodeError, ValueError, json.JSONDecodeError):
+            counters["skipped_lines"] += 1
+            continue
+        if not isinstance(record, dict):
+            counters["skipped_lines"] += 1
+            continue
+        counters["records_scanned"] += 1
+        if not _namespace_matches(record, child):
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict) \
+                or payload.get("hook_event_name") != "SessionStart":
+            continue
+        counters["session_starts_seen"] += 1
+        if payload.get("session_id") == source.session_id:
+            found = True
+    return ("never_bound" if found else "absent"), counters
+
+
+def _classify_unknown_end(child, source, expected_stop):
+    """The verdict for a SessionEnd no live lookup can place — BEFORE remedy.
+
+    Classification first, remedy second, and here every remedy is "none":
+    the caller only chooses which receipt to write. The verdict is computed
+    in full before any state is touched, from live-minted state first and
+    the journal (classification only) second. First match wins:
+
+      resolved_lineage — the session minted an epoch live, under a path the
+        pair lookup cannot see. Receipt-only: nothing is marked dead and
+        `session_ended` is untouched, so the ended-without-replacement
+        disarm cannot trip on state that was never written.
+      never_bound — the start was journaled and never bound. No epoch was
+        minted, so there is nothing to protect and nothing to expire.
+      expected_stop — unresolved, during a stop this supervisor itself asked
+        for. A planned rotation is not an alert.
+      unknown_origin — everything else, with `resolution` naming exactly why
+        (the scan counters, or the scan failure). The one alert-grade shape.
+
+    Returns (verdict, detail): detail carries `epoch`/`moved_from` for a
+    lineage hit and `resolution` for the rest."""
+    lineage = _lineage_epoch(child, source)
+    if lineage is not None:
+        epoch, moved_from = lineage
+        return "resolved_lineage", {"epoch": epoch, "moved_from": moved_from}
+    kind, counters = _journal_classification(child, source)
+    if kind == "scan_failed":
+        counts = "journal scan failed: " + counters["detail"]
+    else:
+        counts = ("records_scanned: {records_scanned}, session_starts_seen: "
+                  "{session_starts_seen}, skipped_lines: {skipped_lines}"
+                  ).format(**counters)
+    if kind == "never_bound":
+        return "never_bound", {
+            "resolution": "this session's SessionStart was journaled but "
+                          "never bound — no epoch was ever minted "
+                          "(" + counts + ")"}
+    if expected_stop:
+        return "expected_stop", {
+            "resolution": "unresolved during a stop this supervisor "
+                          "requested (" + counts + ")"}
+    if kind == "scan_failed":
+        return "unknown_origin", {"resolution": counts}
+    return "unknown_origin", {
+        "resolution": "no SessionStart in this supervisor's namespace ever "
+                      "named this session (" + counts + ")"}
 
 
 def _event_identity(record):
@@ -4516,54 +4662,93 @@ class Supervisor:
                         child.pending_cap.session_id, child.pending_cap.epoch):
                     child.pending_cap = None
                 if epoch is None:
-                    # LOUD, AND NOT A DISARM. Reaching here means no epoch was
-                    # ever recorded for this session, so there is nothing this
-                    # branch can protect: a SessionEnd's job is to mark a
-                    # session dead so a later StopFailure is not acted on, and
-                    # an unknown session has no proof to expire.
+                    # CLASSIFIED, LOUD, AND STILL NEVER A DISARM. Reaching
+                    # here means no epoch was recorded for this pair, so
+                    # there is nothing this branch can protect: a
+                    # SessionEnd's job is to mark a session dead so a later
+                    # StopFailure is not acted on, and an unknown session has
+                    # no proof to expire. The verdict is computed IN FULL
+                    # before anything is emitted — classify, then remedy, and
+                    # every remedy here is a receipt, not a state change.
                     #
-                    # Every child that reaches it is one of two things, and
-                    # disarming is wrong for both. Either it is ALREADY
-                    # disarmed — it lost its SessionStart to the transcript
-                    # birth race hours ago, so the epoch map is empty and this
-                    # is the child's own goodbye — in which case the disarm
-                    # was a no-op on the flag and a second, duplicate row in
-                    # the sink, which is precisely what made one failure read
-                    # as two independent ones (2026-08-02). Or it is alive,
-                    # correctly bound and ARMED, and the epoch went unknown
-                    # because the transcript PATH moved under a stable session
-                    # id — `session_epochs` is keyed by the pair — in which
-                    # case a Claude-side change in transcript placement would
-                    # silently disarm the whole fleet.
+                    # resolved_lineage writes NOTHING on purpose: marking the
+                    # resolved session dead is exactly the key the ended-
+                    # without-replacement disarm below trips on, and a
+                    # moved-path session cannot produce an actable
+                    # StopFailure against the old pair anyway (`same_session`
+                    # compares the bound pair; the stop transition re-proves
+                    # its epoch on its own).
                     #
-                    # "This child never bound at all" is the residual case,
-                    # and it keeps its own guard: the BIND_TIMEOUT disarm,
-                    # which is the better one because it waits the birth out
-                    # instead of racing it.
+                    # `dead_sessions` is deliberately NOT written on any
+                    # verdict: the key would have to be (session_id, None),
+                    # and every lookup against it computes `session_key` as a
+                    # bare None when the epoch is unknown, so the entry could
+                    # never match — while a literal None in that set makes
+                    # _stop_transition treat EVERY unknown-epoch event as an
+                    # expired proof.
                     #
-                    # `dead_sessions` is deliberately NOT written: the key
-                    # would have to be (session_id, None), and every lookup
-                    # against it computes `session_key` as a bare None when
-                    # the epoch is unknown, so the entry could never match —
-                    # while a literal None in that set makes _stop_transition
-                    # treat EVERY unknown-epoch event as an expired proof.
-                    #
-                    # The tail is still abandoned and still announce-only.
-                    # `_read_events` moved the cursor past the whole batch, so
-                    # those bytes are gone either way, and acting on them
-                    # would change when headroom STOPS a child. That is not
-                    # this change; this change is only about the latch.
-                    print("[headroom] SessionEnd has no known session epoch; "
-                          "this child's supervision is unchanged",
-                          file=sys.stderr)
-                    notify.emit({"event": "session_end_unknown_epoch",
-                                 "account": child.account.get("name", ""),
-                                 "session": source.session_id,
-                                 "armed": child.automation,
-                                 "bound": child.binding is not None,
-                                 "reason": "SessionEnd has no known session "
-                                           "epoch"})
-                    self._announce_tail_caps(child, records[index + 1:])
+                    # "This child never bound at all" keeps its own guard:
+                    # the never-bound disarm in `_monitor`, which waits the
+                    # birth out instead of racing it.
+                    expected_stop = (
+                        self._requested_stop_at != 0.0
+                        or (self._signals is not None
+                            and self._signals.shutdown_signal is not None))
+                    verdict, detail = _classify_unknown_end(
+                        child, source, expected_stop)
+                    supervisor_id = os.path.splitext(
+                        os.path.basename(child.event_path))[0]
+                    if verdict == "resolved_lineage":
+                        print(f"[headroom] SessionEnd named a moved "
+                              f"transcript path; resolved to epoch "
+                              f"{detail['epoch']} by session lineage — this "
+                              "child's supervision is unchanged",
+                              file=sys.stderr)
+                        notify.emit({"event": "session_end_epoch_resolved",
+                                     "account": child.account.get("name", ""),
+                                     "session": source.session_id,
+                                     "epoch": detail["epoch"],
+                                     "moved_from": detail["moved_from"],
+                                     "moved_to": source.transcript_path,
+                                     "supervisor_id": supervisor_id,
+                                     "generation": child.generation})
+                    else:
+                        # this stderr line is estate-read; it survives
+                        # verbatim for every unresolved verdict
+                        print("[headroom] SessionEnd has no known session "
+                              "epoch; this child's supervision is unchanged",
+                              file=sys.stderr)
+                        notify.emit({"event": "session_end_unknown_epoch",
+                                     "account": child.account.get("name", ""),
+                                     "session": source.session_id,
+                                     "armed": child.automation,
+                                     "bound": child.binding is not None,
+                                     "classification": verdict,
+                                     "expected": expected_stop,
+                                     "resolution": detail["resolution"],
+                                     "supervisor_id": supervisor_id,
+                                     "generation": child.generation,
+                                     "reason": "SessionEnd has no known "
+                                               "session epoch"})
+                    if waiting_for is not None:
+                        # A deferral episode is still in flight: this
+                        # SessionEnd sorted AHEAD of the record the episode
+                        # is waiting on (the stamp-then-lock out-of-order
+                        # append window). Abandoning the tail here would
+                        # destroy the held record AND leave the spent
+                        # deadline armed for the next episode — so the
+                        # unprocessed tail is RETAINED instead, in order,
+                        # with the episode's budget untouched. Only this
+                        # exit may retain: it is the one non-disarming early
+                        # return a live episode can cross.
+                        child.deferred_events = records[index + 1:]
+                    else:
+                        # No episode in flight: the tail is abandoned and
+                        # announce-only, as ever. `_read_events` moved the
+                        # cursor past the whole batch, so those bytes are
+                        # gone either way, and acting on them would change
+                        # when headroom STOPS a child.
+                        self._announce_tail_caps(child, records[index + 1:])
                     return None
                 child.dead_sessions.add(session_key)
                 if same_session:

@@ -7756,6 +7756,13 @@ class EpochLossAfterALostSessionStart(TempDirCase):
         self.assertEqual([event["event"] for event in events],
                          ["session_end_unknown_epoch"])
         self.assertIs(events[0]["armed"], False)
+        # FLIPPED BY THE CLASSIFIER CYCLE (G1): the row now says WHICH shape
+        # this is. The journal still holds the lost SessionStart, so the
+        # branch can name the echo instead of shrugging — and the map
+        # assertions above SURVIVE, because classification never
+        # reconstructs an epoch from the journal.
+        self.assertEqual(events[0]["classification"], "never_bound")
+        self.assertIs(events[0]["expected"], False)
         self.assertFalse(self.child.automation)
 
     # -- (b) -------------------------------------------------------------
@@ -7825,14 +7832,27 @@ class EpochLossAfterALostSessionStart(TempDirCase):
 
         self.fire("SessionEnd", transcript_path=moved, reason="other")
         events, err = self.handle()
-        self.assertIn("SessionEnd has no known session epoch", err)
+        # FLIPPED BY THE CLASSIFIER CYCLE (G1): this shape is resolvable from
+        # LIVE state — the bound session under a moved path — so the row is
+        # now a receipt carrying the binding's own epoch, and the stderr line
+        # says resolved instead of unknown. Everything the flip does NOT
+        # touch is asserted below unchanged: no disarm, armed stays True,
+        # and the resolution writes NOTHING — `dead_sessions` and
+        # `session_ended` keep their values, so the ended-without-replacement
+        # disarm cannot fire on state that was never written.
+        self.assertIn("resolved to epoch 1 by session lineage", err)
+        self.assertNotIn("SessionEnd has no known session epoch", err)
         self.assertNotIn("automatic handoff disabled", err)
         self.assertEqual([event["event"] for event in events],
-                         ["session_end_unknown_epoch"])
+                         ["session_end_epoch_resolved"])
+        self.assertEqual(events[0]["epoch"], 1)
+        self.assertEqual(events[0]["moved_from"], self.transcript)
+        self.assertEqual(events[0]["moved_to"], moved)
+        self.assertEqual(self.child.dead_sessions, set())
+        self.assertFalse(self.child.session_ended)
         # SAFETY ARGUMENT, CASE (b): alive, bound, armed. A file moving must
         # not cost this child cap handoff, preemptive rotation and the
         # context backstop for the rest of its life.
-        self.assertIs(events[0]["armed"], True)
         self.assertTrue(self.child.automation)
         self.assertIsNotNone(self.child.binding)
 
@@ -7902,6 +7922,242 @@ class EpochLossAfterALostSessionStart(TempDirCase):
         self.assertIs(events[1]["armed"], True)
         self.assertIn("SessionStart hook never bound", events[2]["reason"])
         self.assertFalse(child.automation)
+
+
+class UnknownEpochIsClassifiedBeforeRemedy(EpochLossAfterALostSessionStart):
+    """The unknown-epoch SessionEnd branch classifies BEFORE it speaks.
+
+    G1 of the epoch-loss cycle. The branch still never disarms — that pin is
+    inherited above, along with the fixtures — but the row it writes now
+    names WHICH shape it saw, resolved from live-minted state first (the
+    binding and `session_epochs`, by session-id lineage) and the journal
+    second (classification ONLY: a scan can choose a receipt's vocabulary,
+    never mint an epoch, expire a proof, or disarm). Every verdict is
+    computed in full before anything is emitted, and the resolving verdict
+    writes NOTHING — the ended-without-replacement disarm keys on
+    `dead_sessions`, so a receipt that wrote it would be a disarm with extra
+    steps.
+
+    Subclassing re-runs the parent's pins against this class's name; that is
+    the point — the classifier must not move any of them."""
+
+    OTHER = "55555555-5555-4555-8555-555555555555"
+
+    def foreign(self, sid=None):
+        """A transcript for a session this child never bound, on disk."""
+        sid = sid or self.OTHER
+        path = os.path.join(self.projects, sid + ".jsonl")
+        self.born(path)
+        return path
+
+    # -- never_bound, both directions --------------------------------------
+    def test_a_lost_starts_own_end_carries_the_never_bound_receipt(self):
+        """Corpus shape (a): the SessionStart is in the journal, it never
+        bound, and the child's own goodbye hours later says exactly that —
+        with the counters that prove the scan looked, and with NO state
+        touched. Receipt-grade, not alert-grade."""
+        self.lose_the_birth_race()
+        self.born()
+        self.fire("SessionEnd", reason="other")
+        events, err = self.handle()
+        self.assertIn("SessionEnd has no known session epoch", err)
+        self.assertEqual([event["event"] for event in events],
+                         ["session_end_unknown_epoch"])
+        self.assertEqual(events[0]["classification"], "never_bound")
+        self.assertIs(events[0]["expected"], False)
+        self.assertIn("session_starts_seen: 1", events[0]["resolution"])
+        self.assertIn("never bound", events[0]["resolution"])
+        # no remedy on any classification: nothing written, nothing expired
+        self.assertEqual(self.child.dead_sessions, set())
+        self.assertEqual(self.child.session_epochs, {})
+
+    def test_an_end_with_no_journaled_start_is_unknown_origin_and_loud(self):
+        """The reverse direction: the journal has NO SessionStart at all, so
+        "never bound" would be a guess — the verdict is unknown_origin, the
+        resolution names the zero, and the armed child keeps its supervision
+        (this branch never disarms; the never-bound guard in `_monitor` owns
+        that judgement)."""
+        self.born()
+        self.fire("SessionEnd", reason="other")
+        events, err = self.handle()
+        self.assertIn("SessionEnd has no known session epoch", err)
+        self.assertEqual([event["event"] for event in events],
+                         ["session_end_unknown_epoch"])
+        self.assertEqual(events[0]["classification"], "unknown_origin")
+        self.assertIn("session_starts_seen: 0", events[0]["resolution"])
+        self.assertIs(events[0]["armed"], True)
+        self.assertTrue(self.child.automation)
+
+    # -- lineage, both directions ------------------------------------------
+    def test_lineage_resolution_reports_the_latest_minted_epoch(self):
+        """Latest-wins, proven against the map the live path really writes.
+
+        The same session id mints twice under different paths (a /clear-and-
+        resume shape), a THIRD session takes the binding, and only then does
+        a moved-path SessionEnd for the first sid arrive. Lineage must answer
+        with the MAX epoch that sid ever minted — the answer live minting
+        would give, since a re-mint always increments — never the first."""
+        self.born()
+        self.fire("SessionStart", source="startup")
+        self.handle()
+        # a second mint for the SAME sid under a new path: the basename rule
+        # pins `<sid>.jsonl`, so a re-minted pair means a moved DIRECTORY
+        second_dir = os.path.join(self.home, "projects", "q")
+        os.makedirs(second_dir)
+        second = os.path.join(second_dir, self.SID + ".jsonl")
+        self.born(second)
+        self.fire("SessionStart", source="resume", transcript_path=second)
+        self.handle()
+        third_path = self.foreign()
+        self.fire("SessionStart", source="startup", session_id=self.OTHER,
+                  transcript_path=third_path)
+        self.handle()
+        self.assertEqual(self.child.session_epochs[(self.SID, second)], 2)
+        self.assertEqual(self.child.binding.session_id, self.OTHER)
+
+        moved_dir = os.path.join(self.home, "projects", "r")
+        os.makedirs(moved_dir)
+        moved = os.path.join(moved_dir, self.SID + ".jsonl")
+        self.born(moved)
+        self.fire("SessionEnd", transcript_path=moved, reason="other")
+        events, err = self.handle()
+        self.assertIn("resolved to epoch 2 by session lineage", err)
+        self.assertEqual([event["event"] for event in events],
+                         ["session_end_epoch_resolved"])
+        self.assertEqual(events[0]["epoch"], 2)
+        self.assertEqual(events[0]["moved_from"], second)
+        self.assertEqual(events[0]["moved_to"], moved)
+        # receipt-only: nothing was marked dead, so the ended-without-
+        # replacement disarm below the loop has nothing to trip on — the
+        # child leaves this poll bound, armed, and untouched
+        self.assertEqual(self.child.dead_sessions, set())
+        self.assertFalse(self.child.session_ended)
+        self.assertTrue(self.child.automation)
+
+    def test_a_foreign_sessions_end_is_not_resolved_by_lineage(self):
+        """The reverse direction: a sid that never minted anything in this
+        child must not borrow an epoch from the ones that did."""
+        self.born()
+        self.fire("SessionStart", source="startup")
+        self.handle()
+        self.assertTrue(self.child.automation)
+        path = self.foreign()
+        self.fire("SessionEnd", session_id=self.OTHER, transcript_path=path,
+                  reason="other")
+        events, err = self.handle()
+        self.assertIn("SessionEnd has no known session epoch", err)
+        self.assertEqual([event["event"] for event in events],
+                         ["session_end_unknown_epoch"])
+        self.assertEqual(events[0]["classification"], "unknown_origin")
+        self.assertIs(events[0]["expected"], False)
+        self.assertIs(events[0]["armed"], True)
+        self.assertTrue(self.child.automation)
+        self.assertEqual(self.child.dead_sessions, set())
+
+    # -- expected_stop, both directions ------------------------------------
+    def test_an_unresolved_end_during_a_requested_stop_is_expected(self):
+        """L2: a planned rotation's stray SessionEnd is not an alert. The
+        reverse direction — the same event with NO stop in flight — is the
+        test above, whose row says expected: false."""
+        self.born()
+        self.fire("SessionStart", source="startup")
+        self.handle()
+        path = self.foreign()
+        self.fire("SessionEnd", session_id=self.OTHER, transcript_path=path,
+                  reason="other")
+        self.runner._requested_stop_at = self.launched_at + 500.0
+        events, _err = self.handle()
+        self.assertEqual([event["event"] for event in events],
+                         ["session_end_unknown_epoch"])
+        self.assertEqual(events[0]["classification"], "expected_stop")
+        self.assertIs(events[0]["expected"], True)
+        self.assertTrue(self.child.automation)
+
+    # -- the scan can fail; the scan must not disarm ------------------------
+    def test_a_failed_journal_scan_is_named_not_a_disarm(self):
+        """Contrast with the LIVE read path, where an unreadable journal is
+        a permanent disarm: the ADVISORY scan has no such power. It failed,
+        the receipt says so, and supervision is untouched."""
+        self.born()
+        self.fire("SessionStart", source="startup")
+        self.handle()
+        path = self.foreign()
+        self.fire("SessionEnd", session_id=self.OTHER, transcript_path=path,
+                  reason="other")
+        records = supervisor._read_events(self.child)
+        os.remove(self.child.event_path)
+        with mock.patch.object(supervisor, "_read_events",
+                               return_value=records), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()) as err:
+            self.runner._handle_events(self.child, "")
+        events = [call.args[0] for call in emit.call_args_list]
+        self.assertEqual([event["event"] for event in events],
+                         ["session_end_unknown_epoch"])
+        self.assertEqual(events[0]["classification"], "unknown_origin")
+        self.assertIn("journal scan failed", events[0]["resolution"])
+        self.assertNotIn("automatic handoff disabled", err.getvalue())
+        self.assertTrue(self.child.automation)
+
+    # -- the known-epoch path shares no new code ----------------------------
+    def test_a_known_epoch_end_emits_no_classifier_receipt(self):
+        """The structural half of the byte-identity claim: the classifier is
+        reachable only inside the epoch-is-None arm, so a placeable
+        SessionEnd emits exactly what it always did — the ordinary
+        ended-without-replacement disarm — and neither receipt event."""
+        self.born()
+        self.fire("SessionStart", source="startup")
+        self.handle()
+        self.fire("SessionEnd", reason="other")
+        events, err = self.handle()
+        self.assertEqual([event["event"] for event in events],
+                         ["supervision_lost"])
+        self.assertNotIn("session epoch", err)
+        self.assertIn((self.SID, 1), self.child.dead_sessions)
+
+    # -- the classifier exit must not eat a live deferral episode -----------
+    def test_an_unknown_end_sorting_ahead_of_a_held_birth_keeps_the_episode(self):
+        """The pre-existing race the classifier rebuild walks past (review
+        N1). A SessionEnd nobody can place, stamped BEHIND the frontier of a
+        held birth record (the stamp-then-lock append window), sorts AHEAD
+        of it in the replay — and the old exit abandoned the whole held tail
+        and left the spent deadline armed for the next episode. The exit now
+        RETAINS the unprocessed tail when an episode is in flight: the birth
+        record survives, binds when the file lands, and the receipt for the
+        SessionEnd is written exactly once."""
+        self.fire("SessionStart", source="startup",
+                  received_at=self.launched_at + 5.0)
+        clock = {"t": time.time()}
+        saved, self.runner.now = self.runner.now, lambda: clock["t"]
+        try:
+            with mock.patch.object(supervisor, "TRANSCRIPT_GRACE_SECONDS",
+                                   0.0):
+                self.handle()
+            self.assertEqual(len(self.child.deferred_events), 1)
+            path = self.foreign()
+            self.fire("SessionEnd", session_id=self.OTHER,
+                      transcript_path=path, reason="other",
+                      received_at=self.launched_at + 3.0)
+            with mock.patch.object(supervisor, "TRANSCRIPT_GRACE_SECONDS",
+                                   0.0):
+                events, err = self.handle()
+            self.assertEqual([event["event"] for event in events],
+                             ["session_end_unknown_epoch"])
+            self.assertIn("SessionEnd has no known session epoch", err)
+            self.assertEqual(len(self.child.deferred_events), 1,
+                             "the held birth record was abandoned by the "
+                             "classifier's early return")
+            self.assertTrue(self.child.automation)
+            self.born()
+            events, err = self.handle()
+        finally:
+            self.runner.now = saved
+        self.assertEqual(events, [], "the receipt must be written once, and "
+                         "the bind must be clean")
+        self.assertIsNotNone(self.child.binding)
+        self.assertEqual(self.child.binding.session_id, self.SID)
+        self.assertTrue(self.child.automation)
+        self.assertEqual(self.child.deferred_events, [])
 
 
 class CapFamilyDowngrade(TempDirCase):
