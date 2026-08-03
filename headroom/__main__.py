@@ -50,6 +50,14 @@ usage:
                                     container) plus per-seat batteries; a list
                                     that could not be read is null, with the
                                     reason in "errors"
+  headroom ps [--json]              every live lane and every pid whose death
+                                    takes it down (from /proc, no tmux needed)
+    --killable PID[:STARTTIME]      THE PRE-KILL GATE: exit 0 only when the
+                                    census was read AND the pid is no part of
+                                    any live lane, so `--killable "$p" && kill
+                                    "$p"` refuses on any doubt
+    --is-lane  PID[:STARTTIME]      the informational inverse — it FAILS OPEN
+                                    in a shell gate; use --killable to gate
   headroom doctor                   environment + config health check
 
 Try it with no accounts:  headroom serve --demo   (bundled sample data)
@@ -620,6 +628,9 @@ def _dispatch(argv):
     if command == "ops-status":
         from . import ops_status
         return ops_status.cmd_ops_status(args)
+    if command == "ps":
+        from . import ps
+        return ps.cmd_ps(args)
     if command == "doctor":
         import platform
         import shutil
