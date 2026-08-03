@@ -33,6 +33,15 @@ UNSUPERVISED_MESSAGE = (
 
 POLL_SECONDS = 0.25
 BIND_TIMEOUT = 30.0
+# The cross-poll patience for a BIRTH-class transient only: a SessionStart
+# whose (session_id, transcript_path) pair has never bound in this child is a
+# transcript still being written, and transcript births measured on this box
+# (2026-08-02, 45 SessionStart hooks) run 0.1s-103.9s with the tail driven by
+# launch concurrency — every recovery-killing disarm in the corpus was a
+# birth under 104s that outlived the 30s budget. 120s covers the measured
+# tail with margin. Deletion-class and cwd-class transients keep
+# BIND_TIMEOUT: a transcript that VANISHED after binding is not being born.
+TRANSCRIPT_BIRTH_BUDGET = 120.0
 TERM_TIMEOUT = 10.0
 QUIET_SECONDS = 5.0
 CAP_MODEL_TIMEOUT = QUIET_SECONDS + 1.0
@@ -408,7 +417,25 @@ class TransientSupervisorError(SupervisorError):
     compares two frozen numbers, so retrying it re-tests exactly the same
     comparison for as long as the budget lasts and can never heal. It is
     deduped and tie-broken in `_accept_event_order` instead, and what
-    survives that stays a PermanentSupervisorError."""
+    survives that stays a PermanentSupervisorError.
+
+    `klass` is the STRUCTURED transient class, set at the raise site where
+    the distinguishing fact lives — never derived from the message:
+
+      * "birth"    — the transcript is missing AND its (session_id,
+                     transcript_path) pair has never bound in this child.
+                     A file still being written; gets the wide budget.
+      * "deletion" — the transcript is missing but the pair HAS bound:
+                     something a bind once proved has vanished mid-life.
+                     Keeps BIND_TIMEOUT.
+      * "cwd"      — the cwd branch. Keeps BIND_TIMEOUT.
+
+    "" is a transient raised before this vocabulary existed; `_defer_events`
+    treats it as non-birth, which fails toward the SHORTER budget."""
+
+    def __init__(self, message, klass=""):
+        super().__init__(message)
+        self.klass = klass
 
 
 class PendingCapTimeout(PermanentSupervisorError):
@@ -553,6 +580,18 @@ class Child:
     deferred_events: list = field(default_factory=list)
     deferred_deadline: float = 0.0
     deferred_reason: str = ""
+    # the episode's transient class ("birth"/"deletion"/"cwd"/""), written
+    # ONCE where the deadline is (episode start) and cleared where the
+    # deadline is (arrival of the held record, or expiry) — a mid-episode
+    # re-raise with a different class must not move the budget or the
+    # monitor gate under a running episode
+    deferred_klass: str = ""
+    # how supervision was lost: "" (armed) / "transient" / "permanent". A
+    # one-way ratchet — permanent always overwrites transient, transient can
+    # never downgrade permanent. Vocabulary only this cycle: every live
+    # disarm writes "permanent" and nothing reads it back yet; a future heal
+    # cycle re-arms only from "transient".
+    disarm_class: str = ""
     pending_cap: PendingCap = None
     # a proven cap that has nowhere to go yet: how many times it has been
     # re-tried, when the next attempt is due, and the last reason announced
@@ -635,7 +674,7 @@ class Relaunch:
     recovery: object = None
 
 
-def _lose_supervision(child, reason):
+def _lose_supervision(child, reason, transient=False):
     """Turn automation off for this child and notify the loss.
 
     Post-spawn supervision loss is exactly what an external dispatcher cannot
@@ -654,9 +693,17 @@ def _lose_supervision(child, reason):
     child's, `session` is the bound session id or "". The contract those keys
     serve is stated in notify's docstring: per (supervisor_id, generation),
     ordering — never counting — decides whether a child is protected.
-    `transient` is vocabulary for a future heal cycle; today every disarm is
-    permanent and every row says so."""
+    `transient` is vocabulary for a future heal cycle; today every caller
+    takes the default, so every disarm is permanent and every row says so."""
     child.automation = False
+    # The ratchet is written BEFORE the per-reason dedupe below, on the
+    # `automation = False` precedent: dedupe governs the NOTIFY, never the
+    # class — a repeat disarm that says nothing new must still be allowed to
+    # harden a transient class into a permanent one.
+    if not transient:
+        child.disarm_class = "permanent"
+    elif child.disarm_class != "permanent":
+        child.disarm_class = "transient"
     reason = str(reason)
     if child.supervision_loss_notified == reason:
         return
@@ -670,7 +717,7 @@ def _lose_supervision(child, reason):
                      os.path.basename(event_path))[0],
                  "generation": child.generation,
                  "session": str(getattr(binding, "session_id", "") or ""),
-                 "transient": False})
+                 "transient": bool(transient)})
 
 
 def _supervisors_dir():
@@ -1349,8 +1396,21 @@ def _validated_event(record, child, binding=None):
         # cannot be read — is a statement about the EVENT and keeps its
         # first-look refusal. `_contained_transcript` raises this one, and
         # only this one, for a file that is simply not there yet.
+        #
+        # The CLASS is decided here, at the raise site, because this is the
+        # one place that can tell a birth from a deletion: the same phrase
+        # covers both, and only the child's own bind history splits them. A
+        # pair this child has bound — the live binding or any epoch it ever
+        # minted — is a file that EXISTED and is gone, not one being born.
         if "transcript no longer exists" in str(error):
-            raise TransientSupervisorError(str(error)) from error
+            binding = child.binding
+            pair_bound = ((binding is not None
+                           and session_id == binding.session_id
+                           and transcript == binding.transcript_path)
+                          or (session_id, transcript) in child.session_epochs)
+            raise TransientSupervisorError(
+                str(error),
+                klass="deletion" if pair_bound else "birth") from error
         raise PermanentSupervisorError(str(error)) from error
     if source.transcript_path != transcript:
         raise PermanentSupervisorError("hook event transcript path is not canonical")
@@ -1360,7 +1420,8 @@ def _validated_event(record, child, binding=None):
         # A path that is absent RIGHT NOW: mid-creation, mid-replacement, or
         # on a mount that has not come back yet. The string is unchanged (the
         # estate reads it), only its permanence is.
-        raise TransientSupervisorError("hook event cwd is missing or unreadable")
+        raise TransientSupervisorError("hook event cwd is missing or unreadable",
+                                       klass="cwd")
     if binding is not None and (session_id != binding.session_id
                                 or transcript != binding.transcript_path):
         raise SupervisorError("hook event belongs to a different session epoch")
@@ -4511,11 +4572,18 @@ class Supervisor:
         the record being held — which then comes back as "order is ambiguous"
         and disarms the child anyway. Held in order, replayed in order.
 
-        The budget is BIND_TIMEOUT from the FIRST deferral of an episode, not
-        from each attempt: a per-attempt budget never expires. When it is
-        spent the child gets exactly the disarm it gets today, with the same
-        reason string and the same announce-only tail drain — this changes how
-        long headroom waits before refusing, never what refusing means.
+        The budget runs from the FIRST deferral of an episode, not from each
+        attempt: a per-attempt budget never expires. Its LENGTH is decided by
+        the error's structured class, never its phrase: a birth (a pair this
+        child has never bound, waiting on a file still being written) gets
+        `TRANSCRIPT_BIRTH_BUDGET`, everything else keeps `BIND_TIMEOUT`. The
+        class is recorded once per episode alongside the deadline and never
+        rewritten mid-episode — a later poll re-raising with a DIFFERENT
+        class must not move a budget that is already running, or flip the
+        never-bound gate in `_monitor` under it. When the budget is spent the
+        child gets exactly the disarm it gets today, with the same reason
+        string and the same announce-only tail drain — this changes how long
+        headroom waits before refusing, never what refusing means.
 
         `return None` for the same reason every other early return here does:
         the unprocessed tail may contain the very SessionEnd or SessionStart
@@ -4523,14 +4591,18 @@ class Supervisor:
         deferral."""
         now = self.now()
         if not child.deferred_deadline:
-            child.deferred_deadline = now + BIND_TIMEOUT
+            klass = getattr(error, "klass", "")
+            budget = (TRANSCRIPT_BIRTH_BUDGET if klass == "birth"
+                      else BIND_TIMEOUT)
+            child.deferred_deadline = now + budget
             child.deferred_reason = str(error)
+            child.deferred_klass = klass
             # ONE line per episode, and no notify event: this fires on the
             # majority of launches on this box (13 of 17 measured births cross
             # 3.0s), and a sink row per birth is noise that would train the
             # reader to ignore the class.
             print(f"[headroom] hook event not ready yet ({error}); holding it "
-                  f"for up to {BIND_TIMEOUT:g}s — supervision is unchanged",
+                  f"for up to {budget:g}s — supervision is unchanged",
                   file=sys.stderr)
         if now >= child.deferred_deadline:
             print(f"[headroom] malformed hook event ({error}); automatic "
@@ -4540,6 +4612,7 @@ class Supervisor:
             child.deferred_events = []
             child.deferred_deadline = 0.0
             child.deferred_reason = ""
+            child.deferred_klass = ""
             self._announce_tail_caps(child, list(remaining)[1:])
             return None
         child.deferred_events = list(remaining)
@@ -4618,6 +4691,7 @@ class Supervisor:
                 waiting_for = None
                 child.deferred_deadline = 0.0
                 child.deferred_reason = ""
+                child.deferred_klass = ""
             if hook_name == "SessionStart":
                 try:
                     child.pending_cap = None
@@ -4933,8 +5007,19 @@ class Supervisor:
                             and not child.session_ended):
                         self._record_unrequested_death(child, returncode)
                     return returncode
+                # The never-bound disarm holds its fire while a BIRTH-class
+                # deferral is in flight: a child holding a journaled-but-
+                # unborn SessionStart is "binding in progress", and the
+                # episode's own budget — sized for a birth — is the judge.
+                # Without this gate the two disarms race at ~30s and the
+                # monitor one moots the wider budget (both strings appear
+                # 1-4s apart in every corpus incident). With NOTHING
+                # journaled there is no episode, nothing is deferred, and
+                # this fires exactly as it always has.
                 if child.automation and child.binding is None \
-                        and self.now() - child.launched_at >= BIND_TIMEOUT:
+                        and self.now() - child.launched_at >= BIND_TIMEOUT \
+                        and not (child.deferred_events
+                                 and child.deferred_klass == "birth"):
                     if not child.hint_printed:
                         print("[headroom] no SessionStart handshake within 30s; "
                               "automatic handoff disabled for this child",

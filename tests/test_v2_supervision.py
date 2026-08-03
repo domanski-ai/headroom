@@ -7706,7 +7706,10 @@ class EpochLossAfterALostSessionStart(TempDirCase):
             self.assertTrue(self.child.automation,
                             "a spent in-line grace is a deferral now")
             self.assertEqual(len(self.child.deferred_events), 1)
-            clock["t"] += supervisor.BIND_TIMEOUT + 1.0
+            # FLIPPED AT G2 (named pin): losing a birth race now takes the
+            # BIRTH budget, not BIND_TIMEOUT — the loss this helper builds
+            # is the same loss, further out
+            clock["t"] += supervisor.TRANSCRIPT_BIRTH_BUDGET + 1.0
             with mock.patch.object(supervisor, "TRANSCRIPT_GRACE_SECONDS", 0.0):
                 events, err = self.handle()
         finally:
@@ -7922,6 +7925,48 @@ class EpochLossAfterALostSessionStart(TempDirCase):
         self.assertIs(events[1]["armed"], True)
         self.assertIn("SessionStart hook never bound", events[2]["reason"])
         self.assertFalse(child.automation)
+
+    def test_a_birth_deferral_in_flight_holds_the_never_bound_disarm(self):
+        """The G2 gate, driven through the real `_monitor` loop like the test
+        above — which is also this test's control: with NOTHING journaled the
+        never-bound disarm fires exactly as it always has.
+
+        A journaled-but-unborn SessionStart is 'binding in progress', and the
+        episode's own budget — sized for a birth — is the judge. Without the
+        gate the two disarms race at ~30s and the monitor one moots the wider
+        budget: both strings appear seconds apart in every corpus incident,
+        which is how one lost birth read as two failures."""
+        polls = iter([None, None, 0])
+
+        class FakeProcess:
+            pid = os.getpid()
+
+            @staticmethod
+            def poll():
+                return next(polls)
+
+        clock = {"t": 1000.0}
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.account_row,
+            popen=lambda argv, env=None, cwd=None, **kw: FakeProcess(),
+            now=lambda: clock["t"], sleep=lambda seconds: None)
+        with mock.patch.object(notify, "emit") as emit, \
+                mock.patch.object(supervisor, "TRANSCRIPT_GRACE_SECONDS", 0.0), \
+                redirect_stderr(io.StringIO()):
+            child = runner._spawn(self.account_row, [], self.temp.name, True)
+            # the transcript is NOT born: the SessionStart defers, birth-class
+            self.fire("SessionStart", supervisor_id=runner.supervisor_id,
+                      received_at=1000.5, source="startup")
+            clock["t"] = 1000.0 + supervisor.BIND_TIMEOUT + 1
+            self.assertEqual(runner._monitor(child), 0)
+        self.assertEqual(len(child.deferred_events), 1,
+                         "the episode must still be in flight")
+        self.assertEqual(child.deferred_klass, "birth")
+        self.assertTrue(child.automation,
+                        "the never-bound disarm outran a live birth episode")
+        events = [call.args[0] for call in emit.call_args_list]
+        self.assertEqual([event["event"] for event in events],
+                         ["launch", "child_died_unrequested"])
 
 
 class UnknownEpochIsClassifiedBeforeRemedy(EpochLossAfterALostSessionStart):
@@ -8735,14 +8780,20 @@ class TransientRefusalsAreRetriedNotLatched(TempDirCase):
 
     def test_the_retry_is_bounded_and_ends_exactly_where_it_used_to(self):
         """A transient that never heals must still fail closed, with the same
-        reason string and the same disarm the estate reads today."""
+        reason string and the same disarm the estate reads today.
+
+        FLIPPED AT G2 (named pin): the constants below moved from
+        BIND_TIMEOUT to TRANSCRIPT_BIRTH_BUDGET — this episode is a
+        SessionStart whose pair never bound, which is birth-class by
+        definition. Nothing else moved: the mid-budget probe, the reason
+        strings and the disarm are the same rows they always were."""
         self.fire("SessionStart", source="startup")
         self.handle()
-        self.clock["t"] += supervisor.BIND_TIMEOUT / 2
+        self.clock["t"] += supervisor.TRANSCRIPT_BIRTH_BUDGET / 2
         events, err = self.handle()
         self.assertEqual(events, [], "still inside the budget")
         self.assertTrue(self.child.automation)
-        self.clock["t"] += supervisor.BIND_TIMEOUT
+        self.clock["t"] += supervisor.TRANSCRIPT_BIRTH_BUDGET
         events, err = self.handle()
         self.assertIn("malformed hook event", err)
         self.assertIn("transcript no longer exists", err)
@@ -8769,6 +8820,73 @@ class TransientRefusalsAreRetriedNotLatched(TempDirCase):
         self.assertEqual(events, [])
         self.assertTrue(self.child.automation)
         self.assertEqual(len(self.child.deferred_events), 1)
+
+    # -- the birth-class budget (G2) ---------------------------------------
+    def test_the_birth_budget_covers_the_measured_tail(self):
+        """The constant, pinned to its evidence. Transcript births measured
+        on this box (2026-08-02) run 0.1s-103.9s, and every recovery-killing
+        disarm in the corpus was a birth under 104s that outlived the 30s
+        budget. The birth budget must clear that tail with margin — and it
+        must be a WIDER budget than the general one, or the split is not a
+        split."""
+        self.assertEqual(supervisor.TRANSCRIPT_BIRTH_BUDGET, 120.0)
+        self.assertGreater(supervisor.TRANSCRIPT_BIRTH_BUDGET, 103.9,
+                           "the budget no longer covers the measured tail")
+        self.assertGreater(supervisor.TRANSCRIPT_BIRTH_BUDGET,
+                           supervisor.BIND_TIMEOUT)
+
+    def test_the_measured_tail_birth_binds_inside_the_budget(self):
+        """The corpus row, replayed: a 103.9s birth — the worst measured on
+        this box, the shape that was 10-for-10 recovery-killing — now binds,
+        with supervision never interrupted. This is the row G2 exists for.
+
+        The mid-window poll is the test's teeth: it lands PAST the old 30s
+        budget while the transcript is still unborn, which is exactly where
+        every corpus disarm fired. Expiry is only judged when a poll refuses,
+        so without this poll a late birth binds under any budget and the
+        test proves nothing."""
+        self.fire("SessionStart", source="startup")
+        self.handle()
+        self.assertEqual(len(self.child.deferred_events), 1)
+        self.clock["t"] += supervisor.BIND_TIMEOUT + 20.0
+        events, _err = self.handle()
+        self.assertEqual(events, [], "disarmed mid-birth, inside the budget")
+        self.assertTrue(self.child.automation)
+        self.clock["t"] = 10_000.0 + 103.9
+        self.born()
+        events, err = self.handle()
+        self.assertEqual(events, [])
+        self.assertEqual(err, "")
+        self.assertIsNotNone(self.child.binding)
+        self.assertEqual(self.child.binding.session_id, self.SID)
+        self.assertTrue(self.child.automation)
+        self.assertEqual(self.child.deferred_events, [])
+
+    def test_a_deleted_transcript_keeps_the_bind_timeout_and_is_permanent(self):
+        """The other direction of the class split, so the wide budget cannot
+        leak. A transcript that VANISHES after binding shares the birth's
+        phrase and nothing else: it keeps BIND_TIMEOUT — proven by the clock,
+        which never comes near the birth budget — and its disarm row says
+        `transient: false`, the non-re-armable vocabulary an eventual heal
+        cycle must honor."""
+        self.born()
+        self.fire("SessionStart", source="startup")
+        self.handle()
+        self.assertIsNotNone(self.child.binding)
+        os.remove(self.transcript)
+        self.fire("CwdChanged")
+        events, _err = self.handle()
+        self.assertEqual(events, [], "a deletion is still deferred, not an "
+                         "instant disarm")
+        self.assertEqual(len(self.child.deferred_events), 1)
+        self.clock["t"] += supervisor.BIND_TIMEOUT + 1.0
+        events, err = self.handle()
+        self.assertIn("transcript no longer exists", err)
+        self.assertIn("automatic handoff disabled", err)
+        self.assertEqual([event["event"] for event in events],
+                         ["supervision_lost"])
+        self.assertIs(events[0]["transient"], False)
+        self.assertFalse(self.child.automation)
 
     # -- where the seven-second birth is covered now -----------------------
     def test_a_seven_second_birth_is_survived_by_the_RETRY(self):
@@ -8875,8 +8993,9 @@ class TransientRefusalsAreRetriedNotLatched(TempDirCase):
         self.assertEqual(len(self.child.deferred_events), 1)
         # a late append, stamped EARLIER than the held record and readable —
         # it sorts ahead of it and gets through while the birth is still in
-        # flight
-        self.clock["t"] += supervisor.BIND_TIMEOUT - 1.0
+        # flight. FLIPPED AT G2 (named pin): the probe rides the BIRTH
+        # budget now, one second shy of its edge as before.
+        self.clock["t"] += supervisor.TRANSCRIPT_BIRTH_BUDGET - 1.0
         self.fire("CwdChanged", received_at=self.launched_at + 3.0,
                   session_id=other, transcript_path=path)
         self.handle()
@@ -9027,7 +9146,8 @@ class TransientRefusalsAreRetriedNotLatched(TempDirCase):
         self.fire("StopFailure", error="rate_limit",
                   last_assistant_message=self.CAP)
         self.handle()
-        self.clock["t"] += supervisor.BIND_TIMEOUT + 1.0
+        # FLIPPED AT G2 (named pin): the spend crosses the BIRTH budget now
+        self.clock["t"] += supervisor.TRANSCRIPT_BIRTH_BUDGET + 1.0
         events, err = self.handle()
         self.assertFalse(self.child.automation)
         self.assertIn("hit a subscription cap", err)
