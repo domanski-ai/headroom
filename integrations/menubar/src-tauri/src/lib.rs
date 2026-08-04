@@ -54,7 +54,17 @@ const WINDOW_HEIGHT: f64 = 640.0;
 const POPOVER_HEIGHT: f64 = 720.0;
 const POPOVER_HEIGHT_MIN: f64 = 320.0;
 /// TCP connect + HTTP response-read budget for the reachability probe.
-const PROBE_TIMEOUT: Duration = Duration::from_millis(600);
+///
+/// 600ms -> 4s (2026-08-04). The loopback URL rides an SSH forward over
+/// whatever network the Mac is on; measured on a live commute day, a healthy
+/// 1.1KB fetch took 0.37-1.14s. With a 600ms budget the app repeatedly
+/// declared "server unreachable" while curl on the same box proved the feed
+/// fine in under a second — and every tray click re-ran the same too-short
+/// probe, re-showing the error card. That was the widget's dominant "dead"
+/// state on 2026-08-04 (three operator screenshots). A probe budget must
+/// exceed the link's real worst case with margin; it runs on a worker
+/// thread, so the cost of waiting is nothing.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(4000);
 /// How often the background watcher retries while the fallback page is shown.
 const RETRY_INTERVAL: Duration = Duration::from_secs(3);
 /// Clicking the tray icon while the panel is open fires focus-loss (hide)
@@ -812,8 +822,15 @@ pub fn run() {
                     continue;
                 };
                 let state = watcher.state::<AppState>();
-                let visible = window.is_visible().unwrap_or(false);
-                if visible && !state.widget_loaded.load(Ordering::SeqCst) {
+                // 2026-08-04: the `visible &&` gate is gone. A hidden popover
+                // showing the fallback page never recovered — the first
+                // recovery attempt only ever ran while the operator was
+                // already staring at a broken panel. The probe is one worker-
+                // thread TCP connect every 3s against loopback; recovering
+                // while hidden costs nothing and means the panel is usually
+                // healthy BEFORE it is next opened.
+                let _ = window.is_visible(); // window liveness only
+                if !state.widget_loaded.load(Ordering::SeqCst) {
                     sync_view(&watcher, false);
                 }
             });
