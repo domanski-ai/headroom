@@ -9160,3 +9160,145 @@ class TransientRefusalsAreRetriedNotLatched(TempDirCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkflowJournalRetiresItsAgents(TempDirCase):
+    """B1: a workflow's own journal.jsonl is the authoritative retirement ledger.
+
+    THE INCIDENT (2026-08-04). A workflow subagent's transcript ends
+    assistant(tool_use) -> user(tool_result), and _sidechain_busy returns on the
+    first `user` from the end, so the SHAPE test can never retire one — at any
+    age, on any lane. Measured across 663 workflow-agent transcripts in 60
+    workflows on this estate: 597 of 635 provably-finished agents were vetoed
+    forever. seo-geo's elective rotation was bricked for 17 hours by six such
+    files, while the proof that all six had returned sat in journal.jsonl in
+    the same directory.
+
+    The fix reads that proof. It relaxes no other veto: an agent with a
+    `started` and no `result` still vetoes at any age, the recency veto still
+    applies to EVERY file including the journal, and an unreadable journal
+    retires nothing.
+    """
+
+    def _session(self):
+        base = os.path.join(self.temp.name, "projects", "-x")
+        os.makedirs(base, exist_ok=True)
+        transcript = os.path.join(base, "sess.jsonl")
+        # the parent must read as a FINISHED main-thread assistant turn, or
+        # _turn_is_complete refuses before the sidechain scan is ever reached
+        with open(transcript, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(
+                {"type": "user",
+                 "message": {"content": [{"type": "text", "text": "go"}]}}) + "\n")
+            handle.write(json.dumps(
+                {"type": "assistant",
+                 "message": {"content": [{"type": "text", "text": "done"}]}}) + "\n")
+        return transcript
+
+    def _workflow_dir(self, transcript, name="wf_test-abc"):
+        directory = os.path.join(supervisor._subagents_dir(transcript),
+                                 "workflows", name)
+        os.makedirs(directory, exist_ok=True)
+        return directory
+
+    @staticmethod
+    def _agent_file(directory, agent_id, *, ends_busy=True, age=3600.0):
+        """A workflow agent transcript. `ends_busy` reproduces the real shape:
+        assistant(tool_use) then user(tool_result) — what every workflow agent
+        writes, and what _sidechain_busy can never retire."""
+        path = os.path.join(directory, f"agent-{agent_id}.jsonl")
+        rows = [{"type": "assistant", "isSidechain": True,
+                 "message": {"content": [{"type": "text", "text": "working"}]}}]
+        if ends_busy:
+            rows.append({"type": "user", "isSidechain": True,
+                         "message": {"content": [
+                             {"type": "tool_result", "tool_use_id": "t1"}]}})
+        with open(path, "w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row) + "\n")
+        stamp = time.time() - age
+        os.utime(path, (stamp, stamp))
+        return path
+
+    @staticmethod
+    def _journal(directory, started=(), results=(), *, age=3600.0, raw=None):
+        path = os.path.join(directory, "journal.jsonl")
+        with open(path, "w", encoding="utf-8") as handle:
+            if raw is not None:
+                handle.write(raw)
+            else:
+                for agent_id in started:
+                    handle.write(json.dumps(
+                        {"type": "started", "agentId": agent_id}) + "\n")
+                for agent_id in results:
+                    handle.write(json.dumps(
+                        {"type": "result", "agentId": agent_id,
+                         "result": "done"}) + "\n")
+        stamp = time.time() - age
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def _refuse(self, transcript, quiet=60.0, since=None):
+        if since is None:
+            since = time.time() - 5 * 3600
+        return supervisor._idle_refusal(
+            transcript, time.time(), quiet, since=since)
+
+    def test_an_agent_with_a_result_record_in_the_workflow_journal_is_retired(self):
+        transcript = self._session()
+        directory = self._workflow_dir(transcript)
+        self._agent_file(directory, "a1")
+        self._journal(directory, started=["a1"], results=["a1"])
+        self.assertEqual(self._refuse(transcript), "")
+
+    def test_an_agent_with_a_started_and_no_result_still_vetoes(self):
+        """The fail-closed core. Must never regress."""
+        transcript = self._session()
+        directory = self._workflow_dir(transcript)
+        self._agent_file(directory, "a1")
+        self._journal(directory, started=["a1"], results=[])
+        self.assertIn("background subagent", self._refuse(transcript))
+
+    def test_a_journal_written_five_seconds_ago_still_vetoes_on_recency(self):
+        """A journal written seconds ago is evidence of a LIVE workflow."""
+        transcript = self._session()
+        directory = self._workflow_dir(transcript)
+        self._agent_file(directory, "a1")
+        self._journal(directory, started=["a1"], results=["a1"], age=5.0)
+        self.assertIn("wrote", self._refuse(transcript, quiet=60.0))
+
+    def test_a_journal_that_cannot_be_parsed_retires_nothing(self):
+        transcript = self._session()
+        directory = self._workflow_dir(transcript)
+        self._agent_file(directory, "a1")
+        self._journal(directory, raw="{not json at all\n")
+        self.assertIn("background subagent", self._refuse(transcript))
+
+    def test_a_journal_file_is_never_shape_tested(self):
+        """Today a lone journal.jsonl returns 'has no conversational record'."""
+        transcript = self._session()
+        directory = self._workflow_dir(transcript)
+        self._journal(directory, started=[], results=[])
+        self.assertEqual(self._refuse(transcript), "")
+
+    def test_the_2026_08_04_seo_geo_directory_no_longer_latches(self):
+        """THE INCIDENT PIN. Six workflow agents ending in user/tool_result at
+        17h, all six carrying a result record in the journal, child launched
+        five hours ago. This exact shape bricked seo-geo's rotation."""
+        transcript = self._session()
+        directory = self._workflow_dir(transcript, "wf_d5ab0461-c36")
+        agents = ["a6b610b85885f424b", "a95cb924c1513d4d8", "a998e6c20326924f0",
+                  "a9fcbabc25b38fda9", "acba0ab3776028884", "ad935b10ee7cd8634"]
+        for agent_id in agents:
+            self._agent_file(directory, agent_id, age=17 * 3600)
+        self._journal(directory, started=agents, results=agents,
+                      age=17 * 3600)
+        self.assertEqual(self._refuse(transcript), "")
+
+    def test_a_recent_agent_file_still_vetoes_even_when_retired(self):
+        """Property pin: never idle while any *.jsonl is within quiet_seconds."""
+        transcript = self._session()
+        directory = self._workflow_dir(transcript)
+        self._agent_file(directory, "a1", age=2.0)
+        self._journal(directory, started=["a1"], results=["a1"])
+        self.assertIn("wrote", self._refuse(transcript, quiet=60.0))

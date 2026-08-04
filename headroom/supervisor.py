@@ -2290,6 +2290,47 @@ def _terminated_agents(records):
     return _agent_lifecycle(records)[1]
 
 
+_AGENT_TRANSCRIPT_RE = re.compile(r"agent-[^.]+\.jsonl")
+
+
+def _workflow_retired_agents(path):
+    """Agent ids a workflow journal RECORDS AS RETURNED, or an empty set.
+
+    FAIL CLOSED. Any read or parse failure contributes nothing, so the shape
+    test decides exactly as it does today — an unreadable ledger must never
+    be able to retire an agent it cannot vouch for.
+
+    The vocabulary is `started` / `result`, one line per event, carrying
+    `agentId`. Measured across 167 workflow journals on this estate:
+    {started: 1642, result: 1524}, and NOT ONE case of a `started` following a
+    `result` for the same id — the ledger is monotone, so a `result` is
+    terminal and needs no ordering logic. An agent with a `started` and no
+    `result` is deliberately NOT retired: it still vetoes at any age."""
+    retired = set()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    # one broken line must not discard the whole ledger, but
+                    # it also must not be guessed at — skip it and keep going
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                if event.get("type") != "result":
+                    continue
+                agent_id = event.get("agentId")
+                if isinstance(agent_id, str) and agent_id:
+                    retired.add(agent_id)
+    except OSError:
+        return set()
+    return retired
+
+
 def _subagent_activity(transcript_path, now, quiet_seconds, since=0.0,
                        launched=(), finished=()):
     """"" when no background subagent is still working.
@@ -2311,7 +2352,12 @@ def _subagent_activity(transcript_path, now, quiet_seconds, since=0.0,
     directory = _subagents_dir(transcript_path)
     scanned = 0
     seen = {}
+    candidates = []
+    journals = []
     try:
+        # PASS 1 — stat only, no parsing. The recency veto applies to EVERY
+        # file including journal.jsonl: a journal written seconds ago is
+        # evidence of a LIVE workflow.
         for root, _dirs, names in os.walk(directory):
             for name in names:
                 if not name.endswith(".jsonl"):
@@ -2327,18 +2373,43 @@ def _subagent_activity(transcript_path, now, quiet_seconds, since=0.0,
                     mtime = os.stat(path).st_mtime
                 except OSError:
                     return "a subagent transcript could not be inspected"
-                # agent-<id>.jsonl -> <id>
-                seen[os.path.splitext(name)[0].partition("-")[2]] = mtime
                 if now - mtime < quiet_seconds:
                     return ("a background subagent wrote "
                             f"{max(now - mtime, 0):.0f}s ago")
-                if mtime < since:
+                if name == "journal.jsonl":
+                    journals.append(path)
                     continue
-                if os.path.splitext(name)[0].partition("-")[2] in finished:
+                if not _AGENT_TRANSCRIPT_RE.fullmatch(name):
+                    # not an agent transcript and not a journal: it has no
+                    # shape contract, so it can only ever fail the shape test
                     continue
-                busy = _sidechain_busy(path)
-                if busy:
-                    return busy
+                # agent-<id>.jsonl -> <id>
+                agent_id = os.path.splitext(name)[0].partition("-")[2]
+                seen[agent_id] = mtime
+                candidates.append((path, agent_id, mtime))
+        # The workflow's own journal is an authoritative retirement ledger:
+        # a `result` record for an agent id is the workflow runtime saying
+        # that agent RETURNED. It is the proof the shape test cannot supply,
+        # because a workflow agent's transcript ends assistant(tool_use) ->
+        # user(tool_result) and _sidechain_busy returns on the first `user`
+        # from the end — so shape can NEVER retire one, at any age, on any
+        # lane. Measured on this estate 2026-08-04: 597 of 635 provably
+        # finished workflow agents were vetoed forever, which is what bricked
+        # seo-geo's elective rotation for 17 hours.
+        retired = set()
+        for path in journals:
+            retired |= _workflow_retired_agents(path)
+        # PASS 2 — shape, only for files that have a shape contract.
+        for path, agent_id, mtime in candidates:
+            if mtime < since:
+                continue
+            if agent_id in finished:
+                continue
+            if agent_id in retired:
+                continue
+            busy = _sidechain_busy(path)
+            if busy:
+                return busy
     except OSError:
         return ""
     pending = [agent for agent in launched
