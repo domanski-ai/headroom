@@ -4213,8 +4213,14 @@ class CapWaitsForCapacity(TempDirCase):
             runner, child, self.proof(), polls=40)
         self.assertEqual(outcome, 0)
         self.assertFalse(child.automation)
+        # AMENDED 2026-08-04 by P2: `preemptive_held` now follows the disarm.
+        # That third event IS the fix working — the hold-budget exhaustion is a
+        # BLESSED disarm (the binding is fine, only the cap machinery gave up),
+        # so elective rotation stays armed and immediately tries again instead
+        # of the lane going permanently dark on a capped seat. Before P2 this
+        # list ended at supervision_lost and nothing ever moved that child.
         self.assertEqual([event["event"] for event in events],
-                         ["cap_held", "supervision_lost"])
+                         ["cap_held", "supervision_lost", "preemptive_held"])
         self.assertIn("no seat came free", err.getvalue())
         self.assertIn("automatic handoff disabled", err.getvalue())
 
@@ -6474,13 +6480,32 @@ class ContextBackstop(TempDirCase):
                        "routing": {"context_backstop": False}})
         self.assertFalse(self.runner()._context_backstop_due(self.child, None))
 
-    def test_a_disarmed_or_unbound_child_is_left_alone(self):
+    def test_an_unbound_or_electively_disarmed_child_is_left_alone(self):
+        # AMENDED 2026-08-04 by P2. This used to set `automation = False` and
+        # assert the backstop was due=False, on the old model where ONE flag
+        # gated the cap path and both elective paths together. That fusion is
+        # the defect P2 removes: a transient cap-machinery failure must not
+        # take the context backstop down with it for the rest of the lane's
+        # life. The backstop now reads `preemptive_enabled`.
         runner = self.runner()
-        self.child.automation = False
+        # an UNBLESSED disarm still kills it — the safety property, unchanged
+        supervisor._lose_supervision(self.child, "shutdown signal received")
         self.assertFalse(runner._context_backstop_due(self.child, None))
+        # an unbound child is still left alone, for its own separate reason
         self.child.automation = True
+        self.child.preemptive_enabled = True
         self.child.binding = None
         self.assertFalse(runner._context_backstop_due(self.child, None))
+
+    def test_a_blessed_cap_disarm_leaves_the_context_backstop_ARMED(self):
+        # the other half of the same law, and the reason P2 exists: losing the
+        # cap path to an unreadable hook journal must NOT cost this child its
+        # context backstop as well.
+        runner = self.runner()
+        supervisor._lose_supervision(
+            self.child, "hook event journal unreadable: boom", elective_ok=True)
+        self.assertIs(self.child.automation, False)
+        self.assertTrue(runner._context_backstop_due(self.child, None))
 
     # -- the limits of a same-seat rotation ---------------------------------
 
@@ -9444,3 +9469,93 @@ class AFirstLookCapHoldsOnAnUnreadableMeter(CapWaitsForCapacity):
         plan = runner._preflight(child, self.proof())
         self.assertEqual(plan.target["name"], "target")
         self.assertIs(child.automation, True)
+
+
+class ElectiveRotationSurvivesACapDisarm(TempDirCase):
+    """P2: losing the CAP path must not also kill ELECTIVE rotation.
+
+    `child.automation` was a one-way latch — 18 sites write it False, nothing
+    anywhere sets it True on a live child — and it gated all three protections
+    at once. So one transient failure of the cap-proof machinery (an unreadable
+    hook journal, a malformed event, a throttled meter) left the lane with no
+    preemptive rotation and no context backstop for the rest of its life. That
+    is how freelance rode into its wall on 2026-08-04 with every layer already
+    dead seven minutes beforehand.
+
+    The split: `automation` still answers "may a PROVEN CAP move this child?";
+    the new `preemptive_enabled` answers "may it still rotate ELECTIVELY?".
+    Only sites where the BINDING IS STILL GOOD and merely the cap machinery
+    failed are blessed. Where liveness or identity is in doubt, both stay off.
+    """
+
+    def child(self):
+        process = mock.Mock(pid=os.getpid())
+        process.poll.return_value = None
+        return supervisor.Child(
+            process, {"name": "source", "home": self.temp.name}, 1,
+            os.path.join(self.temp.name, "ev.jsonl"), "",
+            time.time() - 60, True, session_epoch=1)
+
+    def test_a_fresh_child_has_both_paths_armed(self):
+        c = self.child()
+        self.assertIs(c.automation, True)
+        self.assertIs(c.preemptive_enabled, True)
+
+    def test_a_blessed_disarm_keeps_elective_rotation(self):
+        """The whole point: the cap path goes, elective rotation survives."""
+        c = self.child()
+        supervisor._lose_supervision(c, "hook event journal unreadable: boom",
+                                     elective_ok=True)
+        self.assertIs(c.automation, False)          # cap path is off
+        self.assertIs(c.preemptive_enabled, True)   # elective still armed
+
+    def test_the_default_call_still_kills_both_paths(self):
+        """The default-preserves-today pin. An unblessed site must not have
+        quietly become permissive."""
+        c = self.child()
+        supervisor._lose_supervision(c, "something nobody classified")
+        self.assertIs(c.automation, False)
+        self.assertIs(c.preemptive_enabled, False)
+
+    def test_a_shutdown_signal_never_leaves_elective_rotation_armed(self):
+        """SAFETY PIN. We asked this child to stop; rotating it afterwards is
+        the one thing a bare `preemptive_enabled defaulting True` would have
+        got wrong."""
+        c = self.child()
+        supervisor._lose_supervision(c, "shutdown signal received")
+        self.assertIs(c.preemptive_enabled, False)
+
+    def test_a_sigterm_timeout_never_leaves_elective_rotation_armed(self):
+        """SAFETY PIN. The child did not answer a SIGTERM, so its liveness is
+        in doubt and it must not be moved by anything."""
+        c = self.child()
+        supervisor._lose_supervision(c, "Claude did not exit after one SIGTERM")
+        self.assertIs(c.preemptive_enabled, False)
+
+    def test_exactly_the_cap_machinery_sites_are_blessed_in_the_source(self):
+        """The bless list is a POLICY, so pin it against the source rather than
+        trusting a reviewer to re-read 21 call sites. Blessed == the binding is
+        still good and only the cap-proof machinery failed."""
+        import re
+        src = open(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(supervisor.__file__))), "headroom",
+            "supervisor.py"), encoding="utf-8").read()
+        blessed = re.findall(r'_lose_supervision\(\s*child,\s*(f?"[^"]+")[^)]*elective_ok=True', src)
+        expected = {
+            'f"cap-time model unavailable: {error}"',
+            'f"cap not corroborated: {error}"',
+            'f"malformed hook event: {error}"',
+            'f"hook event journal unreadable: {error}"',
+            'f"automatic handoff held: {error}"',
+        }
+        self.assertEqual(set(blessed), expected)
+        # and the ones whose liveness/identity is in doubt must NEVER be blessed
+        for forbidden in ("Claude did not exit after one SIGTERM",
+                          "shutdown signal received",
+                          "session binding failed",
+                          "handoff failed after Claude exited",
+                          "resume spawn could not be ledgered"):
+            for m in re.finditer(re.escape(forbidden), src):
+                tail = src[m.end():m.end() + 120]
+                self.assertNotIn("elective_ok=True", tail,
+                                 f"{forbidden} must never be blessed")

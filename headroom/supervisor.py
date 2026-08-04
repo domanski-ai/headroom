@@ -603,6 +603,13 @@ class Child:
     # answers and the seat now reads healthy, that is the cap we were holding
     # for having RESET, not a contradiction — re-arm, never disarm.
     cap_hold_unreadable: bool = False
+    # may this child still rotate ELECTIVELY (preemptive / context backstop)?
+    # Defaults True and is turned off by every _lose_supervision that is not
+    # explicitly blessed with elective_ok. Deliberately NOT a bare
+    # "preemptive_enabled defaulting True" read in place of automation: that
+    # would leave preemption armed through `shutdown signal received`, which is
+    # the one case where we asked the child to stop.
+    preemptive_enabled: bool = True
     # which proof the hold above belongs to; a different one resets it
     cap_hold_key: tuple = ()
     # WHICH cap fresh usage corroborated: the cooldown key it would spend
@@ -679,7 +686,7 @@ class Relaunch:
     recovery: object = None
 
 
-def _lose_supervision(child, reason, transient=False):
+def _lose_supervision(child, reason, transient=False, elective_ok=False):
     """Turn automation off for this child and notify the loss.
 
     Post-spawn supervision loss is exactly what an external dispatcher cannot
@@ -701,6 +708,24 @@ def _lose_supervision(child, reason, transient=False):
     `transient` is vocabulary for a future heal cycle; today every caller
     takes the default, so every disarm is permanent and every row says so."""
     child.automation = False
+    # P2 (Paul 2026-08-04, "harden the system, make it work consistently").
+    # `automation` is a ONE-WAY LATCH: 18 call sites write it False and NOTHING
+    # anywhere sets it True on a live child. It gated ALL THREE protections at
+    # once -- the cap path, preemptive rotation AND the context backstop -- so a
+    # single transient failure of the CAP-PROOF machinery left the lane with no
+    # elective rotation for the rest of its life. That is the 2026-08-04
+    # incident: freelance disarmed on one unreadable usage row and then rode
+    # into its wall with every layer already dead.
+    # `elective_ok` splits the two questions that were wrongly fused:
+    #   "may this child still be MOVED BY A PROVEN CAP?"  -> automation
+    #   "may this child still rotate ELECTIVELY?"          -> preemptive_enabled
+    # A blessed site is one where the BINDING IS STILL GOOD and only the cap
+    # machinery failed. Where the child's liveness or identity is in doubt --
+    # a SIGTERM it did not answer, a session that ended, a binding that never
+    # happened, a shutdown we asked for -- BOTH stay off, because rotating a
+    # child we cannot describe is worse than not rotating it.
+    if not elective_ok:
+        child.preemptive_enabled = False
     # The ratchet is written BEFORE the per-reason dedupe below, on the
     # `automation = False` precedent: dedupe governs the NOTIFY, never the
     # class — a repeat disarm that says nothing new must still be allowed to
@@ -3015,11 +3040,11 @@ class Supervisor:
                 print("[headroom] rate-limit hook was not a subscription cap; "
                       "child continues", file=sys.stderr)
         except PendingCapTimeout as error:
-            _lose_supervision(child, f"cap-time model unavailable: {error}")
+            _lose_supervision(child, f"cap-time model unavailable: {error}", elective_ok=True)
             print(f"[headroom] {error}; automatic handoff disabled — /exit then "
                   "`headroom handoff` to move manually", file=sys.stderr)
         except PermanentSupervisorError as error:
-            _lose_supervision(child, f"cap not corroborated: {error}")
+            _lose_supervision(child, f"cap not corroborated: {error}", elective_ok=True)
             child.pending_cap = None
             print(f"[headroom] cap not corroborated ({error}); automatic "
                   "handoff disabled for this child", file=sys.stderr)
@@ -3688,7 +3713,7 @@ class Supervisor:
         the poll entirely — and the child must be enabled, bound, and live.
         Ordered so a disqualifying condition short-circuits before the clock
         is consulted."""
-        return (self.preemptive and proof is None and child.automation
+        return (self.preemptive and proof is None and child.preemptive_enabled
                 and child.binding is not None and child.pending_cap is None
                 and not child.session_ended
                 and self.now() >= child.preemptive_next_check
@@ -3910,7 +3935,7 @@ class Supervisor:
         backstop's own clock and hold. Automation being ON is required for a
         second reason here: the stop below wants this child's SessionEnd, and
         only a supervised child emits one."""
-        return (self.context_backstop and proof is None and child.automation
+        return (self.context_backstop and proof is None and child.preemptive_enabled
                 and child.binding is not None and child.pending_cap is None
                 and not child.session_ended
                 and self.now() >= child.context_next_check
@@ -4708,7 +4733,7 @@ class Supervisor:
         if now >= child.deferred_deadline:
             print(f"[headroom] malformed hook event ({error}); automatic "
                   "handoff disabled for this child", file=sys.stderr)
-            _lose_supervision(child, f"malformed hook event: {error}")
+            _lose_supervision(child, f"malformed hook event: {error}", elective_ok=True)
             child.pending_cap = None
             child.deferred_events = []
             child.deferred_deadline = 0.0
@@ -4729,7 +4754,7 @@ class Supervisor:
             # the journal — there is no abandoned tail to speak for.
             print(f"[headroom] {error}; automatic handoff disabled for this child",
                   file=sys.stderr)
-            _lose_supervision(child, f"hook event journal unreadable: {error}")
+            _lose_supervision(child, f"hook event journal unreadable: {error}", elective_ok=True)
             child.pending_cap = None
             return None
         waiting_for = None
@@ -4775,7 +4800,7 @@ class Supervisor:
             except SupervisorError as error:
                 print(f"[headroom] malformed hook event ({error}); automatic "
                       "handoff disabled for this child", file=sys.stderr)
-                _lose_supervision(child, f"malformed hook event: {error}")
+                _lose_supervision(child, f"malformed hook event: {error}", elective_ok=True)
                 child.pending_cap = None
                 self._announce_tail_caps(child, records[index + 1:])
                 return None
@@ -5075,6 +5100,7 @@ class Supervisor:
                     # (P1-4). So until forwarded, skip _handle_events entirely:
                     # just check for exit and keep polling.
                     child.automation = False
+                    child.preemptive_enabled = False
                     if not signals.forwarded:
                         returncode = child.process.poll()
                         if returncode is not None:
@@ -5175,7 +5201,7 @@ class Supervisor:
                                   "— automatic handoff disabled for this child",
                                   file=sys.stderr)
                             _lose_supervision(
-                                child, f"automatic handoff held: {error}")
+                                child, f"automatic handoff held: {error}", elective_ok=True)
                             self._cap_hold_clear(child)
                             proof = None
                     except handoff.HandoffError as error:
@@ -5185,13 +5211,13 @@ class Supervisor:
                             print(f"[headroom] automatic handoff held: {error}; "
                                   "child continues", file=sys.stderr)
                             _lose_supervision(
-                                child, f"automatic handoff held: {error}")
+                                child, f"automatic handoff held: {error}", elective_ok=True)
                             proof = None
                     except SupervisorError as error:
                         print(f"[headroom] automatic handoff held: {error}; child "
                               "continues", file=sys.stderr)
                         _lose_supervision(
-                            child, f"automatic handoff held: {error}")
+                            child, f"automatic handoff held: {error}", elective_ok=True)
                         proof = None
                     else:
                         # admitted: whatever we were waiting for arrived
