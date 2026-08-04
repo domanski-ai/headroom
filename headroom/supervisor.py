@@ -598,6 +598,11 @@ class Child:
     cap_hold_attempts: int = 0
     cap_hold_next: float = 0.0
     cap_hold_reason: str = ""
+    # this hold started because the METER was unreadable, not because every
+    # seat was full. It matters at the other end: when the meter finally
+    # answers and the seat now reads healthy, that is the cap we were holding
+    # for having RESET, not a contradiction — re-arm, never disarm.
+    cap_hold_unreadable: bool = False
     # which proof the hold above belongs to; a different one resets it
     cap_hold_key: tuple = ()
     # WHICH cap fresh usage corroborated: the cooldown key it would spend
@@ -3112,7 +3117,20 @@ class Supervisor:
                 # _lose_supervision, on the dead seat, exactly like the bug
                 # the wait replaced. Trust, identity and policy refusals are
                 # NOT in this class and disarm as they always did.
-                if held and _source_reading_unavailable(reason, proof.family):
+                # P1 (Paul authorised 2026-08-04): the `held` conjunct is GONE
+                # for this class. A FIRST look at an unreadable meter used to
+                # disarm, which is the 2026-08-04 incident exactly: freelance
+                # lost supervision at 08:23:17Z on one
+                # "held: usage_source_rate_limited", 7m36s before its wall, and
+                # the next NINE cap proofs were discarded as "supervision is
+                # off for this child". Nothing had been disproven — the
+                # provider throttles the usage API precisely when the fleet is
+                # hammering the account, so the meter dies exactly when the
+                # wall is coming. The 5h CAP_HOLD budget built for this was
+                # unreachable, because `held` is only ever written BELOW this
+                # gate. The code knew how to wait and refused to.
+                if _source_reading_unavailable(reason, proof.family):
+                    child.cap_hold_unreadable = True
                     raise CapacityHold(
                         f"{reason} — holding the proof rather than disarming "
                         "on a snapshot that proves nothing")
@@ -3124,6 +3142,17 @@ class Supervisor:
                 # That is a CONTRADICTION and it disarms, unchanged — a proof
                 # nobody can corroborate must never move a session.
                 if scope is None:
+                    # A hold that OUTLIVES its cap lands here: we waited out an
+                    # unreadable meter, and when it finally answered the window
+                    # had reset, so the seat now reads healthy. That is the cap
+                    # being OVER, not the contradiction this branch exists to
+                    # catch — disarming here would fire at the exact moment the
+                    # seat became usable again. A blackout straddling a window
+                    # reset is ordinary; today's happened to end still at 100%.
+                    if child.cap_hold_unreadable:
+                        raise CapCleared(
+                            "the cap we held for is over: the meter came back "
+                            "below 99%")
                     raise SupervisorError(
                         "fresh usage is below 99% or the cap scope is ambiguous")
                 child.cap_scope_key = scope.get("key") or ""
@@ -3438,6 +3467,7 @@ class Supervisor:
         child.cap_hold_attempts = 0
         child.cap_hold_next = 0.0
         child.cap_hold_reason = ""
+        child.cap_hold_unreadable = False
         child.cap_hold_key = ()
         child.cap_scope_key = ""
         child.cap_scope_window = ""

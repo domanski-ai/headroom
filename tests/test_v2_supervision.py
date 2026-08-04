@@ -4313,19 +4313,30 @@ class CapWaitsForCapacity(TempDirCase):
 
     UNREADABLE_5H = {"used_percent": 100.0, "freshness": "expired_observation"}
 
-    def test_the_same_unreadable_window_still_disarms_on_a_first_look(self):
-        # the hold is for a cap already corroborated once; with nothing
-        # corroborated there is nothing to wait on, and the fail-closed
-        # first look is unchanged
+    def test_the_same_unreadable_window_now_holds_on_a_first_look(self):
+        # SUPERSEDED 2026-08-04 by P1, on Paul's authorisation. This test used
+        # to assert the opposite and carried the reasoning "the hold is for a
+        # cap already corroborated once; with nothing corroborated there is
+        # nothing to wait on, and the fail-closed first look is unchanged".
+        # The 2026-08-04 incident is what that reasoning costs: an unreadable
+        # meter is NOT a contradiction and disproves nothing, and the provider
+        # throttles the usage API precisely when the fleet is hammering the
+        # account — so the first look is exactly when the meter is most likely
+        # to be dark. freelance disarmed on one such look 7m36s before its
+        # wall and discarded nine later proofs.
+        # Fail-closed is preserved where it belongs: trust/identity/policy
+        # refusals still disarm on a first look, and the documented kill
+        # switch below (CAP_HOLD_MAX=0) still restores the immediate disarm.
         runner = self.runner(
             [({"used_percent": 100.0, "freshness": "expired_observation"},
               5.0)])
         child = self.child()
-        outcome, events, _err = self.monitor(runner, child, self.proof())
+        outcome, events, err = self.monitor(runner, child, self.proof())
         self.assertEqual(outcome, 0)
-        self.assertFalse(child.automation)
-        self.assertEqual([event["event"] for event in events],
-                         ["supervision_lost"])
+        self.assertTrue(child.automation)
+        self.assertNotIn("supervision_lost",
+                         [event["event"] for event in events])
+        self.assertIn("holding the proof rather than", err.getvalue())
 
     def test_zero_budget_restores_the_immediate_first_look_disarm(self):
         # and the documented kill switch still means what it says: with no
@@ -9302,3 +9313,134 @@ class WorkflowJournalRetiresItsAgents(TempDirCase):
         self._agent_file(directory, "a1", age=2.0)
         self._journal(directory, started=["a1"], results=["a1"])
         self.assertIn("wrote", self._refuse(transcript, quiet=60.0))
+
+
+class AFirstLookCapHoldsOnAnUnreadableMeter(CapWaitsForCapacity):
+    """P1: a proven cap must not disarm because the usage meter is throttled.
+
+    THE INCIDENT (2026-08-04). freelance disarmed at 08:23:17Z —
+    7m36s BEFORE its 08:30:52Z wall — on ONE unreadable first look:
+        supervision_lost :: "automatic handoff held: held: usage_source_rate_limited"
+    and the next NINE cap proofs, 08:23:54Z -> 09:02:57Z, were discarded with
+    "supervision is off for this child". The meter was dark 07:10Z -> 09:07Z
+    because the provider throttles the usage API exactly when the fleet is
+    hammering the account, i.e. exactly when the wall is coming.
+
+    A cap that has ALREADY been corroborated once waits an unreadable snapshot
+    out (`held and ...`). A cap on its FIRST look did not, even though nothing
+    was disproven and the condition fixes itself. The 5h hold budget built for
+    precisely this was unreachable, because `held` is only ever written AFTER
+    this gate. The code knew and refused to wait.
+
+    Trust, identity and policy refusals are NOT in this class and still disarm.
+    """
+
+    def unreadable_snapshot(self, code="usage_source_rate_limited"):
+        snapshot = self.snapshot()
+        for row in snapshot["accounts"]:
+            if row["name"] == "source":
+                row["ok"] = False
+                row["error_code"] = code
+        return snapshot
+
+    def runner_with(self, snapshots):
+        """`snapshots` is a list of ready-made snapshot dicts."""
+        state = {"index": 0}
+
+        def collect_fn(quiet=True):
+            index = min(state["index"], len(snapshots) - 1)
+            state["index"] += 1
+            return snapshots[index]
+
+        def sleep(seconds):
+            self.clock["t"] += max(float(seconds), 0.0)
+
+        return supervisor.Supervisor(
+            "fable", [], self.source, collect_fn=collect_fn,
+            now=lambda: self.clock["t"], sleep=sleep, popen=mock.Mock())
+
+    def test_a_throttled_usage_api_holds_the_first_cap_instead_of_disarming(self):
+        """The incident's first move. Today: SupervisorError -> disarm."""
+        runner = self.runner_with([self.unreadable_snapshot()])
+        child = self.child()
+        with self.assertRaises(supervisor.CapacityHold) as caught:
+            runner._preflight(child, self.proof())
+        self.assertIn("usage_source_rate_limited", str(caught.exception))
+        self.assertIn("holding the proof", str(caught.exception))
+        # the whole point: the child stays SUPERVISED
+        self.assertIs(child.automation, True)
+        self.assertEqual(child.disarm_class, "")
+
+    def test_every_unreadable_code_holds_on_a_first_look(self):
+        """Pin: adding a code to route.UNREADABLE_ERROR_CODES without it
+        holding here fails the suite."""
+        for code in sorted(route.UNREADABLE_ERROR_CODES):
+            with self.subTest(code=code):
+                runner = self.runner_with([self.unreadable_snapshot(code)])
+                child = self.child()
+                with self.assertRaises(supervisor.CapacityHold):
+                    runner._preflight(child, self.proof())
+                self.assertIs(child.automation, True)
+
+    def test_a_trust_refusal_on_a_first_look_still_disarms(self):
+        """Negative control. Identity/trust is not absence of evidence."""
+        snapshot = self.snapshot()
+        for row in snapshot["accounts"]:
+            if row["name"] == "source":
+                row["routable"] = False
+                row["trust_state"] = "unverified"
+        runner, child = self.runner_with([snapshot]), self.child()
+        with self.assertRaises(supervisor.SupervisorError) as caught:
+            runner._preflight(child, self.proof())
+        self.assertNotIsInstance(caught.exception, supervisor.CapacityHold)
+
+    def test_a_readable_snapshot_below_ninety_nine_percent_still_disarms(self):
+        """The contradiction test is unchanged: the hook says capped and a
+        READABLE meter says otherwise, with no hold preceding it."""
+        runner, child = self.runner([(10.0, 10.0)]), self.child()
+        with self.assertRaises(supervisor.SupervisorError) as caught:
+            runner._preflight(child, self.proof())
+        self.assertNotIsInstance(caught.exception, supervisor.CapacityHold)
+        self.assertIn("below 99%", str(caught.exception))
+
+    def test_a_first_look_hold_that_outlives_the_cap_rearms_instead_of_disarming(self):
+        """R1#3. The meter returns AFTER the window reset, so the seat now
+        reads healthy. Without the re-arm the hold disarms at the exact moment
+        its seat becomes usable again."""
+        runner = self.runner_with([self.unreadable_snapshot(),
+                                   self.snapshot(source5=10.0)])
+        child = self.child()
+        with self.assertRaises(supervisor.CapacityHold):
+            runner._preflight(child, self.proof())
+        self.assertIs(child.cap_hold_unreadable, True)
+        with self.assertRaises(supervisor.CapCleared) as caught:
+            runner._preflight(child, self.proof())
+        self.assertIn("the cap we held for is over", str(caught.exception))
+        self.assertIs(child.automation, True)
+
+    def test_the_hold_is_cleared_when_the_cap_hold_state_is_cleared(self):
+        runner = self.runner_with([self.unreadable_snapshot()])
+        child = self.child()
+        with self.assertRaises(supervisor.CapacityHold):
+            runner._preflight(child, self.proof())
+        self.assertIs(child.cap_hold_unreadable, True)
+        runner._cap_hold_clear(child)
+        self.assertIs(child.cap_hold_unreadable, False)
+
+    def test_the_2026_08_04_freelance_shape_rotates_unattended(self):
+        """THE INCIDENT PIN. Meter throttled on the first look (08:23:17Z),
+        still throttled for several retries, then it comes back at 100% —
+        the 09:12:48Z reading. The lane must stay armed throughout and then
+        rotate on its own, instead of disarming at the first look and
+        discarding every later proof."""
+        dark = self.unreadable_snapshot()
+        back = self.snapshot(source5=100.0, target5=0.0)
+        runner = self.runner_with([dark, dark, dark, back])
+        child = self.child()
+        for _ in range(3):
+            with self.assertRaises(supervisor.CapacityHold):
+                runner._preflight(child, self.proof())
+            self.assertIs(child.automation, True)   # armed the WHOLE time
+        plan = runner._preflight(child, self.proof())
+        self.assertEqual(plan.target["name"], "target")
+        self.assertIs(child.automation, True)
