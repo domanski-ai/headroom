@@ -5987,10 +5987,33 @@ class ContextMeasurement(TempDirCase):
                 supervisor._context_window(1_000,
                                            supervisor._model_flag(args)),
                 1_000_000, args)
-        # ...and a normal model infers exactly as before
+        # ...and a normal standard-window model infers exactly as before
         self.assertEqual(
             supervisor._context_window(
-                1_000, supervisor._model_flag(["--model", "fable"])), 200_000)
+                1_000, supervisor._model_flag(["--model", "sonnet"])), 200_000)
+
+    def test_fable_is_the_large_window_without_any_tag(self):
+        # 2026-08-05 P1 specimen pair: two production fable sessions read
+        # "9%/7% remaining" under the 200k assumption while their own
+        # statuslines showed 82%/81% free — and the statuslines match the
+        # 1M arithmetic exactly (177,147/1M = 82.3% free). Fable runs the
+        # large window natively; no [1m] tag ever appears in its model
+        # string, so the family itself is the knowledge.
+        for margs in (["--model", "fable"], ["--model=claude-fable-5"],
+                      ["--model", "FABLE"]):
+            self.assertEqual(
+                supervisor._context_window(1_000,
+                                           supervisor._model_flag(margs)),
+                1_000_000, margs)
+        # the steward specimen end-to-end: used -> window -> remaining
+        window = supervisor._context_window(177_147, "claude-fable-5")
+        self.assertEqual(window, 1_000_000)
+        remaining = supervisor._context_remaining(177_147, window)
+        self.assertAlmostEqual(remaining, 82.2853, places=3)
+        # the env override still beats the family knowledge, both ways
+        with mock.patch.dict(os.environ, {"HEADROOM_CTX_WINDOW": "200000"}):
+            self.assertEqual(
+                supervisor._context_window(1_000, "claude-fable-5"), 200_000)
 
     def test_the_hooks_env_override_wins(self):
         with mock.patch.dict(os.environ, {"HEADROOM_CTX_WINDOW": "500000"}):

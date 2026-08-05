@@ -1976,7 +1976,20 @@ def _context_window(used, model="", environ=None):
     itself — anything past the fit limit could not have been served by the
     standard window. `HEADROOM_CTX_WINDOW` overrides both (the same knob, with
     the same precedence, as the cooperative hook)."""
-    if "[1m]" in str(model or "").lower():
+    model_l = str(model or "").lower()
+    if "[1m]" in model_l:
+        window = CONTEXT_WINDOW_LARGE
+    elif "fable" in model_l:
+        # FABLE RUNS THE LARGE WINDOW NATIVELY, no [1m] tag (2026-08-05,
+        # P1 specimen pair): two production fable sessions read as
+        # near-exhaustion under the 200k assumption — steward 1735fc5b
+        # "9% remaining (181,390/200,000)" with its own statusline at CTX
+        # 82% free, freelance "7% remaining (185,673/200,000)" at 81% —
+        # and both statuslines match the 1M arithmetic EXACTLY
+        # (177,147/1M = 82.3% free; 185,673/1M = 81.4%). The false-low
+        # armed forced handoffs on two healthy lanes and nearly rotated
+        # the steward. HEADROOM_CTX_WINDOW still overrides both ways for
+        # any fable variant that ever runs the standard window.
         window = CONTEXT_WINDOW_LARGE
     elif _number(used) and used > CONTEXT_WINDOW_FIT_LIMIT:
         window = CONTEXT_WINDOW_LARGE
