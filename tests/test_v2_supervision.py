@@ -9559,3 +9559,100 @@ class ElectiveRotationSurvivesACapDisarm(TempDirCase):
                 tail = src[m.end():m.end() + 120]
                 self.assertNotIn("elective_ok=True", tail,
                                  f"{forbidden} must never be blessed")
+
+
+class DegradedResumeWaitsForQuiescence(TempDirCase):
+    """The rotation-fallback P0: three lanes died on 2026-08-04 (sales 10:00Z,
+    seo-geo 10:37Z, sales 17:24Z) with the identical signature — the degraded
+    context rotation relaunched `--resume <sid>` IMMEDIATELY after the child
+    exited, the CLI raced the dying process's final transcript flush, answered
+    "No conversation found with session ID", and the child exited 1 into the
+    held shell. The steward's manual resumes of the SAME sessions minutes
+    later succeeded every time: the only variable was time.
+
+    The fix: before the degraded in-place resume, wait (bounded) until the
+    transcript is COMPLETE on disk — the final line parses (dangling tool ids
+    are fine, allow_dangling=True; they are chronic scars, not races) — and
+    STABLE (two consecutive stats identical). Never raises, never waits past
+    the budget: an obstacle at budget is reported and the spawn proceeds into
+    the existing spawn-failure recovery, which is the next belt down."""
+
+    def _transcript(self, complete=True):
+        path = os.path.join(self.temp.name, "t.jsonl")
+        with open(path, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "hi"}]}}) + "\n")
+            out.write(json.dumps({"type": "assistant", "message": {
+                "content": [{"type": "text", "text": "done"}]}}) + "\n")
+            if not complete:
+                out.write('{"type": "assistant", "mess')   # mid-write
+        return path
+
+    def _clockwork(self):
+        clock = {"t": 1000.0}
+        def now():
+            return clock["t"]
+        def sleep(seconds):
+            clock["t"] += max(float(seconds), 0.0)
+        return clock, now, sleep
+
+    def test_a_complete_stable_transcript_returns_immediately_empty(self):
+        clock, now, sleep = self._clockwork()
+        path = self._transcript(complete=True)
+        obstacle = supervisor._await_transcript_quiescence(
+            path, now=now, sleep=sleep, budget=10.0)
+        self.assertEqual(obstacle, "")
+        self.assertLess(clock["t"], 1000.0 + 10.0)  # never burned the budget
+
+    def test_a_mid_write_transcript_is_waited_out(self):
+        """The incident shape: the final line completes shortly after exit."""
+        clock, now, sleep = self._clockwork()
+        path = self._transcript(complete=False)
+        finished = {"done": False}
+        real_sleep = sleep
+        def sleeping(seconds):
+            real_sleep(seconds)
+            if clock["t"] >= 1002.0 and not finished["done"]:
+                finished["done"] = True
+                with open(path, "a", encoding="utf-8") as out:
+                    out.write('age": {"content": [{"type": "text", '
+                              '"text": "tail"}]}}\n')
+        obstacle = supervisor._await_transcript_quiescence(
+            path, now=now, sleep=sleeping, budget=15.0)
+        self.assertEqual(obstacle, "")
+        self.assertTrue(finished["done"])
+
+    def test_a_never_completing_transcript_reports_at_budget_never_raises(self):
+        clock, now, sleep = self._clockwork()
+        path = self._transcript(complete=False)
+        obstacle = supervisor._await_transcript_quiescence(
+            path, now=now, sleep=sleep, budget=8.0)
+        self.assertNotEqual(obstacle, "")
+        self.assertGreaterEqual(clock["t"], 1008.0)
+
+    def test_a_dangling_tool_call_is_not_an_obstacle(self):
+        """Chronic scar, not a race: b70b0674 carries its 10:37Z dangling
+        toolu_ forever, and quiescence must not hold the resume for it."""
+        clock, now, sleep = self._clockwork()
+        path = os.path.join(self.temp.name, "t.jsonl")
+        with open(path, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "user", "message": {
+                "content": [{"type": "text", "text": "hi"}]}}) + "\n")
+            out.write(json.dumps({"type": "assistant", "message": {
+                "content": [{"type": "tool_use", "id": "t1",
+                             "name": "Bash", "input": {}}]}}) + "\n")
+        obstacle = supervisor._await_transcript_quiescence(
+            path, now=now, sleep=sleep, budget=10.0)
+        self.assertEqual(obstacle, "")
+
+    def test_the_degraded_rotation_calls_quiescence_before_relaunching(self):
+        """Wiring pin against the P0: the degraded branch must gate its
+        relaunch on quiescence; the clean-fork branch must not need to."""
+        src = open(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(supervisor.__file__))), "headroom",
+            "supervisor.py"), encoding="utf-8").read()
+        degraded = src.index("resuming the session in place")
+        relaunch = src.index("context_backstop_recovered", degraded)
+        gate = src.find("_await_transcript_quiescence", degraded, relaunch + 400)
+        self.assertNotEqual(gate, -1,
+                            "degraded resume no longer waits for quiescence")

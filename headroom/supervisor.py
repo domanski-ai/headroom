@@ -2165,6 +2165,51 @@ def _turn_is_complete(path, records=None, complete=True):
             else "no completed assistant turn in the transcript tail")
 
 
+def _await_transcript_quiescence(path, now, sleep, budget=10.0):
+    """Bounded wait until a just-stopped session's transcript is COMPLETE and
+    STABLE on disk. "" when quiescent; otherwise the last obstacle, at budget.
+
+    THE P0 THIS CLOSES (2026-08-04, three lanes in one day): the degraded
+    context rotation relaunched `--resume <sid>` IMMEDIATELY after the child
+    exited. The dying CLI was still flushing its final records, the fresh CLI
+    read a transcript whose last line was mid-write, answered "No conversation
+    found with session ID", and exited 1 into the held shell — a dead lane.
+    The steward's manual resumes of those SAME sessions minutes later worked
+    every time; the only variable was time, so time is what this buys,
+    bounded and observable.
+
+    COMPLETE means handoff.inspect_transcript(allow_dangling=True) accepts it:
+    a mid-write final line refuses ("incomplete final line"), while a dangling
+    tool id passes on purpose — that is a chronic scar a crash leaves forever
+    (b70b0674 carries one from 10:37Z), not a race, and holding a resume for
+    it would hold it forever. STABLE means two consecutive stats identical.
+    Never raises: an obstacle at budget is returned for the caller to report,
+    and the spawn proceeds into the existing spawn-failure recovery — the next
+    belt down."""
+    deadline = now() + budget
+    last_stat = None
+    obstacle = "transcript never observed"
+    # Finite under ANY clock: an injected now()/sleep() pair that never
+    # advances (several supervision harnesses freeze time) must not turn this
+    # belt into a spin — the 2026-08-05 forensic run burned 9GB exactly there.
+    for _ in range(max(2, int(budget / 0.5) + 1)):
+        try:
+            handoff.inspect_transcript(path, allow_dangling=True)
+        except (handoff.HandoffError, OSError, ValueError) as error:
+            obstacle = str(error)
+            last_stat = None
+        else:
+            stat = handoff._transcript_stat(path)
+            if stat == last_stat:
+                return ""
+            last_stat = stat
+            obstacle = "transcript still settling"
+        if now() >= deadline:
+            return obstacle
+        sleep(0.5)
+    return obstacle
+
+
 def _subagents_dir(transcript_path):
     """The sibling directory Claude writes BACKGROUND agent transcripts into.
 
@@ -4123,6 +4168,14 @@ class Supervisor:
             notify.emit({"event": "context_backstop_held",
                          "account": child.account.get("name", ""),
                          "reason": f"forked resume degraded: {degraded}"})
+            # P0 gate (2026-08-04): never race the dying child's final flush.
+            obstacle = _await_transcript_quiescence(
+                proof.transcript_path, now=self.now, sleep=self.sleep)
+            if obstacle:
+                print(f"[headroom] transcript not quiescent after the wait "
+                      f"({obstacle}); attempting the resume anyway — the "
+                      f"spawn-failure recovery is the next belt",
+                      file=sys.stderr)
             argv = ["--resume", proof.session_id]
             reason = "context_backstop_recovered"
         else:
