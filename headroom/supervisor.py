@@ -31,6 +31,18 @@ from . import collect, handoff, locks, notify, paths, registry, route
 UNSUPERVISED_MESSAGE = (
     "supervision requires a Unix terminal — launching unsupervised")
 
+
+def _operator_notice(text):
+    """Operator-facing supervision chatter, one channel only.
+
+    With a notify sink armed the structured events already reach the
+    operator's monitor; the tty copy lands inside a live TUI child's
+    composer region and reads as parked input (four estate specimens,
+    2026-08-05). Sink armed -> tty stays silent; no sink -> the tty is the
+    only channel and keeps every line."""
+    if not notify.armed():
+        print(f"[headroom] {text}", file=sys.stderr)
+
 POLL_SECONDS = 0.25
 BIND_TIMEOUT = 30.0
 # The cross-poll patience for a BIRTH-class transient only: a SessionStart
@@ -3017,9 +3029,8 @@ class Supervisor:
             child.pending_cap = None
             why = ("the cap was refused for a background subagent, not this "
                    "session")
-            print(f"[headroom] {child.account['name']} hit a subscription cap "
-                  f"but NO automatic handoff will run: {why}.",
-                  file=sys.stderr)
+            _operator_notice(f"{child.account['name']} hit a subscription cap "
+                             f"but NO automatic handoff will run: {why}.")
             notify.emit({"event": "cap_unhandled",
                          "account": child.account.get("name", ""),
                          "reason": why, "bound": True,
@@ -3082,20 +3093,19 @@ class Supervisor:
             if isinstance(candidate, CapProof):
                 return candidate
             if candidate is None and announce_non_cap:
-                print("[headroom] rate-limit hook was not a subscription cap; "
-                      "child continues", file=sys.stderr)
+                _operator_notice("rate-limit hook was not a subscription cap; "
+                                 "child continues")
         except PendingCapTimeout as error:
             _lose_supervision(child, f"cap-time model unavailable: {error}", elective_ok=True)
-            print(f"[headroom] {error}; automatic handoff disabled — /exit then "
-                  "`headroom handoff` to move manually", file=sys.stderr)
+            _operator_notice(f"{error}; automatic handoff disabled — /exit then "
+                             "`headroom handoff` to move manually")
         except PermanentSupervisorError as error:
             _lose_supervision(child, f"cap not corroborated: {error}", elective_ok=True)
             child.pending_cap = None
-            print(f"[headroom] cap not corroborated ({error}); automatic "
-                  "handoff disabled for this child", file=sys.stderr)
+            _operator_notice(f"cap not corroborated ({error}); automatic "
+                             "handoff disabled for this child")
         except SupervisorError as error:
-            print(f"[headroom] cap not corroborated ({error}); child continues",
-                  file=sys.stderr)
+            _operator_notice(f"cap not corroborated ({error}); child continues")
         return None
 
     @staticmethod
@@ -3571,10 +3581,9 @@ class Supervisor:
         if child.cap_hold_reason == reason:
             return True
         child.cap_hold_reason = reason
-        print(f"[headroom] automatic handoff is waiting for capacity "
-              f"({reason}); child continues with the cap handoff still armed, "
-              f"retrying every {CAP_HOLD_SECONDS:g}s",
-              file=sys.stderr)
+        _operator_notice(f"automatic handoff is waiting for capacity "
+                         f"({reason}); child continues with the cap handoff "
+                         f"still armed, retrying every {CAP_HOLD_SECONDS:g}s")
         notify.emit({"event": "cap_held",
                      "account": child.account.get("name", ""),
                      "reason": reason})
@@ -3776,8 +3785,8 @@ class Supervisor:
         if child.preemptive_last_hold == reason:
             return
         child.preemptive_last_hold = reason
-        print(f"[headroom] preemptive handoff held: {reason}; child continues "
-              f"with cap handoff still armed", file=sys.stderr)
+        _operator_notice(f"preemptive handoff held: {reason}; child continues "
+                         f"with cap handoff still armed")
         if announce:
             notify.emit({"event": "preemptive_held",
                          "account": child.account.get("name", ""),
@@ -3816,9 +3825,8 @@ class Supervisor:
             return None
         if not child.preemptive_announced:
             child.preemptive_announced = True
-            print(f"[headroom] {child.account['name']} {proof.message} — "
-                  f"scheduling a handoff at the next idle boundary",
-                  file=sys.stderr)
+            _operator_notice(f"{child.account['name']} {proof.message} — "
+                             f"scheduling a handoff at the next idle boundary")
             notify.emit({"event": "preemptive_scheduled",
                          "account": child.account.get("name", ""),
                          "family": proof.family, "window": proof.window,
@@ -3994,8 +4002,8 @@ class Supervisor:
         if child.context_last_hold == reason:
             return
         child.context_last_hold = reason
-        print(f"[headroom] context backstop held: {reason}; child continues "
-              f"with cap handoff still armed", file=sys.stderr)
+        _operator_notice(f"context backstop held: {reason}; child continues "
+                         f"with cap handoff still armed")
         if announce:
             notify.emit({"event": "context_backstop_held",
                          "account": child.account.get("name", ""),
@@ -4074,8 +4082,8 @@ class Supervisor:
         if proof.deadline <= self.now():
             raise SupervisorError("context decision window elapsed before stop")
         rotation_id = str(uuid.uuid4())
-        print(f"[headroom] {proof.message}; forcing a lossless rotation of "
-              f"this session on {child.account['name']}", file=sys.stderr)
+        _operator_notice(f"{proof.message}; forcing a lossless rotation of "
+                         f"this session on {child.account['name']}")
         self.stopped_child_model = _model_flag(child.spawn_args)
         saved = self._save_terminal()
         stop_error = None
@@ -4257,9 +4265,8 @@ class Supervisor:
             return None
         if not child.context_announced:
             child.context_announced = True
-            print(f"[headroom] {child.account['name']} {proof.message} — "
-                  f"forcing a handoff at the next idle boundary",
-                  file=sys.stderr)
+            _operator_notice(f"{child.account['name']} {proof.message} — "
+                             f"forcing a handoff at the next idle boundary")
             notify.emit({"event": "context_backstop_scheduled",
                          "account": child.account.get("name", ""),
                          "used": proof.used, "window": proof.window,
@@ -4734,10 +4741,10 @@ class Supervisor:
             seen.add(received)
             why = ("the hook batch was abandoned after an earlier "
                    "malformed event")
-            print(f"[headroom] {child.account['name']} hit a subscription cap "
-                  f"but NO automatic handoff will run: {why}. Switch model "
-                  f"(/model opus) or hand off manually: "
-                  f"headroom handoff --to <slot>", file=sys.stderr)
+            _operator_notice(f"{child.account['name']} hit a subscription cap "
+                             f"but NO automatic handoff will run: {why}. "
+                             f"Switch model (/model opus) or hand off "
+                             f"manually: headroom handoff --to <slot>")
             notify.emit({"event": "cap_unhandled",
                          "account": child.account.get("name", ""),
                          "bound": child.binding is not None,
@@ -4780,12 +4787,11 @@ class Supervisor:
             # majority of launches on this box (13 of 17 measured births cross
             # 3.0s), and a sink row per birth is noise that would train the
             # reader to ignore the class.
-            print(f"[headroom] hook event not ready yet ({error}); holding it "
-                  f"for up to {budget:g}s — supervision is unchanged",
-                  file=sys.stderr)
+            _operator_notice(f"hook event not ready yet ({error}); holding it "
+                             f"for up to {budget:g}s — supervision is unchanged")
         if now >= child.deferred_deadline:
-            print(f"[headroom] malformed hook event ({error}); automatic "
-                  "handoff disabled for this child", file=sys.stderr)
+            _operator_notice(f"malformed hook event ({error}); automatic "
+                             "handoff disabled for this child")
             _lose_supervision(child, f"malformed hook event: {error}", elective_ok=True)
             child.pending_cap = None
             child.deferred_events = []
@@ -4805,8 +4811,7 @@ class Supervisor:
             # raised, so nothing was parsed and the cursor never advanced
             # (it moves only after the parse loop). Every record is still in
             # the journal — there is no abandoned tail to speak for.
-            print(f"[headroom] {error}; automatic handoff disabled for this child",
-                  file=sys.stderr)
+            _operator_notice(f"{error}; automatic handoff disabled for this child")
             _lose_supervision(child, f"hook event journal unreadable: {error}", elective_ok=True)
             child.pending_cap = None
             return None
@@ -4851,8 +4856,8 @@ class Supervisor:
             except TransientSupervisorError as error:
                 return self._defer_events(child, records[index:], error)
             except SupervisorError as error:
-                print(f"[headroom] malformed hook event ({error}); automatic "
-                      "handoff disabled for this child", file=sys.stderr)
+                _operator_notice(f"malformed hook event ({error}); automatic "
+                                 "handoff disabled for this child")
                 _lose_supervision(child, f"malformed hook event: {error}", elective_ok=True)
                 child.pending_cap = None
                 self._announce_tail_caps(child, records[index + 1:])
@@ -4900,8 +4905,8 @@ class Supervisor:
                 except (SupervisorError, handoff.HandoffError, RuntimeError,
                         OSError) as error:
                     _lose_supervision(child, f"session binding failed: {error}")
-                    print(f"[headroom] {error}; automatic handoff disabled for "
-                          "this child", file=sys.stderr)
+                    _operator_notice(f"{error}; automatic handoff disabled for "
+                                     "this child")
                     self._announce_tail_caps(child, records[index + 1:])
                     return None
                 continue
@@ -5043,11 +5048,11 @@ class Supervisor:
                                if not child.automation
                                else "the event does not match this child's "
                                     "live session")
-                        print(f"[headroom] {child.account['name']} hit a "
-                              f"subscription cap but NO automatic handoff will "
-                              f"run: {why}. Switch model (/model opus) or hand "
-                              f"off manually: headroom handoff --to <slot>",
-                              file=sys.stderr)
+                        _operator_notice(f"{child.account['name']} hit a "
+                                         f"subscription cap but NO automatic "
+                                         f"handoff will run: {why}. Switch "
+                                         f"model (/model opus) or hand off "
+                                         f"manually: headroom handoff --to <slot>")
                         notify.emit({"event": "cap_unhandled",
                                      "account": child.account.get("name", ""),
                                      "bound": child.binding is not None,
@@ -5201,9 +5206,8 @@ class Supervisor:
                         and not (child.deferred_events
                                  and child.deferred_klass == "birth"):
                     if not child.hint_printed:
-                        print("[headroom] no SessionStart handshake within 30s; "
-                              "automatic handoff disabled for this child",
-                              file=sys.stderr)
+                        _operator_notice("no SessionStart handshake within 30s; "
+                                         "automatic handoff disabled for this child")
                         child.hint_printed = True
                     _lose_supervision(
                         child, "SessionStart hook never bound within "
@@ -5235,9 +5239,8 @@ class Supervisor:
                     except CapCleared as error:
                         # the window reset under us: nothing to rotate away
                         # from, and every reason to stay armed for the next one
-                        print(f"[headroom] {error}; the seat is usable again "
-                              "and automatic handoff stays armed",
-                              file=sys.stderr)
+                        _operator_notice(f"{error}; the seat is usable again "
+                                         "and automatic handoff stays armed")
                         notify.emit({"event": "cap_cleared",
                                      "account": child.account.get("name", ""),
                                      "reason": str(error)})
@@ -5248,11 +5251,10 @@ class Supervisor:
                         # running, keep automation armed — and disarm only
                         # once the budget for waiting is genuinely spent.
                         if not self._cap_hold(child, error):
-                            print(f"[headroom] automatic handoff held: {error}; "
-                                  f"no seat came free in "
-                                  f"{CAP_HOLD_MAX * CAP_HOLD_SECONDS / 3600:g}h "
-                                  "— automatic handoff disabled for this child",
-                                  file=sys.stderr)
+                            _operator_notice(f"automatic handoff held: {error}; "
+                                             f"no seat came free in "
+                                             f"{CAP_HOLD_MAX * CAP_HOLD_SECONDS / 3600:g}h "
+                                             "— automatic handoff disabled for this child")
                             _lose_supervision(
                                 child, f"automatic handoff held: {error}", elective_ok=True)
                             self._cap_hold_clear(child)
@@ -5261,14 +5263,14 @@ class Supervisor:
                         # A recent mtime is expected just after StopFailure; keep
                         # polling until the required five quiet seconds pass.
                         if "changed recently" not in str(error):
-                            print(f"[headroom] automatic handoff held: {error}; "
-                                  "child continues", file=sys.stderr)
+                            _operator_notice(f"automatic handoff held: {error}; "
+                                             "child continues")
                             _lose_supervision(
                                 child, f"automatic handoff held: {error}", elective_ok=True)
                             proof = None
                     except SupervisorError as error:
-                        print(f"[headroom] automatic handoff held: {error}; child "
-                              "continues", file=sys.stderr)
+                        _operator_notice(f"automatic handoff held: {error}; "
+                                         "child continues")
                         _lose_supervision(
                             child, f"automatic handoff held: {error}", elective_ok=True)
                         proof = None
@@ -5283,9 +5285,8 @@ class Supervisor:
                             self._requested_stop_at = self.now()
                         except Exception as error:
                             self._failure(plan, "pre_stop_failed: " + str(error))
-                            print(f"[headroom] automatic handoff held: {error}; "
-                                  "automatic handoff disabled for this child",
-                                  file=sys.stderr)
+                            _operator_notice(f"automatic handoff held: {error}; "
+                                             "automatic handoff disabled for this child")
                             _lose_supervision(
                                 child, f"handoff stop failed: {error}")
                             proof = None

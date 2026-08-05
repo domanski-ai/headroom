@@ -88,6 +88,16 @@ def _timeout():
     return value if 0 < value <= 60 else NOTIFY_TIMEOUT
 
 
+def armed():
+    """True when a notify sink is configured.
+
+    Supervision chatter belongs on exactly one channel: the sink when one is
+    armed, the tty only as the fallback. Callers gate their tty prints on
+    this so a sinked estate never paints operator text into a live child's
+    composer region."""
+    return bool(os.environ.get("HEADROOM_NOTIFY_CMD", "").strip())
+
+
 def emit(event):
     """Deliver one event to HEADROOM_NOTIFY_CMD; never raises, never unbounded.
 
