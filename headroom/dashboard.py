@@ -482,16 +482,27 @@ def _carry_lastgood_rows(value):
                     # the renderer shows it greyed with honest age.
                     saved = store[name]
                     carried = json.loads(json.dumps(saved.get("row") or {}))
-                    carried["state"] = "stale"
-                    for w in (carried.get("windows") or {}).values():
-                        if not isinstance(w, dict):
-                            continue
-                        left = w.get("left_percent")
-                        if left is not None:
-                            w["last_observed_left_percent"] = left
-                        w["left_percent"] = None
-                        w["state"] = "stale"
-                    carried["carried_seconds"] = int(now - (saved.get("saved_at") or now))
+                    age = int(now - (saved.get("saved_at") or now))
+                    if age <= 3600:
+                        # PAUL'S LAW, verbatim: "As long as it's accurate
+                        # within 60 minutes, I don't care." A sub-hour
+                        # reading renders LIVE (colored), not grey — the row
+                        # keeps its stored current state and live percents.
+                        pass
+                    else:
+                        # Older than his tolerance: the contract's stale
+                        # dialect — number preserved in last_observed, grey
+                        # with honest age.
+                        carried["state"] = "stale"
+                        for w in (carried.get("windows") or {}).values():
+                            if not isinstance(w, dict):
+                                continue
+                            left = w.get("left_percent")
+                            if left is not None:
+                                w["last_observed_left_percent"] = left
+                            w["left_percent"] = None
+                            w["state"] = "stale"
+                    carried["carried_seconds"] = age
                     carried["served_from"] = "lastgood"
                     accounts[index] = carried
             if changed:

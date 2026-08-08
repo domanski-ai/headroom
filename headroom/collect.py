@@ -48,6 +48,26 @@ CODEX_STALE_AFTER = paths.env_int("HEADROOM_CODEX_STALE_AFTER", 1800)
 OBSERVATION_MAX_AGE = paths.env_int("HEADROOM_OBSERVATION_MAX_AGE", 1800)
 SCHEMA_VERSION = 1
 
+# A fresh claude reading published by the estate's cron collector
+# (ai-accounts) is served instead of a second anthropic_usage_api call: the
+# usage API rate-limits per account, and two independent collectors tripping
+# it is exactly what blinds the widget for the provider's ~51-minute backoff
+# window. Empty string disables ingestion entirely (kill switch); the native
+# API path remains the automatic fallback whenever the external reading is
+# missing, stale, or fails any check below.
+EXTERNAL_CLAUDE_SNAPSHOT = os.environ.get(
+    "HEADROOM_EXTERNAL_CLAUDE_SNAPSHOT",
+    os.path.expanduser("~/ai-accounts/snapshots/usage-private.json"))
+EXTERNAL_CLAUDE_MAX_AGE = paths.env_int("HEADROOM_EXTERNAL_CLAUDE_MAX_AGE", 720)
+# past this snapshot age the cron pipeline counts as DEAD and the native API
+# path takes over; younger than this, its verdict is authoritative — held
+# rows DEFER (no API call) rather than triggering a native read, because the
+# post-backoff stampede (serve + cron + primer all calling within minutes of
+# the retry window opening) is what re-trips the provider and made 2026-08-07
+# a day of rolling ~57-minute blind windows
+EXTERNAL_CLAUDE_PIPELINE_DEAD = paths.env_int(
+    "HEADROOM_EXTERNAL_CLAUDE_PIPELINE_DEAD", 1200)
+
 PUBLIC_FIELDS = {
     "id", "name", "email", "provider", "plan", "ok", "note", "error_code",
     "retry_at",
@@ -760,6 +780,98 @@ def limit_entry(limit, minutes):
     }
 
 
+def external_claude_limits(name, identity, now):
+    """The estate cron collector's verdict for this slot: a three-way ruling.
+
+    Returns ``(verdict, value)``:
+      - ``("ingest", payload)`` — the cron pipeline has a fresh verified
+        reading; ``payload`` has the same shape as :func:`claude_limits` so
+        the caller's row assembly, trust derivation and window validation run
+        unchanged. Served only when the external row's login email matches
+        the identity bound in THIS slot's credential, so a reading can never
+        cross accounts. No ``source_identity_fingerprint`` — org pinning
+        stays with real API reads.
+      - ``("defer", retry_at)`` — the cron pipeline is ALIVE but its reading
+        for this slot is held/carryover/stale. Do NOT call the API: one held
+        pipeline means the provider is throttling, and independent callers
+        rushing the retry window is what re-trips it. The caller raises the
+        throttle path with ``retry_at`` so headroom's own carryover keeps the
+        last verified reading serviceable.
+      - ``("native", None)`` — ingestion disabled, pipeline dead (snapshot
+        missing or older than EXTERNAL_CLAUDE_PIPELINE_DEAD), the slot is
+        untracked there, or the reading belongs to a different login. The
+        native API path is the lawful fallback.
+    """
+    if not EXTERNAL_CLAUDE_SNAPSHOT:
+        return ("native", None)
+    try:
+        with open(EXTERNAL_CLAUDE_SNAPSHOT) as handle:
+            document = json.load(handle)
+    except (OSError, ValueError):
+        return ("native", None)
+    rows = document.get("accounts") if isinstance(document, dict) else None
+    if not isinstance(rows, list):
+        return ("native", None)
+    generated = document.get("generated")
+    if isinstance(generated, bool) \
+            or not isinstance(generated, (int, float)) \
+            or now - generated > EXTERNAL_CLAUDE_PIPELINE_DEAD \
+            or generated > now + 60:
+        return ("native", None)
+    row = next((entry for entry in rows if isinstance(entry, dict)
+                and entry.get("name") == "claude-" + name), None)
+    if row is None or row.get("provider") != "claude":
+        return ("native", None)
+
+    def defer():
+        retry_at = row.get("retry_at")
+        if isinstance(retry_at, bool) \
+                or not isinstance(retry_at, (int, float)) \
+                or retry_at <= now:
+            retry_at = now + 600
+        return ("defer", int(retry_at))
+
+    if row.get("ok") is not True or row.get("stale") is True \
+            or row.get("throttle_carryover") is True:
+        return defer()
+    row_email = row.get("email")
+    our_email = identity.get("email") if isinstance(identity, dict) else None
+    if not isinstance(row_email, str) or not isinstance(our_email, str) \
+            or row_email.lower() != our_email.lower():
+        # a reading for a different login must not defer OR serve — only the
+        # native path can establish this slot's own truth
+        return ("native", None)
+    captured = row.get("captured_at")
+    if isinstance(captured, bool) or not isinstance(captured, (int, float)):
+        return defer()
+    if captured > now + 60 or now - captured > EXTERNAL_CLAUDE_MAX_AGE:
+        return defer()
+    raw_windows = row.get("windows")
+    if not isinstance(raw_windows, dict):
+        return defer()
+    windows = {}
+    for key, raw_window in raw_windows.items():
+        if not isinstance(key, str) or not isinstance(raw_window, dict):
+            continue
+        used = raw_window.get("used_percent")
+        if isinstance(used, bool) or not isinstance(used, (int, float)) \
+                or not 0 <= used <= 100:
+            continue
+        window = dict(raw_window)
+        window.setdefault("observed_at", int(captured))
+        windows[key] = window
+    try:
+        validate_required_windows(windows)
+    except Exception:  # noqa: BLE001 — malformed external data defers
+        return defer()
+    return ("ingest", {
+        "captured_at": int(captured),
+        "source": "ai_accounts_snapshot",
+        "stale": False,
+        "windows": windows,
+    })
+
+
 def claude_limits(home, expected_fingerprint, opener=open_authenticated):
     oauth = claude_oauth(home) or {}
     if not oauth.get("accessToken"):
@@ -1092,10 +1204,23 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 if expected and identity["email"] \
                         and identity["email"].lower() != expected.lower():
                     raise IdentityBindingError("slot_bound_to_unexpected_email")
-                if claude_backoff_until > now:
-                    raise ProviderThrottleError(claude_backoff_until)
-                result.update(claude_limits(account["home"],
-                                            account.get("pinned_usage_org")))
+                # the estate cron collector's verdict rules this slot: a
+                # fresh reading serves without touching the usage API (a file
+                # read works straight through a provider backoff window), a
+                # held pipeline DEFERS (calling into the provider's retry
+                # window from a second process is what re-trips it), and only
+                # a dead pipeline unlocks the native API path
+                verdict, value = external_claude_limits(account["name"],
+                                                        identity, now)
+                if verdict == "ingest":
+                    result.update(value)
+                elif verdict == "defer":
+                    raise ProviderThrottleError(value)
+                else:
+                    if claude_backoff_until > now:
+                        raise ProviderThrottleError(claude_backoff_until)
+                    result.update(claude_limits(
+                        account["home"], account.get("pinned_usage_org")))
                 if not account.get("pinned_usage_org") \
                         and result.get("source_identity_fingerprint"):
                     # trust-on-first-use: remember which org this slot's
