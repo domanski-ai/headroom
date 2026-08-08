@@ -472,9 +472,25 @@ def _carry_lastgood_rows(value):
                     store[name] = {"row": row, "saved_at": now}
                     changed = True
                 elif not has_numbers and name in store:
+                    # Speak the widget contract's OWN stale dialect (learned
+                    # 2026-08-08 the hard way: a "carried" state failed
+                    # hrValidFeed's enum and the menubar rendered the whole
+                    # feed as "unreachable"). Per hrValidWindow's invariant,
+                    # only a CURRENT window may hold a live left_percent —
+                    # a stale window carries the number in
+                    # last_observed_left_percent with left_percent null, and
+                    # the renderer shows it greyed with honest age.
                     saved = store[name]
                     carried = json.loads(json.dumps(saved.get("row") or {}))
-                    carried["state"] = "carried"
+                    carried["state"] = "stale"
+                    for w in (carried.get("windows") or {}).values():
+                        if not isinstance(w, dict):
+                            continue
+                        left = w.get("left_percent")
+                        if left is not None:
+                            w["last_observed_left_percent"] = left
+                        w["left_percent"] = None
+                        w["state"] = "stale"
                     carried["carried_seconds"] = int(now - (saved.get("saved_at") or now))
                     carried["served_from"] = "lastgood"
                     accounts[index] = carried
