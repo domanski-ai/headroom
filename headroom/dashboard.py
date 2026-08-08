@@ -404,6 +404,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             elif route == "/widget.json":
                 value = widget.project(result.snapshot,
                                        force_noncurrent_reason=reason)
+                value = _carry_lastgood_rows(value)
                 body = json.dumps(value, allow_nan=False,
                                   separators=(",", ":")).encode("utf-8")
                 content_type = "application/json"
@@ -422,6 +423,69 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self._send_body(503, content_type, body)
             return
         self._send_body(200, content_type, body)
+
+
+_LASTGOOD_LOCK = threading.Lock()
+
+
+def _carry_lastgood_rows(value):
+    """NEVER BLANK — Paul's widget law (2026-08-07, respecified 2026-08-08:
+    "work until the widget is perfect and bulletproof... 100% uptime").
+
+    The usage API rate-limits in ~hourly cycles; during a cycle every claude
+    row projects held with no numbers, and the menubar renders batteries with
+    no measurements — the exact artifact Paul keeps finding. His spec:
+    "accurate within 60 minutes, I don't care. You must ALWAYS show me."
+
+    So: whenever a projected account row carries NO usable percentage, serve
+    the last row that DID, flagged honestly (state "carried", carried_seconds,
+    served_from "lastgood"). Rows we carried are never re-remembered (only
+    real reads update the store), the store write is atomic, and EVERY failure
+    path returns the original value unchanged — this shim may never break
+    serving. The same contract as .system/bin/widget_lastgood.py, applied at
+    the one surface the menubar actually reads (8377), which the file-level
+    protectors never covered."""
+    try:
+        store_path = os.path.join(paths.state_dir(), "widget-lastgood-rows.json")
+        now = time.time()
+        with _LASTGOOD_LOCK:
+            try:
+                store = json.load(open(store_path))
+                store = store if isinstance(store, dict) else {}
+            except (OSError, ValueError):
+                store = {}
+            changed = False
+            accounts = value.get("accounts")
+            accounts = accounts if isinstance(accounts, list) else []
+            for index, row in enumerate(accounts):
+                if not isinstance(row, dict):
+                    continue
+                name = row.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                windows = row.get("windows")
+                windows = windows if isinstance(windows, dict) else {}
+                has_numbers = any(
+                    isinstance(w, dict) and w.get("left_percent") is not None
+                    for w in windows.values())
+                if has_numbers and row.get("served_from") != "lastgood":
+                    store[name] = {"row": row, "saved_at": now}
+                    changed = True
+                elif not has_numbers and name in store:
+                    saved = store[name]
+                    carried = json.loads(json.dumps(saved.get("row") or {}))
+                    carried["state"] = "carried"
+                    carried["carried_seconds"] = int(now - (saved.get("saved_at") or now))
+                    carried["served_from"] = "lastgood"
+                    accounts[index] = carried
+            if changed:
+                tmp = store_path + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(store, f, separators=(",", ":"))
+                os.replace(tmp, store_path)
+        return value
+    except Exception:
+        return value
 
 
 def serve(open_browser=False, port=None, demo=False):
