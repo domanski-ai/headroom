@@ -908,6 +908,8 @@ MUST_DISARM_ERROR_CODES = frozenset({
     # heals neither, so neither may sit in the unreadable class.
     "auth_rotated_out",                 # credentials declared resident elsewhere
     "claude_identity_check_failed",     # the seat's login cannot be verified
+    "usage_http_401",                   # usage endpoint refused the credential
+    "usage_http_403",                   # usage endpoint refused the credential
 })
 
 

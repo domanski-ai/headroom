@@ -823,6 +823,8 @@ def limit_entry(limit, minutes):
 EXTERNAL_HELD_CODES = (
     "auth_rotated_out",               # IdentityBindingError("auth_rotated_out")
     "claude_identity_check_failed",   # IdentityBindingError("claude_identity_check_failed")
+    "usage_http_401",                 # IdentityBindingError("usage_http_401")
+    "usage_http_403",                 # IdentityBindingError("usage_http_403")
 )
 
 
@@ -1444,6 +1446,15 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                         raise IdentityBindingError("auth_rotated_out")
                     if value == "claude_identity_check_failed":
                         raise IdentityBindingError("claude_identity_check_failed")
+                    # A 401 or 403 from the usage endpoint is the provider
+                    # refusing the CREDENTIAL, a standing fact that only a
+                    # re-login cures. Not a throttle: claude-ops sat behind a
+                    # 403 wall from 2026-08-15 while every surface called it
+                    # rate-limited and waited for a retry that could not come.
+                    if value == "usage_http_401":
+                        raise IdentityBindingError("usage_http_401")
+                    if value == "usage_http_403":
+                        raise IdentityBindingError("usage_http_403")
                     raise IdentityBindingError(value)
                 else:
                     if claude_backoff_until > now:
@@ -1620,6 +1631,11 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 result["note"] = ("the Claude login in this seat cannot be "
                                   "verified (logged out or parked); sign in "
                                   "again on this seat")
+            elif error.code in ("usage_http_401", "usage_http_403"):
+                result["note"] = ("the usage endpoint refused this seat's "
+                                  "credential (HTTP %s); re-authenticate on "
+                                  "this seat, waiting will not clear it"
+                                  % error.code[-3:])
             elif error.code == "claude_credentials_missing":
                 # verified identity but the token couldn't be read. On macOS the
                 # token is in the login Keychain (headroom reads it via
