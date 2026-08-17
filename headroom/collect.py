@@ -83,6 +83,12 @@ class IdentityBindingError(ValueError):
         super().__init__(code)
 
 
+class UsageUnknown(RuntimeError):
+    """The estate cron collector declined to spend a provider call this run
+    (its own per-run budget), so this slot has no fresh reading and no
+    provider hold. Unreadable under its own name; never a throttle."""
+
+
 class ProviderThrottleError(RuntimeError):
     def __init__(self, retry_at, provider_response=False):
         self.retry_at = int(retry_at)
@@ -405,8 +411,36 @@ def claude_identity(home, runner=subprocess.run):
     return claude_local_identity(home)
 
 
+# Where the Codex CLI is installed on this box when it is not on PATH. The
+# serve process runs under systemd --user with the unit's default PATH
+# (/usr/local/bin:/usr/bin:/bin and friends), which does not include the
+# user's ~/.local/bin, so shutil.which("codex") returned None from serve
+# while the same call from an interactive shell found it. That single
+# difference made headroom hold codex-gmail as codex_cli_missing (a lie:
+# the CLI was installed and the estate cron collector, which carries its
+# own fallback, read the seat fine) and Paul saw NO READ in DMUX. Measured
+# read-only by the dmux lane 2026-08-17 06:2xZ, root cause confirmed by the
+# steward from serve's /proc environ. Order: PATH first, then the standalone
+# install symlink, then any nvm-managed copy, newest first.
+CODEX_BIN_FALLBACKS = (
+    os.path.expanduser("~/.local/bin/codex"),
+    os.path.expanduser("~/.codex/packages/standalone/current/bin/codex"),
+)
+
+
 def codex_bin():
-    return shutil.which("codex")
+    binary = shutil.which("codex")
+    if binary:
+        return binary
+    for candidate in CODEX_BIN_FALLBACKS:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    for candidate in sorted(glob.glob(
+            os.path.expanduser("~/.nvm/versions/node/*/bin/codex")),
+            reverse=True):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
 
 
 # App-server failure classification: an explicit auth rejection or protocol
@@ -780,6 +814,18 @@ def limit_entry(limit, minutes):
     }
 
 
+# Source-collector codes that mean the SEAT is held, not the reading. Only
+# these travel through the ingest as their own hold; everything else the
+# estate cron collector can stamp (its own deferrals, rate limits, transport
+# errors) keeps the defer verdict because it is an absence of a reading that
+# heals on the next collect. Each entry has a matching literal raise at the
+# call site, which is what the classification test actually reads.
+EXTERNAL_HELD_CODES = (
+    "auth_rotated_out",               # IdentityBindingError("auth_rotated_out")
+    "claude_identity_check_failed",   # IdentityBindingError("claude_identity_check_failed")
+)
+
+
 def _auth_resident(home):
     """The account whose credentials LIVE in this home right now, per the
     auth_resident@1 marker seat-auth-rotate.sh writes, or None when the home
@@ -887,11 +933,15 @@ def external_claude_limits(name, identity, now):
         # through as their own hold so the widget and router say what is
         # actually wrong.
         code = row.get("error_code")
-        if row.get("ok") is not True and isinstance(code, str) \
-                and code not in ("anthropic_usage_rate_limited",
-                                 "usage_unknown") \
-                and not code.startswith("usage_http_"):
+        if row.get("ok") is not True and code in EXTERNAL_HELD_CODES:
             return ("held", code)
+        if row.get("ok") is not True and code == "usage_unknown":
+            # The estate declined to spend a provider call this run (its own
+            # per-run budget), so there is no reading and no provider hold.
+            # It is unreadable, and it says so under its own name rather
+            # than wearing the rate-limit mask: route.py already classifies
+            # usage_unknown as UNREADABLE (wait, do not disarm).
+            return ("unknown", None)
         return defer()
     row_email = row.get("email")
     our_email = identity.get("email") if isinstance(identity, dict) else None
@@ -1382,7 +1432,18 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                     result.update(value)
                 elif verdict == "defer":
                     raise ProviderThrottleError(value)
+                elif verdict == "unknown":
+                    raise UsageUnknown()
                 elif verdict == "held":
+                    # One literal raise per code the ingest can pass through,
+                    # so the AST-walking classification test in
+                    # tests/test_headroom.py sees each one and route.py has to
+                    # classify it. A raise of the variable would be invisible
+                    # to that test and let a new source code slip past.
+                    if value == "auth_rotated_out":
+                        raise IdentityBindingError("auth_rotated_out")
+                    if value == "claude_identity_check_failed":
+                        raise IdentityBindingError("claude_identity_check_failed")
                     raise IdentityBindingError(value)
                 else:
                     if claude_backoff_until > now:
@@ -1498,6 +1559,21 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                     result["note"] = (
                         "codex app-server unavailable — session-log telemetry "
                         "is display-only; seat not capacity-routable")
+        except UsageUnknown:
+            carried = _throttle_carryover(previous, account, now,
+                                          result.get("identity"))
+            if carried is not None:
+                result = carried
+                result["throttle_carryover"] = True
+                result["note"] = ("no fresh reading this run (the estate "
+                                  "held its provider call); serving the "
+                                  "last verified reading")
+            else:
+                result["ok"] = False
+                result["error_code"] = "usage_unknown"
+                result["note"] = ("no fresh reading this run: the estate "
+                                  "held its provider call and nothing is "
+                                  "carried")
         except ProviderThrottleError as error:
             claude_backoff_until = max(claude_backoff_until, error.retry_at)
             if error.provider_response and persist_backoff is not None:
