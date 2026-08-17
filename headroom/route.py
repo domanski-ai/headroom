@@ -586,6 +586,110 @@ def _fable_room(row):
 CODEX_ROUTING_ENABLED = os.environ.get("HEADROOM_CODEX_ROUTING", "1") != "0"
 
 
+def _reserved_exception_applies(account, fam):
+    """Is this reserved seat lawfully available to THIS caller for THIS family?
+
+    WHY THIS EXISTS (2026-08-13, system steward). Paul granted the system lane
+    the ops seat on opus, and widened it by voice the same night ("You can use
+    Codex and you can use ops alone"). That grant was recorded in
+    ai-accounts/accounts.json as ops.reserved_exceptions and was honoured by
+    ai-accounts/bin/route.py and rotate-lane-seat.sh. It was NEVER visible
+    here, and THIS is the oracle the boot path actually calls: lane-boot.sh
+    runs `headroom claude`, which re-picks the account and overrode an explicit
+    operator seat pin three times in a row on the night of 2026-08-12, landing
+    the steward back on claude-domanski-ai, the one seat Paul had just ordered
+    it to keep off. A grant that does not reach the oracle the actor calls is
+    decoration. Existence is not function.
+
+    It is deliberately NOT an unreservation. `reserved` stays true, so the seat
+    stays invisible to every other lane, every other family and every caller
+    that says nothing. A caller opts in by naming itself in ROUTE_LANE and THE
+    DEFAULT IS EXCLUSION, so silence gets exactly today's behaviour.
+
+    This is a convenience gate, not an authentication boundary. ROUTE_LANE is
+    trusted because every process here is Paul's. Sender authentication is a
+    separate open debt in the register and this does not pretend to close it.
+    Semantics are mirrored from ai-accounts/bin/route.py deliberately: two
+    routers that disagree about who may sit where is the defect this repairs,
+    so the rule must be the same rule in both, not merely a similar one.
+
+    STRICTNESS, AND WHY IT IS SHAPED LIKE THIS (adversarial round, 2026-08-13).
+    The first draft skipped malformed entries and coerced both sides with
+    str(). A Codex round proved that fails OPEN on JSON that the registry
+    happily loads, because registry.py validates `reserved` and does not
+    validate `reserved_exceptions`:
+
+        "reserved_exceptions": [null, {"lane": "system", "family": "opus"}]
+
+    The skipping version ignored the null and opened the seat. So:
+      - The list is validated AS A WHOLE, before any matching. One malformed
+        entry voids the entire grant. A grant nobody can read correctly is not
+        a grant, and refusing is the safe direction for a reserved seat.
+      - lane and family must be NON-EMPTY STRINGS. No coercion, so a null lane
+        cannot become the string "None" and match a lane literally called
+        None, which both routers previously allowed.
+      - fam must be a non-empty string too, so a path-like or enum-like family
+        object cannot stringify its way into a match.
+    This function is PURE. It has no side effects, because it is called many
+    times per launch (measured: up to six for one automatic handoff) and a
+    predicate that writes is a predicate that lies about how often the grant
+    was actually used, and that can raise on a closed stderr.
+    """
+    lane = os.environ.get("ROUTE_LANE", "").strip()
+    if not lane:
+        return False
+    if not isinstance(fam, str) or not fam:
+        return False
+    entries = account.get("reserved_exceptions")
+    if entries is None:
+        return False
+    if not isinstance(entries, list) or not entries:
+        return False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return False
+        e_lane = entry.get("lane")
+        e_fam = entry.get("family")
+        if not isinstance(e_lane, str) or not e_lane:
+            return False
+        if not isinstance(e_fam, str) or not e_fam:
+            return False
+    return any(entry["lane"] == lane and entry["family"] == fam
+               for entry in entries)
+
+
+def emit_reserved_override(account, fam, where):
+    """Durable record that a Paul-only reservation was ACTUALLY USED.
+
+    This is the other half of making _reserved_exception_applies pure. The
+    predicate used to write the receipt itself, which the adversarial round
+    showed was three separate lies: it fired on every candidate scan whether or
+    not the seat was chosen (measured at six identical writes for one automatic
+    handoff), it went to stderr which lane-boot.sh already sends to /dev/null on
+    the boot path, and a closed stderr could make a predicate raise.
+
+    So the announcement moved HERE, to the edge where the account is actually
+    being launched on, and into notify.emit, which is durable and already has a
+    live reader (the sentinel). One record per real use, naming the lane and
+    family that admitted it, so a log reader can tell "grant evaluated" from
+    "grant used". Best effort by construction: a broken observer must never
+    strand a launch, which is the estate's standing rule for telemetry.
+    """
+    try:
+        if account.get("reserved") is not True:
+            return
+        notify.emit({
+            "event": "reserved_override",
+            "account": account.get("name"),
+            "family": fam,
+            "lane": os.environ.get("ROUTE_LANE", "").strip(),
+            "where": where,
+            "supervisor_id": os.environ.get("HEADROOM_SUPERVISOR_ID", ""),
+        })
+    except Exception:  # noqa: BLE001 - telemetry can never block a launch
+        pass
+
+
 def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     """None when the account has proven headroom; otherwise why not.
 
@@ -594,7 +698,8 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     caller honours the setting."""
     if reserve is None:
         reserve = registry.reserve_percent()
-    if account.get("reserved") is True:
+    if account.get("reserved") is True \
+            and not _reserved_exception_applies(account, fam):
         # tracked but never routed to (config: reserved) — this must gate every
         # selection path, so it lives here rather than in the candidate listing
         return "reserved (config): tracked but never auto-routed"
@@ -681,7 +786,8 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
         if not _number(percent) or not 0 <= percent <= 100:
             return f"{key} reading invalid"
         if percent >= 100:
-            return f"{key} at 100%"
+            # battery law 2026-08-10: reasons speak in LEFT like the columns
+            return f"{key} 0% left"
         if reserve > 0 and percent > 100 - reserve:
             return f"{key} below {reserve:g}% reserve ({100 - percent:g}% left)"
         if window.get("severity") == "critical" and window.get("is_active"):
@@ -705,7 +811,7 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
         if not _number(scoped_pct) or not 0 <= scoped_pct <= 100:
             return f"{fam} weekly cap reading invalid"
         if scoped_pct >= 100:
-            return f"{fam} weekly cap at 100%"
+            return f"{fam} weekly cap 0% left"
         if reserve > 0 and scoped_pct > 100 - reserve:
             return (f"{fam} weekly cap below {reserve:g}% reserve "
                     f"({100 - scoped_pct:g}% left)")
@@ -753,6 +859,12 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
 # the hold budget, where a wrong disarm costs the session.
 UNREADABLE_ERROR_CODES = frozenset({
     "usage_source_rate_limited",        # provider rate-limited the usage API
+    # 2026-08-12 meter round: the ai-accounts collector stopped stamping the
+    # provider's code on its OWN deferrals and says usage_unknown instead.
+    # Same class exactly -- an absence of a current reading, healing on the
+    # next collect -- and it must be listed here or a deferred seat gets
+    # DISARMED where a fabricated provider hold merely made it wait.
+    "usage_unknown",                    # estate declined to spend a call
     "codex_provider_backoff",           # provider-wide backoff window
     "codex_app_server_throttled",       # documented transient, not capacity
     "codex_app_server_spawn_failed",
@@ -788,6 +900,14 @@ MUST_DISARM_ERROR_CODES = frozenset({
     "codex_identity_email_missing",
     "identity_id_missing",
     "slot_bound_to_unexpected_email",   # this slot is not who we think it is
+    # 2026-08-17 readings repair phase two: the estate cron collector's
+    # identity-shaped holds now travel through the ingest as their own codes
+    # instead of wearing a rate-limit mask. Both are standing facts about
+    # the seat: a parked donor home stays parked until the rotation ends,
+    # and a logged-out seat stays logged out until a human signs in. Waiting
+    # heals neither, so neither may sit in the unreadable class.
+    "auth_rotated_out",                 # credentials declared resident elsewhere
+    "claude_identity_check_failed",     # the seat's login cannot be verified
 })
 
 
@@ -1466,10 +1586,25 @@ def bare_fallback_exec(command, reason, env=None):
     print(f"[headroom] launch fallback: {reason} — running bare "
           f"`{command[0]}` without routing", file=sys.stderr)
     environment = os.environ if env is None else env
+    # 2026-08-11 (balance lane flap): execvpe searched a caller-inherited PATH
+    # that held a plugin cache bin dir and no real CLI, so the fallback whose
+    # contract is "a CLI always runs" itself died rc=127 in a respawn loop.
+    # A bare command name resolves through known-good locations, fail-closed
+    # to the original name; an explicit path is honoured untouched.
+    binary = command[0]
+    if os.sep not in binary:
+        import shutil as _shutil
+        for candidate in (
+                os.path.join("/home/paulsportsza/.local/bin", binary),
+                _shutil.which(binary, path=environment.get("PATH", "")) or "",
+                _shutil.which(binary) or ""):
+            if candidate and os.access(candidate, os.X_OK):
+                binary = candidate
+                break
     try:
-        os.execvpe(command[0], command, environment)
+        os.execvpe(binary, command, environment)
     except OSError as error:
-        print(f"[headroom] fallback exec of {command[0]} failed: {error}",
+        print(f"[headroom] fallback exec of {binary} failed: {error}",
               file=sys.stderr)
         return 127
     return 0  # unreachable outside tests: a successful exec never returns
@@ -1580,6 +1715,7 @@ def _exec_routed(fam, command, launch_note=""):
     os.environ[env_key(account)] = account["home"]
     print(f"[headroom] {fam} -> {account['name']} ({account['home']})",
           file=sys.stderr)
+    emit_reserved_override(account, fam, "exec")
     if not write_launch_marker("exec", account, note=launch_note):
         return 2
     if launch_note:

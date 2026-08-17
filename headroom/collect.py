@@ -780,6 +780,51 @@ def limit_entry(limit, minutes):
     }
 
 
+def _auth_resident(home):
+    """The account whose credentials LIVE in this home right now, per the
+    auth_resident@1 marker seat-auth-rotate.sh writes, or None when the home
+    is unrotated. Mirrors ai-accounts/bin/collect.py so the two chains read
+    ONE declaration. A malformed marker is no marker."""
+    if not home:
+        return None
+    try:
+        with open(os.path.join(home, "auth-resident.json")) as handle:
+            marker = json.load(handle)
+        if marker.get("schema") != "auth_resident@1":
+            return None
+        resident = marker.get("account")
+        return resident if isinstance(resident, str) and resident else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def resident_homes(accounts):
+    """slot name -> the ONE foreign home whose marker names that slot's
+    account, for claude slots only. Two claimants is ambiguous and yields no
+    entry, so the slot is read from its registry home as before.
+
+    RESIDENCY (2026-08-17, steward, readings repair phase two). The estate
+    moves an account's live credentials INTO another seat's home in place and
+    leaves the origin home holding a parked stub. Reading the origin home then
+    fails identity for the life of the rotation, and this chain reported that
+    as usage_source_rate_limited (a lie: nothing was rate limited) while the
+    widget showed the moved account's usage under the DONOR slot's label.
+    Marker names are ai-accounts roster names, "claude-<slot>", so the slot
+    key is derived by stripping that prefix."""
+    claims = {}
+    for row in accounts:
+        if row.get("provider") != "claude":
+            continue
+        resident = _auth_resident(row.get("home"))
+        if not resident or not resident.startswith("claude-"):
+            continue
+        slot = resident[len("claude-"):]
+        if slot == row.get("name"):
+            continue
+        claims.setdefault(slot, []).append(row.get("home"))
+    return {slot: homes[0] for slot, homes in claims.items() if len(homes) == 1}
+
+
 def external_claude_limits(name, identity, now):
     """The estate cron collector's verdict for this slot: a three-way ruling.
 
@@ -833,6 +878,20 @@ def external_claude_limits(name, identity, now):
 
     if row.get("ok") is not True or row.get("stale") is True \
             or row.get("throttle_carryover") is True:
+        # HONEST REASONS (2026-08-17). A source row that is not ok because
+        # its IDENTITY is held (logged out, rotated out, token refused) is
+        # not a throttle, and calling it one made every credential outage in
+        # the estate wear a rate-limit mask with a retry_at that re-minted
+        # itself forever. Only rows the source itself marks as throttled or
+        # stale/carried keep the defer verdict; identity-shaped codes travel
+        # through as their own hold so the widget and router say what is
+        # actually wrong.
+        code = row.get("error_code")
+        if row.get("ok") is not True and isinstance(code, str) \
+                and code not in ("anthropic_usage_rate_limited",
+                                 "usage_unknown") \
+                and not code.startswith("usage_http_"):
+            return ("held", code)
         return defer()
     row_email = row.get("email")
     our_email = identity.get("email") if isinstance(identity, dict) else None
@@ -859,6 +918,26 @@ def external_claude_limits(name, identity, now):
             continue
         window = dict(raw_window)
         window.setdefault("observed_at", int(captured))
+        # VOCABULARY NORMALISATION — the bug Paul hunted for two days
+        # (2026-08-08). The two collectors name model-scoped weekly windows
+        # DIFFERENTLY: ai-accounts writes a bare model key ("fable",
+        # collect.py:494 `{"5h":…, "7d":…, "fable": scoped.get("Fable")}`)
+        # while headroom's native path and the widget contract use
+        # "scoped:<Name>" (widget.py:204 passes through ONLY keys starting
+        # "scoped:"). While headroom collected natively the widget showed a
+        # FABLE row; the moment this ingest bridge landed (2026-08-07 12:58Z)
+        # every Fable reading arrived under a key the projection silently
+        # DROPS — so Paul's Fable gauges vanished estate-wide with the data
+        # sitting right there in the snapshot. Normalise at the boundary,
+        # which is the only place both vocabularies are known. Canonical
+        # casing is restored from a known-model map so "fable" becomes
+        # "scoped:Fable" (the exact string the widget and statusline read);
+        # an unknown bare model is title-cased rather than dropped.
+        if key not in ("5h", "7d") and not key.startswith("scoped:"):
+            canonical = {"fable": "Fable", "opus": "Opus", "sonnet": "Sonnet",
+                         "haiku": "Haiku", "spark": "Spark"}.get(
+                             key.lower(), key[:1].upper() + key[1:])
+            key = "scoped:" + canonical
         windows[key] = window
     try:
         validate_required_windows(windows)
@@ -870,6 +949,71 @@ def external_claude_limits(name, identity, now):
         "stale": False,
         "windows": windows,
     })
+
+
+def external_codex_limits(name, expected_email, now):
+    """The estate cron collector's codex reading for this slot, or a refusal.
+
+    Mirror of external_claude_limits for codex seats (2026-08-08). Same
+    fail-closed discipline: the row must exist, be ok, be fresh, and be bound
+    to the SAME login we expect — an unverifiable row returns ("native", None)
+    so the live app-server path decides, never a silent wrong number."""
+    if not EXTERNAL_CLAUDE_SNAPSHOT:
+        return ("native", None)
+    try:
+        with open(EXTERNAL_CLAUDE_SNAPSHOT) as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return ("native", None)
+    rows = payload.get("accounts") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return ("native", None)
+    row = next((entry for entry in rows if isinstance(entry, dict)
+                and entry.get("name") == name), None)
+    if row is None or row.get("provider") != "codex" or row.get("ok") is not True:
+        return ("native", None)
+    row_email = row.get("email")
+    if expected_email and (not isinstance(row_email, str)
+                           or row_email.lower() != str(expected_email).lower()):
+        return ("native", None)
+    captured = row.get("captured_at")
+    if isinstance(captured, bool) or not isinstance(captured, (int, float)):
+        return ("native", None)
+    if captured > now + 60 or now - captured > EXTERNAL_CLAUDE_MAX_AGE:
+        return ("native", None)
+    raw_windows = row.get("windows")
+    if not isinstance(raw_windows, dict) or not raw_windows:
+        return ("native", None)
+    windows = {}
+    for key, raw_window in raw_windows.items():
+        if not isinstance(key, str) or not isinstance(raw_window, dict):
+            continue
+        used = raw_window.get("used_percent")
+        if isinstance(used, bool) or not isinstance(used, (int, float)) \
+                or not 0 <= used <= 100:
+            continue
+        window = dict(raw_window)
+        window.setdefault("observed_at", int(captured))
+        if key not in ("5h", "7d") and not key.startswith("scoped:"):
+            key = "scoped:" + (key[:1].upper() + key[1:])
+        windows[key] = window
+    try:
+        validate_required_windows(windows, require_5h=False)
+    except Exception:  # noqa: BLE001 — malformed external data falls back
+        return ("native", None)
+    value = {
+        "captured_at": int(captured),
+        "source": "ai_accounts_snapshot",
+        "stale": False,
+        "windows": windows,
+        "identity_verified": True,
+        "identity_method": "ai_accounts_snapshot",
+        "email": row_email,
+    }
+    for key in ("identity", "subscription", "plan"):
+        if row.get(key) is not None:
+            value[key] = row[key]
+    return ("ingest", value)
 
 
 def claude_limits(home, expected_fingerprint, opener=open_authenticated):
@@ -1118,7 +1262,15 @@ def apply_integrity(accounts):
         result["routable"] = result["trust_state"] in ("verified", "verified_local")
 
         key = (result.get("provider"), identity.get("account_fingerprint"))
-        if key[1]:
+        # A DECLARED donor slot is not a duplicate login (2026-08-17). When a
+        # home is auth-rotated, its slot row is held as auth_rotated_out and
+        # its identity read reports the RESIDENT account, so it shares a
+        # fingerprint with the resident's own row by construction. That is
+        # the declared state, not a stolen login, and stamping both rows
+        # duplicate_identity de-routed the one healthy account in the pair.
+        # A held slot has already lost routing; it must not also veto the
+        # account whose credentials it lawfully holds.
+        if key[1] and result.get("error_code") != "auth_rotated_out":
             if key in fingerprints:
                 other = fingerprints[key]
                 for account in (other, result):
@@ -1185,14 +1337,18 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
         "generated_iso": None,
         "accounts": [],
     }
+    _resident = resident_homes(accounts)
     for account in accounts:
         result = {"id": account.get("id"), "name": account["name"],
                   "provider": account["provider"]}
         try:
             if account["provider"] == "claude":
-                identity = claude_identity(account["home"])
+                read_home = _resident.get(account["name"], account["home"])
+                if read_home != account["home"]:
+                    result["read_home_resident"] = True
+                identity = claude_identity(read_home)
                 identity["credential_digest"] = credential_digest(
-                    "claude", account["home"])
+                    "claude", read_home)
                 result["identity"] = identity
                 result["identity_verified"] = identity["verified"]
                 result["identity_method"] = identity["method"]
@@ -1203,6 +1359,16 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 expected = account.get("expected_email")
                 if expected and identity["email"] \
                         and identity["email"].lower() != expected.lower():
+                    # AUTH-ROTATED HOMES ARE NOT BREACHES (2026-08-17, mirror
+                    # of ai-accounts collect.py). When this slot's own home
+                    # carries a marker naming a DIFFERENT roster account, the
+                    # unexpected email is the declared resident and the slot
+                    # is honestly parked, not stolen. Held, not routable, and
+                    # never entered in the duplicate-fingerprint map, so the
+                    # resident account's own row is not de-routed by it.
+                    declared = _auth_resident(account["home"])
+                    if declared and declared != "claude-" + account["name"]:
+                        raise IdentityBindingError("auth_rotated_out")
                     raise IdentityBindingError("slot_bound_to_unexpected_email")
                 # the estate cron collector's verdict rules this slot: a
                 # fresh reading serves without touching the usage API (a file
@@ -1216,11 +1382,13 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                     result.update(value)
                 elif verdict == "defer":
                     raise ProviderThrottleError(value)
+                elif verdict == "held":
+                    raise IdentityBindingError(value)
                 else:
                     if claude_backoff_until > now:
                         raise ProviderThrottleError(claude_backoff_until)
                     result.update(claude_limits(
-                        account["home"], account.get("pinned_usage_org")))
+                        read_home, account.get("pinned_usage_org")))
                 if not account.get("pinned_usage_org") \
                         and result.get("source_identity_fingerprint"):
                     # trust-on-first-use: remember which org this slot's
@@ -1231,6 +1399,23 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 result["ok"] = True
             else:
                 expected = account.get("expected_email")
+                # SAME SINGLE-CALLER RULE AS CLAUDE (2026-08-08). The estate
+                # cron reads every codex seat successfully via its own
+                # app-server call; headroom making a SECOND independent call
+                # buys nothing and, while the app-server is in backoff, left
+                # Paul's widget showing codex seats "stale" for hours with
+                # correct numbers sitting one file away (measured: collector
+                # ok=True at 4%/62% weekly while the widget carried 1h34m-old
+                # values). Ingest the cron's reading first; the live path below
+                # remains the automatic fallback whenever the ingest is
+                # missing, stale, or fails any check.
+                codex_verdict, codex_value = external_codex_limits(
+                    account["name"], expected, now)
+                if codex_verdict == "ingest":
+                    result.update(codex_value)
+                    result["ok"] = True
+                    snapshot["accounts"].append(result)
+                    continue
                 codex_retry_at = active_backoff(backoff, "codex_app_server", now)
                 if codex_retry_at:
                     # transient app-server overload holds the seat; it never
@@ -1351,6 +1536,14 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                     "account (the CLI refreshes its token) or `headroom auth "
                     f"refresh {account['name']}` to re-login; readings held "
                     "until then.")
+            elif error.code == "auth_rotated_out":
+                result["note"] = ("auth-rotated by declaration: this seat's "
+                                  "credentials currently serve another "
+                                  "account; not a re-auth condition")
+            elif error.code == "claude_identity_check_failed":
+                result["note"] = ("the Claude login in this seat cannot be "
+                                  "verified (logged out or parked); sign in "
+                                  "again on this seat")
             elif error.code == "claude_credentials_missing":
                 # verified identity but the token couldn't be read. On macOS the
                 # token is in the login Keychain (headroom reads it via
@@ -1392,6 +1585,52 @@ def redact_email(address):
     return (local[0] if local else "") + "***@" + domain
 
 
+SESSION_TRUTH_DIR = "/home/paulsportsza/ai-accounts/state/session-truth"
+
+
+def _fold_session_truth(row):
+    """2026-08-11 usage-truth unification (census item 0, Paul's ruling that
+    the widget and statusline must never disagree): a live session's provider
+    rate_limits headers, teed per account by the statusline, are ground truth
+    and beat any collector carry. Newest-wins per row, snapshots older than
+    30 minutes prove nothing, and total failure of this fold must never
+    break a projection."""
+    try:
+        name = str(row.get("name") or "")
+        truth = None
+        for cand in (name, "claude-" + name):
+            tp = os.path.join(SESSION_TRUTH_DIR, cand + ".json")
+            if os.path.exists(tp):
+                with open(tp) as fh:
+                    truth = json.load(fh)
+                break
+        if not truth:
+            return row
+        t_cap = float(truth.get("captured_at") or 0)
+        if t_cap <= float(row.get("captured_at") or 0):
+            return row
+        if time.time() - t_cap > 1800:
+            return row
+        wins = row.setdefault("windows", {})
+        changed = False
+        for key in ("5h", "7d"):
+            t_w = (truth.get("windows") or {}).get(key) or {}
+            if t_w.get("used_percent") is None:
+                continue
+            d_w = wins.setdefault(key, {})
+            d_w["used_percent"] = float(t_w["used_percent"])
+            if t_w.get("resets_at"):
+                d_w["resets_at"] = float(t_w["resets_at"])
+            changed = True
+        if changed:
+            row["captured_at"] = int(t_cap)
+            row["truth_source"] = "session_header"
+            row["stale"] = False
+    except Exception:
+        pass
+    return row
+
+
 def public_snapshot(snapshot, redact_emails=False):
     accounts = []
     for account in snapshot["accounts"]:
@@ -1401,7 +1640,7 @@ def public_snapshot(snapshot, redact_emails=False):
             public["note"] = "collector error; see private snapshot"
         if redact_emails:
             public["email"] = redact_email(public.get("email"))
-        accounts.append(public)
+        accounts.append(_fold_session_truth(public))
     return {
         "schema_version": snapshot["schema_version"],
         "run_id": snapshot["run_id"],
@@ -1706,17 +1945,22 @@ def display_left(window):
 
 
 def print_snapshot(snapshot):
+    # PAUL LAW 2026-08-10 (locked): status batteries show how much is LEFT,
+    # never how much is used. This table printed USED for a month while
+    # `headroom status` printed LEFT, and the two contradicting each other is
+    # where the recurring inversion misreads came from. No parser consumes
+    # these rows (swept 2026-08-10); the values self-label with "left".
     for account in snapshot["accounts"]:
         windows = account.get("windows") or {}
         scoped = " ".join(
-            "%s=%s" % (key.split(":", 1)[1], display_percent(windows[key]))
+            "%s=%s" % (key.split(":", 1)[1], display_left(windows[key]))
             for key in windows if key.startswith("scoped:")
         )
         if account.get("ok"):
-            print("%-16s %-14s 5h=%-5s 7d=%-5s %s%s" % (
+            print("%-16s %-14s 5h=%-9s 7d=%-9s %s%s" % (
                 account["name"], account.get("plan", ""),
-                display_percent(windows.get("5h")),
-                display_percent(windows.get("7d")),
+                display_left(windows.get("5h")),
+                display_left(windows.get("7d")),
                 scoped, " STALE" if account.get("stale") else ""))
         else:
             print("%-16s HELD: %s" % (
