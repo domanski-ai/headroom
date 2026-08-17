@@ -1122,6 +1122,12 @@ function windowMarkup(account,key){
 // Calm, specific state per account. Codex reads its CLI's own telemetry, so
 // idle/limited are EXPECTED states — label them clearly, never as "broken".
 function accountState(account){
+  /* UNPAID (Paul, 2026-08-17): "no reading is CORRECT until Paul pays".
+     Checked FIRST and drawn in the calm idle tone, never the alarm tone: an
+     unpaid seat is a standing fact about a bill, not a broken account, and
+     nothing here may nag about signing in. */
+  if(account&&(account.unpaid===true||account.error_code==="unpaid"))
+    return{cls:"idle",label:"Unpaid",note:"not paid yet, so no reading is expected"};
   const state=displayState(account);
   if(state==="current"){
     return{cls:"live",label:"Live",note:"observed "+age(account.captured_at)};
@@ -1163,7 +1169,11 @@ function accountMarkup(account,columns){
   const dot=s.cls==="live"?'<span class="live-dot" aria-hidden="true"></span>':"";
   return '<article class="account is-'+s.cls+'" style="--win-cols:'+columns.length+'">'+
     '<div class="acct-identity"><span class="acct-email">'+esc(account.email||account.name)+"</span>"+
-    '<div class="acct-meta"><span>'+esc(account.name)+"</span><span>"+esc(account.plan||account.provider)+"</span></div></div>"+
+    /* THE TIER LEFT THIS ROW 2026-08-17 (Paul: "The tier should not even be
+       given because you can't read it so it doesn't matter. Its tier should be
+       completely eliminated as a factor."). The provider is what the row needs
+       to say; the plan still rides /usage.json as an informational field. */
+    '<div class="acct-meta"><span>'+esc(account.name)+"</span><span>"+esc(account.provider)+"</span></div></div>"+
     columns.map(k=>windowMarkup(account,k)).join("")+
     '<div class="state"><span class="state-badge state-'+s.cls+'">'+dot+esc(s.label)+"</span>"+
     '<p class="state-note">'+esc(s.note)+"</p></div></article>";

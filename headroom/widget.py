@@ -59,6 +59,31 @@ def _freshness(snapshot, evaluated_at, force_noncurrent_reason=None):
             "reason": "snapshot_current", "evaluated_at": evaluated_at}
 
 
+def _is_unpaid(account):
+    """A seat Paul has not paid for (2026-08-17).
+
+    THE STATE STAYS INSIDE THE CONTRACT ENUM ON PURPOSE. headroom_widget@1
+    consumers validate `state` against exactly {current, limited, stale,
+    held} (dashboard/template.html hrValidFeed, both ubersicht widgets, and
+    Paul's compiled menubar app, which cannot be updated from this server).
+    On 2026-08-08 a novel state value ("carried") failed that enum and the
+    menubar rendered the WHOLE feed as unreachable, which is the blank widget
+    Paul has forbidden. So an unpaid seat projects "held" (grey, never red,
+    which is exactly what unpaid should look like) and carries an ADDITIVE
+    `unpaid: true` that every validator ignores.
+
+    WHICH SURFACES ACTUALLY PRINT THE WORD, measured rather than assumed
+    (grep -c unpaid integrations/ubersicht/*.jsx returns 0 for both): the
+    SwiftBar text at /widget.txt and the dashboard page. The two ubersicht
+    widgets draw batteries with no per-account text, so an unpaid seat shows
+    there as a grey held bar with no numbers, which is honest; and Paul's
+    compiled menubar app cannot be rebuilt from this server. Do not read this
+    flag as fleet-wide coverage."""
+    return (isinstance(account, dict)
+            and (account.get("unpaid") is True
+                 or account.get("error_code") == "unpaid"))
+
+
 def _account_base_state(account, freshness, evaluated_at):
     if freshness["state"] == "held":
         return "held"
@@ -217,14 +242,24 @@ def project(snapshot, evaluated_at=None, force_noncurrent_reason=None):
             state = "current"
         if state in {"held", "stale"}:
             _demote_windows(windows, state)
-        accounts.append({
+        row = {
             "name": raw.get("name") if isinstance(raw.get("name"), str)
             else "unknown",
             "provider": (raw.get("provider")
                          if isinstance(raw.get("provider"), str) else "unknown"),
             "state": state,
             "windows": windows,
-        })
+        }
+        if _is_unpaid(raw):
+            # held (grey) plus the additive flag; see _is_unpaid for why the
+            # enum may not grow a fifth value.
+            row["state"] = "held"
+            row["unpaid"] = True
+            _demote_windows(row["windows"], "held")
+            for window in row["windows"].values():
+                # an unpaid seat has no reading at all, not even an old one
+                window["last_observed_left_percent"] = None
+        accounts.append(row)
     result = {"schema": SCHEMA, "freshness": freshness,
               "accounts": accounts}
     result["headline"] = calculate_headline(accounts)
@@ -387,6 +422,9 @@ def render_swiftbar(value, evaluated_at=None, force_noncurrent_reason=None,
         state = account.get("state") \
             if account.get("state") in {"current", "limited", "stale", "held"} \
             else "held"
+        # The SwiftBar line is plain text, not the validated enum, so it may
+        # say the true word.
+        label_state = "unpaid" if account.get("unpaid") is True else state
         windows_map = account.get("windows") or {}
         # OpenAI lifted Codex's 5h: when the session window is absent, color the
         # account row from the weekly (7d) so a current codex seat reads green,
@@ -397,7 +435,7 @@ def render_swiftbar(value, evaluated_at=None, force_noncurrent_reason=None,
         color = _tone(account_value) if state == "current" \
             else ("red" if state == "limited" else "gray")
         lines.append("{} · {} · {} | color={}".format(
-            name, provider, state.upper(), color))
+            name, provider, label_state.upper(), color))
         for key in WINDOW_KEYS:
             # project() omits an absent 5h on a live codex seat (OpenAI lifted
             # it); skip the dropped key so a current seat gets no phantom

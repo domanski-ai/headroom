@@ -68,9 +68,52 @@ EXTERNAL_CLAUDE_MAX_AGE = paths.env_int("HEADROOM_EXTERNAL_CLAUDE_MAX_AGE", 720)
 EXTERNAL_CLAUDE_PIPELINE_DEAD = paths.env_int(
     "HEADROOM_EXTERNAL_CLAUDE_PIPELINE_DEAD", 1200)
 
+# THE SEAT'S OWN LIVE READING, WHEN THE COLLECTOR'S IS OLD (2026-08-17,
+# rescue-path repair). The estate collector refreshes a given seat roughly
+# once an hour by design (its per-source-IP call budget), so for most of every
+# hour a healthy seat's reading is older than EXTERNAL_CLAUDE_MAX_AGE, arrives
+# stale, and apply_integrity below stamps it stale_observation / routable
+# False. That is the correct default for a reading nobody can vouch for. It is
+# the WRONG answer for a seat that has a live agent on it right now, because
+# that agent's statusline tees the provider's own rate_limit headers to
+# ~/ai-accounts/state/session-truth/<account>.json every turn. Measured
+# 2026-08-17: the dead man drill could not find a routable seat in the same
+# minute across five samples, and rotated onto a seat headroom then re-routed
+# away from, because the router could only see the hourly reading.
+#
+# So a stale row is re-examined against its OWN tee before it is held. The tee
+# must be fresh (SESSION_TRUTH_MAX_AGE), must name this account, must carry
+# both required windows, and must show 5h left ABOVE the routing floor. Then
+# its windows and its capture time replace the old ones and the row routes on
+# the basis "tee-fresh", which the router prints. A seat with NEITHER a fresh
+# collector reading NOR a fresh tee is held exactly as before: this widens no
+# window and lowers no floor, it adds a second, better-evidenced witness.
+SESSION_TRUTH_DIR = os.environ.get(
+    "HEADROOM_SESSION_TRUTH_DIR",
+    "/home/paulsportsza/ai-accounts/state/session-truth")
+# 30 minutes: the same bound headroom's public-snapshot fold has used since
+# 2026-08-11 (a tee older than this proves nothing about a live session), and
+# comfortably inside route.OBSERVATION_MAX_AGE so a rescued row is not handed
+# to the router already expired.
+SESSION_TRUTH_MAX_AGE = paths.env_int("HEADROOM_SESSION_TRUTH_MAX_AGE", 1800)
+# Kill switch. 0 restores the pre-2026-08-17 behaviour exactly: stale is held.
+SESSION_TRUTH_ROUTING = paths.env_int("HEADROOM_SESSION_TRUTH_ROUTING", 1)
+# WHEN a reading stops being good enough to route on. There are TWO gates that
+# hold an old reading and they answer to different settings, which is why the
+# first cut of this repair fixed only half the live failure: collect marks a
+# row `stale` past EXTERNAL_CLAUDE_MAX_AGE (720s by default, 3600s in the
+# headroom-serve unit), and route.block_reason separately refuses any reading
+# older than OBSERVATION_MAX_AGE with "reading expired" no matter what `stale`
+# says. Measured 2026-08-17T17:03Z on the live snapshot: serve had ingested
+# claude-system at 3600s so `stale` was False, and the router still skipped it
+# as "reading expired". So eligibility is the UNION, and it reads the same env
+# var route.py does so an operator who widens one cannot silently widen only
+# one. collect must not import route (route imports collect).
+SESSION_TRUTH_RESCUE_AFTER = paths.env_int("HEADROOM_OBSERVATION_MAX_AGE", 1800)
+
 PUBLIC_FIELDS = {
     "id", "name", "email", "provider", "plan", "ok", "note", "error_code",
-    "retry_at",
+    "retry_at", "unpaid",
     "captured_at", "source", "stale", "windows", "identity_verified",
     "identity_method", "trust_state", "routable", "subscription",
     "throttle_carryover",
@@ -189,27 +232,65 @@ def decode_jwt_payload(token):
         raise ValueError("invalid local identity token") from error
 
 
+# ai-accounts/bin/credloc.py stamps this key on an identity snapshot it built
+# out of a registry row because it could not read a real one. Spelled here as
+# a literal on purpose: headroom also runs on the Mac, where that module does
+# not exist, and an import would make this file unloadable there.
+CREDLOC_SYNTHESIZED_KEY = "synthesized_from_registry"
+
+
 def _claude_metadata_candidates(home):
     """Where Claude Code may keep the oauthAccount block for this home.
 
     Headroom-managed homes (CLAUDE_CONFIG_DIR pointed at the slot) store
-    ``<home>/.claude.json``. The DEFAULT profile — the common Windows and
-    single-account layout — uses ``~/.claude`` as the config dir but keeps
+    ``<home>/.claude.json``. The DEFAULT profile, the common Windows and
+    single-account layout, uses ``~/.claude`` as the config dir but keeps
     ``.claude.json`` one level up in the profile root, leaving only a stub
-    inside the config dir. Yield both, preferred location first.
+    inside the config dir.
+
+    A CREDENTIAL VAULT ENTRY IS THE THIRD SHAPE (2026-08-17, X2). A vault
+    entry is not a seat home and the CLI never logs in there, so its
+    ``.claude.json`` carries onboarding state and no ``oauthAccount``; the
+    identity travels beside the chain in ``oauthAccount.json``, which IS the
+    oauthAccount block rather than a file containing one. Yielded last, so a
+    real login in the directory always wins over the parked snapshot.
+
+    Each candidate is ``(path, key)``: ``key`` is the member holding the
+    block, or None when the whole document is the block.
     """
-    yield os.path.join(home, ".claude.json")
+    yield os.path.join(home, ".claude.json"), "oauthAccount"
     parent = os.path.dirname(os.path.abspath(home))
     if os.path.basename(os.path.abspath(home)) == ".claude":
-        yield os.path.join(parent, ".claude.json")
+        yield os.path.join(parent, ".claude.json"), "oauthAccount"
+    yield os.path.join(home, "oauthAccount.json"), None
 
 
 def claude_local_identity(home):
-    """Identity bound inside the slot from local metadata only (no network)."""
+    """Identity bound inside the slot from local metadata only (no network).
+
+    WHY A VAULT ENTRY BINDS AT ALL (2026-08-17, X2). An account rotated out of
+    every home reads from ``ai-accounts/vault/<account>``, and that directory
+    carried the chain and the identity but no ``.claude.json`` holding an
+    oauthAccount. This raised claude_local_binding_missing, route.py held the
+    row, and the widget said "provider identity mismatch" about an account
+    whose credential and identity were both intact and sitting in the
+    directory it had just been pointed at. The writer now emits the binding
+    file too (credloc.bind_config); this end accepts the snapshot as well, so
+    a vault entry written before that change, or by any other hand, still
+    binds.
+    """
     oauth = {}
-    for candidate in _claude_metadata_candidates(home):
-        metadata = paths.load_json(candidate) or {}
-        found = metadata.get("oauthAccount") or {}
+    for candidate, key in _claude_metadata_candidates(home):
+        document = paths.load_json(candidate) or {}
+        found = (document.get(key) if key else document) or {}
+        if not isinstance(found, dict):
+            continue
+        # A snapshot the estate GUESSED from a registry row is not evidence of
+        # whose credential is in this directory, and this function's answer is
+        # what the router compares against the snapshot to notice a home
+        # re-logged into a different account.
+        if found.get(CREDLOC_SYNTHESIZED_KEY):
+            continue
         if found.get("emailAddress") and found.get("organizationUuid"):
             oauth = found
             break
@@ -825,6 +906,19 @@ EXTERNAL_HELD_CODES = (
     "claude_identity_check_failed",   # IdentityBindingError("claude_identity_check_failed")
     "usage_http_401",                 # IdentityBindingError("usage_http_401")
     "usage_http_403",                 # IdentityBindingError("usage_http_403")
+    # Paul has not paid the seat (2026-08-17). Belt and braces: the slot
+    # short-circuit in collect() below normally answers an unpaid seat before
+    # this ingest is ever consulted, but if only the ESTATE registry knows
+    # about the bill, the code must still travel through as itself. Deferring
+    # it would dress an unpaid seat as a provider rate limit and mint a
+    # retry_at for a wait that cures nothing.
+    "unpaid",                         # IdentityBindingError("unpaid")
+    # 2026-08-17 B2 repair. The estate collector cannot say where this
+    # account's credential is: nothing holds it, or two homes both claim it.
+    # A standing fact like the rest of this list, not an absence that the next
+    # collect heals, so it travels through as itself instead of wearing a
+    # throttle mask and minting a retry_at for a wait that cures nothing.
+    "no_credential_location",         # IdentityBindingError("no_credential_location")
 )
 
 
@@ -844,6 +938,101 @@ def _auth_resident(home):
         return resident if isinstance(resident, str) and resident else None
     except (OSError, ValueError, AttributeError):
         return None
+
+
+# THE ESTATE'S ONE CREDENTIAL RESOLVER (2026-08-17, B2 repair, finding P1-3).
+# This file carried a SECOND copy of the "where does this account's credential
+# live" rule (resident_homes below: marker, else registry home). The estate
+# grew a third location on 2026-08-17, the credential vault, for an account
+# that is resident in no home at all, and this copy had no arm for it. The
+# measured cost was Paul's ruling number one failing on the surface he
+# actually reads: ai-accounts published claude-gmail ok with 5h, 7d and Fable
+# from the vault, while http://127.0.0.1:8377/usage.json showed the same
+# account ok false, auth_rotated_out, windows empty.
+#
+# Rather than write a fourth copy of the rule, this asks the one that already
+# exists. It is loaded by PATH, not by import, because headroom also runs on
+# the Mac where ai-accounts does not exist: when the module or its registry
+# cannot answer, every caller falls back to exactly today's behaviour, so a
+# box without the estate tree behaves as it always did.
+_ESTATE_CREDLOC = os.environ.get(
+    "HEADROOM_CREDLOC", "/home/paulsportsza/ai-accounts/bin/credloc.py")
+_ESTATE_CREDLOC_CACHE = []
+_ESTATE_CREDLOC_WARNED = []
+
+
+def estate_credloc():
+    """ai-accounts/bin/credloc.py as a module, or None where it is absent."""
+    if not _ESTATE_CREDLOC_CACHE:
+        module = None
+        try:
+            import importlib.util as _iu
+            spec = _iu.spec_from_file_location(
+                "ai_accounts_credloc", _ESTATE_CREDLOC)
+            module = _iu.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except Exception as error:
+            # LOG THE ESCAPE, and do not remember it. A negative cached for
+            # the daemon's lifetime turns one unreadable moment (an in place
+            # edit of credloc.py under a running headroom serve) into rows
+            # that silently revert to the registry home until somebody
+            # restarts the unit, with nothing anywhere saying why.
+            module = None
+            if not _ESTATE_CREDLOC_WARNED:
+                _ESTATE_CREDLOC_WARNED.append(True)
+                print(f"[headroom] estate resolver {_ESTATE_CREDLOC} "
+                      f"unavailable ({error}); falling back to registry homes",
+                      file=sys.stderr)
+            return None
+        _ESTATE_CREDLOC_CACHE.append(module)
+    return _ESTATE_CREDLOC_CACHE[0]
+
+
+# Slots whose two registries disagree, warned about once each per process.
+_ESTATE_HOME_MISMATCH_WARNED = []
+
+
+def estate_credential_dir(slot, expect_home=None):
+    """(directory, kind) for a claude slot per the estate resolver.
+
+    ``(None, None)`` means the resolver could not answer at all (not this
+    box, no registry row for the slot, unreadable registry), which is the
+    caller's signal to keep its own marker-or-registry-home behaviour.
+    ``(None, "none")`` is a real answer: no home and no vault holds this
+    account. Slot names are estate roster names without the "claude-" prefix,
+    the same convention resident_homes uses.
+
+    ``expect_home`` is THIS registry's home for the slot. There are two
+    registries on this box, ~/.headroom/config.json and
+    ai-accounts/accounts.json, and they are joined on a NAME. When they carry
+    different homes for one name they are not describing the same seat, and
+    believing the estate's answer would hand a caller a directory this box's
+    own registry never sanctioned: at worst a live seat home for a slot that
+    only shares its name (2026-08-17 R4). A disagreement therefore answers
+    ``(None, None)``, which is "keep today's behaviour", and says so once."""
+    module = estate_credloc()
+    if module is None:
+        return None, None
+    try:
+        rows = module.load_rows()
+        row = next((r for r in rows if r.get("name") == "claude-" + slot), None)
+        if row is None:
+            return None, None
+        estate_home = row.get("home")
+        if expect_home and estate_home \
+                and os.path.realpath(os.path.expanduser(estate_home)) \
+                != os.path.realpath(os.path.expanduser(expect_home)):
+            if slot not in _ESTATE_HOME_MISMATCH_WARNED:
+                _ESTATE_HOME_MISMATCH_WARNED.append(slot)
+                print(f"[headroom] the estate registry puts {slot} in "
+                      f"{estate_home} and this registry puts it in "
+                      f"{expect_home}; using this registry's home",
+                      file=sys.stderr)
+            return None, None
+        location = module.resolve(row, rows)
+        return location.get("dir"), location.get("kind")
+    except Exception:
+        return None, None
 
 
 def resident_homes(accounts):
@@ -1309,12 +1498,185 @@ def active_backoff(document, provider, now):
     return int(retry_at) if retry_at > now else 0
 
 
+def session_truth_reading(name, now, max_age=None, floor=None):
+    """This seat's own statusline tee, or ``(None, why)`` if it proves nothing.
+
+    The tee is written by the live agent on the seat from the provider's
+    rate_limit response headers, so it is a FIRST-hand reading of the same
+    numbers the collector fetches second-hand, minutes old instead of an hour.
+    Every check below fails CLOSED: a tee that is absent, malformed, for
+    another account, in the future, older than ``max_age``, missing either
+    required window, or not comfortably above the routing floor returns None
+    with the reason, and the caller leaves the row held.
+
+    ``floor`` defaults to registry.reserve_percent() so this gate can never be
+    looser than the one route.block_reason applies to the folded row.
+    """
+    if not SESSION_TRUTH_ROUTING:
+        return (None, "session-truth routing disabled "
+                      "(HEADROOM_SESSION_TRUTH_ROUTING=0)")
+    max_age = SESSION_TRUTH_MAX_AGE if max_age is None else max_age
+    if floor is None:
+        try:
+            floor = registry.reserve_percent()
+        except Exception:  # noqa: BLE001 - an unreadable config must not route
+            return (None, "routing floor unreadable")
+    name = str(name or "")
+    if not name:
+        return (None, "no account name")
+    path = None
+    for candidate in (name, "claude-" + name):
+        cand_path = os.path.join(SESSION_TRUTH_DIR, candidate + ".json")
+        if os.path.exists(cand_path):
+            path, stem = cand_path, candidate
+            break
+    if path is None:
+        return (None, "no session-truth tee for this seat")
+    try:
+        with open(path) as handle:
+            truth = json.load(handle)
+    except (OSError, ValueError):
+        return (None, "session-truth tee unreadable")
+    if not isinstance(truth, dict):
+        return (None, "session-truth tee is not an object")
+    if truth.get("schema") != "session_truth@1":
+        return (None, "session-truth schema is %r, not session_truth@1"
+                      % (truth.get("schema"),))
+    # A tee COPIED from another seat is the one way this can serve a wrong
+    # number, so the payload must name the file it was found in.
+    account = truth.get("account")
+    if not isinstance(account, str) or account != stem:
+        return (None, "session-truth tee names %r, not %r" % (account, stem))
+    captured = truth.get("captured_at")
+    if isinstance(captured, bool) or not isinstance(captured, (int, float)):
+        return (None, "session-truth capture time invalid")
+    if captured > now + 60:
+        return (None, "session-truth capture time is in the future")
+    age = int(now - captured)
+    if age > max_age:
+        return (None, "session-truth tee is %ds old, older than %ds"
+                      % (age, max_age))
+    raw = truth.get("windows")
+    if not isinstance(raw, dict):
+        return (None, "session-truth windows invalid")
+    windows = {}
+    for key in ("5h", "7d"):
+        # BOTH required. Folding only the 5h would move the row's capture time
+        # forward while its 7d number stayed an hour old, which is a reading
+        # that claims to be fresher than any of its parts.
+        window = raw.get(key)
+        if not isinstance(window, dict):
+            return (None, "session-truth %s window missing" % key)
+        used = window.get("used_percent")
+        if isinstance(used, bool) or not isinstance(used, (int, float)) \
+                or not 0 <= used <= 100:
+            return (None, "session-truth %s reading invalid" % key)
+        windows[key] = window
+    used_5h = float(windows["5h"]["used_percent"])
+    left_5h = 100.0 - used_5h
+    if left_5h <= floor:
+        return (None, "session-truth shows 5h %g%% left, not above the "
+                      "%g%% routing floor" % (left_5h, floor))
+    return ({"captured_at": int(captured), "age": age, "windows": windows,
+             "left_5h": left_5h}, None)
+
+
+def apply_session_truth_rescue(accounts, now=None, floor=None):
+    """Re-examine every stale Claude row against its own live statusline tee.
+
+    Runs immediately before apply_integrity, which is what turns ``stale`` into
+    ``trust_state`` and ``routable``. A row is eligible when its collector
+    reading is not good enough for the router to route on: marked ``stale``, or
+    older than SESSION_TRUTH_RESCUE_AFTER (route.block_reason refuses those
+    with "reading expired" whatever ``stale`` says). A rescued row carries
+    ``routing_basis="tee-fresh"`` so the router can name the evidence it routed
+    on; every row that is not rescued keeps a ``tee_note`` saying why, so a
+    held seat can be diagnosed without guessing. Only rows that are ALREADY ok
+    and stale are eligible: a held, unpaid, duplicate or credential-missing row
+    is untouched, and a fresh reading is never overwritten.
+
+    ``floor`` is passed through to session_truth_reading, which defaults it to
+    registry.reserve_percent(); a caller (or a test) that pins it must pin the
+    SAME number route.block_reason will use, or the two gates disagree.
+    """
+    now = time.time() if now is None else now
+    rescued = []
+    for result in accounts:
+        if result.get("provider") != "claude":
+            continue
+        if result.get("ok") is not True or result.get("error_code"):
+            continue
+        captured = result.get("captured_at")
+        expiring = (isinstance(captured, (int, float))
+                    and not isinstance(captured, bool)
+                    and now - captured >= SESSION_TRUTH_RESCUE_AFTER)
+        if not result.get("stale") and not expiring:
+            # the collector's own reading is still good enough for the router
+            # to route on, so it stays authoritative: the tee rescues rows the
+            # router would refuse, it does not re-base live ones
+            continue
+        payload, why = session_truth_reading(result.get("name"), now,
+                                             floor=floor)
+        if payload is None:
+            result["tee_note"] = why
+            continue
+        if payload["captured_at"] <= (result.get("captured_at") or 0):
+            result["tee_note"] = "session-truth tee is not newer than the " \
+                                 "collector reading"
+            continue
+        windows = result.setdefault("windows", {})
+        for key, window in payload["windows"].items():
+            merged = dict(windows.get(key) or {})
+            was_used = merged.get("used_percent")
+            was_reset = merged.get("resets_at")
+            now_used = float(window["used_percent"])
+            now_reset = window.get("resets_at")
+            merged["used_percent"] = now_used
+            if now_reset is not None:
+                merged["resets_at"] = now_reset
+            merged["observed_at"] = payload["captured_at"]
+            merged["freshness"] = "fresh"
+            # severity/is_active are HOLD-ONLY signals (route.block_reason
+            # holds a critical live window), so keeping the old ones can only
+            # ever refuse, never route: they are carried forward on purpose.
+            # They are dropped in exactly the two cases where they describe a
+            # window that no longer exists - the provider reports a different
+            # reset time, or usage FELL, which inside one window it cannot do.
+            # Carrying a critical flag across a window reset is how a seat
+            # that has recovered stays held for another hour.
+            rolled = (now_reset is not None and was_reset is not None
+                      and now_reset != was_reset)
+            fell = (isinstance(was_used, (int, float))
+                    and not isinstance(was_used, bool) and now_used < was_used)
+            if rolled or fell:
+                merged.pop("severity", None)
+                merged.pop("is_active", None)
+            windows[key] = merged
+        result["captured_at"] = payload["captured_at"]
+        result["stale"] = False
+        result["truth_source"] = "session_header"
+        result["routing_basis"] = "tee-fresh"
+        result["tee_note"] = (
+            "collector reading was %ds old; this seat's own statusline tee is "
+            "%ds old and shows 5h %g%% left"
+            % (int(now - (captured or 0)), payload["age"], payload["left_5h"]))
+        rescued.append(result.get("name"))
+    return rescued
+
+
 def apply_integrity(accounts):
     """Trust states + duplicate-identity detection across the fleet."""
     fingerprints = {}
     warnings = []
     for result in accounts:
         identity = result.get("identity") or {}
+        if result.get("error_code") == "unpaid":
+            # The short-circuit already wrote this row's whole verdict. Do not
+            # stamp trust vocabulary over a bill (2026-08-17).
+            result["trust_state"] = "held"
+            result["routable"] = False
+            result["unpaid"] = True
+            continue
         if result.get("trust_state") == "dashboard_only":
             # codex display-only telemetry: visible on the dashboard, never
             # routable — keep the explicit state instead of a generic "held"
@@ -1409,9 +1771,42 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
     for account in accounts:
         result = {"id": account.get("id"), "name": account["name"],
                   "provider": account["provider"]}
+        # UNPAID SHORT-CIRCUIT (Paul, 2026-08-17), the mirror of the same
+        # short-circuit in ai-accounts/bin/collect.py so both collectors obey
+        # ONE law. A seat Paul has not paid for is answered before any
+        # credential is opened: there is nothing to read, and reading it can
+        # only manufacture a scary code for a bill. Held, unroutable, grey,
+        # and it says so in his own words. Cure: drop "status" from the
+        # account row in ~/.headroom/config.json.
+        if str(account.get("status") or "") == "unpaid":
+            result["ok"] = False
+            result["error_code"] = "unpaid"
+            result["note"] = "unpaid; no reading expected until it is paid"
+            result["identity_verified"] = False
+            result["trust_state"] = "held"
+            result["routable"] = False
+            result["unpaid"] = True
+            snapshot["accounts"].append(result)
+            continue
         try:
             if account["provider"] == "claude":
-                read_home = _resident.get(account["name"], account["home"])
+                # WHERE THIS SLOT'S CREDENTIAL ACTUALLY IS, from the one
+                # estate resolver (2026-08-17 B2 repair, finding P1-3). Three
+                # answers matter here: a home (resident or canonical, exactly
+                # what the local map used to compute), the credential vault
+                # (an account resident in NO home, which the local map cannot
+                # express and which used to read as auth_rotated_out with no
+                # numbers at all), and none. The local map stays as the
+                # fallback for any box the estate resolver cannot serve.
+                estate_dir, estate_kind = estate_credential_dir(account["name"])
+                if estate_kind == "none":
+                    # A standing fact, not an absence that heals: no home and
+                    # no vault holds this account. Its own code, so the note
+                    # can tell an operator what to do about it instead of
+                    # claiming a rotation that did not happen.
+                    raise IdentityBindingError("no_credential_location")
+                read_home = estate_dir or _resident.get(
+                    account["name"], account["home"])
                 if read_home != account["home"]:
                     result["read_home_resident"] = True
                 identity = claude_identity(read_home)
@@ -1421,7 +1816,15 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 result["identity_verified"] = identity["verified"]
                 result["identity_method"] = identity["method"]
                 result["email"] = identity["email"]
-                result["plan"] = claude_plan(account["home"]) or "Unknown"
+                # THE TIER OF THE CREDENTIAL WE READ (2026-08-17 B2
+                # repair). This read the slot's own home, which for a rotated
+                # or vaulted account holds a different account's login, so the
+                # widget printed one account's tier beside another account's
+                # numbers. Informational only since Paul's ruling of
+                # 2026-08-17, which is exactly why it must not be wrong: an
+                # informational field nobody can act on is only ever read as
+                # a fact.
+                result["plan"] = claude_plan(read_home) or "Unknown"
                 result["subscription"] = {"status": "unknown",
                                           "source": "provider_not_exposed"}
                 expected = account.get("expected_email")
@@ -1462,6 +1865,8 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                         raise IdentityBindingError("auth_rotated_out")
                     if value == "claude_identity_check_failed":
                         raise IdentityBindingError("claude_identity_check_failed")
+                    if value == "no_credential_location":
+                        raise IdentityBindingError("no_credential_location")
                     # A 401 or 403 from the usage endpoint is the provider
                     # refusing the CREDENTIAL, a standing fact that only a
                     # re-login cures. Not a throttle: claude-ops sat behind a
@@ -1471,6 +1876,8 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                         raise IdentityBindingError("usage_http_401")
                     if value == "usage_http_403":
                         raise IdentityBindingError("usage_http_403")
+                    if value == "unpaid":
+                        raise IdentityBindingError("unpaid")
                     raise IdentityBindingError(value)
                 else:
                     if claude_backoff_until > now:
@@ -1639,10 +2046,24 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                     "account (the CLI refreshes its token) or `headroom auth "
                     f"refresh {account['name']}` to re-login; readings held "
                     "until then.")
+            elif error.code == "unpaid":
+                # The estate registry knows about the bill even when this
+                # config row does not, so the code arrives here as a raise.
+                # Without its own arm it fell to the generic else and shipped
+                # "run `headroom connect` to re-login" on the public feed,
+                # which is exactly the nagging Paul banned. Same words as the
+                # short-circuit above, because it is the same fact.
+                result["note"] = "unpaid; no reading expected until it is paid"
+                result["unpaid"] = True
+                result["routable"] = False
             elif error.code == "auth_rotated_out":
                 result["note"] = ("auth-rotated by declaration: this seat's "
                                   "credentials currently serve another "
                                   "account; not a re-auth condition")
+            elif error.code == "no_credential_location":
+                result["note"] = ("no live credential anywhere for this "
+                                  "account; rotate it back into a seat or "
+                                  "sign in again")
             elif error.code == "claude_identity_check_failed":
                 result["note"] = ("the Claude login in this seat cannot be "
                                   "verified (logged out or parked); sign in "
@@ -1675,6 +2096,11 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
             result["error"] = type(error).__name__ + ": " + str(error)[:120]
             result["note"] = "collector error; see private snapshot for detail"
         snapshot["accounts"].append(result)
+    # BEFORE apply_integrity, which is the call that turns `stale` into
+    # `routable`: a stale row whose own live statusline tee is fresh and above
+    # the routing floor is re-based on that tee, so a rescue can find a seat
+    # in the ~50 minutes of every hour when the collector's reading is old.
+    apply_session_truth_rescue(snapshot["accounts"])
     snapshot["integrity_warnings"] = apply_integrity(snapshot["accounts"])
     completed = int(time.time())
     snapshot["generated"] = completed
@@ -1693,7 +2119,9 @@ def redact_email(address):
     return (local[0] if local else "") + "***@" + domain
 
 
-SESSION_TRUTH_DIR = "/home/paulsportsza/ai-accounts/state/session-truth"
+# SESSION_TRUTH_DIR is defined with the other snapshot constants at the top of
+# this module (2026-08-17): the routing rescue and this projection fold read
+# the same directory, and two definitions of it is one place for them to drift.
 
 
 def _fold_session_truth(row):

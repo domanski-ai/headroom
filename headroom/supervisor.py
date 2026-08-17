@@ -646,6 +646,43 @@ class Child:
     context_last_hold: str = ""
 
 
+def resume_paste_line(account, rendered):
+    """``(line, pasteable)``: a resume line a human may paste, or a refusal.
+
+    THE RESOLVED CREDENTIAL DIRECTORY, NEVER THE REGISTRY HOME (2026-08-17
+    R5). Every operator facing resume line used to fall back from the
+    resolver to the account's registry home, and that fallback threw the
+    resolver's refusal away and substituted the registry home. For a vaulted
+    or location less account the registry home is the one directory known to
+    hold somebody else's chain, so pasting the line spends one account's 5h,
+    7d and Fable budget under another account's name, in a directory the
+    refresher does not touch for the account the line names. That is the
+    pile up this build exists to end, and it was printed by the SAME failure
+    that made the machine refuse: ``_environment`` raises for a vaulted
+    target, automatic recovery cannot start, and the manual instruction
+    printed next told the operator to defy the refusal.
+
+    So there is no fallback here either. When the resolver refuses there is
+    no honest command to print, and this answers with the refusal instead:
+    the account by name, where its credential actually is (the vault, or
+    nowhere), and the cure, which is rotating it back into a seat home. The
+    caller decides how to frame it; ``pasteable`` is False exactly when the
+    line is not a command.
+    """
+    directory = route.dispatch_dir(account)
+    if directory is not None:
+        return "CLAUDE_CONFIG_DIR=%s %s" % (shlex.quote(directory), rendered), True
+    # ONE OWNER FOR THE SENTENCE (2026-08-17, R5 repair). This belt was a
+    # sixth verbatim copy of route.UNDISPATCHABLE_LOCATION["none"] inside the
+    # build whose thesis is that this rule has one owner, and it is
+    # unreachable besides: dispatch_dir answers None only for a kind that is
+    # IN that dict, which is the same dict credential_location_reason reads.
+    reason = (route.credential_location_reason(account)
+              or route.UNDISPATCHABLE_LOCATION["none"])
+    return ("headroom: no resume command for %s: %s"
+            % (account.get("name") or "?", reason)), False
+
+
 @dataclass(frozen=True)
 class Recovery:
     """How to bring a session back when its REPLACEMENT could not be spawned.
@@ -663,7 +700,14 @@ class Recovery:
     reason: str = "context_backstop"
 
     def command(self):
-        """This recovery as a command a human can paste.
+        """The LINE half of paste_line: a command, or the refusal that
+        replaces it.
+
+        Not always a command (corrected 2026-08-17, R5 repair): since R5 this
+        returns paste_line()[0], which for an account whose credential is in
+        the vault is a refusal and not something to paste. Callers that print
+        it must read the flag, so nothing in headroom calls this any more and
+        only tests do; it survives as the one-value spelling of paste_line.
 
         Built from the stored argv itself, never re-derived: the argv already
         encodes both things a reconstruction gets wrong — the model a large
@@ -673,8 +717,18 @@ class Recovery:
         user document today, so the redaction is a no-op here — it is applied
         anyway so that "an argv headroom prints never reproduces a document"
         is a property of every renderer rather than an argument about one."""
-        return (f"CLAUDE_CONFIG_DIR={shlex.quote(self.account['home'])} "
-                + redacted_command(["claude"] + list(self.argv)))
+        return self.paste_line()[0]
+
+    def paste_line(self):
+        """``(line, pasteable)`` for this recovery.
+
+        The directory is the one the child ACTUALLY ran in, so an operator
+        pasting this line lands on the same credential the session was
+        spending. When that directory cannot be resolved the answer is a
+        refusal rather than the registry home: see resume_paste_line.
+        """
+        return resume_paste_line(
+            self.account, redacted_command(["claude"] + list(self.argv)))
 
 
 @dataclass(frozen=True)
@@ -2831,7 +2885,26 @@ class Supervisor:
 
     def _environment(self, account, generation, automatic):
         environment = collect.scrubbed_env()
-        environment["CLAUDE_CONFIG_DIR"] = account["home"]
+        # THE RESOLVED CREDENTIAL DIRECTORY, NEVER THE REGISTRY HOME
+        # (2026-08-17 R3). This launches the child, so it is the single most
+        # consequential copy of that rule on the estate, and it was the last
+        # one still reading account["home"]. Measured: dmux pid 1189983
+        # started at 12:58:43Z into homes/claude-mzansiedge, a home holding a
+        # superseded duplicate of claude-mzansiedge's chain that the refresher
+        # no longer touches, while the account's live chain sat in
+        # homes/claude-gmail. That lane would have stranded at the first
+        # refresh past 14:22Z. route.dispatch_dir asks the estate's one
+        # resolver and answers None only for a seat that must not be launched
+        # at all (a vault entry has no settings.json, so no hooks and no
+        # guard); block_reason refuses those long before here, and falling
+        # back to the registry home would reintroduce exactly this defect, so
+        # a None is a refusal, not a default.
+        launch_dir = route.dispatch_dir(account)
+        if launch_dir is None:
+            raise SupervisorError(
+                "%s has no seat home to launch in: %s"
+                % (account["name"], route.credential_location_reason(account)))
+        environment["CLAUDE_CONFIG_DIR"] = launch_dir
         if automatic:
             environment.update({
                 "HEADROOM_SUPERVISOR_ID": self.supervisor_id,
@@ -4516,16 +4589,31 @@ class Supervisor:
         # send the operator back to the child's default model, which after a
         # downgrade is the tier that just capped and after a context rotation
         # is a window the transcript no longer fits.
-        print("headroom: automatic recovery could not start Claude; run one of:",
-              file=sys.stderr)
         target_argv, _forced = _resume_argv_for(plan, model)
-        print(f"CLAUDE_CONFIG_DIR={shlex.quote(plan.target['home'])} "
-              f"{shlex.join(['claude'] + target_argv)}", file=sys.stderr)
         source_argv, _forced = _window_fit_argv(
             ["--resume", plan.source.session_id],
             plan.source.transcript_path, model=model)
-        print(f"CLAUDE_CONFIG_DIR={shlex.quote(plan.source.account['home'])} "
-              f"{shlex.join(['claude'] + source_argv)}", file=sys.stderr)
+        # Each line is either a command in that account's RESOLVED credential
+        # directory or the refusal that says why there is none. A registry
+        # home is never printed here (resume_paste_line): a vaulted target is
+        # one of the reasons automatic recovery could not start at all, so
+        # this print and that refusal come from the same failure.
+        lines = [resume_paste_line(account, shlex.join(["claude"] + argv))
+                 for account, argv in ((plan.target, target_argv),
+                                       (plan.source.account, source_argv))]
+        # THE LEAD IN COUNTS THE COMMANDS (2026-08-17, R5 repair). R5 made the
+        # other two lead ins depend on `pasteable` and left this one printing
+        # "run one of:" unconditionally, so an operator whose two seats are
+        # both unresolvable was invited to run one of two refusals.
+        commands = sum(1 for _line, pasteable in lines if pasteable)
+        print("headroom: automatic recovery could not start Claude; run one of:"
+              if commands > 1 else
+              "headroom: automatic recovery could not start Claude; run:"
+              if commands else
+              "headroom: automatic recovery could not start Claude, and "
+              "neither seat has a command to hand back:", file=sys.stderr)
+        for line, _pasteable in lines:
+            print(line, file=sys.stderr)
 
     def _idle_stop_edge(self, child, proof, expected_stat, label="preemptive"):
         """Last-instant idleness proof, immediately before SIGTERM.
@@ -5135,8 +5223,11 @@ class Supervisor:
             recovery = Recovery(child.account, ["--resume", session],
                                 str(getattr(binding, "cwd", "") or ""),
                                 session, reason="unrequested_death")
-            print(f"[headroom] to bring that conversation back, run:\n"
-                  f"{recovery.command()}", file=sys.stderr)
+            line, pasteable = recovery.paste_line()
+            print((f"[headroom] to bring that conversation back, run:\n"
+                   f"{line}") if pasteable else
+                  (f"[headroom] that conversation cannot be resumed by hand "
+                   f"as things stand:\n{line}"), file=sys.stderr)
         notify.emit({"event": "child_died_unrequested", "account": account,
                      "exit": returncode, "session": session})
 
@@ -5332,6 +5423,9 @@ class Supervisor:
         # spawned (see Recovery)
         pending_recovery = None
         manual_resume = ""
+        # False whenever `manual_resume` is a refusal rather than a command,
+        # so the lead in never says "run:" over a line nobody can run.
+        manual_resume_pasteable = False
         last_exit = 0
         clean_exit = False
         try:
@@ -5449,7 +5543,8 @@ class Supervisor:
                         # command instead drops a model the transcript
                         # requires and re-adds a fork that a degraded stop
                         # already ruled unsafe
-                        manual_resume = failed.command()
+                        manual_resume, manual_resume_pasteable = \
+                            failed.paste_line()
                         continue
                     print(f"headroom: {error}", file=sys.stderr)
                     if recovery_plan is not None:
@@ -5459,7 +5554,10 @@ class Supervisor:
                         # the recovery above could not start either: leave the
                         # user the one command that gets their conversation back
                         print("headroom: automatic recovery could not start "
-                              "Claude; run:", file=sys.stderr)
+                              "Claude; run:" if manual_resume_pasteable else
+                              "headroom: automatic recovery could not start "
+                              "Claude, and there is no command to hand back:",
+                              file=sys.stderr)
                         print(manual_resume, file=sys.stderr)
                     clean_exit = True
                     return 127
@@ -5474,6 +5572,7 @@ class Supervisor:
                 recovery_plan = None
                 pending_recovery = None
                 manual_resume = ""
+                manual_resume_pasteable = False
                 # the active child now exists on `child.account`: hold exactly
                 # its lease. After a rotation this releases the OLD source
                 # lease (kept until the target spawned, per _lease_target);

@@ -224,27 +224,33 @@ def _contained_transcript(path, session_id, account):
             raise HandoffError("source transcript is not a regular file")
     except OSError as error:
         raise HandoffError("cannot stat source transcript") from error
-    projects_path = os.path.join(registry.expand(account["home"]), "projects")
-    if os.path.islink(projects_path):
-        raise HandoffError("source projects directory is a symlink")
-    projects = os.path.realpath(projects_path)
-    try:
-        inside = os.path.commonpath((canonical, projects)) == projects
-    except ValueError:
-        inside = False
-    if not inside or canonical == projects:
-        raise HandoffError(
-            f"session {session_id} is not inside the account's projects directory")
-    return canonical
+    for directory in account_directories(account):
+        projects_path = os.path.join(directory, "projects")
+        if os.path.islink(projects_path):
+            raise HandoffError("source projects directory is a symlink")
+        projects = os.path.realpath(projects_path)
+        try:
+            inside = os.path.commonpath((canonical, projects)) == projects
+        except ValueError:
+            inside = False
+        if inside and canonical != projects:
+            return canonical
+    raise HandoffError(
+        f"session {session_id} is not inside the account's projects directory")
 
 
 def _account_for_path(path, accounts, config_dir=""):
     canonical = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
-    config_home = registry.expand(config_dir) if config_dir else ""
-    ordered = sorted(accounts, key=lambda account:
-                     registry.expand(account["home"]) != config_home)
-    for account in ordered:
-        projects = os.path.realpath(os.path.join(account["home"], "projects"))
+    # RANK BY DIRECTORY, NOT BY ACCOUNT (2026-08-17 R4). One directory can be
+    # named by two accounts at once: a rotated account resolves TO another
+    # account's home, and that home's registered owner still names it too. The
+    # account whose credential actually lives there has to win, or a lane is
+    # attributed to the seat it borrowed rather than the one it spends. So
+    # every account's resolved directory is tried before any account's
+    # registry home. directory_owners is that ranking, and it is now the only
+    # copy of it in this module (R5).
+    for directory, account in directory_owners(accounts, config_dir).items():
+        projects = os.path.realpath(os.path.join(directory, "projects"))
         try:
             if os.path.commonpath((canonical, projects)) == projects:
                 return account
@@ -286,18 +292,104 @@ def _ambiguity(rows, now):
 
 def _filesystem_matches(session_id, accounts):
     matches = []
-    for account in accounts:
+    # ONE DIRECTORY, ONE OWNER, ONE HIT (2026-08-17 R5). Walking accounts and
+    # then their directories reached a shared directory once per account, so
+    # a single transcript under a rotated home returned twice and the caller
+    # refused it as an ambiguity. `seen` keeps that property true of the
+    # FILE as well, whatever nesting the directories have.
+    seen = set()
+    for directory, account in directory_owners(accounts).items():
         if account.get("provider") != "claude":
             continue
-        pattern = os.path.join(account["home"], "projects", "**",
+        pattern = os.path.join(directory, "projects", "**",
                                session_id + ".jsonl")
         for path in glob.glob(pattern, recursive=True):
             try:
-                matches.append((_contained_transcript(path, session_id, account),
-                                account))
+                canonical = _contained_transcript(path, session_id, account)
             except HandoffError:
                 continue
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            matches.append((canonical, account))
     return matches
+
+
+def _ledger_source_slot(session_id):
+    """The slot the handoff ledger says this session came FROM, or "".
+
+    THE NEWEST ROW THAT NAMES A SLOT, NOT THE NEWEST ROW (2026-08-17, R5
+    repair). One automatic handoff writes five rows under one handoff_id and
+    the last of them, `resume_spawned`, carries target_slot and no
+    source_slot at all. Reading `max(rows)` therefore answered None for every
+    COMPLETED handoff, which is the shape almost every row on this estate is
+    in, so the tie breaker below dead ended on the common case while looking
+    like it worked. Measured on the live ledger: of 33 sessions with a second
+    copy on disk, 11 refused for this reason alone.
+    """
+    rows = [row for row in _read_jsonl(_ledger_path(), "handoff ledger")
+            if (row.get("old_session_id") or row.get("session_id")) == session_id
+            and isinstance(row.get("source_slot"), str) and row["source_slot"]]
+    return max(rows, key=_timestamp)["source_slot"] if rows else ""
+
+
+def _ledger_claimed_match(session_id, matches, accounts):
+    """The match the ledger's source slot claims on disk, or None.
+
+    BY DIRECTORY, NOT BY OWNER NAME (2026-08-17, R5 repair). The ledger names
+    a registry SLOT. R5 made one directory answer to one OWNER, the account
+    whose credential is in it, so on a rotated estate the owner of a slot's
+    own home is somebody else and `account["name"] == source_slot` can never
+    match again: the manual rescue R5 opened for a single copy shut for every
+    session that has two. What a slot identifies on disk is a set of
+    DIRECTORIES, so the claim is matched there, best claim first, and
+    `_source` re derives the owner exactly as it does on every other path.
+
+    Measured on the live ledger and the live homes: five sessions whose
+    source slot is `gmail`, whose chain is in the vault, resolved before R5
+    and refused with "matched 2 configured transcripts" after it.
+
+    AND WHEN NO CLAIM MATCHES, SAY WHY (2026-08-17, X2, R5 residual P1). A
+    vaulted slot owns no directory, so when neither of its claims holds a copy
+    this dead ended and `resolve_source` printed "matched N configured
+    transcripts": a count, about the wrong thing, from which no operator can
+    work out that the source account's chain is parked in the vault and that
+    rotating it back into a home is the whole cure. The one sentence the
+    estate already uses for exactly that condition
+    (route.UNDISPATCHABLE_LOCATION, the same words `headroom env` and the
+    handoff target check print) is raised here instead.
+
+    IT RAISES ONLY WHERE IT USED TO ANSWER NOTHING. A vaulted slot whose
+    registry home DOES hold a copy still resolves, to the account that owns
+    that directory today, which is the case the R5 repair exists for and the
+    class above pins. Refusing that too would trade this defect for the one
+    it cured. And a resolver that cannot answer at all (no estate tree, a
+    codex seat) yields no reason, so the caller keeps today's behaviour: a
+    diagnostic never blocks a path it cannot judge.
+    """
+    slot = _ledger_source_slot(session_id)
+    if not slot:
+        return None
+    account = next((item for item in accounts
+                    if item.get("name") == slot), None)
+    if account is None:
+        return None
+    for directory, _rank in account_directory_claims(account):
+        projects = os.path.realpath(os.path.join(directory, "projects"))
+        for path, _owner in matches:
+            try:
+                inside = os.path.commonpath((path, projects)) == projects
+            except ValueError:
+                continue
+            if inside and path != projects:
+                return _source(path, session_id, accounts)
+    reason = route.credential_location_reason(account)
+    if reason:
+        raise HandoffError(
+            f"session {session_id} matched {len(matches)} configured "
+            f"transcripts and the handoff ledger says it came from {slot}, "
+            f"whose {reason}")
+    return None
 
 
 def resolve_source(session_id=None, accounts=None, cwd=None, now=None):
@@ -328,15 +420,9 @@ def resolve_source(session_id=None, accounts=None, cwd=None, now=None):
         if len(matches) == 1:
             return _source(matches[0][0], session_id, accounts)
         if len(matches) > 1:
-            ledger_hits = [row for row in
-                           _read_jsonl(_ledger_path(), "handoff ledger")
-                           if (row.get("old_session_id") or row.get("session_id"))
-                           == session_id]
-            if ledger_hits:
-                source_slot = max(ledger_hits, key=_timestamp).get("source_slot")
-                for path, account in matches:
-                    if account.get("name") == source_slot:
-                        return _source(path, session_id, accounts)
+            claimed = _ledger_claimed_match(session_id, matches, accounts)
+            if claimed is not None:
+                return claimed
             raise HandoffError(
                 f"session {session_id} matched {len(matches)} configured transcripts")
         if journal_error is not None:
@@ -366,10 +452,14 @@ def resolve_source(session_id=None, accounts=None, cwd=None, now=None):
 
     slug = _claude_slug(cwd)
     scanned = []
-    for account in accounts:
+    # Same one map, same reason (R5): reached per account, a rotated home
+    # listed the same session id twice under "pass --session UUID", and
+    # passing it hit the second refusal in _filesystem_matches.
+    seen = set()
+    for directory, account in directory_owners(accounts).items():
         if account.get("provider") != "claude":
             continue
-        pattern = os.path.join(account["home"], "projects", slug, "*.jsonl")
+        pattern = os.path.join(directory, "projects", slug, "*.jsonl")
         for path in glob.glob(pattern):
             candidate = os.path.splitext(os.path.basename(path))[0]
             if not _valid_uuid(candidate):
@@ -379,7 +469,10 @@ def resolve_source(session_id=None, accounts=None, cwd=None, now=None):
                 age = now - os.stat(canonical).st_mtime
             except (OSError, HandoffError):
                 continue
+            if canonical in seen:
+                continue
             if 0 <= age < MAX_SCAN_AGE:
+                seen.add(canonical)
                 scanned.append((canonical, account, age))
     if len(scanned) != 1:
         report = [{"session_id": os.path.splitext(os.path.basename(path))[0],
@@ -548,13 +641,153 @@ def select_target(source_slot, snapshot, family="claude", requested=None):
     return target
 
 
+def target_directory(target):
+    """WHERE this handoff may stage and launch, never the registry home.
+
+    THE FIFTH COPY (2026-08-17 R4, closing R3's P1-1 on both verifiers). R3
+    taught route.py, __main__.py and supervisor._environment that the registry
+    home is where an account BELONGS, not where its login lives, and missed
+    this module, which is the one that performs the estate's wall time rescue.
+    Two failures came out of that, both dated the same day.
+
+    1. `headroom handoff --to <rotated account>` execs claude with
+       CLAUDE_CONFIG_DIR set to a directory the refresher no longer touches,
+       so the rescued lane strands at the next token expiry: the exact defect
+       this build exists to end, on the path used to rescue a walled lane.
+    2. The supervisor's automatic handoff staged the conversation under the
+       registry home while R3's fixed launch started the child at the resolved
+       one, so a `claude --resume` came up where its transcript was not. A
+       lost conversation at a usage wall, which is the one moment the
+       machinery exists for.
+
+    Both are cured by asking ONE question in ONE place. A vault or a homeless
+    account REFUSES here rather than falling back: a vault entry carries no
+    settings.json, so a session launched there runs with no SessionStart hook,
+    no guard and no fan out gate, and the registry home of a rotated account
+    is the one directory known to hold somebody else's chain.
+
+    Re-resolved rather than pinned on the plan, deliberately: a rotation that
+    lands between plan and publish must be SEEN. It cannot be silently
+    straddled, because plan.target_home_stat pins (dev, ino) at plan time and
+    _target_dir_fd re-checks it at publish, so a directory that moved under a
+    handoff fails closed with a stat refusal.
+    """
+    directory = route.dispatch_dir(target)
+    if directory is None:
+        raise HandoffError(
+            "%s cannot receive a handoff: %s"
+            % (target.get("name"), route.credential_location_reason(target)))
+    return registry.expand(directory)
+
+
+def account_directories(account):
+    """Every directory that may hold this account's transcripts, best first.
+
+    The resolved credential directory comes first, because that is where a
+    session on this account runs today. The registry home comes second,
+    because that is where it ran before it was rotated and where its older
+    transcripts still sit. An account whose credential is in the vault, or
+    nowhere, answers with its registry home alone: a vault entry is not a seat
+    home and has no projects directory.
+
+    WHY A LIST AND NOT A DIRECTORY (2026-08-17 R4, reproduce lens P2-2). After
+    R3 a lane spending account A writes its transcripts under home B, so
+    binding a session to an account through account["home"]/projects alone
+    refused to hand off the very lanes R3 had just re-homed, and named every
+    one of their transcripts after B's registered owner.
+    """
+    return [directory for directory, _rank
+            in account_directory_claims(account)]
+
+
+def account_directory_claims(account):
+    """``[(directory, rank)]``: the same directories, each with its RANK.
+
+    Rank 0 is the resolved credential directory, where a session on this
+    account runs today. Rank 1 is the registry home, where it ran before it
+    was rotated and where its older transcripts still sit.
+
+    The rank is carried rather than inferred from the position (2026-08-17
+    R5), because the two are not the same thing. An account whose credential
+    is in the vault or nowhere has NO resolved directory, so its registry
+    home is first in the list while being a rank 1 claim, and a positional
+    reading would let it outrank the account whose chain actually lives in
+    that directory. On this estate that is not a corner case: rotating one
+    account's chain into another's home is what puts two accounts on one
+    directory in the first place.
+    """
+    claims = []
+    resolved = route.dispatch_dir(account)
+    if resolved:
+        claims.append((registry.expand(resolved), 0))
+    home = account.get("home")
+    if home:
+        expanded = registry.expand(home)
+        if all(expanded != directory for directory, _rank in claims):
+            claims.append((expanded, 1))
+    return claims
+
+
+def directory_owners(accounts, config_dir=""):
+    """The ONE directory to account map this module resolves paths with.
+
+    Keyed by ``os.path.realpath``, so one directory on disk is one entry no
+    matter how many accounts name it, and ordered best claim first, so
+    iterating it visits every resolved credential directory before any
+    registry home.
+
+    WHY ONE MAP (2026-08-17 R5). R4 gave every account a LIST of directories
+    and left the two scans consuming that list unranked and undeduplicated.
+    Once a rotated account resolves INTO another account's registry home,
+    both accounts reach the same file, and ONE transcript on disk is counted
+    twice: `headroom handoff --session <id>` refuses with "matched 2
+    configured transcripts" and the cwd scan prints the same session id twice
+    under "pass --session UUID". Both doors of the MANUAL rescue shut, and
+    each points at the other. `_account_for_path` had the ranked answer all
+    along, so the module also held two disagreeing directory to account maps;
+    this is the one map, and all three sites read it.
+
+    TIE BREAKING, AND WHAT IS NEW IN IT (corrected 2026-08-17, R5 repair;
+    the sentence here previously claimed the whole rule was preserved).
+    `_account_for_path` sorted on ONE key before R5: the account whose
+    directories include the caller's own CLAUDE_CONFIG_DIR first. That key is
+    preserved and still ranks first. The second key, a Claude account ahead of
+    a same rank non Claude one, is NEW here and changes behaviour: both scans
+    skip a directory whose owner is not a Claude account, so without it one
+    codex seat naming a directory could hide a real Claude transcript inside
+    it from `--session` and from the cwd scan alike. Registry order breaks
+    what is left, as before.
+    """
+    config_home = registry.expand(config_dir) if config_dir else ""
+    claims = {}
+    for account in accounts:
+        name = account.get("name")
+        if name:
+            claims[name] = account_directory_claims(account)
+
+    def preference(account):
+        directories = [directory for directory, _rank
+                       in claims.get(account.get("name"), [])]
+        return (config_home not in directories,
+                account.get("provider") != "claude")
+
+    ordered = sorted(accounts, key=preference)
+    owners = {}
+    for rank in (0, 1):
+        for account in ordered:
+            for directory, claim_rank in claims.get(account.get("name"), []):
+                if claim_rank == rank:
+                    owners.setdefault(os.path.realpath(directory), account)
+    return owners
+
+
 def destination_path(target_home, source_transcript, session_id):
     slug = os.path.basename(os.path.dirname(source_transcript))
     return os.path.join(target_home, "projects", slug, session_id + ".jsonl")
 
 
 def _preflight_destination(target, source, session_id):
-    home = registry.expand(target["home"])
+    home = target_directory(target)
     if not os.path.isdir(home):
         raise HandoffError(f"target home is missing or not a directory: {home}")
     projects = os.path.join(home, "projects")
@@ -632,7 +865,7 @@ def _target_snapshot_identity(snapshot, target):
 
 
 def _target_home_stat(target):
-    home = registry.expand(target["home"])
+    home = target_directory(target)
     try:
         metadata = os.stat(home, follow_symlinks=False)
     except OSError as error:
@@ -775,7 +1008,7 @@ def _write_marker_unlocked(plan, components, temporary, destination):
     if plan.provider == "codex":
         marker = {
             "schema": _RECOVERY_SCHEMA_V2, "handoff_id": plan.handoff_id,
-            "target_home": registry.expand(plan.target["home"]),
+            "target_home": target_directory(plan.target),
             "target_home_stat": list(plan.target_home_stat),
             "components": list(components),
             "temporary": temporary, "destination": destination,
@@ -785,7 +1018,7 @@ def _write_marker_unlocked(plan, components, temporary, destination):
         # Claude keeps the exact schema@1 marker it always wrote
         marker = {
             "schema": _RECOVERY_SCHEMA, "handoff_id": plan.handoff_id,
-            "target_home": registry.expand(plan.target["home"]),
+            "target_home": target_directory(plan.target),
             "target_home_stat": list(plan.target_home_stat),
             "slug": components[-1],
             "temporary": temporary, "destination": destination,
@@ -940,7 +1173,7 @@ def _publish_layout(plan):
 def _copy_publish_pending(plan):
     components, destination = _publish_layout(plan)
     temporary = ".handoff-" + plan.handoff_id + ".tmp"
-    with _target_dir_fd(registry.expand(plan.target["home"]), components,
+    with _target_dir_fd(target_directory(plan.target), components,
                         plan.target_home_stat, create=True):
         pass
     marker = _write_marker_unlocked(plan, components, temporary, destination)
@@ -1134,8 +1367,16 @@ def _validated_automatic_rows(rows):
 def verify_target_binding(plan):
     """Re-derive both pinned target identity components at the launch edge."""
     try:
+        # THE SNAPSHOT AND THE RE-DERIVATION MUST READ ONE DIRECTORY.
+        # plan.target_identity comes from the collector, which takes it at the
+        # RESOLVED directory; re-deriving it at the registry home compares two
+        # different chains and raises "target identity or credential changed
+        # since planning" for a seat where nothing changed and no recollect
+        # can help. That is the false diagnosis with the impossible cure that
+        # R3 removed from route.block_reason, and it was alive here, in the
+        # pre-spawn guard of the automatic rescue (2026-08-17 R4).
         current = collect.local_binding(
-            plan.target["provider"], plan.target["home"])
+            plan.target["provider"], target_directory(plan.target))
         expected = (plan.target_identity["account_fingerprint"],
                     plan.target_identity["credential_digest"])
     except Exception as error:
@@ -1353,7 +1594,7 @@ def commit_handoff(plan):
                         plan.target["home"], plan.source.session_id)
             else:
                 record["resume_command"] = resume_command(
-                    plan.target["home"], plan.source.session_id,
+                    target_directory(plan.target), plan.source.session_id,
                     plan.resume_model or plan.resume_family)
             try:
                 _append_ledger_unlocked(record)
@@ -1508,7 +1749,7 @@ def cmd_handoff(args):
         if options["print"]:
             return 0
         environment = collect.scrubbed_env()
-        environment["CLAUDE_CONFIG_DIR"] = target["home"]
+        environment["CLAUDE_CONFIG_DIR"] = target_directory(target)
         try:
             argv = resume_argv(result)
             verify_target_binding(plan)

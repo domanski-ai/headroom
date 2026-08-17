@@ -644,6 +644,18 @@ def _carry_lastgood_rows(value):
                 name = row.get("name")
                 if not isinstance(name, str) or not name:
                     continue
+                if row.get("unpaid") is True:
+                    # NEVER CARRY NUMBERS ONTO AN UNPAID SEAT (2026-08-17).
+                    # The carry exists so a rate-limited collector cannot
+                    # blank a seat that HAS a reading. An unpaid seat has no
+                    # reading by definition, and resurrecting last week's
+                    # percentages would show Paul capacity he is not paying
+                    # for. Drop any stored row for it too, so paying the bill
+                    # starts from a real read.
+                    if name in store:
+                        del store[name]
+                        changed = True
+                    continue
                 windows = row.get("windows")
                 windows = windows if isinstance(windows, dict) else {}
                 has_numbers = any(

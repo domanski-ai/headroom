@@ -489,7 +489,16 @@ def _dispatch(argv):
         if not account:
             print("# no account with proven headroom", file=sys.stderr)
             return 2
-        print(f"export {route.env_key(account)}={shlex.quote(account['home'])}"
+        # the RESOLVED credential directory, never the registry home: the
+        # estate rotates a chain into another seat's home in place, and
+        # lane-boot.sh:199 evals this line straight into a live agent
+        launch_dir = route.dispatch_dir(account)
+        if launch_dir is None:
+            print(f"# {account['name']}: "
+                  f"{route.credential_location_reason(account)}",
+                  file=sys.stderr)
+            return 2
+        print(f"export {route.env_key(account)}={shlex.quote(launch_dir)}"
               f"  # account={account['name']}")
         return 0
     if command in ("claude", "codex"):

@@ -690,6 +690,137 @@ def emit_reserved_override(account, fam, where):
         pass
 
 
+UNDISPATCHABLE_LOCATION = {
+    "vault": "credential is in the vault, not a seat home; rotate it into a "
+             "home to route it",
+    "none": "no seat home and no vault holds this account's credential; "
+            "rotate it back into a home or sign in",
+}
+
+
+def credential_dir(account):
+    """(directory, kind) for WHERE this account's credential actually is.
+
+    The registry home is where an account BELONGS, not where its login lives.
+    The estate rotates a chain into another seat's home IN PLACE, and
+    ai-accounts/bin/credloc.py is the one rule that says where it landed.
+    collect.py already reads the account there (collect.estate_credential_dir,
+    named not numbered: the line number this carried was stale before
+    2026-08-17 X2 and staler after it), so a router dispatching on the
+    registry home hands a lane
+    a directory the refresher no longer touches, and the lane strands at its
+    first token refresh. Same resolver, same directory, every path.
+
+    kind is "resident", "canonical" or "vault" when the resolver answered,
+    "none" when nothing holds this account's credential, and None when the
+    resolver could not answer at all (a codex seat, a box with no estate tree,
+    an unreadable registry), which means "keep today's behaviour".
+    """
+    if account.get("provider") != "claude":
+        return account.get("home"), None
+    directory, kind = collector.estate_credential_dir(
+        account["name"], expect_home=account.get("home"))
+    if kind is None:
+        return account.get("home"), None
+    if kind == "none":
+        return None, "none"
+    return directory or account.get("home"), kind
+
+
+def credential_location_reason(account):
+    """Why this account must not be dispatched at all, or None.
+
+    A vault entry is not a seat home: it carries no settings.json, so a lane
+    booted there runs with no SessionStart hook, no guard and no fan-out gate.
+    """
+    _, kind = credential_dir(account)
+    return UNDISPATCHABLE_LOCATION.get(kind)
+
+
+def dispatch_dir(account):
+    """The directory a launch may export, or None when it may not launch."""
+    directory, kind = credential_dir(account)
+    if kind in UNDISPATCHABLE_LOCATION:
+        return None
+    return directory
+
+
+def _corroborated_resident(directory, accounts):
+    """The account a directory's auth-resident marker names, IF corroborated.
+
+    The marker is an unauthenticated plain file, so it is believed here only
+    when the identity actually signed in inside that directory is that
+    account's. Same rule and same reason as ai-accounts/bin/guard.py
+    declared_resident and bin/fanout-gate.py resident_account: this answers
+    "whose budget does a session in this directory spend", where a stale or
+    forged marker must never be able to move the answer. No bound identity, or
+    one naming somebody else, means no marker, and the caller falls back to
+    the registry home, which is exactly today's behaviour.
+    """
+    resident = collector._auth_resident(directory)
+    if not resident:
+        return None
+    slot = resident[len("claude-"):] if resident.startswith("claude-") \
+        else resident
+    account = next((row for row in accounts
+                    if row.get("name") == slot), None)
+    if account is None or account.get("provider") != "claude":
+        return None
+    expected = str(account.get("expected_email") or "").strip().lower()
+    if not expected:
+        return None
+    try:
+        found = str(collector.claude_local_identity(directory).get("email")
+                    or "").strip().lower()
+    except Exception:  # noqa: BLE001 - no bound identity is simply no marker
+        return None
+    return account if found and found == expected else None
+
+
+def resident_account(directory, accounts):
+    """The account whose credential lives in DIRECTORY right now, or None.
+
+    THE REVERSE OF credential_dir, and the two have to agree or the pair lies
+    (2026-08-17 R4, closing R3's correctness finding P2-1). R3 taught every
+    launch path to EXPORT the resolved directory; this is the map back, and it
+    still compared the exported directory to each row's REGISTRY home. So for
+    the one kind of seat R3 fixed, a rotated account whose chain lives in
+    another home, the directory headroom itself had just printed mapped back
+    to a DIFFERENT account: the operator's pin was silently dropped, and the
+    refusal that followed named the home's registered owner rather than the
+    account the lane was actually spending.
+
+    Marker first (corroborated), registry home second. An unrotated estate,
+    which is every estate with no auth-resident.json anywhere, takes the
+    second arm and behaves exactly as it did before.
+    """
+    if not directory:
+        return None
+    target = registry.expand(directory)
+    account = _corroborated_resident(target, accounts)
+    if account is not None:
+        return account
+    for row in accounts:
+        home = row.get("home")
+        if home and registry.expand(home) == target:
+            return row
+    return None
+
+
+def routing_basis(snapshot_row):
+    """The named evidence a row is routable on, when it is not the ordinary one.
+
+    Today there is exactly one: "tee-fresh" (collect.apply_session_truth_rescue),
+    a row whose hourly collector reading had aged out and was re-based on the
+    seat's own live statusline tee. A rescue that routes on that evidence must
+    SAY so, in status and at launch, or the next operator reading the log has
+    no way to tell a first-hand reading from a second-hand one."""
+    if not isinstance(snapshot_row, dict):
+        return None
+    basis = snapshot_row.get("routing_basis")
+    return basis if isinstance(basis, str) and basis else None
+
+
 def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     """None when the account has proven headroom; otherwise why not.
 
@@ -728,6 +859,15 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     # since this snapshot was taken. Re-derive the identity currently bound in
     # the slot (local, no network) and hold if it no longer matches — otherwise
     # we'd launch the new identity on the old one's proven capacity.
+    # WHERE the credential is, before any check that re-derives it. A vaulted
+    # account has no seat home to boot into, and the identity re-derivation
+    # below would otherwise read the account's own home (which lawfully holds
+    # somebody else) and report "slot identity changed since snapshot,
+    # recollect": a false diagnosis with a cure that can never work, because
+    # the next collect reads the vault again.
+    location_reason = credential_location_reason(account)
+    if location_reason:
+        return location_reason
     identity = snapshot_row.get("identity")
     identity = identity if isinstance(identity, dict) else {}
     snap_fp = identity.get("account_fingerprint")
@@ -739,8 +879,10 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
         # require the credential binding too — a routable Claude row always has
         # one; its absence means stale/pre-binding state, so hold
         return "snapshot has no credential binding — recollect"
+    # the SAME directory collect.py snapshotted, so a lawfully rotated seat
+    # compares like with like instead of holding itself for ever
     current_fp, current_digest = collector.local_binding(account["provider"],
-                                                         account["home"])
+                                                         credential_dir(account)[0])
     if current_fp is None:
         return "cannot verify slot identity — recollect"
     if current_fp != snap_fp:
@@ -908,8 +1050,16 @@ MUST_DISARM_ERROR_CODES = frozenset({
     # heals neither, so neither may sit in the unreadable class.
     "auth_rotated_out",                 # credentials declared resident elsewhere
     "claude_identity_check_failed",     # the seat's login cannot be verified
+    # 2026-08-17 B2 repair: the estate cannot say where this account's
+    # credential is (nothing holds it, or two seats both claim it). Waiting
+    # heals neither shape, so it belongs here and not in the unreadable class.
+    "no_credential_location",
     "usage_http_401",                   # usage endpoint refused the credential
     "usage_http_403",                   # usage endpoint refused the credential
+    # Paul has not paid the seat (2026-08-17). The most standing fact of all:
+    # no amount of waiting pays a bill, so a caller must disarm rather than
+    # hold a session open for a reading that is never coming.
+    "unpaid",
 })
 
 
@@ -1144,13 +1294,12 @@ def env_pinned_account(fam):
         value = value.strip()
         if not value:
             return None
-        home = os.path.realpath(os.path.expanduser(value))
-        for account in registry.ordered_for(fam):
-            if os.path.realpath(account["home"]) == home:
-                return account
+        # resident_account, never a registry-home comparison: the value being
+        # mapped back is whatever THIS router exported, which for a rotated
+        # seat is another account's home (R4, R3 correctness P2-1)
+        return resident_account(value, registry.ordered_for(fam))
     except registry.RegistryError:
         return None
-    return None
 
 
 def write_launch_marker(mode, account, note=""):
@@ -1175,10 +1324,21 @@ def write_launch_marker(mode, account, note=""):
               "refusing to launch without the requested handshake",
               file=sys.stderr)
         return False
+    # NO REGISTRY HOME FALLBACK, HERE EITHER (2026-08-17, R5 repair). This
+    # was the tree's last site where a None from the resolver fell through to
+    # the account's registry home, the pattern R5 removed everywhere else and
+    # the one tests/test_credential_location.py now reads every module's AST
+    # for, which is why the comment describes it rather than spelling it. Both
+    # callers refuse a None before they reach it (route.py cmd_exec, and
+    # supervisor._spawn through _environment), so it cannot fire today, but a
+    # future caller of write_launch_marker would inherit a marker naming a
+    # directory the CLI was forbidden to launch into. An empty string is what
+    # the no-account case already writes and what a wrapper already handles.
+    launch_dir = dispatch_dir(account) if account else ""
     payload = {
         "mode": mode,  # "supervised" | "exec"
         "account": account["name"] if account else "",
-        "home": account["home"] if account else "",
+        "home": launch_dir or "",
         "note": note,
         "pid": os.getpid(),
         "written_at": time.time(),
@@ -1409,6 +1569,9 @@ def cmd_status(fam):
             head += " / %s %s" % (fam, collector.display_left(scoped))
         marker = "AVAIL" if reason is None else "skip "
         note = "" if reason is None else f"({reason})"
+        basis = routing_basis(rows.get(account["name"]))
+        if reason is None and basis:
+            note = f"({basis})"
         print(f"  {marker}  {account['name']:<18} {head:<40} {note}")
         if reason is None and chosen is None:
             chosen = account["name"]
@@ -1472,8 +1635,13 @@ def cmd_run(fam, command):
             print(f"[headroom] skip {account['name']}: {fresh_reason} (rechecked)",
                   file=sys.stderr)
             continue
+        launch_dir = dispatch_dir(account)
+        if launch_dir is None:
+            print(f"[headroom] skip {account['name']}: "
+                  f"{credential_location_reason(account)}", file=sys.stderr)
+            continue
         environment = collector.scrubbed_env()
-        environment[env_key(account)] = account["home"]
+        environment[env_key(account)] = launch_dir
         print(f"[headroom] running on {account['name']}", file=sys.stderr)
         try:
             process = subprocess.run(command, env=environment,
@@ -1712,11 +1880,21 @@ def _exec_routed(fam, command, launch_note=""):
         print(f"[headroom] slot lease unavailable ({error}); refusing to "
               f"launch — HEADROOM_SLOT_LEASE=1 fails closed", file=sys.stderr)
         return 2
+    launch_dir = dispatch_dir(account)
+    if launch_dir is None:
+        print(f"[headroom] refusing to launch {account['name']}: "
+              f"{credential_location_reason(account)}", file=sys.stderr)
+        return 2
     for var in collector.AUTH_OVERRIDE_VARS:
         os.environ.pop(var, None)
-    os.environ[env_key(account)] = account["home"]
-    print(f"[headroom] {fam} -> {account['name']} ({account['home']})",
-          file=sys.stderr)
+    os.environ[env_key(account)] = launch_dir
+    # a PURE read of the snapshot already on disk: this line is a label, and
+    # a label must never be the thing that spends a provider call or delays an
+    # exec by re-collecting
+    basis = routing_basis(_snapshot_accounts(
+        paths.load_json(paths.private_snapshot_path())).get(account["name"]))
+    print(f"[headroom] {fam} -> {account['name']} ({launch_dir})"
+          + (f" basis={basis}" if basis else ""), file=sys.stderr)
     emit_reserved_override(account, fam, "exec")
     if not write_launch_marker("exec", account, note=launch_note):
         return 2
@@ -1748,9 +1926,10 @@ def current_account(fam):
     default = "~/.claude" if provider == "claude" else "~/.codex"
     home = os.path.realpath(os.path.expanduser(os.environ.get(var, default)))
     try:
-        for account in registry.ordered_for(fam):
-            if os.path.realpath(account["home"]) == home:
-                return account
+        # same reverse map as the pin: cmd_rotate cools the account this
+        # session is actually spending, which for a rotated seat is not the
+        # account that owns the directory it runs in
+        return resident_account(home, registry.ordered_for(fam))
     except registry.RegistryError:
         pass
     return None
@@ -1787,5 +1966,10 @@ def cmd_rotate(fam):
         return 2
     print(f"rotated {current['name']} -> {successor['name']} ({fam}); "
           f"{current['name']} cools until {tfmt(reset)}")
-    print(f"export {env_key(successor)}={shlex.quote(successor['home'])}")
+    successor_dir = dispatch_dir(successor)
+    if successor_dir is None:
+        print(f"# {successor['name']} cannot be exported: "
+              f"{credential_location_reason(successor)}")
+        return 2
+    print(f"export {env_key(successor)}={shlex.quote(successor_dir)}")
     return 0
