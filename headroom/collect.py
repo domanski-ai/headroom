@@ -877,15 +877,18 @@ def external_claude_limits(name, identity, now):
     """The estate cron collector's verdict for this slot: a three-way ruling.
 
     Returns ``(verdict, value)``:
-      - ``("ingest", payload)`` — the cron pipeline has a fresh verified
-        reading; ``payload`` has the same shape as :func:`claude_limits` so
-        the caller's row assembly, trust derivation and window validation run
-        unchanged. Served only when the external row's login email matches
+      - ``("ingest", payload)`` — the cron pipeline has a verified reading,
+        fresh or old; ``payload`` has the same shape as :func:`claude_limits`
+        so the caller's row assembly, trust derivation and window validation
+        run unchanged. A reading older than EXTERNAL_CLAUDE_MAX_AGE arrives
+        with ``stale`` True and is rendered as a number with an age label,
+        never as a hold. Served only when the external row's login email matches
         the identity bound in THIS slot's credential, so a reading can never
         cross accounts. No ``source_identity_fingerprint`` — org pinning
         stays with real API reads.
       - ``("defer", retry_at)`` — the cron pipeline is ALIVE but its reading
-        for this slot is held/carryover/stale. Do NOT call the API: one held
+        for this slot is absent, malformed, throttle-carried, or marked stale
+        by the source itself. Do NOT call the API: one held
         pipeline means the provider is throttling, and independent callers
         rushing the retry window is what re-trips it. The caller raises the
         throttle path with ``retry_at`` so headroom's own carryover keeps the
@@ -955,8 +958,21 @@ def external_claude_limits(name, identity, now):
     captured = row.get("captured_at")
     if isinstance(captured, bool) or not isinstance(captured, (int, float)):
         return defer()
-    if captured > now + 60 or now - captured > EXTERNAL_CLAUDE_MAX_AGE:
+    if captured > now + 60:
         return defer()
+    # AN OLD READING IS NOT A RATE LIMIT (2026-08-17, readings repair). The
+    # estate cron collector refreshes each seat only when its own reading
+    # ages past CLAUDE_USAGE_TTL (3300s plus a per-seat stagger), by design,
+    # because a shorter TTL is the per-source-IP 429 spiral of 2026-08-08.
+    # This gate demanded 720s, so for most of every hour a seat the source
+    # called ok=True with a verified reading was rejected here, deferred, and
+    # stamped usage_source_rate_limited: a lie about a healthy seat, and the
+    # sentinel's usage-feed-blind alert fired on it three times an hour.
+    # A present, verified, old reading is INGESTED and marked stale, which the
+    # widget renders as the number with a grey age label (Paul's law: always
+    # show the numbers, label the age). Only an absent or malformed reading
+    # defers.
+    old_reading = now - captured > EXTERNAL_CLAUDE_MAX_AGE
     raw_windows = row.get("windows")
     if not isinstance(raw_windows, dict):
         return defer()
@@ -998,7 +1014,7 @@ def external_claude_limits(name, identity, now):
     return ("ingest", {
         "captured_at": int(captured),
         "source": "ai_accounts_snapshot",
-        "stale": False,
+        "stale": bool(old_reading),
         "windows": windows,
     })
 
