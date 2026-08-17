@@ -340,8 +340,19 @@ def project_dashboard(snapshot, evaluated_at=None, force_noncurrent_reason=None)
 
 
 def render_swiftbar(value, evaluated_at=None, force_noncurrent_reason=None,
-                    dashboard_href=None):
-    """Render the one trusted SwiftBar representation, including sentinel."""
+                    dashboard_href=None, projection=None):
+    """Render the one trusted SwiftBar representation, including sentinel.
+
+    `projection` lets a caller hand in a projection it has already built and
+    post-processed, instead of this function projecting the snapshot again.
+    That is how the served text stays identical to the served JSON: the
+    dashboard applies its never-blank last-good carry to the projection, and
+    before 2026-08-16 this function re-projected from the raw snapshot and threw
+    that work away, so /widget.txt showed "-- (held)" for the very seat
+    /widget.json and the dashboard page were showing a number for. Three
+    surfaces, one snapshot, three different answers. Omitted, behaviour is
+    exactly as before.
+    """
     href = _canonical_dashboard_href(dashboard_href) or DASHBOARD_HREF
     if value is None:
         return "\n".join([
@@ -353,7 +364,8 @@ def render_swiftbar(value, evaluated_at=None, force_noncurrent_reason=None,
             "Open dashboard | href=" + href,
             "",
         ])
-    widget = project(value, evaluated_at, force_noncurrent_reason)
+    widget = (projection if isinstance(projection, dict)
+              else project(value, evaluated_at, force_noncurrent_reason))
     summary = widget["headline"]
     avg5 = summary["avg_5h_left_percent"]
     avg7 = summary["avg_7d_left_percent"]

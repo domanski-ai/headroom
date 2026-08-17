@@ -1055,7 +1055,21 @@ function windowView(a,key){
   const left=currentWin&&Number.isFinite(w.left_percent)?w.left_percent:(limited&&w&&Number.isFinite(w.last_observed_left_percent)?w.last_observed_left_percent:null);
   const projTone=currentWin&&["green","yellow","orange","red"].includes(w.tone)?w.tone:null;
   const safeTone=projTone||(left!=null?tone(left):"unknown");
-  return{state:state,left:left,tone:safeTone};
+  /* THE LAST VERIFIED NUMBER, kept alongside the live one.
+     Paul, 2026-08-16: "it is so important that the readings are always accurate
+     AND AVAILABLE". Before this, any window the projection had demoted returned
+     left=null and the card printed "n/a", discarding a number that was sitting
+     right there in last_observed_left_percent. A seat 31 minutes past the
+     freshness window therefore looked identical to a seat nobody has been able
+     to read for a day, and both looked identical to a seat that never had a
+     reading at all. Three very different situations, one blank.
+     This never promotes anything: `left` is still null, so the tone stays
+     "unknown" and the meter stays grey. It only stops us throwing the evidence
+     away, and `seenAt` travels with it so the caller can print its age. */
+  const lastLeft=(left==null&&w&&Number.isFinite(w.last_observed_left_percent))
+    ?w.last_observed_left_percent:null;
+  const seenAt=w&&Number.isFinite(w.observed_at)?w.observed_at:null;
+  return{state:state,left:left,tone:safeTone,lastLeft:lastLeft,seenAt:seenAt};
 }
 function isCurrent(a){return displayState(a)==="current";}
 
@@ -1091,11 +1105,19 @@ function windowMarkup(account,key){
      LIMITED codex seat — 7d capped, 5h lifted — still reads "no 5h limit", and
      a non-codex absent window still fails closed to "n/a". */
   const absentLimit=!w&&!key.startsWith("scoped:")&&account.provider==="codex"&&displayState(account)!=="held";
-  const value=unknown?(absentLimit?"—":"n/a"):Math.round(left)+"% left";
-  const note=unknown?(absentLimit?"no "+key+" limit":(w?"reading unavailable":(key.startsWith("scoped:")?"no scoped cap":"no reading yet"))):untilReset(w.resets_at);
+  /* A demoted window still SHOWS its last verified number, greyed, with the
+     age underneath. Never a bare stale number (the age is always next to it)
+     and never a blank where a known number exists. */
+  const carried=unknown&&!absentLimit&&view.lastLeft!=null;
+  const value=unknown?(absentLimit?"—":(carried?Math.round(view.lastLeft)+"% left":"n/a")):Math.round(left)+"% left";
+  const note=unknown
+    ?(absentLimit?"no "+key+" limit"
+      :(carried?"last verified "+age(view.seenAt)
+        :(w?"reading unavailable":(key.startsWith("scoped:")?"no scoped cap":"no reading yet"))))
+    :untilReset(w.resets_at);
   return '<div class="win"><span class="win-name">'+esc(windowLabel(key))+
     '</span><span class="win-value tone-'+view.tone+'">'+esc(value)+"</span>"+
-    meterMarkup(left,view.tone)+'<p class="win-note">'+esc(note)+"</p></div>";
+    meterMarkup(carried?view.lastLeft:left,view.tone)+'<p class="win-note">'+esc(note)+"</p></div>";
 }
 // Calm, specific state per account. Codex reads its CLI's own telemetry, so
 // idle/limited are EXPECTED states — label them clearly, never as "broken".
@@ -1105,7 +1127,11 @@ function accountState(account){
     return{cls:"live",label:"Live",note:"observed "+age(account.captured_at)};
   }
   if(state==="limited")return{cls:"limited",label:"At limit",note:"window full · observed "+age(account.captured_at)};
-  if(state==="stale")return{cls:"held",label:"Stale",note:"last verified "+age(account.captured_at)};
+  /* Date the card from the reading it is actually displaying. A carried row
+     has no captured_at of its own (the collector never read it this cycle), so
+     age(undefined) printed "time unknown" on the very row whose whole job is to
+     say how old it is. Fall back to the newest observed_at among its windows. */
+  if(state==="stale")return{cls:"held",label:"Stale",note:"last verified "+age(lastSeenAt(account))};
   const code=account.error_code||"";
   const isCodex=account.provider==="codex";
   if(code==="codex_usage_limit"||/usage limit/i.test(account.note||""))
@@ -1117,6 +1143,20 @@ function accountState(account){
   if(isCodex&&/no .*telemetry|no rate_limits/i.test(account.note||""))
     return{cls:"idle",label:"Waiting",note:"run Codex once to start tracking"};
   return{cls:"held",label:"Held",note:account.note||account.error_code||"no verified reading"};
+}
+function lastSeenAt(a){
+  /* The age of the READING ON SCREEN, not of the row that delivered it.
+     captured_at is when the collector last wrote this row, which for a carried
+     row is a different (newer) instant than the measurement it is showing: the
+     gmail card printed "last verified 26m ago" over two windows both stamped
+     1h 34m. The windows carry the observation instant, so they are the honest
+     source; captured_at is the fallback for a row with no windows at all. */
+  const d=projected(a),w=(d&&d.windows)||{};
+  let best=null;
+  Object.keys(w).forEach(k=>{const o=w[k]&&w[k].observed_at;
+    if(Number.isFinite(o)&&(best==null||o>best))best=o;});
+  if(best!=null)return best;
+  return Number.isFinite(a&&a.captured_at)?a.captured_at:null;
 }
 function accountMarkup(account,columns){
   const s=accountState(account);

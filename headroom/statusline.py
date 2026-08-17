@@ -101,14 +101,17 @@ def _journal_session(payload, now=None):
         os.close(marker_fd)
 
 
-def color(used):
-    if used is None:
+def color(left):
+    # PAUL LAW 2026-08-10: batteries show LEFT — and the tone ladder reads
+    # like a battery too: green means a full tank. The old ladder took USED
+    # and painted a nearly-empty seat green.
+    if left is None:
         return DIM
-    if used < 50:
+    if left >= 50:
         return GREEN
-    if used < 75:
+    if left >= 25:
         return YELLOW
-    if used < 90:
+    if left >= 10:
         return ORANGE
     return RED
 
@@ -118,7 +121,8 @@ def window_text(windows, key, label):
     used = window.get("used_percent")
     if used is None:
         return f"{DIM}{label} ?{RESET}"
-    return f"{color(used)}{label} {round(used)}%{RESET}"
+    left = round(100 - float(used))
+    return f"{color(left)}{label} {left}% left{RESET}"
 
 
 def main():

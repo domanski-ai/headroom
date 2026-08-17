@@ -27,6 +27,157 @@ TEMPLATE = os.path.join(os.path.dirname(os.path.dirname(
 SERVE_MAX_AGE = paths.env_int("HEADROOM_SERVE_MAX_AGE", 300)
 FAILURE_BACKOFF_BASE = paths.env_int("HEADROOM_SERVE_FAILURE_BACKOFF_BASE", 5)
 FAILURE_BACKOFF_CAP = paths.env_int("HEADROOM_SERVE_FAILURE_BACKOFF_CAP", 300)
+# How long a CARRIED reading may still be presented as a live measurement.
+#
+# Paul set this number himself, twice: "As long as it's accurate within 60
+# minutes, I don't care. You must ALWAYS show me." Both halves are law, and
+# before 2026-08-16 only the second half was implemented - the carry had no
+# ceiling at all, so a reading of any age was served wearing its original
+# per-window state. Measured that morning: the `system` row was serving a
+# 29-hour-old "100% left" as state "current" (green, live) while that seat had
+# been unreadable since 2026-08-15T12:20Z, and codex-gmail was serving a
+# 6.4-day-old one. That is the failure Paul reported as "the readings are
+# inaccurate" - not a blank row, a CONFIDENT WRONG row, which is worse,
+# because a blank row makes him check and a green row makes him trust it.
+#
+# Past this ceiling the reading is still SHOWN (never blank) but it is shown as
+# what it is: demoted to "stale", the number moved to
+# last_observed_left_percent, and the row's own observed_at left intact so the
+# dashboard renders its "last verified <age> ago" line against it.
+CARRY_LIVE_MAX_AGE = paths.env_int("HEADROOM_CARRY_LIVE_MAX_AGE", 3600)
+
+# The statusline "tee": every live session writes its own provider rate_limits
+# header here, one file per seat, at most once a minute.
+# ~/.system/bin/usage-truth-merge.py folds these into the published feeds on a
+# two-minute cron. That cron is not enough on its own, and this is why:
+# the collector republishes the feed roughly every minute and publishes
+# BLINDNESS for any account the usage API is throttling, so for up to two
+# minutes out of every cycle a seat with a perfectly good live reading is blind
+# in the served file. Paul checks the widget at arbitrary moments; a recurring
+# window is a window he lands in, and he has landed in it repeatedly.
+#
+# So the fold is ALSO done here, in memory, at the moment of serving. Nothing
+# is written: this transforms the response only, the private snapshot the
+# ROUTER reads is untouched, and the cron remains the durable writer.
+SESSION_TRUTH_DIR = os.environ.get(
+    "HEADROOM_SESSION_TRUTH_DIR",
+    "/home/paulsportsza/ai-accounts/state/session-truth")
+SESSION_TRUTH_MAX_AGE = paths.env_int("HEADROOM_SESSION_TRUTH_MAX_AGE", 1800)
+
+
+def _session_truth(name):
+    """This seat's newest session-header reading, or None.
+
+    Tries both spellings because the two sides name seats differently: the
+    headroom registry uses the short name (mzansiedge) and the fleet writes the
+    alias (claude-mzansiedge).
+    """
+    for candidate in (name, "claude-%s" % name):
+        if not isinstance(candidate, str) or not candidate:
+            continue
+        try:
+            with open(os.path.join(SESSION_TRUTH_DIR,
+                                   candidate + ".json")) as handle:
+                truth = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if isinstance(truth, dict):
+            return truth
+    return None
+
+
+def _fold_session_truth(snapshot, now=None):
+    """Return a copy of the snapshot with fresh session-header readings folded in.
+
+    WHY A BLIND ROW MAY BE PROMOTED TO LIVE. The collector's `ok: false` means
+    "the usage API would not answer ME, just now". It is not evidence that the
+    account is unreadable or unhealthy, and headroom's own router already draws
+    that distinction ("the rate-limit CHECK being rate-limited is not evidence
+    of missing capacity"). A session header is a stronger reading than the one
+    that failed: it came back from the provider inside an authenticated live
+    session on that exact account, seconds ago, and it is the number the
+    statusline and DMUX are already showing. Refusing it here is what made
+    Paul's three surfaces contradict each other.
+
+    FAIL-CLOSED EVERYWHERE ELSE. A reading older than SESSION_TRUTH_MAX_AGE is
+    ignored, a reading OLDER than the row's own is ignored (an equal one is
+    re-folded on purpose, see the guard below), a malformed file is ignored, and
+    every original row is passed through untouched when there is nothing to
+    fold. Nothing here can invent a number.
+    """
+    now = time.time() if now is None else now
+    rows = snapshot.get("accounts") if isinstance(snapshot, dict) else None
+    if not isinstance(rows, list):
+        return snapshot
+    out = []
+    folded_any = False
+    for row in rows:
+        if not isinstance(row, dict):
+            out.append(row)
+            continue
+        truth = _session_truth(row.get("name"))
+        captured = (truth or {}).get("captured_at")
+        if (not isinstance(captured, (int, float))
+                or isinstance(captured, bool)
+                or now - captured > SESSION_TRUTH_MAX_AGE
+                or captured > now):
+            out.append(row)
+            continue
+        existing = row.get("captured_at")
+        existing = existing if isinstance(existing, (int, float)) else 0
+        # `<` not `<=`, deliberately. The two-minute cron merge folds the same
+        # tee reading into the published file and stamps the row's captured_at
+        # with it, but it leaves `ok: false` exactly as the collector wrote it.
+        # On the equal case an earlier cut of this function skipped the row, so
+        # the numbers were present and correct and the row was STILL held: the
+        # page printed a grey "last verified 6m ago" over a reading that was
+        # six minutes old and perfectly good, while the statusline and DMUX
+        # showed it live. Re-folding an identical reading is idempotent; what
+        # actually matters on this path is the promotion below.
+        if captured < existing:
+            out.append(row)
+            continue
+        windows = dict(row.get("windows") or {})
+        folded = False
+        for key in ("5h", "7d"):
+            source = (truth.get("windows") or {}).get(key)
+            if not isinstance(source, dict):
+                continue
+            used = source.get("used_percent")
+            if not isinstance(used, (int, float)) or isinstance(used, bool):
+                continue
+            window = dict(windows.get(key) or {})
+            window["used_percent"] = float(used)
+            if isinstance(source.get("resets_at"), (int, float)):
+                window["resets_at"] = float(source["resets_at"])
+            window["observed_at"] = int(captured)
+            window["truth_source"] = "session_header"
+            windows[key] = window
+            folded = True
+        if not folded:
+            out.append(row)
+            continue
+        merged = dict(row)
+        merged["windows"] = windows
+        merged["captured_at"] = int(captured)
+        merged["truth_source"] = "session_header"
+        merged["stale"] = False
+        # The reading is proven, so the row must be allowed to render as one.
+        # Left as published, `ok: false` / `trust_state: held` would make the
+        # projection hold the row and the page would print "n/a" over a number
+        # it is holding. The ORIGINAL verdict is preserved beside it rather
+        # than erased, so nothing downstream loses the collector's own finding.
+        merged["collector_ok"] = row.get("ok")
+        merged["collector_error_code"] = row.get("error_code")
+        merged["ok"] = True
+        merged["trust_state"] = "verified_local"
+        out.append(merged)
+        folded_any = True
+    if not folded_any:
+        return snapshot
+    result = dict(snapshot)
+    result["accounts"] = out
+    return result
 
 
 def display_snapshot(snapshot, evaluated_at=None, force_noncurrent_reason=None,
@@ -37,8 +188,25 @@ def display_snapshot(snapshot, evaluated_at=None, force_noncurrent_reason=None,
     # Remove any stale/cached payload before consulting one exact config view.
     value.pop("token_stats", None)
     value.pop("token_stats_enabled", None)
-    value["_headroom_display"] = widget.project_dashboard(
-        snapshot, evaluated_at, force_noncurrent_reason)
+    value["_headroom_display"] = _carry_lastgood_rows(widget.project_dashboard(
+        snapshot, evaluated_at, force_noncurrent_reason))
+    # THE DASHBOARD CARDS GET THE SAME NEVER-BLANK CARRY AS THE MENUBAR.
+    #
+    # 2026-08-16: the carry was wired to /widget.json only, and /widget.json is
+    # read by the SwiftBar/menubar contract - NOT by the page Paul actually
+    # opens at 127.0.0.1:8377. Its cards render from this payload instead, so
+    # the one surface he was complaining about was the one surface the
+    # protection never reached. Measured that morning, his `system` card read
+    # "n/a / no reading yet" under the note "usage source temporarily
+    # rate-limited", while that account's last verified numbers had been on
+    # disk for 29 hours and the real cause was an expired login, not a
+    # throttle. Two protections on the two surfaces nobody was looking at, and
+    # none on the third.
+    #
+    # The row count is preserved by the carry (rows are replaced in place, never
+    # added or dropped), which the page's own validate() requires: it rejects
+    # the whole payload when display.accounts.length !== data.accounts.length,
+    # and the client joins __display to each raw account BY INDEX.
     try:
         live_config = registry.load() if config is None else config
         enabled = registry.token_stats_enabled(live_config)
@@ -387,10 +555,19 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         stale_failed = result.refresh_failed \
             and not _within_freshness_window(result.snapshot)
         reason = result.reason if stale_failed else None
+        # Fold live session-header readings before ANY of the three routes
+        # project, so the page, the widget JSON and the SwiftBar text can never
+        # disagree with each other or with the statusline about the same seat.
+        # In memory only: nothing is written and the router's private snapshot
+        # is untouched.
+        try:
+            served = _fold_session_truth(result.snapshot)
+        except Exception:
+            served = result.snapshot  # a freshness upgrade may never break serving
         try:
             if route == "/usage.json":
                 value = display_snapshot(
-                    result.snapshot, force_noncurrent_reason=reason)
+                    served, force_noncurrent_reason=reason)
                 if stale_failed:
                     value["refresh_failed"] = True
                 if result.refresh_failed:
@@ -402,16 +579,20 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                                   separators=(",", ":")).encode("utf-8")
                 content_type = "application/json"
             elif route == "/widget.json":
-                value = widget.project(result.snapshot,
+                value = widget.project(served,
                                        force_noncurrent_reason=reason)
                 value = _carry_lastgood_rows(value)
                 body = json.dumps(value, allow_nan=False,
                                   separators=(",", ":")).encode("utf-8")
                 content_type = "application/json"
             else:
+                # Same projection, same carry, same numbers as /widget.json.
                 body = widget.render_swiftbar(
-                    result.snapshot, force_noncurrent_reason=reason,
-                    dashboard_href=self._dashboard_href()).encode("utf-8")
+                    served, force_noncurrent_reason=reason,
+                    dashboard_href=self._dashboard_href(),
+                    projection=_carry_lastgood_rows(widget.project(
+                        served, force_noncurrent_reason=reason))
+                    ).encode("utf-8")
                 content_type = "text/plain; charset=utf-8"
         except (TypeError, ValueError, OverflowError):
             body = (widget.render_swiftbar(
@@ -483,27 +664,62 @@ def _carry_lastgood_rows(value):
                     saved = store[name]
                     carried = json.loads(json.dumps(saved.get("row") or {}))
                     age = int(now - (saved.get("saved_at") or now))
-                    if age <= 3600:
-                        # PAUL'S LAW, verbatim: "As long as it's accurate
-                        # within 60 minutes, I don't care." A sub-hour
-                        # reading renders LIVE (colored), not grey — the row
-                        # keeps its stored current state and live percents.
-                        pass
-                    else:
-                        # Older than his tolerance: the contract's stale
-                        # dialect — number preserved in last_observed, grey
-                        # with honest age.
-                        carried["state"] = "stale"
-                        for w in (carried.get("windows") or {}).values():
-                            if not isinstance(w, dict):
-                                continue
-                            left = w.get("left_percent")
-                            if left is not None:
-                                w["last_observed_left_percent"] = left
-                            w["left_percent"] = None
-                            w["state"] = "stale"
+                    # PAUL'S LAW, restated 2026-08-08 and now absolute:
+                    # "If something is greyed out there should never be
+                    # anything grayed out ever. It should always clearly show
+                    # me what the situation is. If it's greyed out it means it
+                    # is fundamentally broken at its core."
+                    #
+                    # Grey is therefore RESERVED for genuinely-unknown, and a
+                    # number we hold IS known. A carried row keeps its live
+                    # colour and its percentages at every age; the honesty
+                    # lives in the row's own "last verified N ago" line, which
+                    # the renderer derives from observed_at. The previous cut
+                    # greyed anything over an hour, which is how correct codex
+                    # numbers (97% / 38%, verified against the collector) read
+                    # to Paul as a broken feed.
                     carried["carried_seconds"] = age
                     carried["served_from"] = "lastgood"
+                    # EVERY ROW SAYS WHERE ITS NUMBER CAME FROM AND HOW OLD IT
+                    # IS. Additive fields only - the widget contract's required
+                    # keys are untouched, and hrValidFeed ignores extras - so
+                    # every existing consumer (the dashboard page, DMUX's
+                    # seat-usage.py, the SwiftBar text) keeps reading exactly
+                    # what it read before.
+                    carried["reading_source"] = "lastgood"
+                    carried["reading_age_seconds"] = age
+                    # A CARRIED ROW IS ALWAYS MARKED STALE, AT EVERY AGE.
+                    #
+                    # It was tempting to demote only past CARRY_LIVE_MAX_AGE and
+                    # let a recent carry keep its live look. That is wrong twice.
+                    #
+                    # It is wrong in FACT: the collector did not read this
+                    # account this cycle. That is what "carried" means. A row
+                    # wearing state "current" is claiming a live measurement,
+                    # and there isn't one.
+                    #
+                    # It is wrong in PRACTICE, which is how it was caught: the
+                    # dashboard's displayState() ages a row off the RAW
+                    # account's captured_at, and a rate-limited raw row has no
+                    # captured_at at all. So a row left "current" was demoted to
+                    # "held" by the client anyway, and "held" renders the number
+                    # as "n/a" - the carry did all its work and Paul still saw a
+                    # blank. Demoting here puts the number in
+                    # last_observed_left_percent, which is the one place every
+                    # renderer on both surfaces already looks for a number it is
+                    # allowed to show greyed.
+                    #
+                    # So: the badge tells the truth (STALE), the number is
+                    # visible, and the age is printed beside it. Accurate AND
+                    # available, which is the whole of what Paul asked for.
+                    widget._demote_windows(carried.get("windows") or {},
+                                           "stale")
+                    carried["state"] = "stale"
+                    carried["reading_note"] = (
+                        ("no live reading for %d minutes; showing the last "
+                         "verified one" % (age // 60))
+                        if age > CARRY_LIVE_MAX_AGE
+                        else "last verified %d minutes ago" % (age // 60))
                     accounts[index] = carried
             if changed:
                 tmp = store_path + ".tmp"

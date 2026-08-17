@@ -649,11 +649,21 @@ def seats(fallback_path=None, environ=None):
         if not isinstance(row, dict) or not row.get("name"):
             continue
         windows = row.get("windows")
+        fable_u = _window_used(windows, "fable")
+        five_u = _window_used(windows, "5h")
+        seven_u = _window_used(windows, "7d")
         out.append({
             "name": names.get(row["name"], row["name"]),
-            "fable_used": _window_used(windows, "fable"),
-            "five_h_used": _window_used(windows, "5h"),
-            "seven_d_used": _window_used(windows, "7d"),
+            # used fields stay for existing parsers (domanski-ops zod schema,
+            # cappedWindows threshold logic — correct as USED); the *_left
+            # twins are the battery-law additions (Paul 2026-08-10): anything
+            # that RENDERS a number renders LEFT and can now read it directly.
+            "fable_used": fable_u,
+            "five_h_used": five_u,
+            "seven_d_used": seven_u,
+            "fable_left": None if fable_u is None else round(100 - fable_u, 1),
+            "five_h_left": None if five_u is None else round(100 - five_u, 1),
+            "seven_d_left": None if seven_u is None else round(100 - seven_u, 1),
         })
     out.sort(key=lambda seat: seat["name"])
     return out

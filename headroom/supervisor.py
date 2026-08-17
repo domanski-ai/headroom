@@ -5691,6 +5691,7 @@ def cmd_claude(family, args, fallback_argv=None):
         if account is not None:
             print(f"[headroom] {family} -> {account['name']} "
                   f"({account['home']})", file=sys.stderr)
+            route.emit_reserved_override(account, family, "supervised")
             # the wrapper handshake (route.write_launch_marker) is written
             # inside _spawn, immediately before the first Popen — after
             # settings/argv/env preparation, so a marker can never exist
