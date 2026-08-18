@@ -19,6 +19,59 @@ TEXT_SCHEMA = "headroom_widget_txt@1"
 WINDOW_KEYS = ("5h", "7d")
 SNAPSHOT_MAX_AGE = paths.env_int("HEADROOM_SNAPSHOT_MAX_AGE", 900)
 OBSERVATION_MAX_AGE = paths.env_int("HEADROOM_OBSERVATION_MAX_AGE", 1800)
+SCOPED_PREFIX = "scoped:"
+# THE COLLECTOR'S CADENCE IS THE SCOPED POOL'S ONLY CLOCK (2026-08-18).
+#
+# Paul, 05:2xZ: "Why is the Domanski system not reading on the widgets ... why
+# do we still have dead readings." Measured that morning on the live feed:
+# account `system` showed 5h and 7d CURRENT and `scoped:Fable` STALE, observed
+# 04:10Z, 54 minutes old. Two other seats were the same.
+#
+# The cause is a bar set against the wrong evidence, not a broken reading.
+# 5h and 7d have a PER-TURN source: every live agent's statusline tees the
+# provider's own rate_limit headers to ~/ai-accounts/state/session-truth and
+# collect.apply_session_truth_rescue folds them into the row, so demanding
+# those windows be under 30 minutes old is a bar they can actually clear.
+# A model-scoped weekly pool has no such source. Its ONLY producer is the
+# ai-accounts cron collector, which re-reads a given account roughly once
+# every 50 minutes because the usage API rate-limits per source IP and the
+# 2026-08-08 breach cost the estate two days of blind meter. Judging a source
+# that refreshes on a ~50-minute cadence against a 30-minute bar means the
+# gauge is dark for most of every hour BY ARITHMETIC. It had been since the
+# 2026-08-09 budget halving, and nobody had wired the two numbers together.
+#
+# So the scoped windows get their own ceiling, and the ceiling is Paul's own
+# 60-minute accuracy law PLUS this server's own serve cache. The collector
+# side was moved in the same change (ai-accounts/bin/collect.py: rank over
+# paid Claude seats only, TTL 2400, stagger 120): its worst SERVED age,
+# measured as the age of the reading about to be replaced, is exactly 3600 s
+# (verifier P1, 2026-08-18; the build first claimed 3000 by measuring after
+# the refresh). That is the arithmetic floor for five paid seats on one call
+# per 600 s cron run, so the collector sits AT the law, not inside it. On top
+# of that, /widget.json is served through RefreshGate with success_ttl
+# SERVE_MAX_AGE (300 s), so a reading the collector lawfully serves at 3599 s
+# can be shown at 3899 s. A ceiling of 3600 here would call that lawful
+# reading dead for up to five minutes a cycle on four seats, the exact
+# flicker Paul reported at a different scale. So the ceiling is the law plus
+# the serve cache: 3600 + 300. The two collector constants and this one are a
+# TRIPLE with SERVE_MAX_AGE: raising any of them without re-running
+# simulate_claude_refresh is the defect coming back.
+SCOPED_OBSERVATION_MAX_AGE = paths.env_int(
+    "HEADROOM_SCOPED_OBSERVATION_MAX_AGE", 3600 + 300)
+# WHAT THE ACCOUNT ROW'S `stale` FLAG MEANS AFTER THIS CHANGE.
+#
+# collect.external_claude_limits stamps stale=True when the ingested reading is
+# older than EXTERNAL_CLAUDE_MAX_AGE (720 s), and collect.apply_integrity turns
+# that flag into trust_state "stale_observation". That flag is an AGE statement
+# about the ACCOUNT-WIDE 5h and 7d numbers, measured against the bar those
+# windows can clear because they have a per-turn source. It is not, and never
+# was, a statement about the scoped weekly pool, whose clock is 50 minutes
+# long. So a scoped window re-judges "stale_observation" against its own
+# observed_at and its own ceiling, and every OTHER non-verified trust state
+# (held, duplicate_identity, dashboard_only) still holds it closed: those are
+# correctness verdicts, staleness is not. This is the same distinction the
+# statusline made on 2026-08-10 when the Fable gauge went dark there.
+SCOPED_AGE_TRUST_STATES = ("verified", "verified_local", "stale_observation")
 DASHBOARD_HREF = "http://127.0.0.1:8377/"
 
 
@@ -84,7 +137,19 @@ def _is_unpaid(account):
                  or account.get("error_code") == "unpaid"))
 
 
-def _account_base_state(account, freshness, evaluated_at):
+def _account_base_state(account, freshness, evaluated_at, scoped=False):
+    """The row's trust verdict, as the account-wide windows see it.
+
+    ``scoped=True`` answers the same question for a model-scoped weekly
+    window, which differs in exactly two places and nowhere else: the age bar
+    is SCOPED_OBSERVATION_MAX_AGE, and the ``stale`` flag (with the
+    trust_state "stale_observation" it produces) is read as the age statement
+    it is rather than as a correctness verdict. Every correctness gate below
+    is shared, so a scoped window can never render on evidence the
+    account-wide windows would have refused: not ok, wrong or unverifiable
+    identity, a missing or future capture time, or a snapshot the feed itself
+    cannot vouch for all still hold it closed.
+    """
     if freshness["state"] == "held":
         return "held"
     if freshness["state"] == "stale":
@@ -94,18 +159,24 @@ def _account_base_state(account, freshness, evaluated_at):
     # the display layer must accept exactly the trust states the router
     # routes on (route.block_reason): a slot verified via local credential
     # binding is routable and must not render as held
-    if account.get("trust_state") not in ("verified", "verified_local"):
+    trusted = SCOPED_AGE_TRUST_STATES if scoped else ("verified",
+                                                      "verified_local")
+    if account.get("trust_state") not in trusted:
         return "held"
     captured_at = _epoch(account.get("captured_at"))
     if captured_at is None or captured_at > evaluated_at:
         return "held"
-    if account.get("stale") is True \
-            or evaluated_at - captured_at > OBSERVATION_MAX_AGE:
+    max_age = SCOPED_OBSERVATION_MAX_AGE if scoped else OBSERVATION_MAX_AGE
+    if evaluated_at - captured_at > max_age:
+        return "stale"
+    if not scoped and account.get("stale") is True:
         return "stale"
     return "current"
 
 
-def _window_projection(raw, captured_at, base_state, evaluated_at):
+def _window_projection(raw, captured_at, base_state, evaluated_at,
+                       max_age=None):
+    max_age = OBSERVATION_MAX_AGE if max_age is None else max_age
     resets_at = _epoch(raw.get("resets_at")) \
         if isinstance(raw, dict) else None
     observed_at = None
@@ -125,7 +196,7 @@ def _window_projection(raw, captured_at, base_state, evaluated_at):
     elif base_state == "held":
         state = "held"
     elif base_state == "stale" \
-            or evaluated_at - observed_at > OBSERVATION_MAX_AGE:
+            or evaluated_at - observed_at > max_age:
         state = "stale"
     elif used_percent >= 100:
         state = "limited"
@@ -142,8 +213,19 @@ def _window_projection(raw, captured_at, base_state, evaluated_at):
     }
 
 
-def _demote_windows(windows, state):
-    for window in windows.values():
+def _demote_windows(windows, state, keep=()):
+    """Grey every window to ``state`` and park its number as last-observed.
+
+    ``keep`` names windows that survived the demotion on their OWN evidence.
+    It exists for model-scoped pools: the account row is demoted because its
+    5h/7d reading aged past a bar those windows can clear, and applying that
+    verdict to a weekly pool whose only producer refreshes hourly is the
+    2026-08-18 dead-gauge defect. Nothing else may be kept, and a caller that
+    passes nothing gets exactly the old behaviour.
+    """
+    for key, window in windows.items():
+        if key in keep:
+            continue
         if _number(window.get("left_percent")):
             window["last_observed_left_percent"] = window["left_percent"]
         window["left_percent"] = None
@@ -202,6 +284,8 @@ def project(snapshot, evaluated_at=None, force_noncurrent_reason=None):
         raw = raw if isinstance(raw, dict) else {}
         captured_at = _epoch(raw.get("captured_at"))
         base_state = _account_base_state(raw, freshness, evaluated_at)
+        scoped_base_state = _account_base_state(raw, freshness, evaluated_at,
+                                                scoped=True)
         raw_windows = raw.get("windows")
         raw_windows = raw_windows if isinstance(raw_windows, dict) else {}
         windows = {}
@@ -226,10 +310,11 @@ def project(snapshot, evaluated_at=None, force_noncurrent_reason=None):
         # drive the ACCOUNT state below: a scoped model cap does not block
         # the account's other models
         for key, raw_window in raw_windows.items():
-            if isinstance(key, str) and key.startswith("scoped:") \
+            if isinstance(key, str) and key.startswith(SCOPED_PREFIX) \
                     and key not in windows:
                 windows[key] = _window_projection(
-                    raw_window, captured_at, base_state, evaluated_at)
+                    raw_window, captured_at, scoped_base_state, evaluated_at,
+                    max_age=SCOPED_OBSERVATION_MAX_AGE)
         states = {window["state"] for key, window in windows.items()
                   if key in WINDOW_KEYS}
         if base_state == "held" or "held" in states:
@@ -241,7 +326,16 @@ def project(snapshot, evaluated_at=None, force_noncurrent_reason=None):
         else:
             state = "current"
         if state in {"held", "stale"}:
-            _demote_windows(windows, state)
+            # A scoped pool that is still current on its OWN clock survives
+            # the account row's demotion. The account row is demoted because
+            # its 5h/7d evidence aged past a 30-minute bar those windows have
+            # a per-turn source to clear; the weekly Fable pool does not, and
+            # greying a good weekly number because a session window went quiet
+            # is exactly the dead gauge Paul reported on 2026-08-18.
+            keep = tuple(key for key, window in windows.items()
+                         if key.startswith(SCOPED_PREFIX)
+                         and window["state"] in ("current", "limited"))
+            _demote_windows(windows, state, keep=keep)
         row = {
             "name": raw.get("name") if isinstance(raw.get("name"), str)
             else "unknown",
@@ -353,13 +447,19 @@ def project_dashboard(snapshot, evaluated_at=None, force_noncurrent_reason=None)
         raw_windows = raw.get("windows")
         raw_windows = raw_windows if isinstance(raw_windows, dict) else {}
         base_state = _account_base_state(raw, result["freshness"], evaluated_at)
+        scoped_base_state = _account_base_state(
+            raw, result["freshness"], evaluated_at, scoped=True)
         for key, raw_window in raw_windows.items():
             if not isinstance(key, str) or key in account["windows"]:
                 continue
+            scoped = key.startswith(SCOPED_PREFIX)
             window = _window_projection(
-                raw_window, _epoch(raw.get("captured_at")), base_state,
-                evaluated_at)
-            if account["state"] in {"held", "stale"}:
+                raw_window, _epoch(raw.get("captured_at")),
+                scoped_base_state if scoped else base_state, evaluated_at,
+                max_age=SCOPED_OBSERVATION_MAX_AGE if scoped else None)
+            if account["state"] in {"held", "stale"} \
+                    and not (scoped and window["state"] in ("current",
+                                                            "limited")):
                 _demote_windows({key: window}, account["state"])
             account["windows"][key] = window
         for window in account["windows"].values():

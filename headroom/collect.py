@@ -1178,7 +1178,8 @@ def external_claude_limits(name, identity, now):
         return defer()
     # AN OLD READING IS NOT A RATE LIMIT (2026-08-17, readings repair). The
     # estate cron collector refreshes each seat only when its own reading
-    # ages past CLAUDE_USAGE_TTL (3300s plus a per-seat stagger), by design,
+    # ages past CLAUDE_USAGE_TTL (2400 s plus 120 s per paid claude rank
+    # since 2026-08-18; 3300 plus 300 per registry rank before), by design,
     # because a shorter TTL is the per-source-IP 429 spiral of 2026-08-08.
     # This gate demanded 720s, so for most of every hour a seat the source
     # called ok=True with a verified reading was rejected here, deferred, and

@@ -1003,6 +1003,15 @@ const DATA_URL = "usage.json";
 const CACHE_KEY = "headroom-cache-" + ((CONFIG && CONFIG.redact) ? "r" : "f");
 const SNAPSHOT_MAX_AGE = CONFIG&&Number.isFinite(CONFIG.snapshot_max_age)?CONFIG.snapshot_max_age:900;
 const OBSERVATION_MAX_AGE = CONFIG&&Number.isFinite(CONFIG.observation_max_age)?CONFIG.observation_max_age:1800;
+/* A model-scoped weekly pool (scoped:Fable) has no per-turn source: the only
+   producer is the ai-accounts cron collector, which refreshes an account about
+   once every 50 minutes because the usage API rate-limits per source IP. Judged
+   against the 30-minute bar the session windows clear from the statusline tee,
+   the Fable gauge was dark for most of every hour, which is what Paul reported
+   on 2026-08-18. Its ceiling is his own 60-minute accuracy law. Mirrors
+   widget.SCOPED_OBSERVATION_MAX_AGE; dashboard.build injects the server's
+   value so the page and the feed can never quote different bars. */
+const SCOPED_OBSERVATION_MAX_AGE = CONFIG&&Number.isFinite(CONFIG.scoped_observation_max_age)?CONFIG.scoped_observation_max_age:3600;
 const TOKEN_SCAN_INTERVAL = CONFIG&&Number.isFinite(CONFIG.token_scan_interval)?Math.max(0,CONFIG.token_scan_interval):900;
 const TOKEN_MAX_DAYS=400,TOKEN_AGE_LIMITS=tokenTelemetryThresholds(TOKEN_SCAN_INTERVAL),
   TOKEN_STALE_AGE=TOKEN_AGE_LIMITS.stale,TOKEN_SUPPRESS_AGE=TOKEN_AGE_LIMITS.suppress;
@@ -1018,11 +1027,14 @@ function untilReset(epoch){if(!Number.isFinite(epoch))return"reset not reported"
 let snapshotState="held",sourceFailed=false; /* old/failed sources demote every row */
 function epochState(epoch,maxAge){const now=Date.now()/1e3;if(!Number.isFinite(epoch)||epoch>now)return"held";return now-epoch>maxAge?"stale":"current";}
 function projected(a){return a&&a.__display&&typeof a.__display==="object"?a.__display:null;}
+const SCOPED_PREFIX="scoped:"; /* declared here, inside the helpers block the
+   JS test harness extracts, so the harness never has to stub it */
+function isScoped(key){return typeof key==="string"&&key.indexOf(SCOPED_PREFIX)===0;}
 function intrinsicWindowState(a,key){
   const d=projected(a),w=d&&d.windows&&d.windows[key];
   if(!w||w.state==="held")return"held";
   if(w.state==="stale")return"stale";
-  const timed=epochState(w.observed_at,OBSERVATION_MAX_AGE);
+  const timed=epochState(w.observed_at,isScoped(key)?SCOPED_OBSERVATION_MAX_AGE:OBSERVATION_MAX_AGE);
   if(timed!=="current")return timed;
   return w.state==="limited"?"limited":(w.state==="current"?"current":"held");
 }
@@ -1044,7 +1056,20 @@ function displayState(a){
   if(states.includes("stale"))return"stale";
   return states.includes("limited")?"limited":"current";
 }
-function windowState(a,key){const state=displayState(a);return state==="held"||state==="stale"?state:intrinsicWindowState(a,key);}
+/* A scoped weekly pool does not inherit the account row's demotion. The row is
+   demoted because its 5h/7d evidence aged past a bar those windows have a
+   per-turn source to clear; the weekly pool does not, and greying a good weekly
+   number because a session window went quiet is the 2026-08-18 dead gauge. The
+   pool still has to earn "current" on its own evidence through
+   intrinsicWindowState, which reads the SERVER's projected state first, so this
+   can only ever agree with widget.json, never invent a number it did not send. */
+function windowState(a,key){
+  const state=displayState(a);
+  if(state!=="held"&&state!=="stale")return intrinsicWindowState(a,key);
+  if(!isScoped(key))return state;
+  const own=intrinsicWindowState(a,key);
+  return own==="current"||own==="limited"?own:state;
+}
 function windowView(a,key){
   const d=projected(a),w=d&&d.windows&&d.windows[key],state=windowState(a,key),accountState=displayState(a);
   const limited=accountState==="limited"&&state==="limited";

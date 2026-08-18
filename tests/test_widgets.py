@@ -371,7 +371,8 @@ class CodexLiftedFiveHourDashboardJS(unittest.TestCase):
             1)[1].split(
             "/* --------------------------------------------------------------- theme */",
             1)[0]
-        return ("const OBSERVATION_MAX_AGE=1800,SNAPSHOT_MAX_AGE=900;\n"
+        return ("const OBSERVATION_MAX_AGE=1800,SNAPSHOT_MAX_AGE=900,"
+                "SCOPED_OBSERVATION_MAX_AGE=3600;\n"
                 + section + _CODEX_5H_TAIL)
 
     @unittest.skipUnless(NODE, "node runtime required to execute dashboard JS")
@@ -2422,6 +2423,331 @@ class WidgetDocumentationTests(unittest.TestCase):
         self.assertIn(reference, readme)
         self.assertTrue(os.path.exists(os.path.join(ROOT,
                                                     "marketing/hr-widgets.png")))
+
+
+def scoped_account(name="fab", scoped_age=600, used_scoped=48.0, **overrides):
+    """A claude row carrying a model-scoped weekly pool, the shape ai-accounts
+    publishes and headroom's ingest bridge normalises to `scoped:<Name>`."""
+    account = usage_account(name, **overrides)
+    account["windows"]["scoped:Fable"] = {
+        "used_percent": used_scoped, "resets_at": NOW + 86400,
+        "observed_at": NOW - scoped_age,
+    }
+    return account
+
+
+class ScopedWindowFreshnessTests(unittest.TestCase):
+    """Paul, 2026-08-18 05:2xZ: "why do we still have dead readings".
+
+    The scoped Fable gauge was dark for most of every hour on every account
+    because two numbers in two repositories disagreed: the ai-accounts
+    collector refreshes an account roughly once every 50 minutes (its
+    per-source-IP call budget) and this projection demanded every window be
+    under 30 minutes old. 5h and 7d can clear that bar because a live agent's
+    statusline tees the provider's own headers every turn. A weekly
+    model-scoped pool has no such source, so its ceiling is Paul's own
+    60-minute accuracy law and nothing tighter.
+
+    What must NOT change: the correctness gates. A scoped window renders on
+    weaker evidence than the account windows only with respect to AGE.
+    """
+
+    def project(self, account, evaluated_at=NOW):
+        return widget.project(usage_snapshot(account), evaluated_at)["accounts"][0]
+
+    # ---------------------------------------------------------- the ceiling
+    def test_scoped_at_3000_seconds_is_current(self):
+        row = self.project(scoped_account(scoped_age=3000))
+        window = row["windows"]["scoped:Fable"]
+        self.assertEqual(window["state"], "current")
+        self.assertEqual(window["left_percent"], 52.0)
+        self.assertEqual(window["observed_at"], NOW - 3000)
+
+    def test_scoped_at_4000_seconds_is_stale(self):
+        """3700 s used to be the stale case; the ceiling is now the law plus
+        the 300 s serve cache (3900), because a reading the collector lawfully
+        serves at 3599 s is shown at up to 3899 s through RefreshGate."""
+        row = self.project(scoped_account(scoped_age=4000))
+        window = row["windows"]["scoped:Fable"]
+        self.assertEqual(window["state"], "stale")
+        self.assertIsNone(window["left_percent"])
+        self.assertEqual(window["last_observed_left_percent"], 52.0)
+        self.assertEqual(window["observed_at"], NOW - 4000)
+
+    def test_the_boundary_is_exactly_the_constant(self):
+        for age, expected in ((widget.SCOPED_OBSERVATION_MAX_AGE, "current"),
+                              (widget.SCOPED_OBSERVATION_MAX_AGE + 1, "stale")):
+            with self.subTest(age=age):
+                row = self.project(scoped_account(scoped_age=age))
+                self.assertEqual(row["windows"]["scoped:Fable"]["state"],
+                                 expected)
+
+    def test_the_shipped_ceiling_is_pauls_law_plus_the_serve_cache(self):
+        from headroom import dashboard
+        self.assertEqual(widget.SCOPED_OBSERVATION_MAX_AGE,
+                         3600 + dashboard.SERVE_MAX_AGE)
+        self.assertEqual(dashboard.SERVE_MAX_AGE, 300)
+        self.assertEqual(widget.OBSERVATION_MAX_AGE, 1800)
+
+    def test_a_scoped_pool_at_100_percent_is_limited_not_stale(self):
+        row = self.project(scoped_account(scoped_age=3000, used_scoped=100.0))
+        self.assertEqual(row["windows"]["scoped:Fable"]["state"], "limited")
+
+    # ------------------------------------- 5h and 7d keep the tighter bar
+    def test_5h_at_2000_seconds_is_still_stale(self):
+        account = scoped_account(scoped_age=600)
+        account["windows"]["5h"]["observed_at"] = NOW - 2000
+        row = self.project(account)
+        self.assertEqual(row["windows"]["5h"]["state"], "stale")
+        self.assertEqual(row["state"], "stale")
+
+    def test_5h_at_2000_seconds_does_not_darken_the_scoped_pool(self):
+        """The exact live shape on 2026-08-18: session windows aged out, the
+        Fable pool still well inside its own ceiling."""
+        account = scoped_account(scoped_age=600)
+        account["windows"]["5h"]["observed_at"] = NOW - 2000
+        account["windows"]["7d"]["observed_at"] = NOW - 2000
+        row = self.project(account)
+        self.assertEqual(row["state"], "stale")
+        self.assertEqual(row["windows"]["scoped:Fable"]["state"], "current")
+        self.assertEqual(row["windows"]["scoped:Fable"]["left_percent"], 52.0)
+
+    def test_a_stale_scoped_pool_still_darkens_nothing_else(self):
+        """Scoped windows never drive the account state, before or after."""
+        row = self.project(scoped_account(scoped_age=5000))
+        self.assertEqual(row["state"], "current")
+        self.assertEqual(row["windows"]["5h"]["state"], "current")
+        self.assertEqual(row["windows"]["scoped:Fable"]["state"], "stale")
+        self.assertEqual(row["windows"]["scoped:Fable"][
+            "last_observed_left_percent"], 52.0)
+
+    # ------------------------------- the account row's stale flag, restated
+    def test_the_row_stale_flag_no_longer_darkens_a_fresh_scoped_pool(self):
+        """collect.external_claude_limits stamps stale=True past 720 s and
+        apply_integrity turns it into trust_state stale_observation. That is
+        an age statement about 5h/7d, not a correctness verdict, so a scoped
+        pool inside its own ceiling survives it. Measured live the same day on
+        claude-mzansiedge: held with no number, now current at 55 percent."""
+        account = scoped_account(scoped_age=2500, stale=True,
+                                 trust_state="stale_observation",
+                                 captured_at=NOW - 2500)
+        row = self.project(account)
+        self.assertEqual(row["state"], "held")
+        self.assertEqual(row["windows"]["scoped:Fable"]["state"], "current")
+        self.assertEqual(row["windows"]["scoped:Fable"]["left_percent"], 52.0)
+        for key in ("5h", "7d"):
+            self.assertEqual(row["windows"][key]["state"], "held")
+
+    def test_a_capture_past_the_scoped_ceiling_is_not_current(self):
+        """The scoped ceiling is applied to the ROW's capture time as well as
+        the window's own observation: 4000 s is past 3600 either way."""
+        account = scoped_account(scoped_age=1000, captured_at=NOW - 4000)
+        row = self.project(account)
+        self.assertEqual(row["state"], "stale")
+        self.assertEqual(row["windows"]["scoped:Fable"]["state"], "stale")
+        self.assertIsNone(row["windows"]["scoped:Fable"]["left_percent"])
+        self.assertEqual(row["windows"]["scoped:Fable"][
+            "last_observed_left_percent"], 52.0)
+
+    def test_a_stale_observation_row_past_the_ceiling_holds_and_keeps_the_number(self):
+        """Both bars fail at once: trust_state stale_observation makes the
+        account held, and 4000 s is past the scoped ceiling, so the scoped
+        pool is not kept. Paul's other law still applies: the last verified
+        number stays on the page, greyed, with its age."""
+        account = scoped_account(scoped_age=1000, stale=True,
+                                 trust_state="stale_observation",
+                                 captured_at=NOW - 4000)
+        row = self.project(account)
+        self.assertEqual(row["state"], "held")
+        window = row["windows"]["scoped:Fable"]
+        self.assertEqual(window["state"], "held")
+        self.assertIsNone(window["left_percent"])
+        self.assertEqual(window["last_observed_left_percent"], 52.0)
+        self.assertEqual(window["observed_at"], NOW - 1000)
+
+    # ------------------------------------------- correctness gates unchanged
+    def test_every_correctness_gate_still_holds_the_scoped_pool(self):
+        cases = {
+            "not ok": {"ok": False},
+            "trust held": {"trust_state": "held"},
+            "duplicate identity": {"trust_state": "duplicate_identity"},
+            "dashboard only": {"trust_state": "dashboard_only"},
+            "no capture time": {"captured_at": None},
+            "capture in the future": {"captured_at": NOW + 60},
+        }
+        for label, override in cases.items():
+            with self.subTest(gate=label):
+                row = self.project(scoped_account(scoped_age=600, **override))
+                self.assertEqual(row["windows"]["scoped:Fable"]["state"],
+                                 "held", label)
+                self.assertIsNone(
+                    row["windows"]["scoped:Fable"]["left_percent"], label)
+
+    def test_an_expired_snapshot_still_holds_the_scoped_pool(self):
+        account = scoped_account(scoped_age=600)
+        snapshot = usage_snapshot(account,
+                                  generated=NOW - widget.SNAPSHOT_MAX_AGE - 1)
+        row = widget.project(snapshot, NOW)["accounts"][0]
+        self.assertEqual(row["state"], "stale")
+        self.assertEqual(row["windows"]["scoped:Fable"]["state"], "stale")
+
+    def test_a_future_scoped_observation_is_held(self):
+        row = self.project(scoped_account(scoped_age=-60))
+        self.assertEqual(row["windows"]["scoped:Fable"]["state"], "held")
+
+    def test_an_unpaid_seat_shows_no_scoped_number_at_all(self):
+        account = scoped_account(scoped_age=600, error_code="unpaid")
+        row = self.project(account)
+        self.assertEqual(row["state"], "held")
+        self.assertTrue(row["unpaid"])
+        window = row["windows"]["scoped:Fable"]
+        self.assertEqual(window["state"], "held")
+        self.assertIsNone(window["left_percent"])
+        self.assertIsNone(window["last_observed_left_percent"])
+
+    # ----------------------------------------------------- knob and headline
+    def test_the_env_override_is_honoured(self):
+        """Verify the knob EXISTS before trusting a negative test
+        (2026-08-10, the statusline Fable gauge round: a guessed variable name
+        silently read the real file and proved nothing)."""
+        with mock.patch.object(widget, "SCOPED_OBSERVATION_MAX_AGE", 1800):
+            row = self.project(scoped_account(scoped_age=3000))
+            self.assertEqual(row["windows"]["scoped:Fable"]["state"], "stale")
+        self.assertEqual(
+            paths.env_int("HEADROOM_SCOPED_OBSERVATION_MAX_AGE", 3600), 3600)
+        with mock.patch.dict(os.environ,
+                             {"HEADROOM_SCOPED_OBSERVATION_MAX_AGE": "900"}):
+            self.assertEqual(
+                paths.env_int("HEADROOM_SCOPED_OBSERVATION_MAX_AGE", 3600), 900)
+
+    def test_a_scoped_pool_never_moves_the_fleet_average(self):
+        row = widget.project(usage_snapshot(scoped_account(scoped_age=600)),
+                             NOW)
+        self.assertEqual(row["headline"]["avg_5h_left_percent"], 80.0)
+        self.assertEqual(row["headline"]["avg_7d_left_percent"], 60.0)
+
+    def test_the_dashboard_projection_agrees_with_the_widget(self):
+        account = scoped_account(scoped_age=3000)
+        account["windows"]["5h"]["observed_at"] = NOW - 2000
+        account["windows"]["7d"]["observed_at"] = NOW - 2000
+        plain = widget.project(usage_snapshot(account), NOW)["accounts"][0]
+        rich = widget.project_dashboard(usage_snapshot(account), NOW)["accounts"][0]
+        self.assertEqual(plain["windows"]["scoped:Fable"]["state"],
+                         rich["windows"]["scoped:Fable"]["state"])
+        self.assertEqual(plain["windows"]["scoped:Fable"]["left_percent"],
+                         rich["windows"]["scoped:Fable"]["left_percent"])
+
+    def test_a_bare_model_key_the_dashboard_picks_up_uses_the_same_ceiling(self):
+        """project_dashboard carries any leftover raw window key. A scoped one
+        arriving there must be judged by the scoped ceiling too, or the page
+        and the feed disagree about the same number."""
+        account = usage_account("fab")
+        account["windows"]["5h"]["observed_at"] = NOW - 2000
+        account["windows"]["7d"]["observed_at"] = NOW - 2000
+        account["windows"]["scoped:Opus"] = {
+            "used_percent": 10.0, "resets_at": NOW + 86400,
+            "observed_at": NOW - 3000}
+        row = widget.project_dashboard(usage_snapshot(account), NOW)["accounts"][0]
+        self.assertEqual(row["state"], "stale")
+        self.assertEqual(row["windows"]["scoped:Opus"]["state"], "current")
+        self.assertEqual(row["windows"]["scoped:Opus"]["left_percent"], 90.0)
+
+
+_SCOPED_TAIL = r"""
+;(function () {
+  snapshotState = "current"; sourceFailed = false;
+  const nowS = Date.now() / 1e3;
+  const win = (state, left, age) => ({ state: state,
+    left_percent: state === "current" ? left : null,
+    last_observed_left_percent: state === "current" ? null : left,
+    resets_at: nowS + 3600, observed_at: nowS - age });
+  // The live 2026-08-18 shape: session windows aged past 30 minutes, the
+  // weekly Fable pool 50 minutes old and still inside its own ceiling. The
+  // __display block is what widget.project already published.
+  const aged = { name: "sys", provider: "claude", captured_at: nowS - 2500,
+    windows: { "5h": {}, "7d": {}, "scoped:Fable": {} },
+    __display: { state: "stale",
+      windows: { "5h": win("stale", 55, 2500), "7d": win("stale", 48, 2500),
+                 "scoped:Fable": win("current", 52, 3000) } } };
+  // A scoped pool the SERVER demoted must stay demoted on the page: the
+  // client may never invent a number the feed did not send.
+  const serverDemoted = { name: "old", provider: "claude",
+    captured_at: nowS - 2500,
+    windows: { "5h": {}, "7d": {}, "scoped:Fable": {} },
+    __display: { state: "stale",
+      windows: { "5h": win("stale", 55, 2500), "7d": win("stale", 48, 2500),
+                 "scoped:Fable": win("stale", 52, 4200) } } };
+  console.log(JSON.stringify({
+    account_state: displayState(aged),
+    five_h_state: windowState(aged, "5h"),
+    scoped_state: windowState(aged, "scoped:Fable"),
+    scoped_markup: windowMarkup(aged, "scoped:Fable"),
+    demoted_scoped_state: windowState(serverDemoted, "scoped:Fable")
+  }));
+})();
+"""
+
+
+class ScopedWindowDashboardJS(unittest.TestCase):
+    """The page must say what the feed says.
+
+    The dashboard re-derives every state in the browser from the raw account
+    plus the server projection. Before 2026-08-18 windowState handed a scoped
+    pool the ACCOUNT row's demotion, so fixing widget.project alone would have
+    left /widget.json green and the page at 127.0.0.1:8377 grey for the same
+    number. Three surfaces, one snapshot, one answer.
+    """
+
+    @staticmethod
+    def _harness():
+        with open(dashboard.TEMPLATE) as handle:
+            html = handle.read()
+        section = html.split(
+            "/* ------------------------------------------------------------- helpers */",
+            1)[1].split(
+            "/* --------------------------------------------------------------- theme */",
+            1)[0]
+        return ("const OBSERVATION_MAX_AGE=1800,SNAPSHOT_MAX_AGE=900,"
+                "SCOPED_OBSERVATION_MAX_AGE=3600;\n"
+                + section + _SCOPED_TAIL)
+
+    @unittest.skipUnless(NODE, "node runtime required to execute dashboard JS")
+    def test_a_stale_row_keeps_a_fresh_scoped_pool_live_on_the_page(self):
+        proc = subprocess.run([NODE, "-"], input=self._harness(),
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(out["account_state"], "stale")
+        self.assertEqual(out["five_h_state"], "stale")
+        self.assertEqual(out["scoped_state"], "current")
+        self.assertIn("52%", out["scoped_markup"])
+        # fail-closed: the client never promotes what the server demoted
+        self.assertEqual(out["demoted_scoped_state"], "stale")
+
+    def test_the_page_is_handed_the_same_ceiling_the_feed_uses(self):
+        """A constant the page never receives is a constant the page invents."""
+        config = {"schema_version": 1,
+                  "dashboard": {"theme": "midnight", "title": "test"},
+                  "accounts": []}
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "out")
+            os.makedirs(output)
+            source = os.path.join(output, "usage.json")
+            with open(source, "w") as handle:
+                json.dump(usage_snapshot(usage_account()), handle)
+            with redirect_stdout(io.StringIO()), \
+                    mock.patch.object(widget.time, "time", return_value=NOW):
+                dashboard.build(config, output, source)
+            with open(os.path.join(output, "index.html")) as handle:
+                html = handle.read()
+        injected = json.loads(re.search(r"const CONFIG = (\{.*?\});",
+                                        html).group(1))
+        self.assertEqual(injected["scoped_observation_max_age"],
+                         widget.SCOPED_OBSERVATION_MAX_AGE)
+        self.assertEqual(injected["observation_max_age"],
+                         widget.OBSERVATION_MAX_AGE)
+        self.assertNotEqual(injected["scoped_observation_max_age"],
+                            injected["observation_max_age"])
 
 
 if __name__ == "__main__":

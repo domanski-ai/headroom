@@ -370,6 +370,8 @@ def build(config=None, out_dir=None, snapshot_file=None):
         "redact": bool(settings.get("redact_emails", True)),
         "snapshot_max_age": widget.SNAPSHOT_MAX_AGE,
         "observation_max_age": widget.OBSERVATION_MAX_AGE,
+        # the scoped pools' own ceiling; see widget.SCOPED_OBSERVATION_MAX_AGE
+        "scoped_observation_max_age": widget.SCOPED_OBSERVATION_MAX_AGE,
         "token_scan_interval": tokens.scan_interval(),
         "accounts": [{"name": account["name"], "provider": account["provider"]}
                      for account in registry.accounts(config)],
