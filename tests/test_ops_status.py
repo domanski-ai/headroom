@@ -56,7 +56,14 @@ SESSION_KEYS = {
     "subagents", "context_remaining_percentage", "last_transcript_write",
     "generation", "recent_events",
 }
-SEAT_KEYS = {"name", "fable_used", "five_h_used", "seven_d_used"}
+# The *_used fields stay for the parsers that already read them (the
+# domanski-ops zod schema, the cappedWindows threshold logic), which are
+# correct as USED. The *_left twins are the battery-law addition (Paul
+# 2026-08-10, PAUL LAW: a battery renders what is LEFT, never what is spent),
+# so anything that RENDERS a number can read it straight off the contract
+# instead of subtracting and getting the sense wrong.
+SEAT_KEYS = {"name", "fable_used", "five_h_used", "seven_d_used",
+             "fable_left", "five_h_left", "seven_d_left"}
 
 
 def assistant(total=1000):
@@ -235,7 +242,9 @@ class ReportShape(OpsStatusCase):
         self.assertEqual(session["recent_events"], ["SessionStart"])
         self.assertEqual(report["seats"], [
             {"name": "claude-acct-a", "fable_used": 13.0,
-             "five_h_used": 21.0, "seven_d_used": 43.0}])
+             "five_h_used": 21.0, "seven_d_used": 43.0,
+             "fable_left": 87.0, "five_h_left": 79.0,
+             "seven_d_left": 57.0}])
         # the whole report must survive a JSON round trip with no NaN
         self.assertEqual(json.loads(json.dumps(report, allow_nan=False)),
                          report)
@@ -244,9 +253,27 @@ class ReportShape(OpsStatusCase):
         self.usage([{"name": "acct-a", "windows": {}}])
         report, _ok = self.snapshot(panes={})
         self.assertEqual(set(report["seats"][0]), SEAT_KEYS)
+        # an unreadable window has no LEFT either: a missing number must never
+        # render as a full battery
         self.assertEqual(report["seats"][0],
                          {"name": "claude-acct-a", "fable_used": None,
-                          "five_h_used": None, "seven_d_used": None})
+                          "five_h_used": None, "seven_d_used": None,
+                          "fable_left": None, "five_h_left": None,
+                          "seven_d_left": None})
+
+    def test_each_left_twin_is_exactly_the_rest_of_its_own_window(self):
+        """The battery law in arithmetic. A twin that drifts from its own
+        used number is worse than no twin: two fields on one contract that
+        disagree about the same seat."""
+        self.usage([{"name": "acct-a", "windows": {
+            "5h": {"used_percent": 0.0}, "7d": {"used_percent": 99.95},
+            "scoped:Fable": {"used_percent": 100.0}}}])
+        report, _ok = self.snapshot(panes={})
+        seat = report["seats"][0]
+        self.assertEqual(seat["five_h_left"], 100.0)   # nothing spent
+        self.assertEqual(seat["fable_left"], 0.0)      # nothing left
+        self.assertEqual(seat["seven_d_left"],
+                         round(100 - seat["seven_d_used"], 1))
 
     def test_recent_events_drop_cwdchanged_and_keep_the_last_few(self):
         transcript = self.transcript(SID_A, [assistant()])
@@ -753,7 +780,8 @@ class Seats(OpsStatusCase):
         self.assertTrue(ok)
         self.assertEqual(report["seats"], [
             {"name": "claude-acct-b", "fable_used": 6.0, "five_h_used": 4.0,
-             "seven_d_used": 5.0}])
+             "seven_d_used": 5.0, "fable_left": 94.0, "five_h_left": 96.0,
+             "seven_d_left": 95.0}])
 
     def test_an_unregistered_row_keeps_its_own_name(self):
         self.usage([{"name": "stranger", "windows": {}},

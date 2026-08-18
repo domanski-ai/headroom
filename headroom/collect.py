@@ -96,7 +96,34 @@ SESSION_TRUTH_DIR = os.environ.get(
 # comfortably inside route.OBSERVATION_MAX_AGE so a rescued row is not handed
 # to the router already expired.
 SESSION_TRUTH_MAX_AGE = paths.env_int("HEADROOM_SESSION_TRUTH_MAX_AGE", 1800)
-# Kill switch. 0 restores the pre-2026-08-17 behaviour exactly: stale is held.
+# KILL SWITCH, and exactly what it does (corrected 2026-08-17, X1 P1: the old
+# one-liner here promised "0 restores the pre-2026-08-17 behaviour exactly",
+# which was not true of this module alone).
+#
+# 0 here stops this module REWRITING a stale row from the seat's own tee, so
+# no NEW snapshot carries routing_basis="tee-fresh". It cannot undo a rescue
+# already written: the rescue is persisted (stale False, captured_at rebased),
+# and the router reads the file, not this variable. route.py therefore reads
+# the SAME variable and refuses any row still stamped tee-fresh, which is what
+# makes 0 mean "stale is held" again on the snapshot that already exists.
+#
+# HOW TO DISARM. Set HEADROOM_SESSION_TRUTH_ROUTING=0 in the environment of
+# the processes that collect and the processes that route, then restart them:
+#   * the widget/usage feed: add Environment=HEADROOM_SESSION_TRUTH_ROUTING=0
+#     to ~/.config/systemd/user/headroom-serve.service (the file names this
+#     variable in a comment beside the line to add), then
+#     `systemctl --user daemon-reload && systemctl --user restart
+#     headroom-serve`;
+#   * launches: export it where `headroom` itself runs (lane launcher, cron
+#     entry, or the interactive shell). Any headroom CLI whose
+#     ensure_fresh_snapshot finds the snapshot stale collects INLINE, so the
+#     serve unit is not the only writer.
+# Both are read at import: a running process keeps the value it started with.
+#
+# WHAT IT DOES NOT TOUCH. The 2026-08-11 usage-truth fold that makes the
+# widget and the statusline agree (_fold_session_truth here, and the copy in
+# dashboard.py) is a DISPLAY ruling of Paul's and answers to no switch. This
+# one governs ROUTING only, which is what its name says.
 SESSION_TRUTH_ROUTING = paths.env_int("HEADROOM_SESSION_TRUTH_ROUTING", 1)
 # WHEN a reading stops being good enough to route on. There are TWO gates that
 # hold an old reading and they answer to different settings, which is why the

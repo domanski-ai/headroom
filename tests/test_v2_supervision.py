@@ -124,9 +124,15 @@ class TempDirCase(unittest.TestCase):
         # _spawn now pre-validates the executable with shutil.which; make every
         # name resolve by default so these unit tests don't depend on the host
         # PATH. Tests that want a "missing binary" override this locally.
+        # The stub takes `path=` because route.bare_fallback_exec resolves the
+        # bare CLI against the ORIGINAL environment's PATH, not this process's
+        # (2026-08-11 balance-lane flap, route.py: a caller-inherited PATH with
+        # no real CLI made the fallback itself die rc=127 in a respawn loop).
+        # A stub that cannot be called the way production calls it does not
+        # test production: it raised TypeError inside every fallback test.
         which = mock.patch.object(
             supervisor.shutil, "which",
-            side_effect=lambda name: "/usr/bin/" + name)
+            side_effect=lambda name, path=None: "/usr/bin/" + name)
         which.start()
         self.addCleanup(which.stop)
 
@@ -332,7 +338,17 @@ class LaunchFallbackExec(TempDirCase):
                 redirect_stderr(io.StringIO()):
             code = route.cmd_exec("sonnet", command, fallback=True)
         self.assertEqual(code, 0)
-        self.assertEqual(execute.call_args.args[:2], (command[0], command))
+        binary, argv = execute.call_args.args[:2]
+        # argv is passed through untouched...
+        self.assertEqual(argv, command)
+        # ...but the BINARY may be resolved to an absolute path first. The
+        # 2026-08-11 balance-lane flap: a bare name was searched against a
+        # caller-inherited PATH holding a plugin cache bin dir and no real
+        # CLI, so the fallback whose whole contract is "a CLI always runs"
+        # died rc=127 in a respawn loop. Resolved or not, it must still be
+        # the same CLI, and asserting the basename keeps this test true on a
+        # host that has no claude on disk at all.
+        self.assertEqual(os.path.basename(binary), command[0])
         events = [call.args[0]["event"] for call in emit.call_args_list]
         self.assertEqual(events, ["fallback"])
 
@@ -4173,7 +4189,7 @@ class CapWaitsForCapacity(TempDirCase):
         self.assertIn("no seat has headroom worth moving to",
                       str(caught.exception))
         # and it names each seat and why — this text is the cap_held reason
-        self.assertIn("target (5h at 100%)", str(caught.exception))
+        self.assertIn("target (5h 0% left)", str(caught.exception))
         # and it is a SupervisorError, so nothing that catches the base class
         # (a caller that has not been taught about holds) changes behaviour
         self.assertIsInstance(caught.exception, supervisor.SupervisorError)

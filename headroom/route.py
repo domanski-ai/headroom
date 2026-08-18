@@ -585,6 +585,23 @@ def _fable_room(row):
 # and the router's freshness check already holds them).
 CODEX_ROUTING_ENABLED = os.environ.get("HEADROOM_CODEX_ROUTING", "1") != "0"
 
+# THE OTHER HALF OF collect.SESSION_TRUTH_ROUTING (2026-08-17, X1 P1).
+#
+# collect reads the same variable and stops REWRITING stale rows from the
+# seat's own statusline tee. That alone does not disarm the feature, because
+# the rescue is PERSISTED: a row already stamped routing_basis="tee-fresh"
+# sits in the snapshot with stale False and a rebased captured_at, and every
+# later router run routes on it whatever this variable says. The snapshot has
+# two writers (the headroom-serve unit, and any headroom CLI whose
+# ensure_fresh_snapshot finds the file stale and collects inline), so "set it
+# on the collector" was never a complete answer either.
+#
+# So the router refuses tee-fresh rows outright when the switch is off. Set
+# here, an operator's disarm binds from the next command, on whatever snapshot
+# already exists. Read at import like CODEX_ROUTING_ENABLED: a long-lived
+# process (serve) picks it up on restart, a CLI launch on its next run.
+SESSION_TRUTH_ROUTING = paths.env_int("HEADROOM_SESSION_TRUTH_ROUTING", 1)
+
 
 def _reserved_exception_applies(account, fam):
     """Is this reserved seat lawfully available to THIS caller for THIS family?
@@ -896,6 +913,15 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
         codex_reason = _codex_gate(account, snapshot_row, identity)
         if codex_reason:
             return codex_reason
+    if not SESSION_TRUTH_ROUTING and routing_basis(snapshot_row) == "tee-fresh":
+        # Disarmed: this row's numbers came from the seat's own statusline
+        # tee, not from a collector reading the router would have accepted.
+        # Sits exactly where the reading it replaced would have been refused,
+        # so the seat is held for the same reason it was held before the
+        # rescue existed. Only rows the rescue actually touched are affected.
+        return ("session-truth routing disabled "
+                "(HEADROOM_SESSION_TRUTH_ROUTING=0): this reading came from "
+                "the seat's own tee, not the collector")
     if snapshot_row.get("stale"):
         return "reading stale"
     captured_at = snapshot_row.get("captured_at")
@@ -1102,6 +1128,36 @@ def reading_unavailable(reason, fam):
                       f"{fam} weekly cap reading expired — no current proof",
                       f"{fam} weekly cap not recognised in this snapshot "
                       f"— recollect")
+
+
+def spent_reasons(fam):
+    """Every :func:`block_reason` string that means "this seat is SPENT".
+
+    The third class beside :func:`reading_unavailable`: not "no reading" and
+    not "cannot be trusted", but a reading that proves the seat has nothing
+    left. A spent source is the whole point of a rotation, so the supervisor
+    must recognise these and hand the session on; every OTHER reason means the
+    row is unusable and the rotation holds.
+
+    Enumerated HERE, beside the messages themselves, for the same reason
+    `reading_unavailable` is: a copy of this set in another module drifts the
+    first time one string is reworded, and it drifts SILENTLY. That is not a
+    hypothetical. `supervisor._capacity_reasons` carried its own copy naming
+    "5h at 100%" and "<family> weekly cap at 100%"; commit f958883 reworded
+    both to speak in LEFT (battery law 2026-08-10, the columns say LEFT so the
+    reasons do) and the copy stayed. From that commit until this one, a seat at
+    a hard 100% read to the supervisor as a TRUST failure: it disarmed
+    supervision instead of rotating, on exactly the wall a rotation exists for.
+    `tests/test_headroom.py::TheCapacityVocabularyHasOneOwner` drives
+    block_reason through every spent shape and asserts membership here, so a
+    future reword fails loudly in the suite instead of quietly on a live seat.
+
+    The reserve reasons ("5h below 10% reserve (7% left)") are deliberately
+    NOT here: a reserve is a policy floor an operator can move, not a spent
+    seat, and rotating on one would empty a seat the operator asked to keep
+    in hand."""
+    return {"5h 0% left", "7d 0% left", "5h critical", "7d critical",
+            f"{fam} weekly cap 0% left", f"{fam} weekly cap critical"}
 
 
 def _at_wall(window):

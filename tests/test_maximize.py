@@ -123,10 +123,10 @@ class Guard(unittest.TestCase):
     def test_already_blocked_rows_keep_their_reason(self):
         rows = {"a": _row(used7d=60.0, fable_used=20.0),
                 "b": _row(used7d=10.0, fable_used=95.0)}
-        entries = [({"name": "a"}, "7d at 100%", 0, None),
+        entries = [({"name": "a"}, "7d 0% left", 0, None),
                    ({"name": "b"}, None, 1, None)]
         guarded = maximize.fable_guard(entries, "opus", rows, 1.0)
-        self.assertEqual(guarded[0][1], "7d at 100%")
+        self.assertEqual(guarded[0][1], "7d 0% left")
 
 
 class Calibration(unittest.TestCase):

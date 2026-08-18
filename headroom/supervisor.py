@@ -2598,9 +2598,17 @@ def _idle_refusal(transcript_path, now, quiet_seconds, since=0.0):
 def _capacity_reasons(family):
     """Block reasons that mean 'this seat is spent', not 'this reading cannot
     be trusted'. A spent source is the whole point of a rotation; anything
-    else means the source row is unusable and the rotation must hold."""
-    return {"5h at 100%", "7d at 100%", "5h critical", "7d critical",
-            f"{family} weekly cap at 100%", f"{family} weekly cap critical"}
+    else means the source row is unusable and the rotation must hold.
+
+    ROUTE OWNS THE WORDS. This used to be a literal set here, and route.py
+    reworded two of them to speak in LEFT (commit f958883, battery law
+    2026-08-10) without this copy following. A seat at a hard 100% then
+    produced "5h 0% left", which was not in this set, so _source_row_is_bound
+    returned it as a trust refusal, _preflight raised, and _monitor disarmed
+    supervision permanently: the wall a rotation exists for became the thing
+    that killed the rotation. One vocabulary, one owner, and the owner is the
+    module that emits the strings."""
+    return route.spent_reasons(family)
 
 
 def _snapshot_row(snapshot, name):

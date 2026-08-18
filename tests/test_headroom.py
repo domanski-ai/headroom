@@ -979,7 +979,7 @@ class TheSupervisorsOwnUnreadableStrings(unittest.TestCase):
         for reason in ("held: codex_auth_rejected",
                        "held: slot_bound_to_unexpected_email",
                        "slot identity changed since snapshot — recollect",
-                       "5h at 100%"):
+                       "5h 0% left"):
             self.assertFalse(
                 supervisor._source_reading_unavailable(reason, "fable"),
                 f"{reason!r} must never be waited out")
@@ -1037,16 +1037,15 @@ class TheCapacityVocabularyHasOneOwner(unittest.TestCase):
         band is still closed and the fix did nothing."""
         row = self.row(scoped={"used_percent": 100.0, "severity": "critical",
                                "is_active": True})
-        self.assertEqual(self.reason(row), "fable weekly cap at 100%")
+        self.assertEqual(self.reason(row), "fable weekly cap 0% left")
         self.assertEqual(self.bound(row), "")
 
-    def test_every_spent_shape_block_reason_can_emit_is_admitted(self):
-        """Exhaustive over the reasons a SPENT claude seat produces. A reword
-        in route.py that this set does not follow fails here instead of
-        silently disarming a live session."""
-        spent = {
-            "5h at 100%": self.row(used5h=100.0),
-            "7d at 100%": self.row(used7d=100.0),
+    def spent_rows(self):
+        """One row per reason a SPENT claude seat produces, keyed by the exact
+        string route.block_reason emits for it."""
+        return {
+            "5h 0% left": self.row(used5h=100.0),
+            "7d 0% left": self.row(used7d=100.0),
             "5h critical": self.row(
                 windows=dict(_claude_row()["windows"], **{
                     "5h": {"used_percent": 99.5, "resets_at": self.now + 3600,
@@ -1058,18 +1057,43 @@ class TheCapacityVocabularyHasOneOwner(unittest.TestCase):
                            "resets_at": self.now + 8 * 86400,
                            "window_minutes": 10080, "severity": "critical",
                            "is_active": True}})),
-            "fable weekly cap at 100%": self.row(
+            "fable weekly cap 0% left": self.row(
                 scoped={"used_percent": 100.0}),
             "fable weekly cap critical": self.row(
                 scoped={"used_percent": 99.5, "severity": "critical",
                         "is_active": True}),
         }
-        for expected, row in sorted(spent.items()):
+
+    def test_every_spent_shape_block_reason_can_emit_is_admitted(self):
+        """Exhaustive over the reasons a SPENT claude seat produces. A reword
+        in route.py that this set does not follow fails here instead of
+        silently disarming a live session."""
+        for expected, row in sorted(self.spent_rows().items()):
             self.assertEqual(self.reason(row), expected)
             self.assertIn(expected, supervisor._capacity_reasons("fable"),
                           f"{expected!r} is a spent seat, not an unusable one")
             self.assertEqual(self.bound(row), "",
                              f"{expected!r} must rotate, not disarm")
+
+    def test_the_vocabulary_has_no_member_route_cannot_emit(self):
+        """The OTHER direction, and the one that was silently false all day.
+
+        Commit f958883 reworded two reasons to speak in LEFT (battery law
+        2026-08-10) and supervisor._capacity_reasons kept its own copy saying
+        "at 100%". The forward test above caught it; this one says why it can
+        never come back, by pinning both halves: the supervisor reads route's
+        set rather than keeping a copy, and every member of that set is a
+        string block_reason still produces today. A dead member is a rotation
+        trigger that can never fire, which is the same outage wearing a
+        different mask."""
+        self.assertEqual(supervisor._capacity_reasons("fable"),
+                         route.spent_reasons("fable"),
+                         "route owns the words; the supervisor may not keep "
+                         "a second copy of them")
+        self.assertEqual(
+            {self.reason(row) for row in self.spent_rows().values()},
+            route.spent_reasons("fable"),
+            "every spent reason must be one block_reason can still emit")
 
     def test_the_two_readers_of_the_vocabulary_agree(self):
         """`_preemptive_row_bound` and `_source_row_is_bound` decide the same
@@ -2683,7 +2707,7 @@ class HandoffSafety(unittest.TestCase):
             self.target_home, "projects", "weird.slug_dir", self.SID + ".jsonl"))
 
     def test_target_selection_uses_router_and_excludes_source(self):
-        blocked = [(self.accounts[1], "5h at 100%"), (self.accounts[0], None)]
+        blocked = [(self.accounts[1], "5h 0% left"), (self.accounts[0], None)]
         with mock.patch.object(handoff.route, "candidates", return_value=blocked) as call:
             with self.assertRaisesRegex(handoff.HandoffError, "proven headroom"):
                 handoff.select_target("source", {}, requested="target")
@@ -2706,7 +2730,7 @@ class HandoffSafety(unittest.TestCase):
                 mock.patch.object(handoff.route, "ensure_fresh_snapshot",
                                   return_value=snapshot), \
                 mock.patch.object(handoff.route, "candidates",
-                                  return_value=[(self.accounts[0], "5h at 100%"),
+                                  return_value=[(self.accounts[0], "5h 0% left"),
                                                 (self.accounts[1], None)]), \
                 mock.patch.object(handoff, "guard_source_stable"), \
                 mock.patch.object(handoff.route, "mark") as mark, \

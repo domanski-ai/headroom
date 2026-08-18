@@ -15,6 +15,7 @@ tee and routes with the named basis "tee-fresh". A row with neither a fresh
 collector reading nor a fresh tee is held exactly as before. Every test below
 pins one half of that sentence.
 """
+import inspect
 import json
 import os
 import sys
@@ -404,6 +405,82 @@ class TheRouterSaysWhatItRoutedOn(unittest.TestCase):
         # the seat with no rescue must not borrow the label
         line = [ln for ln in out.splitlines() if "mzansiedge" in ln][0]
         self.assertNotIn("tee-fresh", line)
+
+
+class TheKillSwitchIsHonest(unittest.TestCase):
+    """HEADROOM_SESSION_TRUTH_ROUTING=0 must actually hold a tee-fresh seat.
+
+    X1 P1, 2026-08-17. collect read the switch at COLLECT time and the rescue
+    is persisted into the snapshot, so a row already stamped
+    routing_basis="tee-fresh" kept routing for as long as that snapshot lived
+    no matter what the operator set. route.py now reads the same variable and
+    refuses those rows, which is the half that makes the disarm bind on the
+    file that already exists. These tests pin both halves and the boundary
+    between them.
+    """
+
+    def setUp(self):
+        self._orig_binding = collect.local_binding
+        collect.local_binding = lambda provider, home: ("AAAA", "BBBB")
+        self.addCleanup(
+            lambda: setattr(collect, "local_binding", self._orig_binding))
+
+    def rescued_row(self):
+        """A row exactly as apply_session_truth_rescue leaves it."""
+        row = stale_row()
+        row.update({"stale": False, "captured_at": int(NOW - 460),
+                    "trust_state": "verified_local", "routable": True,
+                    "routing_basis": "tee-fresh"})
+        for key in ("5h", "7d"):
+            row["windows"][key]["observed_at"] = int(NOW - 460)
+        return row
+
+    def reason(self, row):
+        return route.block_reason(
+            {"name": row["name"], "provider": "claude",
+             "home": "/tmp/hr-t/" + row["name"]},
+            "sonnet", row, {}, NOW, reserve=FLOOR)
+
+    def test_armed_the_persisted_rescue_still_routes(self):
+        # the control: without it, the test below proves nothing
+        self.assertIsNone(self.reason(self.rescued_row()))
+
+    def test_disarmed_the_persisted_rescue_is_held(self):
+        with mock.patch.object(route, "SESSION_TRUTH_ROUTING", 0):
+            reason = self.reason(self.rescued_row())
+        self.assertIsNotNone(reason, "a tee-fresh row routed with the switch "
+                                     "off: the snapshot outlived the disarm")
+        self.assertIn("HEADROOM_SESSION_TRUTH_ROUTING=0", reason)
+
+    def test_disarmed_an_ordinary_fresh_row_is_untouched(self):
+        # the switch may only ever refuse rows the rescue actually touched
+        row = self.rescued_row()
+        row.pop("routing_basis")
+        with mock.patch.object(route, "SESSION_TRUTH_ROUTING", 0):
+            self.assertIsNone(self.reason(row))
+
+    def test_both_modules_read_the_one_variable(self):
+        """A second variable name, or a default of 0 in one module and 1 in
+        the other, is the same silent half-disarm in a new costume."""
+        declaration = 'paths.env_int("HEADROOM_SESSION_TRUTH_ROUTING", 1)'
+        for module in (collect, route):
+            self.assertEqual(inspect.getsource(module).count(declaration), 1,
+                             f"{module.__name__} must read the switch once, "
+                             "under that name, defaulting to armed")
+        self.assertEqual(collect.SESSION_TRUTH_ROUTING,
+                         route.SESSION_TRUTH_ROUTING)
+
+    def test_the_disarm_is_documented_where_it_has_to_be_set(self):
+        """The unit is where an operator sets it for the serve process, and a
+        switch nobody can find is a switch nobody can pull."""
+        unit = os.path.expanduser(
+            "~/.config/systemd/user/headroom-serve.service")
+        if not os.path.exists(unit):
+            self.skipTest("no headroom-serve unit on this host")
+        with open(unit) as handle:
+            text = handle.read()
+        self.assertIn("HEADROOM_SESSION_TRUTH_ROUTING", text)
+        self.assertIn("restart headroom-serve", text)
 
 
 class TheRescueIsWiredIntoTheCollectRun(unittest.TestCase):

@@ -451,7 +451,7 @@ when you are deciding where to work all print what is **left**, and say so:
 $ headroom status opus
 model family: opus
   AVAIL  work               5h 66% left / 7d 88% left / opus 41% left
-  skip   personal           5h 4% left / 7d 12% left / opus 0% left   (opus weekly cap at 100%)
+  skip   personal           5h 4% left / 7d 12% left / opus 0% left   (opus weekly cap 0% left)
 -> chosen: work
 ```
 
