@@ -28,6 +28,36 @@ from . import locks, maximize, notify, paths, registry
 
 SNAPSHOT_MAX_AGE = paths.env_int("HEADROOM_SNAPSHOT_MAX_AGE", 900)
 OBSERVATION_MAX_AGE = paths.env_int("HEADROOM_OBSERVATION_MAX_AGE", 1800)
+# THE READING BAR FOR A CLAUDE ROW (2026-08-18, round 3 of the idle-seat
+# repair): the collector ceiling, 3600 plus 300, three parts named once:
+#   * collector TTL 2400 plus stagger: the ai-accounts cron collector refreshes
+#     a seat only when its reading is older than 2400 s plus 120 s per paid
+#     Claude rank, and REUSES the last reading inside that window, so a
+#     healthy idle seat's captured_at is lawfully up to about 55 minutes old;
+#   * serve cache 300: headroom-serve republishes a reading for up to 300 s
+#     more before it looks again;
+#   * Paul's 60 minute accuracy law: a reading under an hour old IS the
+#     seat's reading; the same ceiling the widget already judges every Claude
+#     window against (widget.SCOPED_OBSERVATION_MAX_AGE, same env var here so
+#     the feed and the router can never be widened apart).
+# Measured 2026-08-18: `headroom status` at 08:1xZ skipped getdomanski
+# "(reading expired)" and `headroom fable` at 07:3xZ listed mzansiedge NO
+# READING; the dead man re-drill's hand reseat to mzansiedge was REFUSED
+# outright. All three were healthy idle seats whose collector reading was
+# between 30 and 60 minutes old, judged here against the 1800 s tee bar.
+# WHY THIS IS SAFE. An idle seat has no tee: nobody is typing on it, so its
+# ONLY source is the collector, and a collector reading under an hour old is
+# the law. The moment a lane lands on the seat its own statusline tees the
+# truth on the first turn (session-truth, 1800 s, unchanged below and in
+# collect.SESSION_TRUTH_MAX_AGE), and the survival watch rotates the lane in
+# place at the wall; so a seat drained ELSEWHERE inside the hour is caught by
+# exactly the machinery that catches every other wall, not by this bar.
+# Codex rows keep OBSERVATION_MAX_AGE (1800): the codex reading is live
+# app-server telemetry on its own cadence, not the ai-accounts collector's.
+# The stale flag, identity gates, reserve, critical, scoped checks and the
+# tee bar are untouched; only the captured_at bar in block_reason moves.
+CLAUDE_OBSERVATION_MAX_AGE = paths.env_int(
+    "HEADROOM_SCOPED_OBSERVATION_MAX_AGE", 3600 + 300)
 CLOCK_SKEW = paths.env_int("HEADROOM_CLOCK_SKEW", 300)
 
 # --- one cap vocabulary, for every surface that reads a refusal ------------
@@ -838,6 +868,17 @@ def routing_basis(snapshot_row):
     return basis if isinstance(basis, str) and basis else None
 
 
+def reading_max_age(account):
+    """The captured_at bar block_reason judges ``account``'s reading against.
+
+    CLAUDE_OBSERVATION_MAX_AGE (the collector ceiling, see the constant block)
+    for a Claude row; OBSERVATION_MAX_AGE for every other provider. Named
+    once so no second caller can pick a different bar for the same row."""
+    if isinstance(account, dict) and account.get("provider") == "claude":
+        return CLAUDE_OBSERVATION_MAX_AGE
+    return OBSERVATION_MAX_AGE
+
+
 def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     """None when the account has proven headroom; otherwise why not.
 
@@ -927,7 +968,7 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     captured_at = snapshot_row.get("captured_at")
     if not _number(captured_at) or captured_at > now + CLOCK_SKEW:
         return "reading clock invalid"
-    if now - captured_at > OBSERVATION_MAX_AGE:
+    if now - captured_at > reading_max_age(account):
         return "reading expired"
     windows = snapshot_row.get("windows")
     if not isinstance(windows, dict):

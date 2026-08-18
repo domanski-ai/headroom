@@ -644,6 +644,53 @@ class BlockReasonFailClosed(unittest.TestCase):
     def test_stale_holds(self):
         self.assertIsNotNone(self.reason(_claude_row(stale=True)))
 
+    # THE IDLE SEAT'S READING BAR (2026-08-18, round 3). A Claude row's
+    # captured_at is judged against CLAUDE_OBSERVATION_MAX_AGE (3600 plus
+    # 300, the collector ceiling), not the 1800 s tee bar: an idle seat has
+    # no tee, its only source is the collector, and a collector reading under
+    # an hour old is the law. Measured before the change: `headroom status`
+    # skipped getdomanski "(reading expired)" on a healthy 30..60 minute old
+    # reading and a hand reseat to mzansiedge was refused outright.
+    def test_claude_reading_at_2500s_is_routable(self):
+        row = _claude_row()
+        row["captured_at"] = self.now - 2500
+        self.assertIsNone(self.reason(row))
+
+    def test_claude_reading_bar_boundary_is_3900s(self):
+        at_bar = _claude_row()
+        at_bar["captured_at"] = self.now - 3900
+        self.assertIsNone(self.reason(at_bar))
+        past_bar = _claude_row()
+        past_bar["captured_at"] = self.now - 3901
+        self.assertEqual(self.reason(past_bar), "reading expired")
+
+    def test_claude_reading_bar_is_the_collector_ceiling_named_once(self):
+        # the constant, the chooser and the widget's ceiling agree; the tee
+        # bar and the codex bar are untouched at 1800
+        self.assertEqual(route.CLAUDE_OBSERVATION_MAX_AGE, 3600 + 300)
+        self.assertEqual(route.reading_max_age(_account()), 3600 + 300)
+        self.assertEqual(route.reading_max_age(_account(provider="codex")),
+                         route.OBSERVATION_MAX_AGE)
+        self.assertEqual(route.reading_max_age(None), route.OBSERVATION_MAX_AGE)
+        self.assertEqual(route.OBSERVATION_MAX_AGE, 1800)
+        self.assertEqual(collect.SESSION_TRUTH_MAX_AGE, 1800)
+        from headroom import widget
+        self.assertEqual(route.CLAUDE_OBSERVATION_MAX_AGE,
+                         widget.SCOPED_OBSERVATION_MAX_AGE)
+
+    def test_the_stale_flag_still_holds_inside_the_claude_bar(self):
+        # the bar widens ONLY the captured_at gate; the collector's own
+        # verdict (stale) and the window gates keep every hold they had
+        row = _claude_row(stale=True)
+        row["captured_at"] = self.now - 2500
+        self.assertEqual(self.reason(row), "reading stale")
+        row = _claude_row()
+        row["captured_at"] = self.now - 2500
+        row["windows"]["5h"] = {"used_percent": None,
+                                "freshness": "expired_observation",
+                                "resets_at": 1, "window_minutes": 300}
+        self.assertIsNotNone(self.reason(row))
+
     def test_corrupt_cooldown_value_holds(self):
         r = self.reason(_claude_row(), cool={"a:sonnet": "not-a-number"})
         self.assertIsNotNone(r)
@@ -2936,6 +2983,16 @@ class CodexBlockReasonFailClosed(unittest.TestCase):
 
     def test_healthy_codex_routes(self):
         self.assertIsNone(self.reason(_codex_row()))
+
+    def test_codex_reading_keeps_the_1800s_bar(self):
+        # 2026-08-18 round 3: only a CLAUDE row takes the collector ceiling;
+        # codex telemetry is live app-server output on its own cadence
+        row = _codex_row()
+        row["captured_at"] = int(self.now) - 2500
+        self.assertEqual(self.reason(row), "reading expired")
+        row = _codex_row()
+        row["captured_at"] = int(self.now) - 1799
+        self.assertIsNone(self.reason(row))
 
     def test_verified_local_not_routable_for_codex(self):
         row = _codex_row(trust_state="verified_local")

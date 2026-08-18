@@ -145,12 +145,17 @@ SESSION_TRUTH_ROUTING = paths.env_int("HEADROOM_SESSION_TRUTH_ROUTING", 1)
 # row `stale` past EXTERNAL_CLAUDE_MAX_AGE (3600s by default since 2026-08-18,
 # 720s before; the headroom-serve unit sets the same 3600s), and
 # route.block_reason separately refuses any reading
-# older than OBSERVATION_MAX_AGE with "reading expired" no matter what `stale`
+# older than its reading bar with "reading expired" no matter what `stale`
 # says. Measured 2026-08-17T17:03Z on the live snapshot: serve had ingested
 # claude-system at 3600s so `stale` was False, and the router still skipped it
-# as "reading expired". So eligibility is the UNION, and it reads the same env
-# var route.py does so an operator who widens one cannot silently widen only
-# one. collect must not import route (route imports collect).
+# as "reading expired". So eligibility is the UNION. Since 2026-08-18 (round
+# 3 of the idle-seat repair) the router's bar for a CLAUDE row is
+# route.CLAUDE_OBSERVATION_MAX_AGE (3600 plus 300, the collector ceiling) and
+# OBSERVATION_MAX_AGE (1800) only for codex; the rescue below still fires at
+# 1800 on purpose: a tee newer than a 30 minute old collector reading is the
+# better witness whether or not the router would still accept the old one,
+# and rescuing early can only refresh a number, never widen a gate. collect
+# must not import route (route imports collect).
 SESSION_TRUTH_RESCUE_AFTER = paths.env_int("HEADROOM_OBSERVATION_MAX_AGE", 1800)
 
 PUBLIC_FIELDS = {
@@ -1765,8 +1770,9 @@ def _throttle_carryover(previous, account, now, fresh_identity):
     A 429 from the usage endpoint says the METER is busy, not that capacity
     changed — so the last verified reading keeps the slot routable instead of
     stranding launches (every consumer still age-bounds it via captured_at
-    against OBSERVATION_MAX_AGE, so this can never outlive a real reading's
-    normal service window). Returns a copy, or None (fail-closed) when the
+    against its reading bar, OBSERVATION_MAX_AGE here and in the router for
+    codex, route.CLAUDE_OBSERVATION_MAX_AGE for a Claude row, so this can
+    never outlive a real reading's normal service window). Returns a copy, or None (fail-closed) when the
     previous row is anything less than a fresh verified success — including
     when the slot's CURRENT identity/credential binding (read locally moments
     ago, no network) no longer matches the old row: a relogged slot must
