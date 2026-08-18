@@ -1,5 +1,6 @@
 """Widget contract, refresh gate, integrations, and release artifact tests."""
 import hashlib
+import inspect
 import io
 import json
 import math
@@ -224,9 +225,12 @@ class WidgetContractTests(unittest.TestCase):
         self.assertEqual(projected["windows"]["5h"]["state"], "held")
 
     def test_one_stale_window_demotes_every_child_window(self):
+        # a Claude row's windows are judged against the collector ceiling
+        # (2026-08-18, see IdleSeatWindowFreshnessTests), so one second past
+        # SCOPED_OBSERVATION_MAX_AGE is past its bar
         account = usage_account()
         account["windows"]["7d"]["observed_at"] = (
-            NOW - widget.OBSERVATION_MAX_AGE - 1)
+            NOW - widget.SCOPED_OBSERVATION_MAX_AGE - 1)
         projected = widget.project(usage_snapshot(account), NOW)["accounts"][0]
         self.assertEqual(projected["state"], "stale")
         for key, last in (("5h", 80.0), ("7d", 60.0)):
@@ -301,6 +305,16 @@ class WidgetContractTests(unittest.TestCase):
         self.assertIn("hr 0/1 · -- | color=gray", rendered.splitlines()[1])
 
 
+# The constants dashboard.build injects into the page (CONFIG), handed to every
+# JS harness below from the widget module itself so a harness can never quote a
+# bar the feed does not use (2026-08-18: they were literals, and the scoped one
+# lagged the widget by the serve cache).
+_JS_CONSTANTS = ("const OBSERVATION_MAX_AGE=%d,SNAPSHOT_MAX_AGE=%d,"
+                 "SCOPED_OBSERVATION_MAX_AGE=%d;\n"
+                 % (widget.OBSERVATION_MAX_AGE, widget.SNAPSHOT_MAX_AGE,
+                    widget.SCOPED_OBSERVATION_MAX_AGE))
+
+
 # Drives the REAL dashboard template JS under node: exercise both consumer
 # paths — the main dashboard (displayState/windowMarkup) and the compact widget
 # (hrValidFeed/hrAccount/hrAcctMarkup/hrBarsMarkup) — with a lifted-5h codex
@@ -371,9 +385,7 @@ class CodexLiftedFiveHourDashboardJS(unittest.TestCase):
             1)[1].split(
             "/* --------------------------------------------------------------- theme */",
             1)[0]
-        return ("const OBSERVATION_MAX_AGE=1800,SNAPSHOT_MAX_AGE=900,"
-                "SCOPED_OBSERVATION_MAX_AGE=3600;\n"
-                + section + _CODEX_5H_TAIL)
+        return _JS_CONSTANTS + section + _CODEX_5H_TAIL
 
     @unittest.skipUnless(NODE, "node runtime required to execute dashboard JS")
     def test_lifted_5h_keeps_codex_live_but_holds_non_codex(self):
@@ -2493,20 +2505,23 @@ class ScopedWindowFreshnessTests(unittest.TestCase):
         row = self.project(scoped_account(scoped_age=3000, used_scoped=100.0))
         self.assertEqual(row["windows"]["scoped:Fable"]["state"], "limited")
 
-    # ------------------------------------- 5h and 7d keep the tighter bar
-    def test_5h_at_2000_seconds_is_still_stale(self):
+    # ------------- 5h and 7d past their own bar do not darken the pool
+    # (2026-08-18 07:5xZ: a Claude row's 5h and 7d are judged against the
+    # same collector ceiling as the scoped pool, see
+    # IdleSeatWindowFreshnessTests, so "aged out" means past 3900 s here.)
+    def test_5h_at_4000_seconds_is_stale(self):
         account = scoped_account(scoped_age=600)
-        account["windows"]["5h"]["observed_at"] = NOW - 2000
+        account["windows"]["5h"]["observed_at"] = NOW - 4000
         row = self.project(account)
         self.assertEqual(row["windows"]["5h"]["state"], "stale")
         self.assertEqual(row["state"], "stale")
 
-    def test_5h_at_2000_seconds_does_not_darken_the_scoped_pool(self):
-        """The exact live shape on 2026-08-18: session windows aged out, the
-        Fable pool still well inside its own ceiling."""
+    def test_5h_at_4000_seconds_does_not_darken_the_scoped_pool(self):
+        """The 2026-08-18 shape one step further: session windows aged past
+        the ceiling, the Fable pool still well inside its own."""
         account = scoped_account(scoped_age=600)
-        account["windows"]["5h"]["observed_at"] = NOW - 2000
-        account["windows"]["7d"]["observed_at"] = NOW - 2000
+        account["windows"]["5h"]["observed_at"] = NOW - 4000
+        account["windows"]["7d"]["observed_at"] = NOW - 4000
         row = self.project(account)
         self.assertEqual(row["state"], "stale")
         self.assertEqual(row["windows"]["scoped:Fable"]["state"], "current")
@@ -2642,8 +2657,8 @@ class ScopedWindowFreshnessTests(unittest.TestCase):
         arriving there must be judged by the scoped ceiling too, or the page
         and the feed disagree about the same number."""
         account = usage_account("fab")
-        account["windows"]["5h"]["observed_at"] = NOW - 2000
-        account["windows"]["7d"]["observed_at"] = NOW - 2000
+        account["windows"]["5h"]["observed_at"] = NOW - 4000
+        account["windows"]["7d"]["observed_at"] = NOW - 4000
         account["windows"]["scoped:Opus"] = {
             "used_percent": 10.0, "resets_at": NOW + 86400,
             "observed_at": NOW - 3000}
@@ -2651,6 +2666,298 @@ class ScopedWindowFreshnessTests(unittest.TestCase):
         self.assertEqual(row["state"], "stale")
         self.assertEqual(row["windows"]["scoped:Opus"]["state"], "current")
         self.assertEqual(row["windows"]["scoped:Opus"]["left_percent"], 90.0)
+
+
+class IdleSeatWindowFreshnessTests(unittest.TestCase):
+    """2026-08-18 07:4xZ, two hours after the scoped fix: account mzansiedge
+    showed 5h and 7d STALE (last observed 99 and 24) while its own
+    scoped:Fable was CURRENT at 55. Nobody had sat on the seat since 06:27Z,
+    so no tee could rescue the row, its captured_at was the collector's, and
+    the 30-minute bar called the collector's lawful 50-minute cadence dead by
+    arithmetic. The per-turn source that bar assumes exists only while an
+    agent is live on the seat.
+
+    The rule (steward ruling 07:5xZ): ONE ceiling for every window on a
+    Claude row, SCOPED_OBSERVATION_MAX_AGE, whatever the row's routing_basis.
+    The first cut kept a tee-fresh row on the tee bar 1800 and the verifier
+    showed it flaps (a newer tee reading judged stale at 1801 s, then the
+    older collector reading judged current at 3900), so the tee case is gone
+    and routing_basis is not read by the widget at all. The choice is made
+    once and used for the account state and the per window state alike.
+    """
+
+    def project(self, account, evaluated_at=NOW):
+        return widget.project(usage_snapshot(account), evaluated_at)["accounts"][0]
+
+    def idle_row(self, age, **overrides):
+        """A Claude row whose captured_at and both windows are ``age`` old:
+        the idle seat shape, 5h 99 left and 7d 24 left as measured. It
+        carries no routing_basis unless the caller sets one."""
+        used5 = overrides.pop("used5", 1.0)
+        used7 = overrides.pop("used7", 76.0)
+        account = usage_account("mzansiedge", used5=used5, used7=used7,
+                                captured_at=NOW - age)
+        for key in ("5h", "7d"):
+            account["windows"][key]["observed_at"] = NOW - age
+        account.update(overrides)
+        return account
+
+    # ------------------------------------------------------- the idle seat
+    def test_an_idle_claude_row_at_2500_seconds_is_current(self):
+        row = self.project(self.idle_row(2500))
+        self.assertEqual(row["state"], "current")
+        for key, left in (("5h", 99.0), ("7d", 24.0)):
+            self.assertEqual(row["windows"][key]["state"], "current", key)
+            self.assertEqual(row["windows"][key]["left_percent"], left, key)
+            self.assertIsNone(
+                row["windows"][key]["last_observed_left_percent"], key)
+
+    def test_an_idle_claude_row_at_4000_seconds_is_stale(self):
+        row = self.project(self.idle_row(4000))
+        self.assertEqual(row["state"], "stale")
+        for key, left in (("5h", 99.0), ("7d", 24.0)):
+            self.assertEqual(row["windows"][key]["state"], "stale", key)
+            self.assertIsNone(row["windows"][key]["left_percent"], key)
+            self.assertEqual(
+                row["windows"][key]["last_observed_left_percent"], left, key)
+
+    def test_the_boundary_is_exactly_the_collector_ceiling(self):
+        """Current AT 3900, stale one second past it."""
+        self.assertEqual(widget.SCOPED_OBSERVATION_MAX_AGE, 3900)
+        for age, expected in ((3900, "current"), (3901, "stale")):
+            with self.subTest(age=age):
+                row = self.project(self.idle_row(age))
+                self.assertEqual(row["state"], expected)
+                self.assertEqual(row["windows"]["5h"]["state"], expected)
+                self.assertEqual(row["windows"]["7d"]["state"], expected)
+
+    # ------------------------------ one ceiling whatever the routing_basis
+    def test_every_routing_basis_takes_the_same_ceiling(self):
+        """The tee-fresh special case is gone: a row the rescue rebased on
+        its own tee is judged like any other Claude row, so a seat whose agent
+        just went quiet cannot read stale at 1801 s and current again on an
+        older collector reading a collect later."""
+        for basis in ("tee-fresh", "collector", "", None, 7):
+            with self.subTest(basis=basis, age=2500):
+                row = self.project(self.idle_row(2500, routing_basis=basis))
+                self.assertEqual(row["state"], "current")
+                self.assertEqual(row["windows"]["5h"]["state"], "current")
+                self.assertEqual(row["windows"]["7d"]["state"], "current")
+            with self.subTest(basis=basis, age=4000):
+                row = self.project(self.idle_row(4000, routing_basis=basis))
+                self.assertEqual(row["state"], "stale")
+                self.assertEqual(row["windows"]["5h"]["state"], "stale")
+
+    def test_the_bar_table(self):
+        """The one place the choice is made, read directly."""
+        self.assertEqual(widget.OBSERVATION_MAX_AGE, 1800)
+        self.assertEqual(widget.SCOPED_OBSERVATION_MAX_AGE, 3600 + 300)
+        for row in ({"provider": "claude"},
+                    {"provider": "claude", "routing_basis": "tee-fresh"},
+                    {"provider": "claude", "routing_basis": "collector"}):
+            with self.subTest(row=row):
+                self.assertEqual(widget._observation_max_age(row),
+                                 widget.SCOPED_OBSERVATION_MAX_AGE)
+                self.assertEqual(widget._observation_max_age(row, scoped=True),
+                                 widget.SCOPED_OBSERVATION_MAX_AGE)
+        self.assertEqual(widget._observation_max_age({"provider": "codex"}),
+                         widget.OBSERVATION_MAX_AGE)
+        self.assertEqual(widget._observation_max_age(None),
+                         widget.OBSERVATION_MAX_AGE)
+        self.assertEqual(widget._observation_max_age(
+            {"provider": "codex"}, scoped=True),
+            widget.SCOPED_OBSERVATION_MAX_AGE)
+        self.assertFalse(hasattr(widget, "TEE_ROUTING_BASIS"))
+
+    # -------------------------------- the two places cannot disagree
+    def test_account_state_and_window_state_take_the_same_bar(self):
+        """The row's capture time and each window's observed_at are judged
+        against ONE bar: nothing is current at the row and stale at the
+        window, or the other way round, at any age or basis."""
+        for basis in (None, "tee-fresh"):
+            for age, expected in ((2500, "current"), (4000, "stale")):
+                with self.subTest(basis=basis, age=age):
+                    account = self.idle_row(age)
+                    if basis:
+                        account["routing_basis"] = basis
+                    row = self.project(account)
+                    states = {row["state"]} | {
+                        row["windows"][key]["state"] for key in ("5h", "7d")}
+                    self.assertEqual(states, {expected})
+
+    def test_the_dashboard_projection_agrees_with_the_widget(self):
+        for basis in (None, "tee-fresh"):
+            for age in (2500, 4000):
+                with self.subTest(basis=basis, age=age):
+                    account = self.idle_row(age)
+                    if basis:
+                        account["routing_basis"] = basis
+                    plain = widget.project(usage_snapshot(account), NOW)[
+                        "accounts"][0]
+                    rich = widget.project_dashboard(
+                        usage_snapshot(account), NOW)["accounts"][0]
+                    self.assertEqual(plain["state"], rich["state"])
+                    for key in ("5h", "7d"):
+                        self.assertEqual(plain["windows"][key]["state"],
+                                         rich["windows"][key]["state"], key)
+
+    # ------------------------------------------------- what did not move
+    def test_a_scoped_window_is_unchanged_either_way(self):
+        for basis in (None, "tee-fresh"):
+            with self.subTest(basis=basis):
+                account = scoped_account("mzansiedge", scoped_age=3000)
+                if basis:
+                    account["routing_basis"] = basis
+                row = self.project(account)
+                self.assertEqual(row["windows"]["scoped:Fable"]["state"],
+                                 "current")
+                self.assertEqual(
+                    row["windows"]["scoped:Fable"]["left_percent"], 52.0)
+                account = scoped_account("mzansiedge", scoped_age=4000)
+                if basis:
+                    account["routing_basis"] = basis
+                row = self.project(account)
+                self.assertEqual(row["windows"]["scoped:Fable"]["state"],
+                                 "stale")
+
+    def test_a_codex_row_keeps_the_30_minute_bar(self):
+        row = self.project(self.idle_row(2500, provider="codex"))
+        self.assertEqual(row["state"], "stale")
+        self.assertEqual(row["windows"]["7d"]["state"], "stale")
+        row = self.project(self.idle_row(1700, provider="codex"))
+        self.assertEqual(row["state"], "current")
+        row = self.project(self.idle_row(1801, provider="codex"))
+        self.assertEqual(row["state"], "stale")
+
+    def test_the_row_stale_flag_still_demotes_an_idle_row(self):
+        """The collector's own verdict (stale=True at ingest) outranks the
+        wider bar: the ceiling never outlives EXTERNAL_CLAUDE_MAX_AGE."""
+        row = self.project(self.idle_row(2500, stale=True))
+        self.assertEqual(row["state"], "stale")
+        self.assertEqual(row["windows"]["5h"]["state"], "stale")
+
+    def test_the_snapshot_bar_and_the_held_gates_did_not_move(self):
+        self.assertEqual(widget.SNAPSHOT_MAX_AGE, 900)
+        account = self.idle_row(2500)
+        snapshot = usage_snapshot(account,
+                                  generated=NOW - widget.SNAPSHOT_MAX_AGE - 1)
+        self.assertEqual(widget.project(snapshot, NOW)["accounts"][0]["state"],
+                         "stale")
+        for label, override in (("not ok", {"ok": False}),
+                                ("trust held", {"trust_state": "held"}),
+                                ("duplicate", {"trust_state":
+                                               "duplicate_identity"}),
+                                ("dashboard only", {"trust_state":
+                                                    "dashboard_only"}),
+                                ("no capture", {"captured_at": None}),
+                                ("future capture", {"captured_at": NOW + 60}),
+                                ("unpaid", {"error_code": "unpaid"})):
+            with self.subTest(gate=label):
+                row = self.project(self.idle_row(2500, **override))
+                self.assertEqual(row["state"], "held", label)
+                self.assertEqual(row["windows"]["5h"]["state"], "held", label)
+
+    def test_the_state_enum_is_untouched(self):
+        seen = set()
+        for age in (100, 2500, 4000):
+            for override in ({}, {"routing_basis": "tee-fresh"},
+                             {"used5": 100.0}, {"ok": False},
+                             {"error_code": "unpaid"}):
+                row = self.project(self.idle_row(age, **override))
+                seen.add(row["state"])
+                seen.update(w["state"] for w in row["windows"].values())
+        self.assertEqual(seen, {"current", "limited", "stale", "held"})
+
+    def test_routing_basis_never_leaks_into_the_widget_contract(self):
+        row = self.project(self.idle_row(2500, routing_basis="tee-fresh"))
+        self.assertEqual(set(row), {"name", "provider", "state", "windows"})
+        rendered = json.dumps(widget.project(
+            usage_snapshot(self.idle_row(2500, routing_basis="tee-fresh")),
+            NOW)).lower()
+        self.assertNotIn("tee-fresh", rendered)
+        self.assertNotIn("routing_basis", rendered)
+
+    def test_the_public_snapshot_does_not_carry_routing_basis(self):
+        """The widget does not read the basis, so the public feed does not
+        carry it (the first cut added it to collect.PUBLIC_FIELDS; reverted
+        with the tee case)."""
+        from headroom import collect
+        self.assertNotIn("routing_basis", collect.PUBLIC_FIELDS)
+        self.assertNotIn("tee_note", collect.PUBLIC_FIELDS)
+
+
+class CollectorIngestAgeDefaultTests(unittest.TestCase):
+    """The second writer (2026-08-18, verifier finding 4, live at 07:52:18Z
+    run 805cff46). headroom-serve runs with HEADROOM_EXTERNAL_CLAUDE_MAX_AGE
+    3600 in its unit environment, but any headroom CLI whose snapshot has gone
+    old collects INLINE with no such environment and the code default. At
+    720 that default marked idle seats stale True at 735 s, apply_integrity
+    stamped them stale_observation, and the widget showed them HELD until the
+    serve unit collected again, whatever bar the widget used. The code
+    default is now the unit's value, so every writer of the snapshot agrees.
+    """
+
+    EMAIL = "seat@example.com"
+
+    def setUp(self):
+        from headroom import collect
+        self.collect = collect
+        self.directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.directory, ignore_errors=True)
+        self.snapshot = os.path.join(self.directory, "usage-private.json")
+
+    def source_row(self, age):
+        captured = NOW - age
+        return {"name": "claude-mzansiedge", "provider": "claude", "ok": True,
+                "stale": False, "email": self.EMAIL, "captured_at": captured,
+                "windows": {
+                    "5h": {"used_percent": 1.0, "resets_at": NOW + 1800,
+                           "observed_at": captured},
+                    "7d": {"used_percent": 76.0, "resets_at": NOW + 86400,
+                           "observed_at": captured}}}
+
+    def ingest(self, age):
+        with open(self.snapshot, "w") as handle:
+            json.dump({"schema_version": 1, "generated": NOW - 60,
+                       "accounts": [self.source_row(age)]}, handle)
+        with mock.patch.object(self.collect, "EXTERNAL_CLAUDE_SNAPSHOT",
+                               self.snapshot):
+            return self.collect.external_claude_limits(
+                "mzansiedge", {"email": self.EMAIL}, NOW)
+
+    def test_the_code_default_is_the_units_value(self):
+        self.assertEqual(self.collect.EXTERNAL_CLAUDE_MAX_AGE, 3600)
+        source = inspect.getsource(self.collect)
+        self.assertIn(
+            'paths.env_int("HEADROOM_EXTERNAL_CLAUDE_MAX_AGE", 3600)', source)
+        self.assertNotIn(
+            'paths.env_int("HEADROOM_EXTERNAL_CLAUDE_MAX_AGE", 720)', source)
+
+    def test_a_2500_second_old_row_is_not_marked_stale_by_the_default(self):
+        verdict, payload = self.ingest(2500)
+        self.assertEqual(verdict, "ingest")
+        self.assertIs(payload["stale"], False)
+        self.assertEqual(payload["captured_at"], NOW - 2500)
+
+    def test_the_ingest_boundary_is_the_60_minute_law(self):
+        for age, stale in ((3600, False), (3601, True)):
+            with self.subTest(age=age):
+                verdict, payload = self.ingest(age)
+                self.assertEqual(verdict, "ingest")
+                self.assertIs(payload["stale"], stale)
+
+    def test_the_ingested_idle_row_projects_current_on_the_widget(self):
+        """End to end for the measured case: an inline collect at 2500 s
+        hands the widget a row it shows current, not held."""
+        verdict, payload = self.ingest(2500)
+        self.assertEqual(verdict, "ingest")
+        account = usage_account("mzansiedge", captured_at=payload["captured_at"],
+                                stale=payload["stale"])
+        account["windows"] = payload["windows"]
+        row = widget.project(usage_snapshot(account), NOW)["accounts"][0]
+        self.assertEqual(row["state"], "current")
+        self.assertEqual(row["windows"]["5h"]["left_percent"], 99.0)
+        self.assertEqual(row["windows"]["7d"]["left_percent"], 24.0)
 
 
 _SCOPED_TAIL = r"""
@@ -2661,9 +2968,11 @@ _SCOPED_TAIL = r"""
     left_percent: state === "current" ? left : null,
     last_observed_left_percent: state === "current" ? null : left,
     resets_at: nowS + 3600, observed_at: nowS - age });
-  // The live 2026-08-18 shape: session windows aged past 30 minutes, the
-  // weekly Fable pool 50 minutes old and still inside its own ceiling. The
-  // __display block is what widget.project already published.
+  // The live 2026-08-18 05:2xZ shape: the SERVER demoted the session windows
+  // (then at 30 minutes; since 07:5xZ a Claude row's bar is the collector
+  // ceiling, so at 2500 s this row is a server demotion the client must keep,
+  // never re-promote), the weekly Fable pool 50 minutes old and still inside
+  // its own ceiling. The __display block is what widget.project published.
   const aged = { name: "sys", provider: "claude", captured_at: nowS - 2500,
     windows: { "5h": {}, "7d": {}, "scoped:Fable": {} },
     __display: { state: "stale",
@@ -2688,6 +2997,128 @@ _SCOPED_TAIL = r"""
 """
 
 
+_IDLE_SEAT_TAIL = r"""
+;(function () {
+  snapshotState = "current"; sourceFailed = false;
+  // freeze the page clock so the 3900 boundary is judged at exactly 3900
+  const frozen = Date.now(); Date.now = () => frozen;
+  const nowS = frozen / 1e3;
+  const win = (state, left, age) => ({ state: state,
+    left_percent: state === "current" ? left : null,
+    last_observed_left_percent: state === "current" ? null : left,
+    resets_at: nowS + 3600, observed_at: nowS - age });
+  // A Claude row the server projected CURRENT with capture and windows at
+  // the given age; the page re-judges the ages on its own clock.
+  const claude = (age) => ({ name: "mz", provider: "claude",
+    captured_at: nowS - age,
+    windows: { "5h": {}, "7d": {}, "scoped:Fable": {} },
+    __display: { state: "current",
+      windows: { "5h": win("current", 99, age), "7d": win("current", 24, age),
+                 "scoped:Fable": win("current", 55, 3000) } } });
+  // The same ages on a codex row (weekly only, 5h lifted).
+  const codex = (age) => ({ name: "cx", provider: "codex",
+    captured_at: nowS - age,
+    windows: { "7d": {} },
+    __display: { state: "current",
+      windows: { "7d": win("current", 80, age) } } });
+  console.log(JSON.stringify({
+    claude_2500_account: displayState(claude(2500)),
+    claude_2500_5h: windowState(claude(2500), "5h"),
+    claude_2500_7d: windowState(claude(2500), "7d"),
+    claude_2500_5h_markup: windowMarkup(claude(2500), "5h"),
+    claude_2500_scoped: windowState(claude(2500), "scoped:Fable"),
+    claude_3900_account: displayState(claude(3900)),
+    claude_3901_account: displayState(claude(3901)),
+    claude_3901_5h: windowState(claude(3901), "5h"),
+    claude_4000_account: displayState(claude(4000)),
+    claude_4000_7d: windowState(claude(4000), "7d"),
+    claude_4000_scoped: windowState(claude(4000), "scoped:Fable"),
+    codex_1700_account: displayState(codex(1700)),
+    codex_2500_account: displayState(codex(2500)),
+    codex_2500_7d: windowState(codex(2500), "7d"),
+    bar_claude: observationMaxAge({ provider: "claude" }, "5h"),
+    bar_claude_scoped: observationMaxAge({ provider: "claude" }, "scoped:Fable"),
+    bar_codex: observationMaxAge({ provider: "codex" }, "7d"),
+    bar_codex_scoped: observationMaxAge({ provider: "codex" }, "scoped:Fable"),
+    bar_none: observationMaxAge(null, "5h")
+  }));
+})();
+"""
+
+
+class IdleSeatDashboardJS(unittest.TestCase):
+    """The page judges a Claude row's captured_at, 5h and 7d against the same
+    collector ceiling /widget.json uses (2026-08-18 07:5xZ). Before this the
+    template re-judged them client side at 1800, so an idle seat the feed
+    called current from minute 30 to 60 of the collector cycle was grey on
+    the page at 127.0.0.1:8377. Three surfaces, one snapshot, one answer."""
+
+    @staticmethod
+    def _harness():
+        with open(dashboard.TEMPLATE) as handle:
+            html = handle.read()
+        section = html.split(
+            "/* ------------------------------------------------------------- helpers */",
+            1)[1].split(
+            "/* --------------------------------------------------------------- theme */",
+            1)[0]
+        return _JS_CONSTANTS + section + _IDLE_SEAT_TAIL
+
+    @unittest.skipUnless(NODE, "node runtime required to execute dashboard JS")
+    def test_an_idle_claude_row_is_judged_at_the_collector_ceiling(self):
+        proc = subprocess.run([NODE, "-"], input=self._harness(),
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout.strip().splitlines()[-1])
+        # the measured case: 2500 s, current on the page as on the feed
+        self.assertEqual(out["claude_2500_account"], "current")
+        self.assertEqual(out["claude_2500_5h"], "current")
+        self.assertEqual(out["claude_2500_7d"], "current")
+        self.assertIn("99%", out["claude_2500_5h_markup"])
+        self.assertEqual(out["claude_2500_scoped"], "current")
+        # the boundary is exactly the widget's
+        self.assertEqual(out["claude_3900_account"], "current")
+        self.assertEqual(out["claude_3901_account"], "stale")
+        self.assertEqual(out["claude_3901_5h"], "stale")
+        self.assertEqual(out["claude_4000_account"], "stale")
+        self.assertEqual(out["claude_4000_7d"], "stale")
+        # the scoped rule is as it was: its own clock, 3000 s still current
+        self.assertEqual(out["claude_4000_scoped"], "current")
+        # codex keeps the 30 minute bar
+        self.assertEqual(out["codex_1700_account"], "current")
+        self.assertEqual(out["codex_2500_account"], "stale")
+        self.assertEqual(out["codex_2500_7d"], "stale")
+        # the bar table mirrors widget._observation_max_age
+        self.assertEqual(out["bar_claude"], widget.SCOPED_OBSERVATION_MAX_AGE)
+        self.assertEqual(out["bar_claude_scoped"],
+                         widget.SCOPED_OBSERVATION_MAX_AGE)
+        self.assertEqual(out["bar_codex"], widget.OBSERVATION_MAX_AGE)
+        self.assertEqual(out["bar_codex_scoped"],
+                         widget.SCOPED_OBSERVATION_MAX_AGE)
+        self.assertEqual(out["bar_none"], widget.OBSERVATION_MAX_AGE)
+
+    def test_the_page_falls_back_to_the_widgets_own_numbers(self):
+        """With no CONFIG (the harness, a page served without a build) the
+        template's literal fallbacks must be the widget's constants, or the
+        page invents a bar the feed never used."""
+        with open(dashboard.TEMPLATE) as handle:
+            html = handle.read()
+        fallback = {}
+        for name in ("snapshot_max_age", "observation_max_age",
+                     "scoped_observation_max_age"):
+            match = re.search(r"CONFIG\." + name + r":(\d+);", html)
+            self.assertIsNotNone(match, name)
+            fallback[name] = int(match.group(1))
+        self.assertEqual(fallback["snapshot_max_age"], widget.SNAPSHOT_MAX_AGE)
+        self.assertEqual(fallback["observation_max_age"],
+                         widget.OBSERVATION_MAX_AGE)
+        self.assertEqual(fallback["scoped_observation_max_age"],
+                         widget.SCOPED_OBSERVATION_MAX_AGE)
+        # the harness itself hands the page the same three numbers
+        self.assertIn("SCOPED_OBSERVATION_MAX_AGE=%d;"
+                      % widget.SCOPED_OBSERVATION_MAX_AGE, _JS_CONSTANTS)
+
+
 class ScopedWindowDashboardJS(unittest.TestCase):
     """The page must say what the feed says.
 
@@ -2707,9 +3138,7 @@ class ScopedWindowDashboardJS(unittest.TestCase):
             1)[1].split(
             "/* --------------------------------------------------------------- theme */",
             1)[0]
-        return ("const OBSERVATION_MAX_AGE=1800,SNAPSHOT_MAX_AGE=900,"
-                "SCOPED_OBSERVATION_MAX_AGE=3600;\n"
-                + section + _SCOPED_TAIL)
+        return _JS_CONSTANTS + section + _SCOPED_TAIL
 
     @unittest.skipUnless(NODE, "node runtime required to execute dashboard JS")
     def test_a_stale_row_keeps_a_fresh_scoped_pool_live_on_the_page(self):

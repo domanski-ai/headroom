@@ -28,10 +28,13 @@ SCOPED_PREFIX = "scoped:"
 # 04:10Z, 54 minutes old. Two other seats were the same.
 #
 # The cause is a bar set against the wrong evidence, not a broken reading.
-# 5h and 7d have a PER-TURN source: every live agent's statusline tees the
-# provider's own rate_limit headers to ~/ai-accounts/state/session-truth and
-# collect.apply_session_truth_rescue folds them into the row, so demanding
-# those windows be under 30 minutes old is a bar they can actually clear.
+# 5h and 7d have a PER-TURN source WHILE AN AGENT IS LIVE ON THE SEAT: every
+# live agent's statusline tees the provider's own rate_limit headers to
+# ~/ai-accounts/state/session-truth and collect.apply_session_truth_rescue
+# folds them into the row, so demanding those windows be under 30 minutes
+# old is a bar they can clear as long as somebody is turning on the seat.
+# An IDLE seat has no tee, and its 5h and 7d are on the collector's clock
+# exactly like the scoped pool; see the second case below.
 # A model-scoped weekly pool has no such source. Its ONLY producer is the
 # ai-accounts cron collector, which re-reads a given account roughly once
 # every 50 minutes because the usage API rate-limits per source IP and the
@@ -56,12 +59,55 @@ SCOPED_PREFIX = "scoped:"
 # the serve cache: 3600 + 300. The two collector constants and this one are a
 # TRIPLE with SERVE_MAX_AGE: raising any of them without re-running
 # simulate_claude_refresh is the defect coming back.
+#
+# THE SAME ARITHMETIC ON AN IDLE SEAT'S 5h AND 7d (2026-08-18, 07:4xZ).
+#
+# Measured on the live feed two hours after the scoped fix above shipped:
+# account `mzansiedge` showed 5h and 7d STALE (left_percent null, last
+# observed 99 and 24) while its own `scoped:Fable` was CURRENT at 55. The
+# row's captured_at was 06:50Z, reused by the collector inside its lawful
+# TTL 2400 plus stagger window. No agent had sat on claude-mzansiedge since
+# 06:27Z, so there was no tee for collect.apply_session_truth_rescue to
+# rescue the row with (tee_note "no session-truth tee for this seat"), and
+# _account_base_state and _window_projection judged the 5h and 7d windows
+# against OBSERVATION_MAX_AGE (1800) and called them stale from minute 30 to
+# minute 40..60 of every collector cycle. That is the scoped defect again on
+# whichever seats happen to be idle: the per-turn source the 30-minute bar
+# assumes exists only while an agent is live, and an idle seat's 5h and 7d
+# have exactly one producer, the collector, on the same 50-minute cadence.
+#
+# THE RULE (steward ruling after the first verify, 07:5xZ): ONE ceiling for
+# every window on a Claude row, scoped or not, whatever wrote it. The bar is
+# SCOPED_OBSERVATION_MAX_AGE, Paul's 60-minute accuracy law plus the serve
+# cache, and it is the bar for the seat's reading whether the collector or
+# the seat's own tee stamped captured_at. The choice is written once
+# (_observation_max_age) and used in both places the bar is read, the
+# account state and the per window state, so the two can never disagree.
+# Every other provider (codex) keeps OBSERVATION_MAX_AGE: those rows are not
+# on the ai-accounts collector's cadence.
+#
+# WHY THERE IS NO tee-fresh SPECIAL CASE. The first cut judged a row the
+# rescue had rebased on its tee (routing_basis "tee-fresh") against the tee
+# bar 1800 and only a tee-less row against the collector ceiling. The
+# verifier showed that flaps: a seat whose agent has just gone quiet is
+# tee-fresh with captured_at equal to the last tee time; from tee age 1801
+# until the next serve collect its 5h and 7d read STALE, then the collect
+# drops the basis and the OLDER collector reading is judged at 3900 and reads
+# CURRENT again. A newer reading judged dead and an older one judged live is
+# the accuracy law broken twice. A tee time is a real observation time, and
+# the 60-minute law is the bar for the seat's reading whoever wrote it, so
+# the row's routing_basis is not read here at all and collect.PUBLIC_FIELDS
+# does not carry it to the public snapshot. The row's own `stale` flag
+# (EXTERNAL_CLAUDE_MAX_AGE at ingest, 3600 by default since the same day)
+# still demotes it, so this ceiling never outlives the collector's own
+# verdict. The scoped path, SNAPSHOT_MAX_AGE, the held rules, the identity
+# gates and the state enum {current, limited, stale, held} are untouched.
 SCOPED_OBSERVATION_MAX_AGE = paths.env_int(
     "HEADROOM_SCOPED_OBSERVATION_MAX_AGE", 3600 + 300)
 # WHAT THE ACCOUNT ROW'S `stale` FLAG MEANS AFTER THIS CHANGE.
 #
 # collect.external_claude_limits stamps stale=True when the ingested reading is
-# older than EXTERNAL_CLAUDE_MAX_AGE (720 s), and collect.apply_integrity turns
+# older than EXTERNAL_CLAUDE_MAX_AGE (3600 s), and collect.apply_integrity turns
 # that flag into trust_state "stale_observation". That flag is an AGE statement
 # about the ACCOUNT-WIDE 5h and 7d numbers, measured against the bar those
 # windows can clear because they have a per-turn source. It is not, and never
@@ -137,12 +183,33 @@ def _is_unpaid(account):
                  or account.get("error_code") == "unpaid"))
 
 
+def _observation_max_age(account, scoped=False):
+    """The age bar a row's windows are judged against; see the constant block.
+
+    Scoped windows always take the collector ceiling. Every window on a
+    Claude row takes that same ceiling, SCOPED_OBSERVATION_MAX_AGE, whatever
+    the row's routing_basis: the 60-minute law is the bar for the seat's
+    reading whether the collector or the seat's own tee wrote it (a tee bar
+    on tee-fresh rows flapped, see the constant block). Every other row
+    keeps OBSERVATION_MAX_AGE. This is the ONE place the choice is made, so
+    the account state and the per window state cannot disagree.
+    """
+    if scoped:
+        return SCOPED_OBSERVATION_MAX_AGE
+    if not isinstance(account, dict) or account.get("provider") != "claude":
+        return OBSERVATION_MAX_AGE
+    return SCOPED_OBSERVATION_MAX_AGE
+
+
 def _account_base_state(account, freshness, evaluated_at, scoped=False):
     """The row's trust verdict, as the account-wide windows see it.
 
     ``scoped=True`` answers the same question for a model-scoped weekly
     window, which differs in exactly two places and nowhere else: the age bar
-    is SCOPED_OBSERVATION_MAX_AGE, and the ``stale`` flag (with the
+    is SCOPED_OBSERVATION_MAX_AGE unconditionally (a non scoped window on a
+    Claude row gets that same ceiling too, and a codex row keeps
+    OBSERVATION_MAX_AGE, see _observation_max_age), and the ``stale`` flag
+    (with the
     trust_state "stale_observation" it produces) is read as the age statement
     it is rather than as a correctness verdict. Every correctness gate below
     is shared, so a scoped window can never render on evidence the
@@ -166,7 +233,7 @@ def _account_base_state(account, freshness, evaluated_at, scoped=False):
     captured_at = _epoch(account.get("captured_at"))
     if captured_at is None or captured_at > evaluated_at:
         return "held"
-    max_age = SCOPED_OBSERVATION_MAX_AGE if scoped else OBSERVATION_MAX_AGE
+    max_age = _observation_max_age(account, scoped)
     if evaluated_at - captured_at > max_age:
         return "stale"
     if not scoped and account.get("stale") is True:
@@ -303,8 +370,9 @@ def project(snapshot, evaluated_at=None, force_noncurrent_reason=None):
             if (key == "5h" and key not in raw_windows and base_state != "held"
                     and raw.get("provider") == "codex"):
                 continue
-            windows[key] = _window_projection(raw_window, captured_at,
-                                              base_state, evaluated_at)
+            windows[key] = _window_projection(
+                raw_window, captured_at, base_state, evaluated_at,
+                max_age=_observation_max_age(raw))
         # model-scoped weekly windows (e.g. "scoped:Fable") ride along for
         # display with the same projection/demotion rules — but they never
         # drive the ACCOUNT state below: a scoped model cap does not block
@@ -328,10 +396,12 @@ def project(snapshot, evaluated_at=None, force_noncurrent_reason=None):
         if state in {"held", "stale"}:
             # A scoped pool that is still current on its OWN clock survives
             # the account row's demotion. The account row is demoted because
-            # its 5h/7d evidence aged past a 30-minute bar those windows have
-            # a per-turn source to clear; the weekly Fable pool does not, and
-            # greying a good weekly number because a session window went quiet
-            # is exactly the dead gauge Paul reported on 2026-08-18.
+            # its 5h/7d evidence aged past its own bar (the collector ceiling
+            # on a Claude row, OBSERVATION_MAX_AGE on any other) or its stale
+            # flag was set at ingest; the weekly Fable pool is on the
+            # collector's clock alone, and greying a good weekly number
+            # because a session window went quiet is exactly the dead gauge
+            # Paul reported on 2026-08-18.
             keep = tuple(key for key, window in windows.items()
                          if key.startswith(SCOPED_PREFIX)
                          and window["state"] in ("current", "limited"))
@@ -456,7 +526,7 @@ def project_dashboard(snapshot, evaluated_at=None, force_noncurrent_reason=None)
             window = _window_projection(
                 raw_window, _epoch(raw.get("captured_at")),
                 scoped_base_state if scoped else base_state, evaluated_at,
-                max_age=SCOPED_OBSERVATION_MAX_AGE if scoped else None)
+                max_age=_observation_max_age(raw, scoped))
             if account["state"] in {"held", "stale"} \
                     and not (scoped and window["state"] in ("current",
                                                             "limited")):

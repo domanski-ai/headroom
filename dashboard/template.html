@@ -1008,10 +1008,21 @@ const OBSERVATION_MAX_AGE = CONFIG&&Number.isFinite(CONFIG.observation_max_age)?
    once every 50 minutes because the usage API rate-limits per source IP. Judged
    against the 30-minute bar the session windows clear from the statusline tee,
    the Fable gauge was dark for most of every hour, which is what Paul reported
-   on 2026-08-18. Its ceiling is his own 60-minute accuracy law. Mirrors
-   widget.SCOPED_OBSERVATION_MAX_AGE; dashboard.build injects the server's
-   value so the page and the feed can never quote different bars. */
-const SCOPED_OBSERVATION_MAX_AGE = CONFIG&&Number.isFinite(CONFIG.scoped_observation_max_age)?CONFIG.scoped_observation_max_age:3600;
+   on 2026-08-18. Its ceiling is his own 60-minute accuracy law plus the serve
+   cache (3600 + 300). Mirrors widget.SCOPED_OBSERVATION_MAX_AGE; dashboard.build
+   injects the server's value so the page and the feed can never quote
+   different bars.
+   THE SAME CEILING FOR EVERY WINDOW ON A CLAUDE ROW (2026-08-18, 07:5xZ). The
+   per-turn source exists only while an agent is live on the seat; an idle seat
+   (mzansiedge that morning: 5h and 7d grey, scoped:Fable green) has exactly one
+   producer, the collector, and its captured_at is the collector's. So a Claude
+   row's captured_at, 5h and 7d are judged against this ceiling too, whatever
+   wrote them (a tee time is a real observation time; the 60-minute law is the
+   bar for the seat's reading whoever wrote it). This page must say what
+   /widget.json says: widget._observation_max_age is the server copy of
+   observationMaxAge below. Codex rows are not on the collector's cadence and
+   keep OBSERVATION_MAX_AGE. */
+const SCOPED_OBSERVATION_MAX_AGE = CONFIG&&Number.isFinite(CONFIG.scoped_observation_max_age)?CONFIG.scoped_observation_max_age:3900;
 const TOKEN_SCAN_INTERVAL = CONFIG&&Number.isFinite(CONFIG.token_scan_interval)?Math.max(0,CONFIG.token_scan_interval):900;
 const TOKEN_MAX_DAYS=400,TOKEN_AGE_LIMITS=tokenTelemetryThresholds(TOKEN_SCAN_INTERVAL),
   TOKEN_STALE_AGE=TOKEN_AGE_LIMITS.stale,TOKEN_SUPPRESS_AGE=TOKEN_AGE_LIMITS.suppress;
@@ -1030,11 +1041,18 @@ function projected(a){return a&&a.__display&&typeof a.__display==="object"?a.__d
 const SCOPED_PREFIX="scoped:"; /* declared here, inside the helpers block the
    JS test harness extracts, so the harness never has to stub it */
 function isScoped(key){return typeof key==="string"&&key.indexOf(SCOPED_PREFIX)===0;}
+/* the ONE place the age bar is chosen, mirror of widget._observation_max_age:
+   a scoped pool or any window on a Claude row takes the collector ceiling,
+   every other row keeps OBSERVATION_MAX_AGE */
+function observationMaxAge(a,key){
+  if(isScoped(key)||(a&&a.provider==="claude"))return SCOPED_OBSERVATION_MAX_AGE;
+  return OBSERVATION_MAX_AGE;
+}
 function intrinsicWindowState(a,key){
   const d=projected(a),w=d&&d.windows&&d.windows[key];
   if(!w||w.state==="held")return"held";
   if(w.state==="stale")return"stale";
-  const timed=epochState(w.observed_at,isScoped(key)?SCOPED_OBSERVATION_MAX_AGE:OBSERVATION_MAX_AGE);
+  const timed=epochState(w.observed_at,observationMaxAge(a,key));
   if(timed!=="current")return timed;
   return w.state==="limited"?"limited":(w.state==="current"?"current":"held");
 }
@@ -1044,7 +1062,7 @@ function displayState(a){
   const d=projected(a);
   if(!d||d.state==="held")return"held";
   if(d.state==="stale")return"stale";
-  const captured=epochState(a&&a.captured_at,OBSERVATION_MAX_AGE);
+  const captured=epochState(a&&a.captured_at,observationMaxAge(a,null));
   if(captured!=="current")return captured;
   /* 5h is optional only for a live codex seat (OpenAI lifted it): skip an
      absent 5h so it can't force "held". 7d is always counted (mandatory), and
@@ -1057,9 +1075,10 @@ function displayState(a){
   return states.includes("limited")?"limited":"current";
 }
 /* A scoped weekly pool does not inherit the account row's demotion. The row is
-   demoted because its 5h/7d evidence aged past a bar those windows have a
-   per-turn source to clear; the weekly pool does not, and greying a good weekly
-   number because a session window went quiet is the 2026-08-18 dead gauge. The
+   demoted because its 5h/7d evidence aged past its own bar or the collector
+   marked it stale at ingest; the weekly pool is on its own clock, and greying a
+   good weekly number because a session window went quiet is the 2026-08-18
+   dead gauge. The
    pool still has to earn "current" on its own evidence through
    intrinsicWindowState, which reads the SERVER's projected state first, so this
    can only ever agree with widget.json, never invent a number it did not send. */

@@ -58,7 +58,21 @@ SCHEMA_VERSION = 1
 EXTERNAL_CLAUDE_SNAPSHOT = os.environ.get(
     "HEADROOM_EXTERNAL_CLAUDE_SNAPSHOT",
     os.path.expanduser("~/ai-accounts/snapshots/usage-private.json"))
-EXTERNAL_CLAUDE_MAX_AGE = paths.env_int("HEADROOM_EXTERNAL_CLAUDE_MAX_AGE", 720)
+# THE CODE DEFAULT IS THE UNIT'S VALUE (2026-08-18, idle seat repair). It was
+# 720, written when the estate cron refreshed every account every 10 minutes;
+# the headroom-serve unit has set this variable to 3600 in its Environment
+# since 2026-08-08 because the collector's call budget now lets a good
+# reading age up to about 50 minutes on purpose. But the unit is NOT the only
+# writer of the private snapshot: any headroom CLI whose ensure_fresh_snapshot
+# finds the snapshot old collects INLINE (lane launcher, route, handoff), with
+# no such environment. Measured 07:52:18Z that day (run 805cff46): an inline
+# collect marked idle seats mzansiedge (735 s) and getdomanski (1327 s) stale
+# True, apply_integrity stamped them stale_observation, and the widget showed
+# both HELD until the serve unit collected again, whatever bar the widget
+# judged their age against. Two writers, one file, two answers. So the code
+# default is Paul's 60-minute accuracy law, the same number the unit sets, and
+# every writer agrees. The unit keeps its line; it is now a restatement.
+EXTERNAL_CLAUDE_MAX_AGE = paths.env_int("HEADROOM_EXTERNAL_CLAUDE_MAX_AGE", 3600)
 # past this snapshot age the cron pipeline counts as DEAD and the native API
 # path takes over; younger than this, its verdict is authoritative — held
 # rows DEFER (no API call) rather than triggering a native read, because the
@@ -128,8 +142,9 @@ SESSION_TRUTH_ROUTING = paths.env_int("HEADROOM_SESSION_TRUTH_ROUTING", 1)
 # WHEN a reading stops being good enough to route on. There are TWO gates that
 # hold an old reading and they answer to different settings, which is why the
 # first cut of this repair fixed only half the live failure: collect marks a
-# row `stale` past EXTERNAL_CLAUDE_MAX_AGE (720s by default, 3600s in the
-# headroom-serve unit), and route.block_reason separately refuses any reading
+# row `stale` past EXTERNAL_CLAUDE_MAX_AGE (3600s by default since 2026-08-18,
+# 720s before; the headroom-serve unit sets the same 3600s), and
+# route.block_reason separately refuses any reading
 # older than OBSERVATION_MAX_AGE with "reading expired" no matter what `stale`
 # says. Measured 2026-08-17T17:03Z on the live snapshot: serve had ingested
 # claude-system at 3600s so `stale` was False, and the router still skipped it
