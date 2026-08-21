@@ -2118,9 +2118,31 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                                   "verified (logged out or parked); sign in "
                                   "again on this seat")
             elif error.code in ("usage_http_401", "usage_http_403"):
+                # DO NOT TELL ANYONE TO RE-AUTHENTICATE FROM THIS SIGNAL ALONE.
+                # This note used to assert "re-authenticate on this seat, waiting
+                # will not clear it". On 2026-08-20 it said that about
+                # claude-getdomanski, Paul's reserved Vanta account, for an hour.
+                # The steward then proved the credential was FINE: refresh.py
+                # rotated it successfully at 15:55:52Z, the collector read that
+                # exact fresh token 33 seconds later (digests matched) and still
+                # got 401, and a live `claude -p` call on the same seat returned
+                # normally. So the account worked and only this endpoint refused
+                # it. The old wording would have sent Paul to a browser to fix
+                # nothing. The estate already knows this shape from the
+                # renewal-day 403 that de-routes a healthy seat and self clears.
+                #
+                # A usage read is not an authorisation test. The discriminator is
+                # a real call on the seat, so the note names it instead of
+                # guessing.
                 result["note"] = ("the usage endpoint refused this seat's "
-                                  "credential (HTTP %s); re-authenticate on "
-                                  "this seat, waiting will not clear it"
+                                  "credential (HTTP %s), so this account is "
+                                  "UNMEASURED. That is not proof the credential "
+                                  "is dead: a usage read is not an "
+                                  "authorisation test, and this endpoint has "
+                                  "refused healthy seats before. Before anyone "
+                                  "is asked to sign in again, run one live call "
+                                  "on this seat; if it answers, the account is "
+                                  "fine and only the meter is blind"
                                   % error.code[-3:])
             elif error.code == "claude_credentials_missing":
                 # verified identity but the token couldn't be read. On macOS the
