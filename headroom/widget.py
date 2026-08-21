@@ -468,25 +468,36 @@ def _reset_label(value):
 
 
 def _tone(value):
+    # Paul, 2026-08-21: "Use the pages and match the widget to the pages."
+    # The dock menus page's three bucket ladder, the same one _dashboard_tone
+    # and both template ramps carry: 60 and up green, 25 to 59 yellow, under
+    # 25 red. This SwiftBar ramp used to be its own coarser one (red at 10,
+    # orange to 50, green above); superseded the same day, because a reading
+    # must never colour orange on any surface while the page and the dashboard
+    # call it yellow. No number stays gray, never red.
     if not _number(value):
         return "gray"
-    if value <= 10:
-        return "red"
-    if value <= 50:
-        return "orange"
-    return "green"
+    if value >= 60:
+        return "green"
+    if value >= 25:
+        return "yellow"
+    return "red"
 
 
 def _dashboard_tone(value):
+    # Paul, 2026-08-21: "Use the pages and match the widget to the pages."
+    # The page is the source and this widget is the follower, so the ramp is
+    # the page's three buckets: 60 and up green, 25 to 59 yellow, under 25
+    # red. The superseded ramp, kept on the record: red at 10 and below,
+    # orange to 30, yellow to 50, green above. No reading produces orange
+    # now, and an unreadable value stays unknown, never red.
     if not _number(value):
         return "unknown"
-    if value <= 10:
-        return "red"
-    if value <= 30:
-        return "orange"
-    if value <= 50:
+    if value >= 60:
+        return "green"
+    if value >= 25:
         return "yellow"
-    return "green"
+    return "red"
 
 
 def _canonical_dashboard_href(value):

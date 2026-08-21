@@ -64,8 +64,10 @@ function esc(v) {
 }
 function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
 function hrTone(left) {
-  return left == null ? "unknown"
-    : left <= 10 ? "red" : left <= 30 ? "orange" : left <= 50 ? "yellow" : "green";
+  /* Paul, 2026-08-21: "Use the pages and match the widget to the pages."
+     The page's three bucket ladder; no reading colours orange. */
+  return left == null || !Number.isFinite(left) ? "unknown"
+    : left >= 60 ? "green" : left >= 25 ? "yellow" : "red";
 }
 function hrPct(v) { return Number.isFinite(v) ? clamp(v, 0, 100) : null; }
 

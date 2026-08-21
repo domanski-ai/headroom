@@ -1032,7 +1032,12 @@ let tokenStats = null,tokenTelemetryStale=false,tokenStatsEnabled=false;
 /* ------------------------------------------------------------- helpers */
 function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function clamp(v,lo,hi){return Math.min(hi,Math.max(lo,v));}
-function tone(left){if(left==null)return"unknown";if(left<=10)return"red";if(left<=30)return"orange";if(left<=50)return"yellow";return"green";}
+/* Paul, 2026-08-21: "Use the pages and match the widget to the pages." The
+   page's three bucket ladder replaces the old red at 10, orange at 30,
+   yellow at 50 ramp: no reading colours orange any more, and a null or non
+   numeric reading stays unknown, never red. Keep in step with hrTone below,
+   widget._dashboard_tone and both ubersicht widgets. */
+function tone(left){if(left==null||!Number.isFinite(left))return"unknown";if(left>=60)return"green";if(left>=25)return"yellow";return"red";}
 function age(epoch){if(!Number.isFinite(epoch))return"time unknown";const s=Math.max(0,Math.floor(Date.now()/1e3-epoch));if(s<60)return s+"s ago";if(s<3600)return Math.floor(s/60)+"m ago";if(s<86400)return Math.floor(s/3600)+"h "+Math.floor(s%3600/60)+"m ago";return Math.floor(s/86400)+"d ago";}
 function untilReset(epoch){if(!Number.isFinite(epoch))return"reset not reported";const s=epoch-Math.floor(Date.now()/1e3);if(s<=0)return"reset due";if(s<86400){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return"resets in "+(h?h+"h ":"")+m+"m";}return"resets "+new Intl.DateTimeFormat(undefined,{weekday:"short",hour:"2-digit",minute:"2-digit"}).format(new Date(1e3*epoch));}
 let snapshotState="held",sourceFailed=false; /* old/failed sources demote every row */
@@ -2094,7 +2099,9 @@ function initTabs(){
    the unknown grey with the last-observed value (or n/a), never a live color. */
 const HR_URL="widget.json";
 let hrData=null,hrSize="popup",hrLastOffline=false,hrRequest=0;
-function hrTone(left){return left==null?"unknown":left<=10?"red":left<=30?"orange":left<=50?"yellow":"green";}
+/* Paul, 2026-08-21: "Use the pages and match the widget to the pages." The
+   same three buckets as tone() above; no reading colours orange. */
+function hrTone(left){return left==null||!Number.isFinite(left)?"unknown":left>=60?"green":left>=25?"yellow":"red";}
 function hrPct(v){return Number.isFinite(v)?clamp(v,0,100):null;}
 function hrAgeText(s){if(!Number.isFinite(s))return"age unknown";s=Math.max(0,Math.floor(s));if(s<60)return s+"s ago";if(s<3600)return Math.floor(s/60)+"m ago";return Math.floor(s/3600)+"h "+Math.floor(s%3600/60)+"m ago";}
 function hrClock(epoch){if(!Number.isFinite(epoch))return null;try{return new Intl.DateTimeFormat(undefined,{hour:"numeric",minute:"2-digit"}).format(new Date(1e3*epoch));}catch(e){return null;}}

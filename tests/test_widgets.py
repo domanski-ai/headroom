@@ -1181,9 +1181,11 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertEqual(account["state"], "current")
         self.assertEqual(account["windows"]["5h"]["left_percent"], 80.0)
         self.assertEqual(account["windows"]["5h"]["tone"], "green")
+        # SUPERSEDED 2026-08-21, the page's ladder: 80 left is green, 40
+        # yellow, and both 20 and 5 red. The seat names predate the ruling.
         self.assertEqual([row["windows"]["5h"]["tone"]
                           for row in display["accounts"]],
-                         ["green", "yellow", "orange", "red"])
+                         ["green", "yellow", "red", "red"])
         limited = dashboard.display_snapshot(
             usage_snapshot(usage_account(used5=100)), NOW)[
                 "_headroom_display"]["accounts"][0]
@@ -1224,7 +1226,9 @@ class DashboardHttpTests(unittest.TestCase):
                     "_headroom_display"]["accounts"][0]["windows"]["5h"]
             self.assertEqual(row["state"], "current")
             emitted.add(row["tone"])
-        self.assertEqual(emitted, {"green", "yellow", "orange", "red"})
+        # SUPERSEDED 2026-08-21 (Paul: "Use the pages and match the widget
+        # to the pages"): the projection emits three live tones, never orange.
+        self.assertEqual(emitted, {"green", "yellow", "red"})
         window_view = self.template_text().split(
             "function windowView(a,key){", 1)[1].split("\n}", 1)[0]
         allow = re.search(r'\[([^\]]*)\]\.includes\(w\.tone\)', window_view)
@@ -1565,15 +1569,24 @@ class LiquidGlassWidgetTests(unittest.TestCase):
 
     # -------------------------------------------------- fail-closed core
     def test_widget_tone_ramp_matches_projection_thresholds(self):
+        # SUPERSEDED 2026-08-21. Paul: "Use the pages and match the widget to
+        # the pages." The four bucket ramp this test pinned (red at 10, orange
+        # at 30, yellow at 50, green above) is his page's three buckets now,
+        # asserted on both sides of each boundary, and no reading may colour
+        # orange on any surface.
         body = self.js_function("hrTone")
-        self.assertIn('left==null?"unknown":left<=10?"red":left<=30?'
-                      '"orange":left<=50?"yellow":"green"', body)
+        self.assertIn('left==null||!Number.isFinite(left)?"unknown":'
+                      'left>=60?"green":left>=25?"yellow":"red"', body)
         # pinned to the Python projection's ramp, not a lookalike
-        samples = {5: "red", 10: "red", 11: "orange", 30: "orange",
-                   31: "yellow", 50: "yellow", 51: "green", 100: "green"}
+        samples = {5: "red", 24: "red", 25: "yellow", 59: "yellow",
+                   60: "green", 100: "green"}
         for left, expected in samples.items():
             self.assertEqual(widget._dashboard_tone(left), expected)
         self.assertEqual(widget._dashboard_tone(None), "unknown")
+        # the ruling's second half: no reading colours orange on either ramp
+        for left in range(0, 101):
+            self.assertNotEqual(widget._dashboard_tone(left), "orange")
+            self.assertNotEqual(widget._tone(left), "orange")
 
     def test_fail_closed_only_current_windows_get_live_tone(self):
         body = self.js_function("hrWindow")
