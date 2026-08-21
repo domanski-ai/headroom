@@ -7635,7 +7635,13 @@ class TranscriptBirthRace(TempDirCase):
                 "content": [{"type": "text", "text": "hi"}]}}) + "\n")
         cwd = os.path.join(self.temp.name, "work")
         os.makedirs(cwd, exist_ok=True)
+        # launch_dir is where the LAUNCHER put this child, and a bare Mock
+        # would auto-create it as a Mock object that registry.expand cannot
+        # read. This test is about the transcript birth race, not about the
+        # home check, so the child is launched into its own home and the two
+        # agree, which is what the record below already assumes.
         child = mock.Mock(account=account, binding=None,
+                          launch_dir=account["home"],
                           launched_at=time.time() - 60)
         record = {"source_slot": account["name"],
                   "config_dir": account["home"],

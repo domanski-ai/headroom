@@ -631,6 +631,36 @@ class Child:
     # different cap, and only the recorded window may say this one is over.
     cap_scope_key: str = ""
     cap_scope_window: str = ""
+    # WHERE THE LAUNCHER ACTUALLY PUT THIS CHILD, frozen at construction.
+    #
+    # WHY THIS EXISTS (2026-08-21, six lanes lost automatic handoff). The
+    # launcher resolves the credential directory through route.dispatch_dir
+    # and exports THAT as CLAUDE_CONFIG_DIR, obeying "THE RESOLVED CREDENTIAL
+    # DIRECTORY, NEVER THE REGISTRY HOME (2026-08-17 R3)" in `_environment`.
+    # The two hook-event checks did not: they compared the child's reported
+    # config_dir against account["home"], the REGISTRY's answer. Those two
+    # answers differ for any home whose name lies about what it holds, and
+    # this estate has had two such homes all day. The result was a supervisor
+    # that started a child in the resolved folder and then refused that
+    # child's first hook event for being in it, permanently, within seconds
+    # of launch. The R3 sweep's own comment claimed the launcher was "the
+    # LAST one still reading account["home"]"; it was not, and nothing
+    # re-checked that claim.
+    #
+    # RESOLVED ONCE, NEVER PER EVENT (dmux's design point, and it is right).
+    # Per-event resolution would re-read live residency and flip validation
+    # under a running child the moment a credential moved, which is exactly
+    # what this file forbids two hundred lines down: "a config edit
+    # mid-session can never flip the policy under a live child." On
+    # 2026-08-21 at 11:47Z a swap moved seven live lanes' residency in one
+    # act; per-event resolution would have turned all seven invalid mid-run.
+    #
+    # In production this carries the LITERAL string `_environment` exported,
+    # so the launcher and the validator do not merely call the same function,
+    # they share one answer and cannot drift. A Child built without it (tests,
+    # and only tests, since `_spawn` always passes it) resolves the same way
+    # once, below.
+    launch_dir: str = ""
     # the last disarm reason already notified ("" / False = none yet)
     supervision_loss_notified: object = False
     # preemptive rotation state (never affects the cap-reactive path)
@@ -644,6 +674,25 @@ class Child:
     context_next_check: float = 0.0
     context_announced: bool = False
     context_last_hold: str = ""
+
+    def __post_init__(self):
+        """Freeze `launch_dir` ONCE, for a Child nobody handed one to.
+
+        `_spawn` always passes the exact string it exported, so in production
+        this branch never runs and there is only ever ONE resolution. It
+        exists for a Child built directly, which today means tests, and it
+        resolves the way the launcher would have.
+
+        `route.dispatch_dir` answers None only for a seat that must not be
+        launched at all, and `_environment` refuses such an account long
+        before a Child could be built from it, so a None here belongs to a
+        Child that never went through a launcher. Falling back to the
+        registry home for that case keeps a hand-built Child behaving as it
+        always has; it is NOT a fallback on the production path, because the
+        production path never reaches this method with an empty value."""
+        if not self.launch_dir:
+            self.launch_dir = (route.dispatch_dir(self.account)
+                               or self.account.get("home", ""))
 
 
 def resume_paste_line(account, rendered):
@@ -1361,10 +1410,13 @@ def _namespace_matches(record, child):
 def _record_matches(record, child, binding=None):
     if not _namespace_matches(record, child):
         return False
+    # child.launch_dir, NOT account["home"]: the question is "is this child
+    # where the launcher put it", and only the launcher's own resolved answer
+    # can be compared against without reintroducing the 2026-08-21 defect.
     if record.get("source_slot") != child.account.get("name") \
             or not isinstance(record.get("config_dir"), str) \
             or registry.expand(record["config_dir"]) \
-            != registry.expand(child.account["home"]):
+            != registry.expand(child.launch_dir):
         return False
     payload = record.get("payload")
     if not isinstance(payload, dict):
@@ -1463,9 +1515,13 @@ def _validated_event(record, child, binding=None):
     if record.get("source_slot") != child.account.get("name"):
         raise PermanentSupervisorError("hook event source slot is malformed")
     config_dir = record.get("config_dir")
+    # child.launch_dir, NOT account["home"]. See the field's own comment: this
+    # comparison against the REGISTRY home is what disarmed six lanes on
+    # 2026-08-21, because the launcher had already resolved a different and
+    # correct answer for the same account.
     if not isinstance(config_dir, str) or not config_dir \
             or registry.expand(config_dir) \
-            != registry.expand(child.account["home"]):
+            != registry.expand(child.launch_dir):
         raise PermanentSupervisorError("hook event config home is malformed")
     received = record.get("received_at")
     if (not isinstance(received, (int, float)) or isinstance(received, bool)
@@ -3044,7 +3100,11 @@ class Supervisor:
                          "model": self.family, "note": ""})
         return Child(process, account, self.generation,
                      event_path(self.supervisor_id), settings, launched_at,
-                     automatic, spawn_args=tuple(args))
+                     automatic, spawn_args=tuple(args),
+                     # the LITERAL directory this child was launched into, so
+                     # the checks that police its hook events compare against
+                     # the launcher's answer rather than re-deriving one
+                     launch_dir=environment.get("CLAUDE_CONFIG_DIR", ""))
 
     def _collect_once(self, event_time):
         # Provider snapshots use whole-second timestamps.  Crossing the next
