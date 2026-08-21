@@ -139,6 +139,84 @@ def _token_extra_root_entries(config):
     return entries
 
 
+# ---------------------------------------------------------------------------
+# TWO ROWS MAY NAME ONE FOLDER. TWO CHAINS MAY NOT LIVE IN IT.
+#
+# WHY THIS EXISTS (2026-08-21). This validator runs inside `load()`, which runs
+# in MANY processes, the router and Paul's accounts panel among them. It used
+# to refuse the WHOLE config the moment two rows shared a home string, so when
+# the dmux lane correctly repointed the ops row onto homes/claude-mzansiedge,
+# every consumer that loads the registry died at once. Paul's accounts panel
+# went empty, the model menu's effort read n/a, and the line he saw was this
+# one. His words: "Oh no, not this again. This is the worst of all."
+#
+# Nothing was ambiguous. The mzansiedge account still names that folder as its
+# own home, its chain being in the vault exactly as getdomanski's is. One
+# folder, one chain in it, and no way to confuse whose credential is whose.
+#
+# The check tested a PROXY, whether two rows share a string, instead of the
+# property it defends: could two accounts be READ FROM one directory. Same
+# defect, same day, as ai-accounts/bin/collect.py validate_registry.
+#
+# COST, which is dmux's condition and the reason for the shape. The fast path
+# is unchanged: while no two rows share a string, nothing here runs at all and
+# `load()` costs exactly what it always did. The resolver is consulted ONLY in
+# the case that used to raise, which is rare and already exceptional.
+#
+# WITHOUT THE RESOLVER WE REFUSE, exactly as before. A registry that cannot be
+# proved safe must not load, and a missing estate tree is precisely the box
+# where the old string rule was the whole truth anyway.
+def _estate_credloc():
+    """The estate resolver, through collect.py's ONE loader, or None.
+
+    Imported lazily and deliberately. collect.py imports registry at module
+    load, so a top level import here would be a cycle; and this is only ever
+    reached on the exceptional path, so the cost is paid nowhere else.
+
+    It calls collect.estate_credloc rather than repeating its loader because
+    the recorded pain in this estate is a rule written out three times in
+    three files that then disagreed. One implementation, one behaviour, one
+    place to fix."""
+    try:
+        from . import collect as _collect
+        return _collect.estate_credloc()
+    except Exception:
+        return None
+
+
+def _refuse_only_a_real_collision(accounts, name, resolved):
+    """Raise unless the folder holds at most one account's live chain."""
+    sharers = [row.get("name") for row in accounts
+               if isinstance(row, dict) and expand(row.get("home") or "") == resolved]
+    credloc = _estate_credloc()
+    if credloc is None:
+        raise RegistryError(
+            f"account {name}: home {resolved} already used by another account")
+    read_from = set()
+    for row in accounts:
+        if not isinstance(row, dict):
+            continue
+        try:
+            location = credloc.resolve(row, accounts)
+        except Exception:
+            raise RegistryError(
+                f"account {name}: home {resolved} already used by another "
+                f"account, and the estate resolver could not say whether that "
+                f"is a real collision")
+        directory = (location or {}).get("dir")
+        if not directory:
+            # nothing to read, so nothing to collide with. A vaulted account
+            # is LAWFUL: mzansiedge and getdomanski are both in that state.
+            continue
+        key = os.path.realpath(directory)
+        if key in read_from:
+            raise RegistryError(
+                f"account {name}: home {resolved} would be read as the "
+                f"credential directory for more than one account "
+                f"({', '.join(sorted(str(n) for n in sharers))})")
+        read_from.add(key)
+
+
 def validate(config):
     if not isinstance(config, dict) or config.get("schema_version") != 1:
         raise RegistryError("config.json missing or wrong schema_version (expected 1)")
@@ -187,7 +265,7 @@ def validate(config):
                     f"account {name}: handoff_group must be a non-empty string")
         resolved = expand(home)
         if resolved in homes:
-            raise RegistryError(f"account {name}: home {resolved} already used by another account")
+            _refuse_only_a_real_collision(accounts, name, resolved)
         names.add(name)
         homes.add(resolved)
     _token_extra_root_entries(config)
