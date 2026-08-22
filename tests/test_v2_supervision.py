@@ -6346,6 +6346,35 @@ class ContextBackstop(TempDirCase):
             outcome = runner._context_backstop_cycle(self.child)
         return outcome, killed, self.events(emit)
 
+    # -- the directory the replacement runs in ------------------------------
+
+    def test_a_session_that_cd_away_is_resumed_in_its_start_directory(self):
+        """2026-08-22, live: the steward ran `cd ~/.system` in its Bash tool
+        (a CwdChanged hook), the backstop relaunched `--resume` in THAT
+        directory, the seat home had never trusted it, and the CLI parked on
+        the workspace trust modal for 75 minutes with every actor correctly
+        refusing. The conversation belongs to the project it STARTED in: that
+        is the directory whose trust the session holds and whose projects/
+        slug holds the transcript. `cwd` keeps following CwdChanged (two
+        tests use that move as proof a record was processed); the relaunch
+        and its recovery use `start_cwd`."""
+        import dataclasses
+        elsewhere = os.path.join(self.temp.name, "elsewhere")
+        os.makedirs(elsewhere)
+        self.child.binding = dataclasses.replace(
+            self.child.binding, cwd=elsewhere, start_cwd=self.cwd)
+        runner = self.runner()
+        outcome, killed, _events = self.cycle(runner)
+        self.assertIsNotNone(outcome)
+        killed.assert_called_once()
+        self.assertEqual(outcome.cwd, self.cwd)
+        self.assertEqual(outcome.recovery.cwd, self.cwd)
+        self.assertNotEqual(outcome.cwd, elsewhere)
+        # a binding minted before start_cwd existed still resumes where it ran
+        legacy = supervisor.Binding(self.SID, self.transcript, elsewhere,
+                                    "Fable", "2.1", self.source["home"])
+        self.assertEqual(supervisor.relaunch_cwd(legacy), elsewhere)
+
     # -- the crossing -------------------------------------------------------
 
     def test_a_nearly_full_idle_session_is_forked_onto_a_bigger_window(self):
@@ -8630,6 +8659,43 @@ class OrderAmbiguityIsDedupedNotLatched(TempDirCase):
         self.assertEqual(events, [])
         self.assertIsNotNone(self.child.binding)
         self.assertTrue(self.child.automation)
+
+    # -- the start directory survives a cwd move ---------------------------
+    def test_a_cwd_move_never_moves_the_start_directory(self):
+        """SessionStart sets start_cwd; CwdChanged moves cwd and only cwd.
+        The relaunch directory is therefore the one the session started in,
+        whatever the agent cd'd to since (2026-08-22 trust-modal incident)."""
+        self.bind()
+        self.assertEqual(self.child.binding.start_cwd,
+                         os.path.realpath(self.cwd))
+        self.fire("CwdChanged", self.launched_at + 2.0, cwd=self.temp.name)
+        self.handle()
+        self.assertEqual(self.child.binding.cwd,
+                         os.path.realpath(self.temp.name))
+        self.assertEqual(self.child.binding.start_cwd,
+                         os.path.realpath(self.cwd))
+        self.assertEqual(supervisor.relaunch_cwd(self.child.binding),
+                         os.path.realpath(self.cwd))
+
+    def test_a_same_process_session_start_keeps_the_start_directory(self):
+        """SessionStart(A), CwdChanged(B), then a SessionStart reporting B in
+        the SAME process (/clear, a manual /resume): the generation was
+        spawned in A, so start_cwd stays A and a relaunch goes to A. Codex
+        round 1 (2026-08-22) reproduced start_cwd=B here; that reopened the
+        trust-modal failure one rotation later."""
+        self.bind()
+        self.fire("CwdChanged", self.launched_at + 2.0, cwd=self.temp.name)
+        self.handle()
+        self.fire("SessionStart", self.launched_at + 3.0, source="clear",
+                  cwd=self.temp.name)
+        events, err = self.handle()
+        self.assertNotIn("malformed hook event", err)
+        self.assertEqual(self.child.binding.cwd,
+                         os.path.realpath(self.temp.name))
+        self.assertEqual(self.child.binding.start_cwd,
+                         os.path.realpath(self.cwd))
+        self.assertEqual(supervisor.relaunch_cwd(self.child.binding),
+                         os.path.realpath(self.cwd))
 
     # -- direction 1: a true duplicate is dropped, harmlessly ---------------
     def test_the_same_record_twice_is_dropped_not_a_disarm(self):

@@ -487,6 +487,23 @@ class Binding:
     config_dir: str
     epoch: int = 0
     received_at: float = 0.0
+    # The directory the session STARTED in (its SessionStart cwd). `cwd`
+    # follows every CwdChanged hook, which is the agent's Bash tool moving
+    # around; a relaunch must NOT follow it. 2026-08-22, live: the steward ran
+    # `cd ~/.system`, the context backstop resumed it there, the seat home had
+    # never trusted that directory, and the CLI parked on the workspace trust
+    # modal for 75 minutes while every actor correctly refused to answer it.
+    # The conversation belongs to the project it started in: that directory
+    # holds the trust the session was granted and the projects/ slug that
+    # holds its transcript. Defaults to "" so a binding minted by older code
+    # (or a test) still resumes in `cwd`; see relaunch_cwd.
+    start_cwd: str = ""
+
+
+def relaunch_cwd(binding):
+    """The directory a replacement child runs in: where the session
+    started, never where its Bash tool last cd'd to."""
+    return binding.start_cwd or binding.cwd
 
 
 @dataclass(frozen=True)
@@ -772,9 +789,10 @@ class Recovery:
     def paste_line(self):
         """``(line, pasteable)`` for this recovery.
 
-        The directory is the one the child ACTUALLY ran in, so an operator
-        pasting this line lands on the same credential the session was
-        spending. When that directory cannot be resolved the answer is a
+        The line carries the account's config dir, never a directory: the
+        operator pastes it from wherever they stand, and `self.cwd` (the
+        session's start directory) is what the AUTOMATIC fallback spawns in.
+        When the credential's home cannot be resolved the answer is a
         refusal rather than the registry home: see resume_paste_line.
         """
         return resume_paste_line(
@@ -1641,7 +1659,17 @@ def parse_session_start(record, child):
         _model_name(payload.get("model")),
         payload.get("version", "") if isinstance(payload.get("version"), str)
         else "", record["config_dir"], child.session_epoch + 1,
-        record["received_at"])
+        record["received_at"],
+        # WITHIN ONE CHILD GENERATION the start directory is fixed at the
+        # first SessionStart: this process was spawned there. A later
+        # SessionStart in the same process (/clear, a manual /resume) reports
+        # the CLI's CURRENT cwd, which a Bash-tool cd may have moved, and
+        # copying that into start_cwd would ratify the move and reopen the
+        # trust-modal failure one rotation later (Codex round 1, 2026-08-22).
+        # A handoff successor is a NEW Child with no binding, so its first
+        # SessionStart binds the directory it was actually spawned in.
+        start_cwd=(relaunch_cwd(child.binding) if child.binding is not None
+                   else cwd))
 
 
 def _cap_text(record, *, absent=""):
@@ -3539,7 +3567,7 @@ class Supervisor:
             # gated on THAT, not on the pool we are moving away from.
             plan = handoff.plan_handoff(
                 source, proof.family, target, snapshot, cap_proof,
-                binding.cwd, cooldown_scope=scope, automatic=True,
+                relaunch_cwd(binding), cooldown_scope=scope, automatic=True,
                 resume_family=target_family,
                 child_generation=child.generation)
             route.preflight_cooldowns()
@@ -4135,7 +4163,7 @@ class Supervisor:
             {"authenticated": False, "preemptive": True,
              "window": proof.window, "used_percent": proof.used_percent,
              "observed_at": proof.event["received_at"]},
-            binding.cwd, cooldown_scope=None, automatic=True,
+            relaunch_cwd(binding), cooldown_scope=None, automatic=True,
             child_generation=child.generation, preemptive=True)
         route.preflight_cooldowns()
         handoff.select_target(child.account["name"], snapshot, proof.family,
@@ -4435,11 +4463,11 @@ class Supervisor:
         fallback, _fitted = _window_fit_argv(
             ["--resume", proof.session_id], proof.transcript_path,
             used=proof.used, model=self.stopped_child_model)
-        recovery = Recovery(child.account, fallback, child.binding.cwd,
-                            proof.session_id)
+        recovery = Recovery(child.account, fallback,
+                            relaunch_cwd(child.binding), proof.session_id)
         # supervised either way: an elective stop must never cost the
         # cap-reactive guarantee, and this seat is not capped
-        return Relaunch(child.account, argv, child.binding.cwd,
+        return Relaunch(child.account, argv, relaunch_cwd(child.binding),
                         reason == "context_backstop", reason=reason,
                         supervised=True, recovery=recovery)
 
@@ -5346,7 +5374,7 @@ class Supervisor:
             # the SIMPLE resume, rendered by Recovery so the quoting and the
             # redaction are the same ones every other printed argv gets
             recovery = Recovery(child.account, ["--resume", session],
-                                str(getattr(binding, "cwd", "") or ""),
+                                relaunch_cwd(binding) if binding else "",
                                 session, reason="unrequested_death")
             line, pasteable = recovery.paste_line()
             print((f"[headroom] to bring that conversation back, run:\n"

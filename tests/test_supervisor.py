@@ -1921,7 +1921,9 @@ class SupervisorIntegration(unittest.TestCase):
         os.environ["FAKE_CHANGED_CWD"] = changed
         runner = supervisor.Supervisor(
             "sonnet", [], self.accounts[0], collect_fn=self.snapshot)
-        result = runner.run()
+        with mock.patch.object(supervisor, "relaunch_cwd",
+                               wraps=supervisor.relaunch_cwd) as seen:
+            result = runner.run()
         self.assertEqual(result, 0)
         source_sid = str(__import__("uuid").uuid5(
             __import__("uuid").NAMESPACE_DNS, "headroom-fake-source-1"))
@@ -1938,7 +1940,23 @@ class SupervisorIntegration(unittest.TestCase):
         self.assertEqual(launches[1]["args"],
                          ["--resume", source_sid, "--fork-session"])
         self.assertEqual(launches[1]["config_dir"], self.accounts[1]["home"])
-        self.assertEqual(launches[1]["cwd"], changed)
+        # The fake child fires a REAL CwdChanged hook (FAKE_CHANGED_CWD) and
+        # the replacement still runs where the session STARTED. Until
+        # 2026-08-22 this line asserted `changed`: a CwdChanged is the agent's
+        # Bash tool moving, not the user, and resuming there moved the
+        # conversation into a directory the seat had never trusted, which
+        # parked the estate steward on the workspace trust modal for 75
+        # minutes. The proof that the move was APPLIED, not merely seen: the
+        # binding the relaunch consulted (relaunch_cwd, wrapped above) had
+        # already followed the CwdChanged while its start directory had not.
+        consulted = [call.args[0] for call in seen.call_args_list]
+        self.assertTrue(consulted, "the cap plan never consulted relaunch_cwd")
+        self.assertIn(os.path.realpath(changed),
+                      [binding.cwd for binding in consulted])
+        self.assertEqual({binding.start_cwd for binding in consulted},
+                         {os.path.realpath(self.cwd)})
+        self.assertEqual(launches[1]["cwd"], os.path.realpath(self.cwd))
+        self.assertNotEqual(launches[1]["cwd"], changed)
         bound = [row for row in self.ledger_actions()
                  if row.get("action") == "resume_bound"][-1]
         self.assertTrue(handoff._valid_uuid(bound["new_session_id"]))
