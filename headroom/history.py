@@ -83,6 +83,19 @@ def _project_account(account):
         and ID_RE.fullmatch(slot_id) else None
     plan = account.get("plan")
     plan = plan if _safe_label(plan) else None
+    # THE READING STAMPS RIDE THROUGH THIS WHITELIST TOO (steward, 2026-08-22).
+    # This projection returned id, name, provider, plan, ok, stale and windows,
+    # so a field added upstream still never reached the forecaster: the history
+    # it reads is built from here. Two batons asked for "a reader" and the
+    # reader was never the missing part. Absent stays absent.
+    readings = {}
+    for field in ("reading_age_seconds", "reading_ceiling_seconds",
+                  "reading_over_ceiling"):
+        value = account.get(field)
+        if isinstance(value, bool):
+            readings[field] = value
+        elif isinstance(value, (int, float)) and math.isfinite(value):
+            readings[field] = value
     source_windows = account.get("windows")
     if source_windows is None:
         source_windows = {}
@@ -98,7 +111,7 @@ def _project_account(account):
             "used_percent": used,
             "resets_at": int(reset) if reset is not None else None,
         }
-    return {
+    projected = {
         "id": slot_id,
         "name": name,
         "provider": provider,
@@ -107,6 +120,8 @@ def _project_account(account):
         "stale": account.get("stale") is True,
         "windows": windows,
     }
+    projected.update(readings)
+    return projected
 
 
 def project_snapshot(snapshot, ts=None):

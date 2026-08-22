@@ -1248,12 +1248,33 @@ def external_claude_limits(name, identity, now):
         validate_required_windows(windows)
     except Exception:  # noqa: BLE001 — malformed external data defers
         return defer()
-    return ("ingest", {
+    # CARRY THE READING STAMPS ACROSS THE BOUNDARY (steward, 2026-08-22).
+    # ai-accounts/bin/collect.py:1490 allow lists these three deliberately, and
+    # its own comment says why: "without these three in the allow list the
+    # fields are stripped before any reader sees them, which is how
+    # reused_age_seconds came to exist with no consumer for so long". They then
+    # arrived here and were dropped again by a DIFFERENT writer's whitelist, so
+    # the estate wrote the lesson down inside one program and repeated the
+    # mistake in another. Measured 2026-08-22: 4 of 8 accounts carry a reading_*
+    # field in the ai-accounts snapshot and 0 of 8 carry one in headroom's.
+    #
+    # An ABSENT stamp stays absent. Only a present, finite value is carried, so
+    # a reader can still tell "this account has no reading age" from "its
+    # reading age is zero", which is the distinction a defaulted field destroys.
+    ingested = {
         "captured_at": int(captured),
         "source": "ai_accounts_snapshot",
         "stale": bool(old_reading),
         "windows": windows,
-    })
+    }
+    for field in ("reading_age_seconds", "reading_ceiling_seconds",
+                  "reading_over_ceiling"):
+        value = row.get(field)
+        if isinstance(value, bool):
+            ingested[field] = value
+        elif isinstance(value, (int, float)) and math.isfinite(value):
+            ingested[field] = value
+    return ("ingest", ingested)
 
 
 def external_codex_limits(name, expected_email, now):
