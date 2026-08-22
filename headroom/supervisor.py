@@ -8,6 +8,7 @@ usage collect before every remaining pre-stop check succeeds.
 import contextlib
 import copy
 import hashlib
+import io
 import json
 import math
 import os
@@ -871,6 +872,56 @@ def _supervisors_dir():
 
 def event_path(supervisor_id):
     return os.path.join(_supervisors_dir(), supervisor_id + ".jsonl")
+
+
+def diagnostics_path(supervisor_id):
+    return os.path.join(_supervisors_dir(), supervisor_id + ".stderr.log")
+
+
+@contextlib.contextmanager
+def _quiet_terminal(supervisor_id):
+    """Keep the supervisor's own diagnostics OFF the child's screen.
+
+    WHY THIS EXISTS (steward, 2026-08-22). The supervisor keeps its child on
+    the SAME terminal it was launched in, and it runs collect periodically
+    while that child is drawing a full screen interface. A registry mismatch
+    notice from collect.py printed to stderr mid session and landed in the
+    sales lane's composer row. IT LOOKED EXACTLY LIKE TEXT A PERSON HAD TYPED,
+    and no keystroke could delete it, because it was never in the composer at
+    all: stray output had corrupted the frame, and a redraw cleared it.
+
+    That is not a cosmetic bug. The sentinel raised stuck-composer-sales, and
+    that alert's own instruction for authored text is PRESS ENTER, which would
+    have submitted a fabricated instruction into a live sales lane.
+
+    The property being defended is not "collect must be silent". It is that
+    NOTHING may paint on a terminal a child is drawing. So the diagnostics are
+    still written, to this supervisor's own log, and the screen is left alone.
+
+    ONLY sys.stderr is swapped, never fd 2. The child inherited its own copy of
+    fd 2 at spawn and must never be touched by the parent.
+    """
+    path = diagnostics_path(supervisor_id)
+    stream = None
+    try:
+        paths.ensure_private(_supervisors_dir())
+        stream = open(path, "a", encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        # A log we cannot open is not a reason to paint on the child's screen.
+        # Swallow the diagnostics instead: losing a notice costs a line in a
+        # log, printing it costs a live lane a fabricated instruction.
+        stream = None
+    saved = sys.stderr
+    sys.stderr = stream if stream is not None else io.StringIO()
+    try:
+        yield
+    finally:
+        sys.stderr = saved
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _model_name(value):
@@ -3113,17 +3164,20 @@ class Supervisor:
         while self.now() < boundary:
             self.sleep(min(POLL_SECONDS, boundary - self.now()))
         started = self.now()
-        try:
-            snapshot = self.collect_fn(quiet=True)
-        except TypeError:
-            snapshot = self.collect_fn()
-        except Exception as error:  # noqa: BLE001 — a failed proof never stops
-            # A collect that failed proves nothing either way: it is the same
-            # "no information" class as an empty target ranking, not a
-            # contradiction, so it holds and retries rather than costing a
-            # live session its automation over one network blip.
-            raise CapacityHold(
-                f"fresh usage collect failed: {error}") from error
+        # The child owns this terminal, so collect's diagnostics go to the log
+        # rather than onto the screen it is drawing (see _quiet_terminal).
+        with _quiet_terminal(self.supervisor_id):
+            try:
+                snapshot = self.collect_fn(quiet=True)
+            except TypeError:
+                snapshot = self.collect_fn()
+            except Exception as error:  # noqa: BLE001, a failed proof holds
+                # A collect that failed proves nothing either way: it is the
+                # same "no information" class as an empty target ranking, not
+                # a contradiction, so it holds and retries rather than costing
+                # a live session its automation over one network blip.
+                raise CapacityHold(
+                    f"fresh usage collect failed: {error}") from error
         return snapshot, started
 
     def _fresh_collect(self, event_time):
@@ -3765,12 +3819,15 @@ class Supervisor:
         snapshot = paths.load_json(paths.private_snapshot_path())
         if route._snapshot_fresh(snapshot, self.now(), PREEMPT_SNAPSHOT_MAX_AGE):
             return snapshot
-        try:
-            return self.collect_fn(quiet=True)
-        except TypeError:
-            return self.collect_fn()
-        except Exception as error:  # noqa: BLE001 — a failed poll never stops
-            raise SupervisorError(f"fresh usage collect failed: {error}") from error
+        # Same terminal, same rule: this poll runs while the child is drawing.
+        with _quiet_terminal(self.supervisor_id):
+            try:
+                return self.collect_fn(quiet=True)
+            except TypeError:
+                return self.collect_fn()
+            except Exception as error:  # noqa: BLE001, a failed poll holds
+                raise SupervisorError(
+                    f"fresh usage collect failed: {error}") from error
 
     def _child_family(self, child):
         """The Claude family this child is actually running (raises when it
