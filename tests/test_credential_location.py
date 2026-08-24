@@ -49,6 +49,21 @@ import tests  # noqa: E402,F401 - hermetic bootstrap; see tests/__init__.py
 from headroom import collect, handoff, route  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_AUTH_BINARY_PATCH = None
+
+
+def setUpModule():
+    """Keep credential-location fixtures isolated from the installed CLI."""
+    global _AUTH_BINARY_PATCH
+    route._CLAUDE_AUTH_STATUS_CACHE.clear()
+    _AUTH_BINARY_PATCH = mock.patch.object(
+        route, "_claude_auth_binary", return_value=None)
+    _AUTH_BINARY_PATCH.start()
+
+
+def tearDownModule():
+    _AUTH_BINARY_PATCH.stop()
+    route._CLAUDE_AUTH_STATUS_CACHE.clear()
 
 
 def _dispatch_dir_fallbacks(source, label):
@@ -317,7 +332,8 @@ class TheEnvCommandEmitsTheResolvedDirectory(CredlocSeam):
         with open(self.answers, "w") as handle:
             json.dump({"rows": rows, "resolve": resolve}, handle)
         env = dict(os.environ)
-        env.update({"HEADROOM_DIR": headroom_dir,
+        env.update({"HOME": self.tmp,
+                    "HEADROOM_DIR": headroom_dir,
                     "HEADROOM_CREDLOC": self.credloc,
                     "FIXTURE_CREDLOC_JSON": self.answers})
         return subprocess.run(

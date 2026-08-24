@@ -35,6 +35,23 @@ from headroom import (  # noqa: E402
 )
 
 
+_AUTH_BINARY_PATCH = None
+
+
+def setUpModule():
+    """Keep legacy router fixtures isolated from the installed Claude CLI."""
+    global _AUTH_BINARY_PATCH
+    route._CLAUDE_AUTH_STATUS_CACHE.clear()
+    _AUTH_BINARY_PATCH = mock.patch.object(
+        route, "_claude_auth_binary", return_value=None)
+    _AUTH_BINARY_PATCH.start()
+
+
+def tearDownModule():
+    _AUTH_BINARY_PATCH.stop()
+    route._CLAUDE_AUTH_STATUS_CACHE.clear()
+
+
 def _slot_id(name):
     return hashlib.sha256(name.encode()).hexdigest()[:12]
 

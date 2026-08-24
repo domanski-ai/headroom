@@ -20,6 +20,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 
 from . import collect as collector
@@ -59,6 +60,13 @@ OBSERVATION_MAX_AGE = paths.env_int("HEADROOM_OBSERVATION_MAX_AGE", 1800)
 CLAUDE_OBSERVATION_MAX_AGE = paths.env_int(
     "HEADROOM_SCOPED_OBSERVATION_MAX_AGE", 3600 + 300)
 CLOCK_SKEW = paths.env_int("HEADROOM_CLOCK_SKEW", 300)
+CLAUDE_AUTH_STATUS_TTL = max(
+    1, paths.env_int("HEADROOM_CLAUDE_AUTH_STATUS_TTL", 60))
+CLAUDE_AUTH_STATUS_TIMEOUT = max(
+    1, paths.env_int("HEADROOM_CLAUDE_AUTH_STATUS_TIMEOUT", 5))
+_CLAUDE_AUTH_STATUS_CACHE = {}
+_CLAUDE_AUTH_STATUS_LOCKS = {}
+_CLAUDE_AUTH_STATUS_LOCKS_GUARD = threading.Lock()
 
 # --- one cap vocabulary, for every surface that reads a refusal ------------
 # A subscription cap and a transient refusal demand OPPOSITE actions: a cap
@@ -879,6 +887,76 @@ def reading_max_age(account):
     return OBSERVATION_MAX_AGE
 
 
+def _claude_auth_binary():
+    """The official versioned Claude binary, never a shell alias or wrapper."""
+    try:
+        versions = os.path.realpath(os.path.expanduser(
+            "~/.local/share/claude/versions"))
+        binary = os.path.realpath(os.path.expanduser("~/.local/bin/claude"))
+        if os.path.dirname(binary) != versions:
+            return None
+        if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
+            return None
+        return binary
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _claude_auth_lock(name):
+    with _CLAUDE_AUTH_STATUS_LOCKS_GUARD:
+        return _CLAUDE_AUTH_STATUS_LOCKS.setdefault(name, threading.Lock())
+
+
+def _claude_auth_reason(account):
+    """Block only when Claude positively reports ``loggedIn: false``.
+
+    Every other result is indeterminate and passes. Indeterminate results are
+    cached too, so a broken probe cannot put a subprocess in every hot-path
+    eligibility check.
+    """
+    if account.get("provider") != "claude":
+        return None
+    try:
+        name = account.get("name")
+        directory = credential_dir(account)[0]
+        binary = _claude_auth_binary()
+        if not isinstance(name, str) or not name or not directory or not binary \
+                or not os.path.isdir(directory):
+            return None
+        with _claude_auth_lock(name):
+            checked_at = time.monotonic()
+            cached = _CLAUDE_AUTH_STATUS_CACHE.get(name)
+            if cached and cached[1:3] == (directory, binary) \
+                    and checked_at - cached[0] < CLAUDE_AUTH_STATUS_TTL:
+                logged_in = cached[3]
+            else:
+                logged_in = None
+                try:
+                    env = os.environ.copy()
+                    env["CLAUDE_CONFIG_DIR"] = directory
+                    result = subprocess.run(
+                        [binary, "auth", "status"], env=env,
+                        capture_output=True, text=True,
+                        timeout=CLAUDE_AUTH_STATUS_TIMEOUT, check=False)
+                    # Claude 2.1.241 exits 1 for a logged-out config directory
+                    # while still returning authoritative JSON on stdout.
+                    if result.returncode in (0, 1):
+                        payload = json.loads(result.stdout)
+                        value = payload.get("loggedIn") \
+                            if isinstance(payload, dict) else None
+                        if value is True or value is False:
+                            logged_in = value
+                except Exception:  # noqa: BLE001 - every probe error fails open
+                    logged_in = None
+                _CLAUDE_AUTH_STATUS_CACHE[name] = (
+                    checked_at, directory, binary, logged_in)
+        if logged_in is False:
+            return "authentication unavailable: Claude auth status loggedIn=false"
+    except Exception:  # noqa: BLE001 - an uncertain probe must fail open
+        return None
+    return None
+
+
 def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     """None when the account has proven headroom; otherwise why not.
 
@@ -1051,7 +1129,7 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
             return "cooldown entry unreadable — inspect state/cooldowns.json"
         if now < cooldown:
             return f"cooldown until {tfmt(cooldown)}"
-    return None
+    return _claude_auth_reason(account)
 
 
 # `block_reason` reports EVERY not-ok collector row as "held: <error_code>",
