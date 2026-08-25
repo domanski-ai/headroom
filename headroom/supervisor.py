@@ -230,6 +230,34 @@ CONTEXT_KEEP_LARGE_PERCENT = 30.0
 # rotation that cannot change the window (already on 1M) would otherwise
 # observe the same crossing again on the next poll, forever.
 CONTEXT_BACKSTOP_MAX = max(1, paths.env_int("HEADROOM_CONTEXT_BACKSTOP_MAX", 2))
+# A HELD BACKSTOP MUST GET LOUDER, NOT QUIETER (2026-08-24).
+# `_context_defer` dedupes on the reason, so a hold that never clears announced
+# itself ONCE and then deferred in silence for ever. It never disarmed, which is
+# what the contract promises, but from outside silence is indistinguishable from
+# resolved, and the one state that needs a human looked exactly like the healthy
+# one. Measured that day: six feed monitors kept the steward's transcript inside
+# the five second quiescence window, so `guard_source_stable` raised "changed
+# recently" on every pass, the busy branch deferred without backoff, and the
+# backstop retried for ever while saying nothing after the first line.
+# So a hold that persists past this many seconds re-announces, carrying how long
+# it has been stuck. It changes NOTHING about whether a rotation happens.
+#
+# THE 300 IS NOT A TASTE, IT IS COUPLED TO THE CONSUMER. The estate sentinel
+# treats context_backstop_held as a TRANSIENT class with EV_TTL=600s
+# (~/.system/sentinel.sh:171) and latches alerts by set difference on
+# `class + pane` (sentinel.sh:2800). So an event that stops arriving for longer
+# than 600s leaves the current set and the sentinel prints RECOVERED, whether or
+# not the hold cleared. MEASURED 2026-08-24 on this steward's own pane: ALERT at
+# 17:10:39Z, then RECOVERED minutes later with the hold still active, purely
+# because the supervisor had gone quiet. The false all clear was the sentinel
+# faithfully reporting silence.
+# Re-announcing every 300s keeps the key continuously present, so the alert
+# stays UP and no false RECOVERED is ever printed. At 900s it would flap:
+# a lying RECOVERED at 600s and a fresh ALERT at 900s, for ever.
+# IF EV_TTL EVER CHANGES, THIS MUST STAY BELOW IT. A gap in the other direction
+# turns an honest standing alert back into a periodic lie.
+CONTEXT_HOLD_ESCALATE_SECONDS = max(60.0, float(
+    paths.env_int("HEADROOM_CONTEXT_HOLD_ESCALATE", 300)))
 # A forced rotation is only worth its restart if the successor gets a window
 # the conversation actually fits in. A session already on the 1M window has
 # nowhere bigger to go: forking it would carry the same tokens into the same
@@ -4270,8 +4298,29 @@ class Supervisor:
         child.context_next_check = self.now() + (
             PREEMPT_BACKOFF_SECONDS if backoff else PREEMPT_POLL_SECONDS)
         if child.context_last_hold == reason:
+            # SAME REASON AS LAST TIME. Stay quiet for a while, then say so
+            # again, because a hold nobody can see is the failure this whole
+            # backstop exists to prevent.
+            began = getattr(child, "context_hold_since", None)
+            if began is None:
+                began = self.now()
+                child.context_hold_since = began
+            spoken = getattr(child, "context_hold_announced_at", began)
+            if announce and self.now() - spoken >= CONTEXT_HOLD_ESCALATE_SECONDS:
+                child.context_hold_announced_at = self.now()
+                held = int(self.now() - began)
+                _operator_notice(
+                    f"context backstop STILL held after {held // 60} minutes: "
+                    f"{reason}; the child continues and nothing has rotated")
+                notify.emit({"event": "context_backstop_held",
+                             "account": child.account.get("name", ""),
+                             "reason": reason,
+                             "escalated": True,
+                             "held_seconds": held})
             return
         child.context_last_hold = reason
+        child.context_hold_since = self.now()
+        child.context_hold_announced_at = self.now()
         _operator_notice(f"context backstop held: {reason}; child continues "
                          f"with cap handoff still armed")
         if announce:

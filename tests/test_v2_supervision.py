@@ -9767,3 +9767,102 @@ class DegradedResumeWaitsForQuiescence(TempDirCase):
         gate = src.find("_await_transcript_quiescence", degraded, relaunch + 400)
         self.assertNotEqual(gate, -1,
                             "degraded resume no longer waits for quiescence")
+
+
+class AHeldContextBackstopGetsLouderNotQuieter(unittest.TestCase):
+    """A hold that never clears must keep saying so.
+
+    THE FAILURE THIS PINS, measured 2026-08-24 on the steward's own pane.
+    `_context_defer` dedupes on the reason, so a backstop held by a transcript
+    that never goes quiet announced itself ONCE and then deferred in silence for
+    ever. It never disarmed, which is what its contract promises, but from
+    outside a permanent silent hold is indistinguishable from a resolved one,
+    and the single state that needs a human looked exactly like the healthy one.
+    Six feed monitors kept the transcript inside the five second quiescence
+    window, so `guard_source_stable` raised "changed recently" every pass and the
+    busy branch retried without backoff, for ever, saying nothing.
+
+    The cure must not become a new noise source, so this pins BOTH halves: quiet
+    across ordinary polling, and loud again once the hold is genuinely stuck.
+    """
+
+    class _Child:
+        def __init__(self):
+            self.account = {"name": "mzansiedge"}
+            self.context_next_check = 0.0
+            self.context_last_hold = None
+
+    def _runner(self, clock):
+        runner = supervisor.Supervisor.__new__(supervisor.Supervisor)
+        runner.now = lambda: clock["t"]
+        return runner
+
+    def test_a_stuck_hold_reannounces_with_how_long_it_has_been_stuck(self):
+        clock = {"t": 1000.0}
+        runner = self._runner(clock)
+        child = self._Child()
+        reason = "source transcript changed recently"
+        with mock.patch.object(notify, "emit") as emit, \
+                mock.patch.object(supervisor, "_operator_notice"), \
+                redirect_stderr(io.StringIO()):
+            runner._context_defer(child, reason, backoff=False)
+            self.assertEqual(emit.call_count, 1, "the first hold must speak")
+
+            # ordinary polling: the same reason stays quiet, or the cure is
+            # just a new way to flood the feed. Measured against the constant
+            # rather than a wall-clock guess, because the interval is tuned to
+            # the sentinel's event TTL and moves when that does.
+            quiet_for = supervisor.CONTEXT_HOLD_ESCALATE_SECONDS / 2.0
+            polls = int(quiet_for // supervisor.PREEMPT_POLL_SECONDS)
+            self.assertGreater(polls, 1, "the probe must actually poll")
+            for _ in range(polls):
+                clock["t"] += supervisor.PREEMPT_POLL_SECONDS
+                runner._context_defer(child, reason, backoff=False)
+            self.assertEqual(emit.call_count, 1,
+                             "a hold must not re-announce on every poll")
+
+            # genuinely stuck: say so again, and say how long
+            clock["t"] += supervisor.CONTEXT_HOLD_ESCALATE_SECONDS + 60.0
+            runner._context_defer(child, reason, backoff=False)
+            self.assertEqual(emit.call_count, 2,
+                             "a hold stuck past the escalation window is "
+                             "silent, which is the defect this pins")
+
+        events = [call.args[0] for call in emit.call_args_list]
+        escalated = [event for event in events if event.get("escalated")]
+        self.assertEqual(len(escalated), 1)
+        self.assertEqual(escalated[0]["event"], "context_backstop_held")
+        self.assertEqual(escalated[0]["reason"], reason)
+        self.assertGreaterEqual(escalated[0]["held_seconds"],
+                                supervisor.CONTEXT_HOLD_ESCALATE_SECONDS)
+
+    def test_a_new_reason_resets_the_clock_and_speaks_immediately(self):
+        clock = {"t": 1000.0}
+        runner = self._runner(clock)
+        child = self._Child()
+        with mock.patch.object(notify, "emit") as emit, \
+                mock.patch.object(supervisor, "_operator_notice"), \
+                redirect_stderr(io.StringIO()):
+            runner._context_defer(child, "first reason", backoff=False)
+            clock["t"] += 10.0
+            runner._context_defer(child, "a different reason", backoff=False)
+            self.assertEqual(emit.call_count, 2)
+            # the new reason must not inherit the old one's stuck clock
+            clock["t"] += 10.0
+            runner._context_defer(child, "a different reason", backoff=False)
+            self.assertEqual(emit.call_count, 2)
+
+    def test_announce_false_stays_silent_even_when_stuck(self):
+        """The caller's own suppression still wins."""
+        clock = {"t": 1000.0}
+        runner = self._runner(clock)
+        child = self._Child()
+        with mock.patch.object(notify, "emit") as emit, \
+                mock.patch.object(supervisor, "_operator_notice"), \
+                redirect_stderr(io.StringIO()):
+            runner._context_defer(child, "quiet reason", backoff=False,
+                                  announce=False)
+            clock["t"] += supervisor.CONTEXT_HOLD_ESCALATE_SECONDS + 60.0
+            runner._context_defer(child, "quiet reason", backoff=False,
+                                  announce=False)
+            emit.assert_not_called()
