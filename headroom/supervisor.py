@@ -399,6 +399,13 @@ HOOK_RESTRICTING_KEYS = ("disableAllHooks", "allowManagedHooksOnly")
 # what actually makes an unrunnable hook fail closed and loudly.
 RESERVED_SETTINGS_ENV = ("HOME", "USERPROFILE")
 RESERVED_SETTINGS_ENV_PREFIXES = ("CLAUDE_", "HEADROOM_")
+EFFORT_MODEL_ALIASES = {
+    "opus": "claude-opus-5",
+    "fable": "claude-fable-5",
+    "sonnet": "claude-sonnet-5",
+    "haiku": "claude-haiku-4-5-20251001",
+}
+_NO_EFFORT_PICK = object()
 # CLI flags that suppress the injected hooks no matter what the merged
 # document says, and so cannot be merged at all. `--managed-settings` loads a
 # POLICY document, and policy sits ABOVE flag settings: an
@@ -1364,6 +1371,42 @@ def merge_user_settings(document=None, source=""):
                 f"merged with the supervisor's own {event} hook")
         supervised[event] = list(groups) + list(existing)
     return merged
+
+
+def carry_lane_effort(document, model, config_dir):
+    """Carry the lane's saved effort into a higher-precedence document."""
+    model = str(model or "")
+    if model.endswith("[1m]"):
+        model = model[:-4]
+    model_id = EFFORT_MODEL_ALIASES.get(model, model)
+    settings_path = os.path.join(str(config_dir or ""), "settings.json")
+    try:
+        with open(settings_path, encoding="utf-8") as handle:
+            settings = json.load(handle)
+    except Exception:  # noqa: BLE001, effort loading is advisory
+        settings = None
+
+    effort = _NO_EFFORT_PICK
+    source = ""
+    if isinstance(settings, dict):
+        model_settings = settings.get("modelSettings")
+        model_pick = (model_settings.get(model_id)
+                      if isinstance(model_settings, dict) else None)
+        if isinstance(model_pick, dict) and "effortLevel" in model_pick:
+            effort = model_pick["effortLevel"]
+            source = f"modelSettings.{model_id}"
+        elif "effortLevel" in settings:
+            effort = settings["effortLevel"]
+            source = "effortLevel"
+
+    if effort is _NO_EFFORT_PICK:
+        _operator_notice(f"no effort pick in {settings_path}")
+    else:
+        if "effortLevel" not in document:
+            document["effortLevel"] = effort
+        _operator_notice(
+            f"effort {effort} from {source} in {settings_path}")
+    return document
 
 
 def validate_user_settings(args):
@@ -2924,7 +2967,8 @@ class _SignalGuard:
 
 class Supervisor:
     def __init__(self, family, args, account, *, collect_fn=None,
-                 popen=None, now=None, sleep=None, supervisor_id=None):
+                 popen=None, now=None, sleep=None, supervisor_id=None,
+                 lane_config_dir=None):
         self.family = family
         # The user's `--settings` never reaches the child as a flag — Claude
         # honours only one and the child must be launched with the
@@ -2947,6 +2991,9 @@ class Supervisor:
         self.now = time.time if now is None else now
         self.sleep = time.sleep if sleep is None else sleep
         self.supervisor_id = supervisor_id or str(uuid.uuid4())
+        self.lane_config_dir = (
+            os.environ.get("HEADROOM_LANE_CONFIG_DIR", "")
+            if lane_config_dir is None else lane_config_dir) or ""
         # Preemptive rotation is resolved ONCE per supervised launch, so a
         # config edit mid-session can never flip the policy under a live
         # child. Reading it can't fail the launch (registry helpers swallow a
@@ -3008,7 +3055,8 @@ class Supervisor:
         # forensics are still needed.
         self.unrequested_death = None
 
-    def _settings_file(self, generation, account, automatic=True):
+    def _settings_file(self, generation, account, automatic=True,
+                       config_dir=None):
         directory = paths.ensure_private(_supervisors_dir())
         # The slot name goes in the filename because the filename is the ONLY
         # thing a live lane says about itself in `ps`. On 2026-08-01 at
@@ -3041,6 +3089,12 @@ class Supervisor:
             # would be refused by the adapter and print to the operator's
             # terminal: automation off has to mean off, not noisy.
             document = copy.deepcopy(self.user_settings)
+        if config_dir is None:
+            try:
+                config_dir = self.lane_config_dir or route.dispatch_dir(account)
+            except Exception:  # noqa: BLE001, effort loading is advisory
+                config_dir = self.lane_config_dir or account.get("home", "")
+        carry_lane_effort(document, self.family, config_dir)
         paths.write_json_atomic(destination, document, mode=0o600)
         self.settings_files.append(destination)
         return destination
@@ -3075,7 +3129,13 @@ class Supervisor:
             raise SupervisorError(
                 "%s has no seat home to launch in: %s"
                 % (account["name"], route.credential_location_reason(account)))
-        environment["CLAUDE_CONFIG_DIR"] = launch_dir
+        lane_config_dir = getattr(self, "lane_config_dir", "")
+        if lane_config_dir:
+            environment["CLAUDE_CONFIG_DIR"] = lane_config_dir
+            environment["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = launch_dir
+        else:
+            environment["CLAUDE_CONFIG_DIR"] = launch_dir
+            environment.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
         if automatic:
             environment.update({
                 "HEADROOM_SUPERVISOR_ID": self.supervisor_id,
@@ -3090,17 +3150,19 @@ class Supervisor:
 
     def _spawn(self, account, args, cwd, automatic, plan=None):
         self.generation += 1
+        environment = self._environment(account, self.generation, automatic)
         # a settings file is written whenever there is anything to say: the
         # supervisor's hooks, the user's document, or both. With neither
         # (an unsupervised child and no user settings) the argv is unchanged.
         settings = ""
         if automatic or self.user_settings:
-            settings = self._settings_file(self.generation, account, automatic)
+            settings = self._settings_file(
+                self.generation, account, automatic,
+                config_dir=environment.get("CLAUDE_CONFIG_DIR", ""))
         argv = ["claude"]
         if settings:
             argv.extend(["--settings", settings])
         argv.extend(args)
-        environment = self._environment(account, self.generation, automatic)
         launched_at = self.now()
         # Install the signal guard BEFORE the spawn window and reuse it in
         # _monitor, so no instant after a child could exist is ever unguarded
