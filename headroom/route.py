@@ -24,7 +24,7 @@ import threading
 import time
 
 from . import collect as collector
-from . import locks, maximize, notify, paths, registry
+from . import locks, maximize, notify, paths, registry, seat
 
 
 SNAPSHOT_MAX_AGE = paths.env_int("HEADROOM_SNAPSHOT_MAX_AGE", 900)
@@ -1464,8 +1464,8 @@ def env_pinned_account(fam):
     environment value counts; the provider default home is not a pin."""
     try:
         provider = registry.family_provider(fam)
-        value = os.environ.get(
-            "CLAUDE_CONFIG_DIR" if provider == "claude" else "CODEX_HOME", "")
+        value = (seat.seat_dir_from_env(os.environ) if provider == "claude"
+                 else os.environ.get("CODEX_HOME", ""))
         value = value.strip()
         if not value:
             return None
@@ -2097,9 +2097,10 @@ def _exec_routed(fam, command, launch_note=""):
 def current_account(fam):
     """The registry account this process's environment actually points at."""
     provider = registry.family_provider(fam)
-    var = "CLAUDE_CONFIG_DIR" if provider == "claude" else "CODEX_HOME"
     default = "~/.claude" if provider == "claude" else "~/.codex"
-    home = os.path.realpath(os.path.expanduser(os.environ.get(var, default)))
+    value = (seat.seat_dir_from_env(os.environ) if provider == "claude"
+             else os.environ.get("CODEX_HOME", ""))
+    home = os.path.realpath(os.path.expanduser(value or default))
     try:
         # same reverse map as the pin: cmd_rotate cools the account this
         # session is actually spending, which for a rotated seat is not the

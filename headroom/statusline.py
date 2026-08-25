@@ -15,7 +15,7 @@ import re
 import sys
 import time
 
-from . import locks, paths, registry
+from . import locks, paths, registry, seat
 
 GREEN, YELLOW, ORANGE, RED, DIM, RESET = (
     "\x1b[32m", "\x1b[33m", "\x1b[38;5;208m", "\x1b[31m", "\x1b[2m", "\x1b[0m")
@@ -73,7 +73,7 @@ def _journal_session(payload, now=None):
             "ts": int(now), "session_id": session_id,
             "transcript_path": transcript_path, "cwd": cwd,
             "model": model, "version": version,
-            "config_dir": os.environ.get("CLAUDE_CONFIG_DIR") or "",
+            "config_dir": seat.seat_dir_from_env(os.environ),
         }
         journal_lock = open(os.path.join(state, "sessions.lock"), "a+")
         try:
@@ -142,7 +142,7 @@ def main():
     rows = {row["name"]: row for row in snapshot.get("accounts", [])
             if isinstance(row, dict) and row.get("name")}
     current_home = os.path.realpath(
-        os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude")))
+        seat.seat_dir_from_env(os.environ) or os.path.expanduser("~/.claude"))
     current = None
     try:
         for account in registry.accounts():

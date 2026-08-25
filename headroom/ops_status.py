@@ -44,7 +44,7 @@ import subprocess
 import sys
 import time
 
-from . import handoff, paths, registry, supervisor
+from . import handoff, paths, registry, seat, supervisor
 
 SCHEMA = "headroom_ops_status@1"
 
@@ -278,7 +278,7 @@ def supervised_children(proc_root=None):
         if not _parent_is_supervisor(proc_root, ppid, supervisor_id):
             continue
         generation = environ.get("HEADROOM_CHILD_GENERATION", "")
-        config_dir = environ.get("CLAUDE_CONFIG_DIR", "")
+        config_dir = seat.seat_dir_from_env(environ)
         if config_dir:
             try:
                 config_dir = registry.expand(config_dir)

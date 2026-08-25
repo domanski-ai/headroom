@@ -2896,7 +2896,8 @@ class _SignalGuard:
 
 class Supervisor:
     def __init__(self, family, args, account, *, collect_fn=None,
-                 popen=None, now=None, sleep=None, supervisor_id=None):
+                 popen=None, now=None, sleep=None, supervisor_id=None,
+                 lane_config_dir=None):
         self.family = family
         # The user's `--settings` never reaches the child as a flag — Claude
         # honours only one and the child must be launched with the
@@ -2919,6 +2920,9 @@ class Supervisor:
         self.now = time.time if now is None else now
         self.sleep = time.sleep if sleep is None else sleep
         self.supervisor_id = supervisor_id or str(uuid.uuid4())
+        self.lane_config_dir = (
+            os.environ.get("HEADROOM_LANE_CONFIG_DIR", "")
+            if lane_config_dir is None else lane_config_dir) or ""
         # Preemptive rotation is resolved ONCE per supervised launch, so a
         # config edit mid-session can never flip the policy under a live
         # child. Reading it can't fail the launch (registry helpers swallow a
@@ -3047,7 +3051,13 @@ class Supervisor:
             raise SupervisorError(
                 "%s has no seat home to launch in: %s"
                 % (account["name"], route.credential_location_reason(account)))
-        environment["CLAUDE_CONFIG_DIR"] = launch_dir
+        lane_config_dir = getattr(self, "lane_config_dir", "")
+        if lane_config_dir:
+            environment["CLAUDE_CONFIG_DIR"] = lane_config_dir
+            environment["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = launch_dir
+        else:
+            environment["CLAUDE_CONFIG_DIR"] = launch_dir
+            environment.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
         if automatic:
             environment.update({
                 "HEADROOM_SUPERVISOR_ID": self.supervisor_id,

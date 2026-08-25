@@ -1518,9 +1518,30 @@ def resume_command(target_home, session_id, model=""):
     operator reading this line after a failed spawn has no other source of
     that fact, and the ledger row is the only record left if the process is
     gone, so both carry it."""
+    environment = _claude_resume_environment(target_home)
+    config = f"CLAUDE_CONFIG_DIR={shlex.quote(environment['CLAUDE_CONFIG_DIR'])}"
+    secure = environment.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+    if secure:
+        config += (" CLAUDE_SECURESTORAGE_CONFIG_DIR="
+                   + shlex.quote(secure))
     model_flag = f" --model {shlex.quote(model)}" if model else ""
-    return (f"CLAUDE_CONFIG_DIR={shlex.quote(target_home)} claude --resume "
+    return (f"{config} claude --resume "
             f"{shlex.quote(session_id)} --fork-session{model_flag}")
+
+
+def _claude_resume_environment(target_home, environ=None):
+    source = os.environ if environ is None else environ
+    environment = collect.scrubbed_env(source)
+    lane_config_dir = source.get("HEADROOM_LANE_CONFIG_DIR", "")
+    if not lane_config_dir and source.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+        lane_config_dir = source.get("CLAUDE_CONFIG_DIR", "")
+    if lane_config_dir:
+        environment["CLAUDE_CONFIG_DIR"] = lane_config_dir
+        environment["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = target_home
+    else:
+        environment["CLAUDE_CONFIG_DIR"] = target_home
+        environment.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
+    return environment
 
 
 def resume_argv(result):
@@ -1748,8 +1769,7 @@ def cmd_handoff(args):
         _print_baton(result.record, plan.inspected["unresolved_tool_ids"])
         if options["print"]:
             return 0
-        environment = collect.scrubbed_env()
-        environment["CLAUDE_CONFIG_DIR"] = target_directory(target)
+        environment = _claude_resume_environment(target_directory(target))
         try:
             argv = resume_argv(result)
             verify_target_binding(plan)
