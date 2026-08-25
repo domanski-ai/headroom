@@ -6031,6 +6031,26 @@ class ContextMeasurement(TempDirCase):
             self.assertEqual(
                 supervisor._context_window(1_000, "claude-fable-5"), 200_000)
 
+    def test_opus_runs_the_large_window_natively(self):
+        # 2026-08-25 specimens against the CLI's own ctx statement: sales
+        # 202,176 used at 80% free, domanski-ops 227,359 at 77%; under the
+        # 200k assumption both read past the wall and the backstop armed
+        for margs in (["--model", "opus"], ["--model=claude-opus-5"],
+                      ["--resume", "x", "--model", "OPUS"]):
+            self.assertEqual(
+                supervisor._context_window(1_000,
+                                           supervisor._model_flag(margs)),
+                1_000_000, margs)
+        window = supervisor._context_window(202_176, "opus")
+        self.assertEqual(window, 1_000_000)
+        self.assertAlmostEqual(
+            supervisor._context_remaining(202_176, window), 79.7824, places=3)
+        # an explicit standard window knob still wins
+        with mock.patch.dict(os.environ, {"HEADROOM_CTX_WINDOW": "200000"}):
+            self.assertEqual(supervisor._context_window(1_000, "opus"), 200_000)
+        # and a model nobody named still infers from usage alone
+        self.assertEqual(supervisor._context_window(190_000, ""), 200_000)
+
     def test_the_hooks_env_override_wins(self):
         with mock.patch.dict(os.environ, {"HEADROOM_CTX_WINDOW": "500000"}):
             self.assertEqual(supervisor._context_window(190_000), 500_000)
@@ -6442,6 +6462,64 @@ class ContextBackstop(TempDirCase):
             killed.assert_not_called()
             self.assertEqual(events, [])
         self.assertTrue(self.child.automation)
+
+    def ctx_statement(self, remaining, used=None, age=0):
+        """Plant the CLI's own ctx file for the child's session."""
+        directory = os.path.join(supervisor.paths.state_dir(), "ctx")
+        os.makedirs(directory, exist_ok=True)
+        payload = {"remaining_percentage": remaining, "ts": time.time() - age}
+        if used is not None:
+            payload["used_percentage"] = used
+        with open(os.path.join(directory, self.SID + ".json"), "w",
+                  encoding="utf-8") as out:
+            json.dump(payload, out)
+
+    def test_the_clis_own_ctx_statement_beats_inference(self):
+        # the sales specimen: 190k used, no model flag, the CLI says 81% free
+        runner = self.runner()
+        self.write(190_000)
+        self.ctx_statement(81, used=19)
+        self.assertIsNone(runner._context_observation(self.child))
+        used, window, remaining = runner._context_state(self.child)
+        self.assertEqual((used, window, remaining), (190_000, 1_000_000, 81.0))
+        # the statement can also say the wall is nearer than inference thinks
+        self.ctx_statement(8, used=92)
+        proof = runner._context_observation(self.child)
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof.remaining_percent, 8.0)
+        self.assertEqual(proof.window, 200_000)
+
+    def test_a_stale_ctx_statement_counts_only_while_the_transcript_is_quiet(self):
+        runner = self.runner()
+        # transcript written 10 minutes ago, statement an hour old: stale
+        self.write(190_000, idle=600)
+        self.ctx_statement(81, used=19, age=3600)
+        self.assertIsNotNone(runner._context_observation(self.child))
+        # transcript older than the statement: the numbers cannot have moved
+        self.write(190_000, idle=7200)
+        self.assertIsNone(runner._context_observation(self.child))
+
+    def test_the_env_knob_still_beats_the_ctx_statement(self):
+        runner = self.runner()
+        self.write(190_000)
+        self.ctx_statement(81, used=19)
+        with mock.patch.dict(os.environ, {"HEADROOM_CTX_WINDOW": "200000"}):
+            proof = runner._context_observation(self.child)
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof.remaining_percent, 5.0)
+
+    def test_a_broken_ctx_statement_falls_back_to_inference(self):
+        runner = self.runner()
+        self.write(190_000)
+        directory = os.path.join(supervisor.paths.state_dir(), "ctx")
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, self.SID + ".json")
+        for junk in ("not json", json.dumps([1, 2]),
+                     json.dumps({"remaining_percentage": "80", "ts": time.time()}),
+                     json.dumps({"remaining_percentage": 140, "ts": time.time()})):
+            with open(path, "w", encoding="utf-8") as out:
+                out.write(junk)
+            self.assertIsNotNone(runner._context_observation(self.child), junk)
 
     def test_the_threshold_itself_fires(self):
         runner = self.runner()

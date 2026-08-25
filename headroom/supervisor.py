@@ -2271,6 +2271,19 @@ def _context_window(used, model="", environ=None):
         # the steward. HEADROOM_CTX_WINDOW still overrides both ways for
         # any fable variant that ever runs the standard window.
         window = CONTEXT_WINDOW_LARGE
+    elif "opus" in model_l:
+        # OPUS 5 RUNS THE LARGE WINDOW NATIVELY TOO (2026-08-25, three
+        # production specimens against the CLI's own ctx statement): sales
+        # 202,176 used at CTX 80% free (implied window 1,010,880),
+        # domanski-ops 227,359 at 77% (988,517), the steward on fable 413,207
+        # at 58% (983,826). Under the 200k assumption sales read 2% remaining
+        # at 196k and the backstop armed a forced handoff on a healthy lane
+        # (context_backstop_held on sales 12:19Z, domanski-ops 11:51Z), held
+        # only because the transcripts kept changing. An idle Opus lane
+        # between 180k and 200k would have been rotated for nothing.
+        # HEADROOM_CTX_WINDOW still overrides for any opus variant on the
+        # standard window.
+        window = CONTEXT_WINDOW_LARGE
     elif _number(used) and used > CONTEXT_WINDOW_FIT_LIMIT:
         window = CONTEXT_WINDOW_LARGE
     else:
@@ -2285,6 +2298,53 @@ def _context_window(used, model="", environ=None):
         if forced > 0:
             return forced
     return window
+
+
+CTX_FILE_MAX_AGE = 15 * 60
+
+
+def _ctx_file_state(session_id, transcript_path, now):
+    """``(used_percent, remaining_percent)`` from the CLI's own ctx statement
+    for this session, or None.
+
+    The cooperative hook writes ``<state>/ctx/<session>.json`` with the
+    percentages the CLI itself computed (``remaining_percentage``,
+    ``used_percentage``, ``ts``). That is knowledge of the real window, where
+    everything in `_context_window` is inference from usage and a model name,
+    and inference was wrong for a whole model family twice (fable 2026-08-05,
+    opus 2026-08-25). The statement is CURRENT while it is under
+    CTX_FILE_MAX_AGE old, or while the transcript has not been written since
+    it was made (an idle session's numbers do not move). Anything unreadable,
+    non numeric or out of range is None, and None means inference."""
+    if not session_id or "/" in str(session_id):
+        return None
+    path = os.path.join(paths.state_dir(), "ctx", str(session_id) + ".json")
+    try:
+        payload = paths.load_json(path)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    stamp = payload.get("ts")
+    remaining = payload.get("remaining_percentage")
+    used_pct = payload.get("used_percentage")
+    if not (_number(stamp) and _number(remaining)):
+        return None
+    if not 0 <= remaining <= 100:
+        return None
+    if not _number(used_pct):
+        used_pct = 100.0 - float(remaining)
+    if not 0 <= used_pct <= 100:
+        return None
+    fresh = now - stamp <= CTX_FILE_MAX_AGE
+    if not fresh:
+        try:
+            fresh = os.stat(transcript_path).st_mtime <= stamp
+        except OSError:
+            fresh = False
+    if not fresh:
+        return None
+    return float(used_pct), float(remaining)
 
 
 def _context_remaining(used, window):
@@ -4328,6 +4388,19 @@ class Supervisor:
         remaining = _context_remaining(used, window)
         if remaining is None:
             return None
+        # the CLI's own statement, while current, beats every inference
+        # above; the operator's HEADROOM_CTX_WINDOW knob still beats both
+        stated = _ctx_file_state(binding.session_id, binding.transcript_path,
+                                 self.now())
+        if stated is not None and not str(
+                os.environ.get("HEADROOM_CTX_WINDOW", "")).strip():
+            used_pct, remaining = stated
+            if used_pct > 0:
+                implied = used * 100.0 / used_pct
+                window = (CONTEXT_WINDOW_LARGE
+                          if implied > (CONTEXT_WINDOW_STANDARD
+                                        + CONTEXT_WINDOW_LARGE) / 2
+                          else CONTEXT_WINDOW_STANDARD)
         return used, window, remaining
 
     def _context_backstop_due(self, child, proof):
