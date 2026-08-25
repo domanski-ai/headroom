@@ -197,8 +197,9 @@ def _read_jsonl(path, label):
     return rows
 
 
-def _contained_transcript(path, session_id, account, lane_config_dir=""):
-    """Return a canonical regular transcript owned by ``account``."""
+def _contained_transcript(path, session_id, account, lane_config_dir="",
+                          allow_missing=False):
+    """Return a canonical contained transcript path owned by ``account``."""
     absolute = os.path.abspath(os.path.expanduser(path))
     if os.path.basename(absolute) != session_id + ".jsonl":
         raise HandoffError(
@@ -206,24 +207,26 @@ def _contained_transcript(path, session_id, account, lane_config_dir=""):
     try:
         metadata = os.lstat(absolute)
     except FileNotFoundError as error:
-        # ONLY a genuinely absent file says "no longer exists": the supervisor
-        # treats that one phrase as "may still be being written" and waits a
-        # bounded moment for it. A permission or ENOTDIR failure is a real,
-        # unfixable identity failure and must keep saying so.
-        raise HandoffError(
-            f"session {session_id} transcript no longer exists") from error
+        # A lane SessionStart can name its contained transcript before the
+        # first turn creates the file. Every other missing path keeps the
+        # established sentence used by the supervisor's retry logic.
+        if not allow_missing:
+            raise HandoffError(
+                f"session {session_id} transcript no longer exists") from error
+        metadata = None
     except OSError as error:
         raise HandoffError(
             f"session {session_id} transcript cannot be read "
             f"({error.strerror or error})") from error
-    if stat.S_ISLNK(metadata.st_mode):
+    if metadata is not None and stat.S_ISLNK(metadata.st_mode):
         raise HandoffError("source transcript is a symlink — refusing to copy")
     canonical = os.path.realpath(absolute)
-    try:
-        if not stat.S_ISREG(os.stat(canonical).st_mode):
-            raise HandoffError("source transcript is not a regular file")
-    except OSError as error:
-        raise HandoffError("cannot stat source transcript") from error
+    if metadata is not None:
+        try:
+            if not stat.S_ISREG(os.stat(canonical).st_mode):
+                raise HandoffError("source transcript is not a regular file")
+        except OSError as error:
+            raise HandoffError("cannot stat source transcript") from error
     directories = account_directories(account)
     if lane_config_dir:
         directories.append(registry.expand(lane_config_dir))
@@ -271,7 +274,7 @@ def _account_for_path(path, accounts, config_dir="", lane_config_dir=""):
 
 
 def _source(path, session_id, accounts, model="", seen_at=0, config_dir="",
-            lane_config_dir=""):
+            lane_config_dir="", allow_missing=False):
     account = _account_for_path(
         path, accounts, config_dir, lane_config_dir=lane_config_dir)
     if account is None:
@@ -280,7 +283,8 @@ def _source(path, session_id, accounts, model="", seen_at=0, config_dir="",
     if account.get("provider") != "claude":
         raise HandoffError("handoff only supports same-provider Claude sessions")
     canonical = _contained_transcript(
-        path, session_id, account, lane_config_dir=lane_config_dir)
+        path, session_id, account, lane_config_dir=lane_config_dir,
+        allow_missing=bool(lane_config_dir and allow_missing))
     return SourceSession(session_id, canonical, account, model,
                          int(_timestamp({"ts": seen_at})))
 

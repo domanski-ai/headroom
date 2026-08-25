@@ -36,22 +36,28 @@ class PerLaneConfigDirectory(unittest.TestCase):
             handle.write("{}\n")
         return path
 
-    def _validate_hook(self, transcript, launch_dir, lane_config_dir):
-        child = mock.Mock(
-            account=self.account, launch_dir=launch_dir,
-            lane_config_dir=lane_config_dir, launched_at=0,
-            binding=None, session_epochs={})
-        record = {
+    def _child(self, launch_dir, lane_config_dir):
+        return supervisor.Child(
+            mock.Mock(pid=os.getpid()), self.account, 1, "", "", 0, True,
+            launch_dir=launch_dir, lane_config_dir=lane_config_dir)
+
+    def _hook_record(self, transcript, launch_dir, hook_name="SessionStart",
+                     received_at=1):
+        return {
             "source_slot": self.account["name"],
             "config_dir": launch_dir,
-            "received_at": 1,
+            "received_at": received_at,
             "payload": {
-                "hook_event_name": "SessionStart",
+                "hook_event_name": hook_name,
                 "session_id": self.SESSION_ID,
                 "transcript_path": transcript,
                 "cwd": self.temp.name,
             },
         }
+
+    def _validate_hook(self, transcript, launch_dir, lane_config_dir):
+        child = self._child(launch_dir, lane_config_dir)
+        record = self._hook_record(transcript, launch_dir)
         with mock.patch.object(supervisor, "_namespace_matches",
                                return_value=True), \
                 mock.patch.object(supervisor.time, "time", return_value=1):
@@ -77,6 +83,50 @@ class PerLaneConfigDirectory(unittest.TestCase):
         self.assertEqual(
             str(caught.exception),
             f"session {self.SESSION_ID} is not inside a configured Claude home")
+
+    def test_unborn_lane_transcript_is_accepted_without_losing_supervision(self):
+        transcript = os.path.join(
+            self.lane, "projects", "-fixture", self.SESSION_ID + ".jsonl")
+        child = self._child(self.lane, self.lane)
+        record = self._hook_record(transcript, self.lane)
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.account, popen=mock.Mock(), now=lambda: 1)
+        with mock.patch.object(supervisor, "_read_events",
+                               return_value=[record]), \
+                mock.patch.object(supervisor, "_namespace_matches",
+                                  return_value=True), \
+                mock.patch.object(supervisor.time, "time", return_value=1), \
+                mock.patch.object(supervisor.notify, "emit") as emit:
+            runner._handle_events(child, "")
+
+        self.assertTrue(child.automation)
+        self.assertIsNotNone(child.binding)
+        self.assertEqual(child.binding.transcript_path, transcript)
+        self.assertFalse(any(call.args[0].get("event") == "supervision_lost"
+                             for call in emit.call_args_list))
+
+    def test_deleted_lane_transcript_keeps_the_existing_rejection(self):
+        transcript = self._transcript(self.lane)
+        child = self._child(self.lane, self.lane)
+        child.binding = supervisor.Binding(
+            self.SESSION_ID, transcript, self.temp.name, "", "", self.lane)
+        child.session_epochs[(self.SESSION_ID, transcript)] = 1
+        os.remove(transcript)
+
+        with mock.patch.object(supervisor, "TRANSCRIPT_GRACE_SECONDS", 0.0), \
+                mock.patch.object(supervisor, "_namespace_matches",
+                                  return_value=True), \
+                mock.patch.object(supervisor.time, "time", return_value=1):
+            with self.assertRaises(supervisor.TransientSupervisorError) as caught:
+                supervisor._validated_event(
+                    self._hook_record(
+                        transcript, self.lane, "CwdChanged", received_at=2),
+                    child)
+
+        self.assertEqual(
+            str(caught.exception),
+            f"session {self.SESSION_ID} transcript no longer exists")
+        self.assertEqual(caught.exception.klass, "deletion")
 
     def test_lane_launch_uses_seat_credentials_and_census_names_seat(self):
         request_env = {

@@ -1557,21 +1557,34 @@ TRANSCRIPT_GRACE_STEP = 0.1
 
 
 def _source_once_written(transcript, session_id, child, config_dir,
-                         sleep=time.sleep, now=time.time):
+                         sleep=time.sleep, now=time.time,
+                         allow_missing=False):
     """`handoff._source`, tolerant of a transcript that is still being born.
 
     Retries ONLY the not-yet-written case — every other HandoffError (wrong
     basename, symlink, foreign home) is a genuine identity failure and is
-    raised on the first look, unchanged."""
+    raised on the first look, unchanged. An unbound lane SessionStart may
+    bind a contained path before its first turn creates the file."""
     deadline = now() + max(0.0, TRANSCRIPT_GRACE_SECONDS)
     lane_config_dir = getattr(child, "lane_config_dir", "")
     if not isinstance(lane_config_dir, str):
         lane_config_dir = ""
+    binding = getattr(child, "binding", None)
+    session_epochs = getattr(child, "session_epochs", {})
+    if not isinstance(session_epochs, dict):
+        session_epochs = {}
+    pair_bound = ((binding is not None
+                   and session_id == binding.session_id
+                   and transcript == binding.transcript_path)
+                  or (session_id, transcript) in session_epochs)
     while True:
         try:
             return handoff._source(transcript, session_id, [child.account],
                                    config_dir=config_dir,
-                                   lane_config_dir=lane_config_dir)
+                                   lane_config_dir=lane_config_dir,
+                                   allow_missing=bool(allow_missing
+                                                      and lane_config_dir
+                                                      and not pair_bound))
         except handoff.HandoffError as error:
             remaining = deadline - now()
             if "transcript no longer exists" not in str(error) \
@@ -1614,7 +1627,9 @@ def _validated_event(record, child, binding=None):
             or os.path.abspath(os.path.expanduser(transcript)) != transcript:
         raise PermanentSupervisorError("hook event transcript path is not canonical")
     try:
-        source = _source_once_written(transcript, session_id, child, config_dir)
+        source = _source_once_written(
+            transcript, session_id, child, config_dir,
+            allow_missing=payload.get("hook_event_name") == "SessionStart")
     except handoff.HandoffError as error:
         # THE ALLOWLIST, and it is one phrase long on this path. Every other
         # HandoffError out of the identity check — a symlink, a foreign home,
