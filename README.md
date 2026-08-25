@@ -871,6 +871,20 @@ provider controls; it just routes your own tools at your own logins and tells
 you what's left. Check your providers' terms if you're unsure what applies
 to your setup.
 
+## Who builds this
+
+headroom is built and maintained by [Paul Domanski](https://www.linkedin.com/in/paul-domanski-ai/)
+at **[Domanski.AI](https://domanski.ai)**, Cape Town.
+
+Domanski.AI installs AI agents into existing roles inside real businesses, and
+runs its own operations on the same multi-agent stack it sells. headroom came
+out of that: running many agents across several provider accounts makes
+capacity the thing that actually stops you, so it needed a live answer rather
+than a guess.
+
+If that is the problem you have, [domanski.ai](https://domanski.ai) is where to
+find the rest of the work.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
