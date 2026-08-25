@@ -16,6 +16,7 @@ from headroom import handoff, ops_status, route, statusline, supervisor  # noqa:
 
 class PerLaneConfigDirectory(unittest.TestCase):
     SUPERVISOR_ID = "11111111-2222-4333-8444-555555555555"
+    SESSION_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -26,6 +27,56 @@ class PerLaneConfigDirectory(unittest.TestCase):
         self.account = {
             "name": "alpha", "provider": "claude", "home": self.seat,
         }
+
+    def _transcript(self, root):
+        directory = os.path.join(root, "projects", "-fixture")
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, self.SESSION_ID + ".jsonl")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("{}\n")
+        return path
+
+    def _validate_hook(self, transcript, launch_dir, lane_config_dir):
+        child = mock.Mock(
+            account=self.account, launch_dir=launch_dir,
+            lane_config_dir=lane_config_dir, launched_at=0,
+            binding=None, session_epochs={})
+        record = {
+            "source_slot": self.account["name"],
+            "config_dir": launch_dir,
+            "received_at": 1,
+            "payload": {
+                "hook_event_name": "SessionStart",
+                "session_id": self.SESSION_ID,
+                "transcript_path": transcript,
+                "cwd": self.temp.name,
+            },
+        }
+        with mock.patch.object(supervisor, "_namespace_matches",
+                               return_value=True), \
+                mock.patch.object(supervisor.time, "time", return_value=1):
+            return supervisor._validated_event(record, child)
+
+    def test_hook_event_under_lane_projects_maps_to_supervisor_account(self):
+        source, _cwd = self._validate_hook(
+            self._transcript(self.lane), self.lane, self.lane)
+        self.assertIs(source.account, self.account)
+
+    def test_hook_event_under_lane_projects_without_lane_is_rejected(self):
+        with self.assertRaises(supervisor.PermanentSupervisorError) as caught:
+            self._validate_hook(self._transcript(self.lane), self.seat, "")
+        self.assertEqual(
+            str(caught.exception),
+            f"session {self.SESSION_ID} is not inside a configured Claude home")
+
+    def test_hook_event_under_random_projects_is_rejected(self):
+        random_root = os.path.join(self.temp.name, "random")
+        with self.assertRaises(supervisor.PermanentSupervisorError) as caught:
+            self._validate_hook(
+                self._transcript(random_root), self.lane, self.lane)
+        self.assertEqual(
+            str(caught.exception),
+            f"session {self.SESSION_ID} is not inside a configured Claude home")
 
     def test_lane_launch_uses_seat_credentials_and_census_names_seat(self):
         request_env = {

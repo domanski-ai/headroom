@@ -197,7 +197,7 @@ def _read_jsonl(path, label):
     return rows
 
 
-def _contained_transcript(path, session_id, account):
+def _contained_transcript(path, session_id, account, lane_config_dir=""):
     """Return a canonical regular transcript owned by ``account``."""
     absolute = os.path.abspath(os.path.expanduser(path))
     if os.path.basename(absolute) != session_id + ".jsonl":
@@ -224,7 +224,10 @@ def _contained_transcript(path, session_id, account):
             raise HandoffError("source transcript is not a regular file")
     except OSError as error:
         raise HandoffError("cannot stat source transcript") from error
-    for directory in account_directories(account):
+    directories = account_directories(account)
+    if lane_config_dir:
+        directories.append(registry.expand(lane_config_dir))
+    for directory in directories:
         projects_path = os.path.join(directory, "projects")
         if os.path.islink(projects_path):
             raise HandoffError("source projects directory is a symlink")
@@ -239,7 +242,7 @@ def _contained_transcript(path, session_id, account):
         f"session {session_id} is not inside the account's projects directory")
 
 
-def _account_for_path(path, accounts, config_dir=""):
+def _account_for_path(path, accounts, config_dir="", lane_config_dir=""):
     canonical = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
     # RANK BY DIRECTORY, NOT BY ACCOUNT (2026-08-17 R4). One directory can be
     # named by two accounts at once: a rotated account resolves TO another
@@ -256,17 +259,28 @@ def _account_for_path(path, accounts, config_dir=""):
                 return account
         except ValueError:
             continue
+    if lane_config_dir and len(accounts) == 1:
+        projects = os.path.realpath(os.path.join(
+            registry.expand(lane_config_dir), "projects"))
+        try:
+            if os.path.commonpath((canonical, projects)) == projects:
+                return accounts[0]
+        except ValueError:
+            pass
     return None
 
 
-def _source(path, session_id, accounts, model="", seen_at=0, config_dir=""):
-    account = _account_for_path(path, accounts, config_dir)
+def _source(path, session_id, accounts, model="", seen_at=0, config_dir="",
+            lane_config_dir=""):
+    account = _account_for_path(
+        path, accounts, config_dir, lane_config_dir=lane_config_dir)
     if account is None:
         raise HandoffError(
             f"session {session_id} is not inside a configured Claude home")
     if account.get("provider") != "claude":
         raise HandoffError("handoff only supports same-provider Claude sessions")
-    canonical = _contained_transcript(path, session_id, account)
+    canonical = _contained_transcript(
+        path, session_id, account, lane_config_dir=lane_config_dir)
     return SourceSession(session_id, canonical, account, model,
                          int(_timestamp({"ts": seen_at})))
 

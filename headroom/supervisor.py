@@ -692,6 +692,7 @@ class Child:
     context_next_check: float = 0.0
     context_announced: bool = False
     context_last_hold: str = ""
+    lane_config_dir: str = ""
 
     def __post_init__(self):
         """Freeze `launch_dir` ONCE, for a Child nobody handed one to.
@@ -1563,10 +1564,14 @@ def _source_once_written(transcript, session_id, child, config_dir,
     basename, symlink, foreign home) is a genuine identity failure and is
     raised on the first look, unchanged."""
     deadline = now() + max(0.0, TRANSCRIPT_GRACE_SECONDS)
+    lane_config_dir = getattr(child, "lane_config_dir", "")
+    if not isinstance(lane_config_dir, str):
+        lane_config_dir = ""
     while True:
         try:
             return handoff._source(transcript, session_id, [child.account],
-                                   config_dir=config_dir)
+                                   config_dir=config_dir,
+                                   lane_config_dir=lane_config_dir)
         except handoff.HandoffError as error:
             remaining = deadline - now()
             if "transcript no longer exists" not in str(error) \
@@ -3193,7 +3198,8 @@ class Supervisor:
                      # the LITERAL directory this child was launched into, so
                      # the checks that police its hook events compare against
                      # the launcher's answer rather than re-deriving one
-                     launch_dir=environment.get("CLAUDE_CONFIG_DIR", ""))
+                     launch_dir=environment.get("CLAUDE_CONFIG_DIR", ""),
+                     lane_config_dir=getattr(self, "lane_config_dir", ""))
 
     def _collect_once(self, event_time):
         # Provider snapshots use whole-second timestamps.  Crossing the next
