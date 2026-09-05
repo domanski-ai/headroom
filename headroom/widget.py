@@ -414,6 +414,17 @@ def project(snapshot, evaluated_at=None, force_noncurrent_reason=None):
             "state": state,
             "windows": windows,
         }
+        # Additive lifecycle metadata. Consumers that only understand the
+        # versioned state/windows contract ignore it; dashboard and operator
+        # surfaces can distinguish an expired Claude login immediately from a
+        # transiently old observation.
+        if raw.get("auth_state") in {"renewal_required", "identity_changed"}:
+            row["auth_state"] = raw["auth_state"]
+            if raw.get("error_code") in {
+                    "claude_usage_token_expired",
+                    "claude_usage_token_rejected",
+                    "claude_auth_identity_changed"}:
+                row["error_code"] = raw["error_code"]
         if _is_unpaid(raw):
             # held (grey) plus the additive flag; see _is_unpaid for why the
             # enum may not grow a fifth value.

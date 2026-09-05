@@ -41,6 +41,8 @@ from datetime import datetime, timezone
 from . import history, locks, paths, registry, tokens
 
 IDENTITY_TIMEOUT = paths.env_int("HEADROOM_IDENTITY_TIMEOUT", 15)
+CLAUDE_AUTH_RENEW_TIMEOUT = paths.env_int(
+    "HEADROOM_CLAUDE_AUTH_RENEW_TIMEOUT", 45)
 CODEX_STALE_AFTER = paths.env_int("HEADROOM_CODEX_STALE_AFTER", 1800)
 # how long a past reading stays serviceable — keep in sync with route.py,
 # which enforces the same bound at routing time (collect must not import
@@ -163,7 +165,7 @@ PUBLIC_FIELDS = {
     "retry_at", "unpaid",
     "captured_at", "source", "stale", "windows", "identity_verified",
     "identity_method", "trust_state", "routable", "subscription",
-    "throttle_carryover",
+    "throttle_carryover", "auth_state",
 }
 
 
@@ -220,7 +222,8 @@ def fingerprint(value):
 AUTH_OVERRIDE_VARS = (
     # Anthropic direct
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_OAUTH_SCOPES",
     # Claude Code alternate providers — these reroute Claude off the OAuth slot
     "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
     "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL",
@@ -537,6 +540,68 @@ def claude_identity(home, runner=subprocess.run):
         except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
             pass
     return claude_local_identity(home)
+
+
+def claude_renew_oauth(home, expected_identity, runner=subprocess.run,
+                       identity_reader=claude_identity):
+    """Ask Claude Code to renew its own saved login for exactly one home.
+
+    Claude Code documents ``CLAUDE_CODE_OAUTH_REFRESH_TOKEN`` plus
+    ``CLAUDE_CODE_OAUTH_SCOPES`` as the non-interactive input to
+    ``claude auth login``. Headroom passes the existing per-home credential
+    only in the child environment, captures all output, and never performs or
+    persists the OAuth exchange itself.
+    """
+    oauth = claude_oauth(home) or {}
+    refresh_token = oauth.get("refreshToken")
+    scopes = oauth.get("scopes")
+    if not refresh_token or not scopes:
+        raise IdentityBindingError("claude_auth_renewal_required")
+    if isinstance(scopes, (list, tuple)):
+        scopes = " ".join(str(scope) for scope in scopes if scope)
+    else:
+        scopes = str(scopes).strip()
+    if not scopes:
+        raise IdentityBindingError("claude_auth_renewal_required")
+
+    refresh_expires = oauth.get("refreshTokenExpiresAt")
+    if isinstance(refresh_expires, (int, float)):
+        refresh_expires = (refresh_expires / 1000
+                           if refresh_expires > 10_000_000_000
+                           else refresh_expires)
+        if refresh_expires <= time.time():
+            raise IdentityBindingError("claude_auth_renewal_required")
+
+    binary = claude_bin()
+    if not binary:
+        raise IdentityBindingError("claude_auth_renewal_required")
+    env = scrubbed_env()
+    env["CLAUDE_CONFIG_DIR"] = home
+    env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] = refresh_token
+    env["CLAUDE_CODE_OAUTH_SCOPES"] = scopes
+    try:
+        process = runner(
+            [binary, "auth", "login", "--claudeai"], env=env,
+            capture_output=True, text=True, timeout=CLAUDE_AUTH_RENEW_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise IdentityBindingError("claude_auth_renewal_required")
+    if process.returncode != 0:
+        raise IdentityBindingError("claude_auth_renewal_required")
+
+    renewed = identity_reader(home)
+    if renewed.get("verified") is not True:
+        raise IdentityBindingError("claude_auth_identity_changed")
+    expected_email = expected_identity.get("email")
+    renewed_email = renewed.get("email")
+    if expected_email and (not renewed_email or
+                           renewed_email.lower() != expected_email.lower()):
+        raise IdentityBindingError("claude_auth_identity_changed")
+    expected_fingerprint = expected_identity.get("account_fingerprint")
+    if expected_fingerprint and renewed.get("account_fingerprint") \
+            != expected_fingerprint:
+        raise IdentityBindingError("claude_auth_identity_changed")
+    return renewed
 
 
 # Where the Codex CLI is installed on this box when it is not on PATH. The
@@ -1952,8 +2017,39 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 else:
                     if claude_backoff_until > now:
                         raise ProviderThrottleError(claude_backoff_until)
-                    result.update(claude_limits(
-                        read_home, account.get("pinned_usage_org")))
+                    try:
+                        usage = claude_limits(
+                            read_home, account.get("pinned_usage_org"))
+                    except IdentityBindingError as usage_error:
+                        configured_home = os.path.normcase(os.path.realpath(
+                            account["home"]))
+                        resolved_read_home = os.path.normcase(os.path.realpath(
+                            read_home))
+                        if (usage_error.code != "claude_usage_token_expired"
+                                or account.get("claude_auth_auto_renew")
+                                is not True
+                                or resolved_read_home != configured_home):
+                            raise
+                        try:
+                            renewed = claude_renew_oauth(read_home, identity)
+                        except IdentityBindingError as renewal_error:
+                            if renewal_error.code == \
+                                    "claude_auth_identity_changed":
+                                raise
+                            # Preserve the physical cause in the published row;
+                            # the outer handler adds the operator-facing
+                            # renewal_required lifecycle classification.
+                            raise usage_error
+                        renewed["credential_digest"] = credential_digest(
+                            "claude", read_home)
+                        identity = renewed
+                        result["identity"] = identity
+                        result["identity_verified"] = identity["verified"]
+                        result["identity_method"] = identity["method"]
+                        result["email"] = identity["email"]
+                        usage = claude_limits(
+                            read_home, account.get("pinned_usage_org"))
+                    result.update(usage)
                 if not account.get("pinned_usage_org") \
                         and result.get("source_identity_fingerprint"):
                     # trust-on-first-use: remember which org this slot's
@@ -2107,15 +2203,24 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 result["note"] = CODEX_HOLD_NOTES[error.code]
             elif error.code in ("claude_usage_token_expired",
                                 "claude_usage_token_rejected"):
+                # Claude Code's documented owner path could not renew this
+                # login. Publish the lifecycle decision explicitly so the
+                # dashboard's last-good carry cannot disguise it as generic
+                # multi-hour staleness.
+                result["auth_state"] = "renewal_required"
                 what = ("has expired" if error.code.endswith("expired")
                         else "was rejected by the usage API (expired or "
                              "revoked)")
                 result["note"] = (
-                    f"cached Claude token {what} — headroom never refreshes "
-                    "credentials itself. Run one Claude Code turn on this "
-                    "account (the CLI refreshes its token) or `headroom auth "
-                    f"refresh {account['name']}` to re-login; readings held "
-                    "until then.")
+                    f"cached Claude token {what} and Claude Code could not "
+                    "renew it non-interactively. Run `headroom auth refresh "
+                    f"{account['name']}` to re-login; readings held until "
+                    "then.")
+            elif error.code == "claude_auth_identity_changed":
+                result["auth_state"] = "identity_changed"
+                result["note"] = (
+                    "Claude renewed the login but the provider identity "
+                    "changed; slot held and quota not read")
             elif error.code == "unpaid":
                 # The estate registry knows about the bill even when this
                 # config row does not, so the code arrives here as a raise.

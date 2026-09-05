@@ -702,6 +702,14 @@ def _carry_lastgood_rows(value):
                     # what it read before.
                     carried["reading_source"] = "lastgood"
                     carried["reading_age_seconds"] = age
+                    # Preserve the CURRENT collector's auth verdict alongside
+                    # the older displayed numbers. Otherwise last-good replaces
+                    # the held projection wholesale and an expired login reads
+                    # only as ambiguous STALE for hours.
+                    if row.get("auth_state") in {
+                            "renewal_required", "identity_changed"}:
+                        carried["auth_state"] = row["auth_state"]
+                        carried["error_code"] = row.get("error_code")
                     # A CARRIED ROW IS ALWAYS MARKED STALE, AT EVERY AGE.
                     #
                     # It was tempting to demote only past CARRY_LIVE_MAX_AGE and
@@ -729,11 +737,21 @@ def _carry_lastgood_rows(value):
                     widget._demote_windows(carried.get("windows") or {},
                                            "stale")
                     carried["state"] = "stale"
-                    carried["reading_note"] = (
-                        ("no live reading for %d minutes; showing the last "
-                         "verified one" % (age // 60))
-                        if age > CARRY_LIVE_MAX_AGE
-                        else "last verified %d minutes ago" % (age // 60))
+                    if carried.get("auth_state") == "renewal_required":
+                        carried["reading_note"] = (
+                            "authentication renewal required; showing the "
+                            "last verified reading")
+                    elif carried.get("auth_state") == "identity_changed":
+                        carried["reading_note"] = (
+                            "authentication identity changed; showing the "
+                            "last verified reading")
+                    elif age > CARRY_LIVE_MAX_AGE:
+                        carried["reading_note"] = (
+                            "no live reading for %d minutes; showing the last "
+                            "verified one" % (age // 60))
+                    else:
+                        carried["reading_note"] = (
+                            "last verified %d minutes ago" % (age // 60))
                     accounts[index] = carried
             if changed:
                 tmp = store_path + ".tmp"
