@@ -173,6 +173,59 @@ class RenewalIsSingleShotPerRefreshCredential(RenewalTestCase):
         self.assertIsInstance(entry["attempted_at"], int)
 
 
+class TokenExpiredGuidanceNeverNamesAnOwnedOnlyCommand(unittest.TestCase):
+    """The contract, not a specific user's account.
+
+    `headroom auth refresh <slot>` is refused by connect.cmd_refresh for any
+    home that is not exactly Headroom's own homes/<slot> path -- an adopted or
+    external home, which wm-a is a real example of but this test does not
+    couple to. The guidance for an expired or rejected cached token must never
+    point there; it must point at the universal CLI sign-in instead, and it
+    must do so without publishing the account's name or its home path, and
+    without touching the error code or the renewal_required classification
+    that drives routing.
+    """
+
+    def row_for(self, error_code):
+        # A generic fixture home, deliberately not shaped like either a
+        # Headroom-owned homes/<slot> path or any real adopted path -- the
+        # fix must not depend on which shape this is.
+        account = {"name": "fixture-slot", "provider": "claude",
+                  "home": "/fixtures/does-not-exist/fixture-slot"}
+        identity = {"verified": True, "email": "fixture-slot@example.test",
+                    "account_fingerprint": "FP", "method": "local"}
+        with mock.patch.object(collect, "claude_identity",
+                               return_value=identity),                 mock.patch.object(collect, "credential_digest",
+                                  return_value="digest"),                 mock.patch.object(collect, "claude_plan", return_value="Max"),                 mock.patch.object(
+                    collect, "claude_limits",
+                    side_effect=collect.IdentityBindingError(error_code)):
+            return collect.collect([account])["accounts"][0]
+
+    def assert_guidance_is_universal(self, row, error_code):
+        self.assertEqual(row["error_code"], error_code)
+        # classification and routing must be exactly as before this fix
+        self.assertEqual(row.get("auth_state"), "renewal_required")
+        note = row.get("note", "")
+        self.assertNotIn("auth refresh", note)
+        self.assertIn("claude auth login", note)
+        self.assertIn("CLAUDE_CONFIG_DIR", note)
+        # note is published: no slot name, no home path
+        self.assertNotIn("fixture-slot", note)
+        self.assertNotIn("/fixtures/", note)
+
+    def test_expired_token_guidance_is_universal(self):
+        self.assert_guidance_is_universal(
+            self.row_for("claude_usage_token_expired"),
+            "claude_usage_token_expired")
+
+    def test_rejected_token_guidance_shares_the_same_fix(self):
+        """claude_usage_token_rejected shares the expired arm's template, so
+        it inherits the same correction -- not a second, separate fix."""
+        self.assert_guidance_is_universal(
+            self.row_for("claude_usage_token_rejected"),
+            "claude_usage_token_rejected")
+
+
 class ABlankedCredentialIsItsOwnLifecycleState(RenewalTestCase):
     def limits(self):
         return collect.claude_limits(self.home, None)

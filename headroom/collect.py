@@ -2277,11 +2277,22 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 what = ("has expired" if error.code.endswith("expired")
                         else "was rejected by the usage API (expired or "
                              "revoked)")
+                # NOT `headroom auth refresh <slot>`: same reasoning as the
+                # claude_credentials_blanked and claude_credentials_missing
+                # notes below — connect.cmd_refresh refuses an adopted or
+                # external home, which is exactly the shape of slot this
+                # arm applies to just as much as those. Point at the CLI
+                # sign-in directly and universally rather than adding a
+                # second ownership check that would only duplicate
+                # cmd_refresh's own. claude_usage_token_rejected shares this
+                # template and is corrected by the same edit, not a second
+                # one. No home path or email — `note` is published.
                 result["note"] = (
                     f"cached Claude token {what} and Claude Code could not "
-                    "renew it non-interactively. Run `headroom auth refresh "
-                    f"{account['name']}` to re-login; readings held until "
-                    "then.")
+                    "renew it non-interactively. Sign in again on this seat "
+                    "by running `claude auth login` with CLAUDE_CONFIG_DIR "
+                    "set to this slot's configured home; readings held "
+                    "until then.")
             elif error.code == "claude_auth_identity_changed":
                 result["auth_state"] = "identity_changed"
                 result["note"] = (
