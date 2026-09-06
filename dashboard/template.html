@@ -1177,6 +1177,11 @@ function accountState(account){
      nothing here may nag about signing in. */
   if(account&&(account.unpaid===true||account.error_code==="unpaid"))
     return{cls:"idle",label:"Unpaid",note:"not paid yet, so no reading is expected"};
+  const code=account.error_code||"";
+  if(account&&account.provider==="claude"&&account.auth_state==="renewal_required")
+    return{cls:"held",label:"Auth renewal required",note:"run `headroom auth refresh "+account.name+"`"};
+  if(account&&account.provider==="claude"&&account.auth_state==="identity_changed")
+    return{cls:"held",label:"Auth identity changed",note:"slot held; verify the configured Claude account"};
   const state=displayState(account);
   if(state==="current"){
     return{cls:"live",label:"Live",note:"observed "+age(account.captured_at)};
@@ -1187,7 +1192,6 @@ function accountState(account){
      age(undefined) printed "time unknown" on the very row whose whole job is to
      say how old it is. Fall back to the newest observed_at among its windows. */
   if(state==="stale")return{cls:"held",label:"Stale",note:"last verified "+age(lastSeenAt(account))};
-  const code=account.error_code||"";
   const isCodex=account.provider==="codex";
   if(code==="codex_usage_limit"||/usage limit/i.test(account.note||""))
     return{cls:"held",label:"Held",note:account.retry_at?("resets "+untilReset(account.retry_at)):"usage limit reported"};

@@ -258,6 +258,10 @@ def validate(config):
                 and not isinstance(account["reserved"], bool):
             raise RegistryError(
                 f"account {name}: reserved must be true or false")
+        if "claude_auth_auto_renew" in account \
+                and not isinstance(account["claude_auth_auto_renew"], bool):
+            raise RegistryError(
+                f"account {name}: claude_auth_auto_renew must be true or false")
         if "handoff_group" in account:
             group = account["handoff_group"]
             if not isinstance(group, str) or not group.strip():

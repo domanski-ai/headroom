@@ -201,6 +201,15 @@ def collect_lock_path():
     return os.path.join(state_dir(), "collect.lock")
 
 
+def auth_renewal_path():
+    """Ledger of Claude OAuth renewal ATTEMPTS, keyed by credential home.
+
+    Holds the refresh token's DIGEST, never the token. Written before a
+    renewal runs so a credential the provider may already have consumed is
+    never presented twice — see :func:`collect.claude_renew_oauth`."""
+    return os.path.join(state_dir(), "auth-renewal.json")
+
+
 def load_json(path):
     try:
         with open(path) as handle:

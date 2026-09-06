@@ -4645,8 +4645,13 @@ class ActionableClaudeRefresh(unittest.TestCase):
                                       "claude_usage_token_expired")):
             row = collect.collect([account])["accounts"][0]
         self.assertEqual(row["error_code"], "claude_usage_token_expired")
-        self.assertIn("headroom auth refresh a", row["note"])
+        # `headroom auth refresh <slot>` refuses an adopted or external home
+        # (connect.cmd_refresh) and this arm applies to exactly that shape of
+        # slot, so the note must not send an operator to it — see
+        # tests/test_claude_renewal_single_shot.py for the focused contract.
+        self.assertNotIn("headroom auth refresh a", row["note"])
         self.assertNotIn("headroom connect a", row["note"])
+        self.assertIn("claude auth login", row["note"])
 
 
 if __name__ == "__main__":
