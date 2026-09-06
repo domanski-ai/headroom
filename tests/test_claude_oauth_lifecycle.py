@@ -217,6 +217,21 @@ class OAuthCollectionIsolation(unittest.TestCase):
 
 
 class ClaudeOwnedRenewal(unittest.TestCase):
+    def setUp(self):
+        # Renewal is single-shot per refresh credential, and the ledger that
+        # enforces it lives under HEADROOM_DIR — which this suite shares for
+        # the whole process. Every case in this class renews the SAME token in
+        # the SAME home, so without a private state directory the first case
+        # to run burns that credential's one attempt and every later case is
+        # refused before it reaches the behaviour it is actually testing.
+        # See tests/test_claude_renewal_single_shot.py for why the guard is
+        # there.
+        state = tempfile.TemporaryDirectory()
+        self.addCleanup(state.cleanup)
+        patcher = mock.patch.dict(os.environ, {"HEADROOM_DIR": state.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def oauth(self):
         return {
             "accessToken": "fake-access-secret",

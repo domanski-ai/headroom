@@ -1175,6 +1175,7 @@ UNREADABLE_ERROR_CODES = frozenset({
 # human — `test_every_collector_error_code_is_classified` fails until it is.
 MUST_DISARM_ERROR_CODES = frozenset({
     "claude_credentials_missing",       # token unreadable — needs a re-login
+    "claude_credentials_blanked",       # login cleared in place — re-login
     "claude_auth_renewal_required",     # CLI owner cannot renew unattended
     "claude_local_binding_missing",
     "claude_usage_org_changed",         # the login underneath was swapped

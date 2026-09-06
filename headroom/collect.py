@@ -542,6 +542,34 @@ def claude_identity(home, runner=subprocess.run):
     return claude_local_identity(home)
 
 
+def _renewal_key(home):
+    return os.path.normcase(os.path.realpath(home))
+
+
+def renewal_attempted(home, refresh_digest):
+    """Whether this exact refresh credential has already had its one renewal
+    attempt in this slot."""
+    ledger = paths.load_json(paths.auth_renewal_path())
+    entry = ledger.get(_renewal_key(home)) if isinstance(ledger, dict) else None
+    return (isinstance(entry, dict)
+            and entry.get("refresh_digest") == refresh_digest)
+
+
+def record_renewal_attempt(home, refresh_digest, now=None):
+    """Burn this refresh credential's single renewal attempt.
+
+    Stores a digest, never the token. One entry per slot: a rotated
+    credential overwrites its predecessor instead of accumulating."""
+    ledger = paths.load_json(paths.auth_renewal_path())
+    if not isinstance(ledger, dict):
+        ledger = {}
+    ledger[_renewal_key(home)] = {
+        "refresh_digest": refresh_digest,
+        "attempted_at": int(time.time() if now is None else now),
+    }
+    paths.write_json_atomic(paths.auth_renewal_path(), ledger)
+
+
 def claude_renew_oauth(home, expected_identity, runner=subprocess.run,
                        identity_reader=claude_identity):
     """Ask Claude Code to renew its own saved login for exactly one home.
@@ -579,6 +607,34 @@ def claude_renew_oauth(home, expected_identity, runner=subprocess.run,
     env["CLAUDE_CONFIG_DIR"] = home
     env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] = refresh_token
     env["CLAUDE_CODE_OAUTH_SCOPES"] = scopes
+
+    # ONE attempt per refresh credential, ever — recorded BEFORE the exchange
+    # runs, not after it returns, and placed here so that everything which
+    # could reach the provider is on this side of the record and everything
+    # that provably could not (no binary, unusable scopes) is on the other.
+    #
+    # OAuth refresh tokens are single-use and rotate. A renewal that fails may
+    # still have CONSUMED the token on the provider's side, and nothing here
+    # can tell the two apart: this function sees one non-zero exit either way.
+    # Retrying therefore presents an already-spent token, the provider answers
+    # invalid_grant, and the CLI purges the stored token pair in place —
+    # turning a recoverable expiry into a destroyed login that only an
+    # interactive browser flow can undo.
+    #
+    # Not hypothetical. wm-a's access token expired at 10:52 on 2026-09-06,
+    # this path fired on the 10:56:41 collection cycle and again on the 11:01
+    # one, and the second attempt left the credential blanked at 11:01:42.753
+    # with its refresh token gone. Nothing non-interactive could recover the
+    # slot after that.
+    #
+    # The guard is keyed on the token's DIGEST, so a genuinely ROTATED
+    # credential presents a new digest and stays renewable. Only a replay of
+    # the same bytes is refused.
+    digest = hashlib.sha256(refresh_token.encode()).hexdigest()[:16]
+    if renewal_attempted(home, digest):
+        raise IdentityBindingError("claude_auth_renewal_required")
+    record_renewal_attempt(home, digest)
+
     try:
         process = runner(
             [binary, "auth", "login", "--claudeai"], env=env,
@@ -1410,6 +1466,16 @@ def external_codex_limits(name, expected_email, now):
 def claude_limits(home, expected_fingerprint, opener=open_authenticated):
     oauth = claude_oauth(home) or {}
     if not oauth.get("accessToken"):
+        # A credential RECORD that survived with an EMPTY token pair is not
+        # "no login here yet" — it is a login that was destroyed in place, and
+        # the two want different operator advice. Observed 2026-09-06 on wm-a:
+        # accessToken and refreshToken both blanked to "" and expiresAt zeroed
+        # while scopes, rateLimitTier and refreshTokenExpiresAt survived.
+        # Sharing the missing-credentials code cost that slot four hours of
+        # ambiguous STALE badge, because only codes carrying an auth_state
+        # reach the dashboard as a lifecycle decision and that one does not.
+        if oauth and not oauth.get("refreshToken"):
+            raise IdentityBindingError("claude_credentials_blanked")
         raise IdentityBindingError("claude_credentials_missing")
     # The CACHED access token may have expired since the CLI last refreshed
     # it (headroom never refreshes credentials itself — racing the CLI's own
@@ -2270,18 +2336,49 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                                   "on this seat; if it answers, the account is "
                                   "fine and only the meter is blind"
                                   % error.code[-3:])
+            elif error.code == "claude_credentials_blanked":
+                # The login was destroyed in place: the record is still there,
+                # its token pair is empty. Publish the lifecycle decision so
+                # the dashboard's last-good carry cannot dress hours of dead
+                # credential up as ordinary staleness. Renewal is NOT the
+                # remedy and must not be advertised as one — the refresh token
+                # went with the access token, so only an interactive sign-in
+                # brings this slot back.
+                result["auth_state"] = "renewal_required"
+                # NOT `headroom auth refresh <slot>`: that command serves
+                # Headroom-OWNED homes and refuses an adopted or external one
+                # (connect.cmd_refresh), which is exactly the shape of slot
+                # this state shows up on. Name the CLI sign-in instead, and
+                # name it without the home path — `note` is published, so
+                # local paths and usernames stay out of it.
+                result["note"] = (
+                    "this seat's Claude login was cleared — its stored token "
+                    "pair is empty, so no reading can be taken and "
+                    "non-interactive renewal cannot recover it. Sign in again "
+                    "on this seat by running `claude auth login` with "
+                    "CLAUDE_CONFIG_DIR set to this slot's configured home")
             elif error.code == "claude_credentials_missing":
                 # verified identity but the token couldn't be read. On macOS the
                 # token is in the login Keychain (headroom reads it via
                 # `security`) — this path means the Keychain was locked or the
                 # item name differs; elsewhere it means no file-based login yet.
+                #
+                # NOT `headroom auth refresh <slot>`, which this note used to
+                # recommend: that command serves Headroom-OWNED homes and
+                # refuses an adopted or external one (connect.cmd_refresh), so
+                # on an adopted slot the old wording sent an operator to a
+                # command that exits 2 — observed on wm-a, 2026-09-06. Same CLI
+                # sign-in guidance as claude_credentials_blanked above, and the
+                # home path stays out of it because `note` is published.
                 result["note"] = ("Claude login found but its token could not "
                                   "be read. On macOS unlock the login Keychain "
                                   "and allow `security` access when prompted "
                                   "(set HEADROOM_CLAUDE_KEYCHAIN_SERVICE if your "
                                   "CLI uses a different item name); on "
-                                  "Linux/Windows run `headroom auth refresh "
-                                  f"{account['name']}` to log in.")
+                                  "Linux/Windows sign in again on this seat by "
+                                  "running `claude auth login` with "
+                                  "CLAUDE_CONFIG_DIR set to this slot's "
+                                  "configured home.")
             else:
                 result["note"] = ("identity could not be bound to this slot; "
                                   "account held — run `headroom connect` "
