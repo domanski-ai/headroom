@@ -28,6 +28,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -506,6 +507,51 @@ def claude_plan(home):
     if "max_5x" in tier:
         return "Max 5x"
     return {"max": "Max", "pro": "Pro", "free": "Free"}.get(subscription)
+
+
+# The default config home the Claude CLI uses when CLAUDE_CONFIG_DIR is unset.
+# A slot living here needs no env prefix in the refresh command below; every
+# other slot does, and omitting it would refresh the WRONG account's token.
+CLAUDE_DEFAULT_HOME = "~/.claude"
+
+
+def claude_refresh_command(home):
+    """The exact shell command an operator can paste to refresh THIS slot's
+    access token.
+
+    A lapsed access token is cured by the CLI itself making one authenticated
+    call; headroom never refreshes credentials on its own (racing the CLI's
+    rotation could invalidate its session), so the cure is always a command
+    the operator runs. Verified 2026-09-07 against a slot whose token had
+    lapsed 9.7h earlier: `claude auth status --json` reports `loggedIn: true`
+    and leaves `expiresAt` in the past — reading local state exchanges no
+    token — while one `-p` turn moved it from -9.7h to +8.0h. So the command
+    has to be a real turn; there is no inference-free refresh handle.
+
+    `</dev/null` is not decoration: without it the CLI waits on stdin and
+    prints a "no stdin data received in 3s" warning before proceeding.
+    """
+    turn = "claude -p ok </dev/null"
+    # A blank home must never reach os.path.abspath: it resolves to the CURRENT
+    # DIRECTORY, which would print a confident command pointing at whatever
+    # directory the collector happened to run from. Registry homes are always
+    # absolute, so this is unreachable in practice and stays a guard.
+    if not str(home or "").strip():
+        return turn
+    home = os.path.abspath(os.path.expanduser(str(home)))
+    if home == os.path.abspath(os.path.expanduser(CLAUDE_DEFAULT_HOME)):
+        return turn
+    display = shlex.quote(home)
+    user_home = os.path.expanduser("~")
+    if home == user_home or home.startswith(user_home + os.sep):
+        # Abbreviate to ~ for readability, but `~` must stay UNQUOTED or the
+        # shell will not expand it — so test the remainder, not the whole
+        # string (shlex.quote always quotes a leading ~, which would make this
+        # branch dead code and every home print in full).
+        tail = home[len(user_home):]
+        if not tail or shlex.quote(tail) == tail:
+            display = "~" + tail
+    return "CLAUDE_CONFIG_DIR=%s %s" % (display, turn)
 
 
 def claude_bin():
@@ -1858,6 +1904,11 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
             result["unpaid"] = True
             snapshot["accounts"].append(result)
             continue
+        # Where a `claude` command must point to touch THIS slot's credential.
+        # Seeded from the registry home so the hold note below can always name
+        # a command, even when the failure happened before the estate resolver
+        # answered; corrected to the resolved read home as soon as we have it.
+        refresh_home = account["home"]
         try:
             if account["provider"] == "claude":
                 # WHERE THIS SLOT'S CREDENTIAL ACTUALLY IS, from the one
@@ -1877,6 +1928,7 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                     raise IdentityBindingError("no_credential_location")
                 read_home = estate_dir or _resident.get(
                     account["name"], account["home"])
+                refresh_home = read_home
                 if read_home != account["home"]:
                     result["read_home_resident"] = True
                 identity = claude_identity(read_home)
@@ -2107,15 +2159,34 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 result["note"] = CODEX_HOLD_NOTES[error.code]
             elif error.code in ("claude_usage_token_expired",
                                 "claude_usage_token_rejected"):
+                # NAME THE COMMAND, DO NOT DESCRIBE IT (2026-09-07). The note
+                # used to say "run one Claude Code turn on this account"
+                # without saying how to aim a turn AT an account: every slot
+                # outside the default home needs CLAUDE_CONFIG_DIR, and a bare
+                # `claude` refreshes whichever login the default home holds
+                # while the held slot stays expired. An operator following the
+                # old note literally could work for minutes and see no change.
+                command = claude_refresh_command(refresh_home)
                 what = ("has expired" if error.code.endswith("expired")
                         else "was rejected by the usage API (expired or "
                              "revoked)")
+                # An expired token is normally cured by the refresh token the
+                # CLI still holds, so the cheap turn comes first. A REJECTED
+                # one usually means the credential itself is gone, so re-login
+                # leads. Both paths are always offered: only the order moves.
+                if error.code.endswith("expired"):
+                    cure = (f"run `{command}` (the CLI refreshes its own "
+                            "token), or `headroom auth refresh "
+                            f"{account['name']}` to re-login")
+                else:
+                    cure = (f"run `headroom auth refresh {account['name']}` "
+                            f"to re-login, or `{command}` if the login is "
+                            "still good")
                 result["note"] = (
                     f"cached Claude token {what} — headroom never refreshes "
-                    "credentials itself. Run one Claude Code turn on this "
-                    "account (the CLI refreshes its token) or `headroom auth "
-                    f"refresh {account['name']}` to re-login; readings held "
+                    f"credentials itself. To fix: {cure}; readings held "
                     "until then.")
+                result["refresh_command"] = command
             elif error.code == "unpaid":
                 # The estate registry knows about the bill even when this
                 # config row does not, so the code arrives here as a raise.
