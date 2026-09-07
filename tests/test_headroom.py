@@ -13,6 +13,7 @@ import json
 import hashlib
 import io
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -1759,6 +1760,123 @@ class ClaudeLimits(unittest.TestCase):
         with self._with_oauth(self._oauth()):
             with self.assertRaises(collect.ProviderThrottleError):
                 collect.claude_limits("/h", None, opener=opener)
+
+
+class ClaudeRefreshCommand(unittest.TestCase):
+    """The hold note has to name a command an operator can paste.
+
+    Saying "run one Claude Code turn on this account" is not actionable once
+    slots live in isolated config homes: a bare `claude` refreshes whichever
+    login the DEFAULT home holds, so an operator can follow the old note
+    literally, see the turn succeed, and watch the held slot stay expired.
+    """
+
+    def test_non_default_home_carries_the_config_dir(self):
+        command = collect.claude_refresh_command("/srv/homes/slot-a")
+        self.assertTrue(command.startswith(
+            "CLAUDE_CONFIG_DIR=/srv/homes/slot-a "), command)
+        self.assertIn("claude -p", command)
+
+    def test_stdin_is_closed_so_the_cli_does_not_wait_on_it(self):
+        # Without this the CLI blocks and prints "no stdin data received in
+        # 3s" before proceeding, which reads like the command hung.
+        self.assertIn("</dev/null",
+                      collect.claude_refresh_command("/srv/homes/slot-a"))
+
+    def test_default_home_needs_no_config_dir(self):
+        for home in ("~/.claude", os.path.expanduser("~/.claude")):
+            self.assertNotIn("CLAUDE_CONFIG_DIR",
+                             collect.claude_refresh_command(home))
+
+    def test_home_under_the_user_home_abbreviates_to_tilde(self):
+        home = os.path.expanduser("~/.headroom/homes/slot-a")
+        self.assertIn("CLAUDE_CONFIG_DIR=~/.headroom/homes/slot-a",
+                      collect.claude_refresh_command(home))
+
+    def test_home_needing_quotes_is_quoted_and_stays_absolute(self):
+        # A ~-abbreviation cannot be quoted (the shell would stop expanding
+        # the tilde), so a home whose tail needs quoting must print in full.
+        command = collect.claude_refresh_command(
+            os.path.expanduser("~/odd dir/slot"))
+        self.assertNotIn("~", command)
+        self.assertIn(shlex.quote(os.path.expanduser("~/odd dir/slot")),
+                      command)
+
+    def test_blank_home_never_resolves_to_the_current_directory(self):
+        # os.path.abspath("") is the CWD: a blank home must not print a
+        # confident command aimed at wherever the collector happened to run.
+        for home in ("", None, "   "):
+            command = collect.claude_refresh_command(home)
+            self.assertNotIn("CLAUDE_CONFIG_DIR", command)
+
+    def test_generated_command_is_parseable_and_assigns_only_that_var(self):
+        home = "/srv/homes/slot-a"
+        parts = shlex.split(collect.claude_refresh_command(home))
+        self.assertEqual(parts[0], "CLAUDE_CONFIG_DIR=" + home)
+        self.assertEqual(parts[1], "claude")
+
+
+class ExpiredTokenHoldNote(unittest.TestCase):
+    """The note an operator actually reads when a slot is held."""
+
+    ACCOUNT = {"id": "a" * 32, "name": "slot-a", "provider": "claude",
+               "home": "/srv/homes/slot-a"}
+
+    def _hold(self, code, home=None):
+        account = dict(self.ACCOUNT)
+        if home is not None:
+            account["home"] = home
+        identity = {"verified": True, "method": "claude_auth_status",
+                    "email": "e@x.com", "account_fingerprint": "AAAA"}
+        with mock.patch.object(collect, "claude_identity",
+                               return_value=dict(identity)), \
+                mock.patch.object(collect, "credential_digest",
+                                  return_value="BBBB"), \
+                mock.patch.object(collect, "claude_plan",
+                                  return_value="Max 20x"), \
+                mock.patch.object(collect, "estate_credential_dir",
+                                  return_value=(None, "home")), \
+                mock.patch.object(
+                    collect, "claude_limits",
+                    side_effect=collect.IdentityBindingError(code)):
+            return collect.collect([account])["accounts"][0]
+
+    def test_expired_note_names_this_slots_own_command(self):
+        row = self._hold("claude_usage_token_expired")
+        self.assertIs(row["ok"], False)
+        self.assertIn("CLAUDE_CONFIG_DIR=/srv/homes/slot-a", row["note"])
+        self.assertEqual(row["refresh_command"],
+                         collect.claude_refresh_command("/srv/homes/slot-a"))
+
+    def test_expired_note_leads_with_the_cheap_turn_not_a_relogin(self):
+        # An expired ACCESS token is normally cured by the refresh token the
+        # CLI still holds, so the turn must come before the re-login.
+        note = self._hold("claude_usage_token_expired")["note"]
+        self.assertLess(note.index("CLAUDE_CONFIG_DIR"),
+                        note.index("headroom auth refresh"), note)
+
+    def test_rejected_note_leads_with_relogin(self):
+        # A REJECTED credential is usually gone; a turn cannot revive it.
+        note = self._hold("claude_usage_token_rejected")["note"]
+        self.assertLess(note.index("headroom auth refresh"),
+                        note.index("CLAUDE_CONFIG_DIR"), note)
+
+    def test_note_still_offers_both_cures(self):
+        for code in ("claude_usage_token_expired",
+                     "claude_usage_token_rejected"):
+            note = self._hold(code)["note"]
+            self.assertIn("headroom auth refresh slot-a", note)
+            self.assertIn("claude -p", note)
+
+    def test_note_drops_the_unactionable_run_one_turn_phrasing(self):
+        note = self._hold("claude_usage_token_expired")["note"]
+        self.assertNotIn("Run one Claude Code turn", note)
+
+    def test_default_home_slot_gets_a_bare_command(self):
+        row = self._hold("claude_usage_token_expired",
+                         home=os.path.expanduser("~/.claude"))
+        self.assertNotIn("CLAUDE_CONFIG_DIR", row["note"])
+        self.assertIn("claude -p", row["note"])
 
 
 class ResetTimestampUnits(unittest.TestCase):
