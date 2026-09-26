@@ -554,8 +554,168 @@ def claude_refresh_command(home):
     return "CLAUDE_CONFIG_DIR=%s %s" % (display, turn)
 
 
+def _epoch_seconds(value):
+    """A provider timestamp as epoch seconds, or None when it proves nothing.
+
+    expiresAt is milliseconds in current CLI builds; a plain-seconds value is
+    accepted too, so a unit change upstream can never mark every fresh token
+    expired (or, worse, every expired token fresh).
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return value / 1000.0 if value > 1e11 else value
+
+
+def claude_access_token_expired(oauth):
+    """True only when the cached access token is PROVABLY past its expiry.
+
+    An absent or mistyped expiry is not proof of anything, so it reads as not
+    expired and the usage probe runs: a 401 then tells the truth. This is the
+    one definition of "expired" shared by the reader (which holds the seat)
+    and the refresher (which spends a turn), so the two can never disagree
+    about whether a token needs rotating.
+    """
+    expires = _epoch_seconds((oauth or {}).get("expiresAt"))
+    return expires is not None and expires <= time.time()
+
+
+def claude_refresh_token_alive(oauth):
+    """True when the CLI still holds a refresh token that a turn could use.
+
+    Without this, `--refresh` would spend a turn on a slot whose refresh token
+    is itself dead — the turn cannot help there, only `headroom auth refresh`
+    can. A PRESENT refresh token with no stated expiry counts as alive: the
+    field is informational, and refusing on its absence would silently stop
+    refreshing if a future CLI drops it.
+    """
+    oauth = oauth or {}
+    if not oauth.get("refreshToken"):
+        return False
+    expires = _epoch_seconds(oauth.get("refreshTokenExpiresAt"))
+    return expires is None or expires > time.time()
+
+
 def claude_bin():
     return shutil.which("claude")
+
+
+# One tiny turn is enough to make the CLI rotate its own token, and a turn is
+# the ONLY thing that does: `claude auth status --json` reads local state and
+# exchanges nothing (measured 2026-09-07 on a slot 9.7h past expiry — it
+# reported loggedIn true and left expiresAt in the past), so there is no
+# inference-free handle to use instead. Kept deliberately trivial: the answer
+# is thrown away, only the rotation matters.
+REFRESH_PROMPT = "ok"
+REFRESH_TIMEOUT = paths.env_int("HEADROOM_REFRESH_TIMEOUT", 120)
+# The rotation is worth the same whatever model performs it, so it is bought at
+# the lowest price the plan offers: the seats here are weighted per model, and
+# the default model on a Max seat is the dearest one. Overridable because a
+# plan or a future alias could make another model the cheap one. Verified
+# 2026-09-26: `-p ok --model haiku` on a slot 6.25h past expiry exited 0 and
+# moved expiresAt to +7.99h.
+REFRESH_MODEL = os.environ.get("HEADROOM_REFRESH_MODEL", "haiku").strip()
+
+
+def claude_refresh_turn(home, runner=subprocess.run):
+    """Spend one throwaway turn in ``home`` so the CLI rotates its own token.
+
+    headroom still never writes a credential: the provider's CLI owns the
+    whole exchange, which is the point. Doing the OAuth refresh ourselves
+    would mean holding the refresh token and writing the result back, and if
+    the provider rotates refresh tokens on use, a write we lost would leave
+    the slot unusable — the exact hazard the "never refresh" rule exists for.
+
+    Returns the re-read oauth blob, or None when no turn could be run.
+    """
+    binary = claude_bin()
+    if not binary:
+        return None
+    env = scrubbed_env()
+    env["CLAUDE_CONFIG_DIR"] = home
+    # cwd is the slot's own config home, NOT the caller's directory: a turn
+    # started in a project would pick up that project's settings and hooks, so
+    # a collect run from inside a repo could fire that repo's hooks as a side
+    # effect of refreshing a token.
+    # stdin is closed because the CLI otherwise waits on it and warns
+    # "no stdin data received in 3s", turning a 2s refresh into a stall.
+    cwd = home if os.path.isdir(home) else None
+    # Cheap model first, then the plan's default. The fallback is what keeps a
+    # rejected or renamed model alias from turning "token expired" into a seat
+    # that can never be refreshed again: a wrong --model is a dead turn, and
+    # without the retry the slot would stay held with no hint why.
+    attempts = [[binary, "-p", REFRESH_PROMPT, "--model", REFRESH_MODEL],
+                [binary, "-p", REFRESH_PROMPT]] if REFRESH_MODEL else \
+               [[binary, "-p", REFRESH_PROMPT]]
+    ran = False
+    for argv in attempts:
+        try:
+            runner(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL,
+                   capture_output=True, text=True, timeout=REFRESH_TIMEOUT)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        ran = True
+        if not claude_access_token_expired(claude_oauth(home) or {}):
+            break
+    if not ran:
+        return None
+    # The turn's exit status is deliberately ignored: what matters is whether
+    # the KEYCHAIN moved, which is read back here rather than inferred. A turn
+    # can fail for reasons that have nothing to do with the token (a cap, a
+    # transient API error) after the refresh already landed.
+    return claude_oauth(home) or {}
+
+
+def refresh_expired_claude_tokens(accounts, runner=subprocess.run,
+                                  report=None):
+    """Rotate every Claude slot whose cached access token has lapsed.
+
+    Only ever called for an explicit `headroom collect --refresh`. A plain
+    collect must stay free of inference: `headroom serve` collects on a loop,
+    and a background refresh would spend quota nobody asked for, on a
+    schedule nobody sees.
+
+    Returns a {slot name: outcome} map for the caller to report.
+    """
+    outcomes = {}
+    for account in accounts:
+        if account.get("provider") != "claude":
+            continue
+        if str(account.get("status") or "") == "unpaid":
+            continue  # nothing to read on an unpaid seat, so nothing to spend
+        home = account.get("home") or ""
+        oauth = claude_oauth(home) or {}
+        if not oauth.get("accessToken"):
+            outcomes[account["name"]] = "no_credential"
+            continue
+        if not claude_access_token_expired(oauth):
+            continue  # a live token needs no turn: silence, not a line of noise
+        if not claude_refresh_token_alive(oauth):
+            # A turn cannot revive a dead refresh token; only a re-login can.
+            outcomes[account["name"]] = "relogin_required"
+            continue
+        refreshed = claude_refresh_turn(home, runner=runner)
+        if refreshed is None:
+            outcomes[account["name"]] = "no_cli"
+        elif claude_access_token_expired(refreshed):
+            outcomes[account["name"]] = "still_expired"
+        else:
+            outcomes[account["name"]] = "refreshed"
+    if report is not None:
+        for name in sorted(outcomes):
+            report(name, outcomes[name])
+    return outcomes
+
+
+REFRESH_OUTCOME_NOTES = {
+    "refreshed": "token refreshed",
+    "still_expired": "refresh turn ran but the token is still expired",
+    "relogin_required": ("refresh token is gone too; run `headroom auth "
+                         "refresh <slot>` to re-login"),
+    "no_cli": "no `claude` on PATH to run the refresh with",
+    "no_credential": "no credential to refresh",
+}
 
 
 def claude_identity(home, runner=subprocess.run):
@@ -1399,11 +1559,8 @@ def claude_limits(home, expected_fingerprint, opener=open_authenticated):
     # code instead. expiresAt is milliseconds in current CLI builds — accept
     # a plain-seconds value too, so a unit change can never mark every fresh
     # token as expired.
-    expires_at = oauth.get("expiresAt")
-    if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
-        expires_epoch = expires_at / 1000.0 if expires_at > 1e11 else expires_at
-        if expires_epoch <= time.time():
-            raise IdentityBindingError("claude_usage_token_expired")
+    if claude_access_token_expired(oauth):
+        raise IdentityBindingError("claude_usage_token_expired")
     request = urllib.request.Request(
         "https://api.anthropic.com/api/oauth/usage",
         headers={
@@ -2175,17 +2332,23 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 # one usually means the credential itself is gone, so re-login
                 # leads. Both paths are always offered: only the order moves.
                 if error.code.endswith("expired"):
-                    cure = (f"run `{command}` (the CLI refreshes its own "
-                            "token), or `headroom auth refresh "
-                            f"{account['name']}` to re-login")
+                    cure = ("run `headroom collect --refresh` to rotate every "
+                            f"lapsed slot, or `{command}` for this one, or "
+                            f"`headroom auth refresh {account['name']}` to "
+                            "re-login")
                 else:
                     cure = (f"run `headroom auth refresh {account['name']}` "
                             f"to re-login, or `{command}` if the login is "
                             "still good")
+                # Say only that the CLI owns the rotation. The note used to
+                # add "headroom never refreshes credentials itself", which
+                # reads as a flat contradiction now that it goes on to offer
+                # `--refresh`. The rule it was stating is narrower and still
+                # true: headroom never WRITES a credential, it only ever asks
+                # the CLI to rotate its own.
                 result["note"] = (
-                    f"cached Claude token {what} — headroom never refreshes "
-                    f"credentials itself. To fix: {cure}; readings held "
-                    "until then.")
+                    f"cached Claude token {what}; only the Claude CLI can "
+                    f"rotate it. To fix: {cure}; readings held until then.")
                 result["refresh_command"] = command
             elif error.code == "unpaid":
                 # The estate registry knows about the bill even when this
@@ -2402,8 +2565,14 @@ def _trigger_token_scan(synchronous):
         return None
 
 
-def run_collect(quiet=False):
-    """Full collect run: lock, read, write both snapshots. Returns snapshot."""
+def run_collect(quiet=False, refresh=False):
+    """Full collect run: lock, read, write both snapshots. Returns snapshot.
+
+    ``refresh`` spends one throwaway turn per Claude slot whose cached token
+    has lapsed, before reading. It is opt-in per run and never implied: a
+    plain collect spends nothing, which is what lets `headroom serve` collect
+    on a loop without quietly burning quota.
+    """
     with collection_lock(blocking=False) as locked:
         if not locked:
             # A SKIP, returned as the previous run's snapshot: no exception and
@@ -2419,6 +2588,16 @@ def run_collect(quiet=False):
         # Load only after the collection lock: a concurrent remove must not
         # race a stale registry into a freshly written snapshot.
         config = registry.load()
+        if refresh:
+            # Inside the collection lock and BEFORE the read, so the rotation
+            # cannot race another collector and the reading below sees the
+            # token this turn just minted.
+            def _say(name, outcome):
+                if not quiet:
+                    print("%-16s %s" % (
+                        name, REFRESH_OUTCOME_NOTES.get(outcome, outcome)))
+            refresh_expired_claude_tokens(registry.accounts(config),
+                                          report=_say)
         backoff = paths.load_json(paths.backoff_path()) or empty_backoff()
 
         def persist(retry_at, provider="anthropic_usage_api"):

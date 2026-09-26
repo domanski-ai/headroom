@@ -8,7 +8,11 @@ usage:
   headroom auth refresh <slot>     interactively re-login an owned Claude slot
                                     (then run `headroom collect`; never automatic)
   headroom remove <slot> [--yes]   unregister one non-final slot; keeps its home
-  headroom collect                  read usage for every account (no tokens spent)
+  headroom collect [--refresh]      read usage for every account (no tokens
+                                    spent). --refresh (alias --force) first
+                                    spends one throwaway turn per Claude slot
+                                    whose cached token has expired, so the
+                                    reading succeeds instead of holding
   headroom status [model]           who has headroom right now (default: claude)
   headroom fable [--json] [--days N]  Fable-maximization calculator: per-seat
                                     usable/stranded/at-risk Fable week + the
@@ -467,7 +471,17 @@ def _dispatch(argv):
         return collect.cmd_remove(args)
     if command == "collect":
         from . import collect
-        collect.run_collect()
+        # --refresh (spelled --force too, since that is what it feels like from
+        # the outside) is the ONLY way a collect spends inference. Default stays
+        # free so the serve loop can keep collecting without spending quota.
+        refresh = any(arg in ("--refresh", "--force") for arg in args)
+        unknown = [arg for arg in args
+                   if arg.startswith("-") and arg not in ("--refresh", "--force")]
+        if unknown:
+            print("headroom collect: unknown option %s" % unknown[0],
+                  file=sys.stderr)
+            return 2
+        collect.run_collect(refresh=refresh)
         collect._trigger_token_scan(synchronous=True)
         return 0
     if command == "status":

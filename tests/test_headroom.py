@@ -1879,6 +1879,206 @@ class ExpiredTokenHoldNote(unittest.TestCase):
         self.assertIn("claude -p", row["note"])
 
 
+class AutoRefreshGuards(unittest.TestCase):
+    """What may and may not buy a turn.
+
+    A refresh costs real quota, so every guard here exists to stop headroom
+    spending it on a slot the turn cannot help.
+    """
+
+    def test_expired_is_only_claimed_on_proof(self):
+        now = time.time()
+        self.assertTrue(collect.claude_access_token_expired(
+            {"expiresAt": (now - 60) * 1000}))
+        self.assertTrue(collect.claude_access_token_expired(
+            {"expiresAt": now - 60}))  # plain seconds tolerated
+        self.assertFalse(collect.claude_access_token_expired(
+            {"expiresAt": (now + 3600) * 1000}))
+        # Absent or unusable expiry is NOT proof of expiry: read it and let a
+        # 401 speak, rather than spending a turn on a guess.
+        for oauth in ({}, {"expiresAt": None}, {"expiresAt": "soon"},
+                      {"expiresAt": True}, {"expiresAt": float("nan")},
+                      {"expiresAt": float("inf")}):
+            self.assertFalse(collect.claude_access_token_expired(oauth), oauth)
+
+    def test_refresh_token_must_exist_for_a_turn_to_be_worth_buying(self):
+        now = time.time()
+        self.assertFalse(collect.claude_refresh_token_alive({}))
+        self.assertFalse(collect.claude_refresh_token_alive(
+            {"refreshToken": ""}))
+        self.assertFalse(collect.claude_refresh_token_alive(
+            {"refreshToken": "r", "refreshTokenExpiresAt": (now - 60) * 1000}))
+        self.assertTrue(collect.claude_refresh_token_alive(
+            {"refreshToken": "r", "refreshTokenExpiresAt": (now + 60) * 1000}))
+        # A present refresh token with no stated expiry counts as alive, so a
+        # future CLI dropping the field cannot silently stop refreshes.
+        self.assertTrue(collect.claude_refresh_token_alive(
+            {"refreshToken": "r"}))
+
+
+class RefreshExpiredTokens(unittest.TestCase):
+    """The per-slot sweep `--refresh` runs.
+
+    The fake models the real sequence: a home reads EXPIRED until a turn has
+    actually run in it, and fresh afterwards. An earlier version of this fake
+    returned the refreshed value on the first read, which made every lapsed
+    slot look live and quietly asserted nothing.
+    """
+
+    def _accounts(self):
+        return [
+            {"name": "live", "provider": "claude", "home": "/h/live"},
+            {"name": "lapsed", "provider": "claude", "home": "/h/lapsed"},
+            {"name": "dead", "provider": "claude", "home": "/h/dead"},
+            {"name": "codex", "provider": "codex", "home": "/h/codex"},
+        ]
+
+    def _harness(self, heals=("/h/lapsed",)):
+        """Returns (turns, runner, reader). ``heals`` names the homes whose
+        token actually moves once a turn has run there."""
+        now = time.time()
+        turns = []
+        ran = set()
+
+        def runner(argv, **kwargs):
+            turns.append((argv, kwargs))
+            ran.add(kwargs.get("env", {}).get("CLAUDE_CONFIG_DIR"))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        def reader(home, runner=None):
+            fresh = {"accessToken": "a", "refreshToken": "r",
+                     "expiresAt": (now + 3600) * 1000}
+            if home == "/h/live":
+                return fresh
+            if home == "/h/dead":  # no refresh token at all
+                return {"accessToken": "a", "expiresAt": (now - 60) * 1000}
+            if home in ran and home in heals:
+                return fresh
+            return {"accessToken": "a", "refreshToken": "r",
+                    "expiresAt": (now - 60) * 1000}
+
+        return turns, runner, reader
+
+    def _run(self, heals=("/h/lapsed",), accounts=None, binary="/bin/claude"):
+        turns, runner, reader = self._harness(heals)
+        with mock.patch.object(collect, "claude_oauth", side_effect=reader), \
+                mock.patch.object(collect, "claude_bin", return_value=binary):
+            outcomes = collect.refresh_expired_claude_tokens(
+                self._accounts() if accounts is None else accounts,
+                runner=runner)
+        return outcomes, turns
+
+    @staticmethod
+    def _homes(turns):
+        return [k.get("env", {}).get("CLAUDE_CONFIG_DIR") for _, k in turns]
+
+    def test_codex_and_live_slots_buy_no_turn(self):
+        outcomes, turns = self._run()
+        self.assertNotIn("codex", outcomes)
+        self.assertNotIn("live", outcomes)
+        self.assertNotIn("/h/codex", self._homes(turns))
+        self.assertNotIn("/h/live", self._homes(turns))
+
+    def test_lapsed_slot_is_refreshed(self):
+        outcomes, turns = self._run()
+        self.assertEqual(outcomes["lapsed"], "refreshed")
+        self.assertIn("/h/lapsed", self._homes(turns))
+
+    def test_dead_refresh_token_buys_no_turn_and_asks_for_relogin(self):
+        outcomes, turns = self._run()
+        self.assertEqual(outcomes["dead"], "relogin_required")
+        self.assertNotIn("/h/dead", self._homes(turns))
+
+    def test_turn_that_does_not_move_the_token_reports_still_expired(self):
+        outcomes, _ = self._run(heals=())
+        self.assertEqual(outcomes["lapsed"], "still_expired")
+
+    def test_cheap_model_is_tried_first(self):
+        _, turns = self._run()
+        first = turns[0][0]
+        self.assertIn("--model", first)
+        self.assertEqual(first[first.index("--model") + 1],
+                         collect.REFRESH_MODEL)
+
+    def test_one_turn_is_enough_when_the_cheap_model_works(self):
+        # No wasted second turn once the token has moved.
+        _, turns = self._run()
+        lapsed = [a for a, k in turns
+                  if k.get("env", {}).get("CLAUDE_CONFIG_DIR") == "/h/lapsed"]
+        self.assertEqual(len(lapsed), 1, lapsed)
+
+    def test_default_model_is_retried_when_the_cheap_one_does_not_help(self):
+        # A rejected or renamed model alias must not leave a slot permanently
+        # unrefreshable, so the plan default is tried too.
+        _, turns = self._run(heals=())
+        lapsed = [a for a, k in turns
+                  if k.get("env", {}).get("CLAUDE_CONFIG_DIR") == "/h/lapsed"]
+        self.assertTrue(any("--model" not in argv for argv in lapsed), lapsed)
+
+    def test_turn_runs_with_stdin_closed_and_in_the_slot_home(self):
+        with mock.patch.object(collect.os.path, "isdir", return_value=True):
+            _, turns = self._run()
+        _, kwargs = turns[0]
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["cwd"], "/h/lapsed")
+
+    def test_turn_carries_the_slots_config_dir(self):
+        _, turns = self._run()
+        self.assertEqual(turns[0][1]["env"]["CLAUDE_CONFIG_DIR"], "/h/lapsed")
+
+    def test_unpaid_seat_buys_no_turn(self):
+        accounts = [{"name": "unpaid", "provider": "claude",
+                     "home": "/h/lapsed", "status": "unpaid"}]
+        outcomes, turns = self._run(accounts=accounts)
+        self.assertEqual(outcomes, {})
+        self.assertEqual(turns, [])
+
+    def test_missing_cli_reports_rather_than_crashing(self):
+        outcomes, turns = self._run(binary=None)
+        self.assertEqual(outcomes["lapsed"], "no_cli")
+        self.assertEqual(turns, [])
+
+    def test_every_outcome_has_an_operator_facing_note(self):
+        # An outcome with no note would print a bare enum at the operator.
+        for outcome in ("refreshed", "still_expired", "relogin_required",
+                        "no_cli", "no_credential"):
+            self.assertIn(outcome, collect.REFRESH_OUTCOME_NOTES)
+
+
+class CollectRefreshFlag(unittest.TestCase):
+    """A plain collect must never spend inference.
+
+    `headroom serve` collects on a loop. If a bare collect could buy a turn,
+    it would spend quota on a schedule nobody watches.
+    """
+
+    def _main(self, argv):
+        import headroom.__main__ as entry
+        with mock.patch("headroom.collect.run_collect") as run, \
+                mock.patch("headroom.collect._trigger_token_scan"):
+            code = entry.main(argv)
+        return code, run
+
+    def test_plain_collect_does_not_refresh(self):
+        code, run = self._main(["collect"])
+        self.assertEqual(code, 0)
+        self.assertIs(run.call_args.kwargs.get("refresh"), False)
+
+    def test_refresh_and_force_both_opt_in(self):
+        for flag in ("--refresh", "--force"):
+            _, run = self._main(["collect", flag])
+            self.assertIs(run.call_args.kwargs.get("refresh"), True, flag)
+
+    def test_unknown_option_is_refused_rather_than_ignored(self):
+        code, run = self._main(["collect", "--bogus"])
+        self.assertEqual(code, 2)
+        run.assert_not_called()
+
+    def test_run_collect_defaults_to_no_refresh(self):
+        signature = inspect.signature(collect.run_collect)
+        self.assertIs(signature.parameters["refresh"].default, False)
+
+
 class ResetTimestampUnits(unittest.TestCase):
     """`iso_ep` is the one door every provider timestamp enters through, and
     it used to return `int(value)` for any number at all.
