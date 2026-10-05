@@ -13,6 +13,7 @@ import json
 import hashlib
 import io
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -1759,6 +1760,459 @@ class ClaudeLimits(unittest.TestCase):
         with self._with_oauth(self._oauth()):
             with self.assertRaises(collect.ProviderThrottleError):
                 collect.claude_limits("/h", None, opener=opener)
+
+
+class ClaudeRefreshCommand(unittest.TestCase):
+    """The hold note has to name a command an operator can paste.
+
+    Saying "run one Claude Code turn on this account" is not actionable once
+    slots live in isolated config homes: a bare `claude` refreshes whichever
+    login the DEFAULT home holds, so an operator can follow the old note
+    literally, see the turn succeed, and watch the held slot stay expired.
+    """
+
+    def test_non_default_home_carries_the_config_dir(self):
+        command = collect.claude_refresh_command("/srv/homes/slot-a")
+        self.assertTrue(command.startswith(
+            "CLAUDE_CONFIG_DIR=/srv/homes/slot-a "), command)
+        self.assertIn("claude -p", command)
+
+    def test_stdin_is_closed_so_the_cli_does_not_wait_on_it(self):
+        # Without this the CLI blocks and prints "no stdin data received in
+        # 3s" before proceeding, which reads like the command hung.
+        self.assertIn("</dev/null",
+                      collect.claude_refresh_command("/srv/homes/slot-a"))
+
+    def test_default_home_needs_no_config_dir(self):
+        for home in ("~/.claude", os.path.expanduser("~/.claude")):
+            self.assertNotIn("CLAUDE_CONFIG_DIR",
+                             collect.claude_refresh_command(home))
+
+    def test_home_under_the_user_home_abbreviates_to_tilde(self):
+        home = os.path.expanduser("~/.headroom/homes/slot-a")
+        self.assertIn("CLAUDE_CONFIG_DIR=~/.headroom/homes/slot-a",
+                      collect.claude_refresh_command(home))
+
+    def test_home_needing_quotes_is_quoted_and_stays_absolute(self):
+        # A ~-abbreviation cannot be quoted (the shell would stop expanding
+        # the tilde), so a home whose tail needs quoting must print in full.
+        command = collect.claude_refresh_command(
+            os.path.expanduser("~/odd dir/slot"))
+        self.assertNotIn("~", command)
+        self.assertIn(shlex.quote(os.path.expanduser("~/odd dir/slot")),
+                      command)
+
+    def test_blank_home_never_resolves_to_the_current_directory(self):
+        # os.path.abspath("") is the CWD: a blank home must not print a
+        # confident command aimed at wherever the collector happened to run.
+        for home in ("", None, "   "):
+            command = collect.claude_refresh_command(home)
+            self.assertNotIn("CLAUDE_CONFIG_DIR", command)
+
+    def test_generated_command_is_parseable_and_assigns_only_that_var(self):
+        home = "/srv/homes/slot-a"
+        parts = shlex.split(collect.claude_refresh_command(home))
+        self.assertEqual(parts[0], "CLAUDE_CONFIG_DIR=" + home)
+        self.assertEqual(parts[1], "claude")
+
+
+class ExpiredTokenHoldNote(unittest.TestCase):
+    """The note an operator actually reads when a slot is held."""
+
+    ACCOUNT = {"id": "a" * 32, "name": "slot-a", "provider": "claude",
+               "home": "/srv/homes/slot-a"}
+
+    def _hold(self, code, home=None):
+        account = dict(self.ACCOUNT)
+        if home is not None:
+            account["home"] = home
+        identity = {"verified": True, "method": "claude_auth_status",
+                    "email": "e@x.com", "account_fingerprint": "AAAA"}
+        with mock.patch.object(collect, "claude_identity",
+                               return_value=dict(identity)), \
+                mock.patch.object(collect, "credential_digest",
+                                  return_value="BBBB"), \
+                mock.patch.object(collect, "claude_plan",
+                                  return_value="Max 20x"), \
+                mock.patch.object(collect, "estate_credential_dir",
+                                  return_value=(None, "home")), \
+                mock.patch.object(
+                    collect, "claude_limits",
+                    side_effect=collect.IdentityBindingError(code)):
+            return collect.collect([account])["accounts"][0]
+
+    def test_expired_note_names_this_slots_own_command(self):
+        row = self._hold("claude_usage_token_expired")
+        self.assertIs(row["ok"], False)
+        self.assertIn("CLAUDE_CONFIG_DIR=/srv/homes/slot-a", row["note"])
+        self.assertEqual(row["refresh_command"],
+                         collect.claude_refresh_command("/srv/homes/slot-a"))
+
+    def test_expired_note_leads_with_the_cheap_turn_not_a_relogin(self):
+        # An expired ACCESS token is normally cured by the refresh token the
+        # CLI still holds, so the turn must come before the re-login.
+        note = self._hold("claude_usage_token_expired")["note"]
+        self.assertLess(note.index("CLAUDE_CONFIG_DIR"),
+                        note.index("headroom auth refresh"), note)
+
+    def test_rejected_note_leads_with_relogin(self):
+        # A REJECTED credential is usually gone; a turn cannot revive it.
+        note = self._hold("claude_usage_token_rejected")["note"]
+        self.assertLess(note.index("headroom auth refresh"),
+                        note.index("CLAUDE_CONFIG_DIR"), note)
+
+    def test_note_still_offers_both_cures(self):
+        for code in ("claude_usage_token_expired",
+                     "claude_usage_token_rejected"):
+            note = self._hold(code)["note"]
+            self.assertIn("headroom auth refresh slot-a", note)
+            self.assertIn("claude -p", note)
+
+    def test_note_drops_the_unactionable_run_one_turn_phrasing(self):
+        note = self._hold("claude_usage_token_expired")["note"]
+        self.assertNotIn("Run one Claude Code turn", note)
+
+    def test_default_home_slot_gets_a_bare_command(self):
+        row = self._hold("claude_usage_token_expired",
+                         home=os.path.expanduser("~/.claude"))
+        self.assertNotIn("CLAUDE_CONFIG_DIR", row["note"])
+        self.assertIn("claude -p", row["note"])
+
+
+class AutoRefreshGuards(unittest.TestCase):
+    """What may and may not buy a turn.
+
+    A refresh costs real quota, so every guard here exists to stop headroom
+    spending it on a slot the turn cannot help.
+    """
+
+    def test_expired_is_only_claimed_on_proof(self):
+        now = time.time()
+        self.assertTrue(collect.claude_access_token_expired(
+            {"expiresAt": (now - 60) * 1000}))
+        self.assertTrue(collect.claude_access_token_expired(
+            {"expiresAt": now - 60}))  # plain seconds tolerated
+        self.assertFalse(collect.claude_access_token_expired(
+            {"expiresAt": (now + 3600) * 1000}))
+        # Absent or unusable expiry is NOT proof of expiry: read it and let a
+        # 401 speak, rather than spending a turn on a guess.
+        for oauth in ({}, {"expiresAt": None}, {"expiresAt": "soon"},
+                      {"expiresAt": True}, {"expiresAt": float("nan")},
+                      {"expiresAt": float("inf")}):
+            self.assertFalse(collect.claude_access_token_expired(oauth), oauth)
+
+    def test_refresh_token_must_exist_for_a_turn_to_be_worth_buying(self):
+        now = time.time()
+        self.assertFalse(collect.claude_refresh_token_alive({}))
+        self.assertFalse(collect.claude_refresh_token_alive(
+            {"refreshToken": ""}))
+        self.assertFalse(collect.claude_refresh_token_alive(
+            {"refreshToken": "r", "refreshTokenExpiresAt": (now - 60) * 1000}))
+        self.assertTrue(collect.claude_refresh_token_alive(
+            {"refreshToken": "r", "refreshTokenExpiresAt": (now + 60) * 1000}))
+        # A present refresh token with no stated expiry counts as alive, so a
+        # future CLI dropping the field cannot silently stop refreshes.
+        self.assertTrue(collect.claude_refresh_token_alive(
+            {"refreshToken": "r"}))
+
+
+class RefreshExpiredTokens(unittest.TestCase):
+    """The per-slot sweep `--refresh` runs.
+
+    The fake models the real sequence: a home reads EXPIRED until a turn has
+    actually run in it, and fresh afterwards. An earlier version of this fake
+    returned the refreshed value on the first read, which made every lapsed
+    slot look live and quietly asserted nothing.
+    """
+
+    def _accounts(self):
+        return [
+            {"name": "live", "provider": "claude", "home": "/h/live"},
+            {"name": "lapsed", "provider": "claude", "home": "/h/lapsed"},
+            {"name": "dead", "provider": "claude", "home": "/h/dead"},
+            {"name": "codex", "provider": "codex", "home": "/h/codex"},
+        ]
+
+    def _harness(self, heals=("/h/lapsed",)):
+        """Returns (turns, runner, reader). ``heals`` names the homes whose
+        token actually moves once a turn has run there."""
+        now = time.time()
+        turns = []
+        ran = set()
+
+        def runner(argv, **kwargs):
+            turns.append((argv, kwargs))
+            ran.add(kwargs.get("env", {}).get("CLAUDE_CONFIG_DIR"))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        def reader(home, runner=None):
+            fresh = {"accessToken": "a", "refreshToken": "r",
+                     "expiresAt": (now + 3600) * 1000}
+            if home == "/h/live":
+                return fresh
+            if home == "/h/dead":  # no refresh token at all
+                return {"accessToken": "a", "expiresAt": (now - 60) * 1000}
+            if home in ran and home in heals:
+                return fresh
+            return {"accessToken": "a", "refreshToken": "r",
+                    "expiresAt": (now - 60) * 1000}
+
+        return turns, runner, reader
+
+    def _run(self, heals=("/h/lapsed",), accounts=None, binary="/bin/claude"):
+        turns, runner, reader = self._harness(heals)
+        with mock.patch.object(collect, "claude_oauth", side_effect=reader), \
+                mock.patch.object(collect, "claude_bin", return_value=binary):
+            outcomes = collect.refresh_expired_claude_tokens(
+                self._accounts() if accounts is None else accounts,
+                runner=runner)
+        return outcomes, turns
+
+    @staticmethod
+    def _homes(turns):
+        return [k.get("env", {}).get("CLAUDE_CONFIG_DIR") for _, k in turns]
+
+    def test_codex_and_live_slots_buy_no_turn(self):
+        outcomes, turns = self._run()
+        self.assertNotIn("codex", outcomes)
+        self.assertNotIn("live", outcomes)
+        self.assertNotIn("/h/codex", self._homes(turns))
+        self.assertNotIn("/h/live", self._homes(turns))
+
+    def test_lapsed_slot_is_refreshed(self):
+        outcomes, turns = self._run()
+        self.assertEqual(outcomes["lapsed"], "refreshed")
+        self.assertIn("/h/lapsed", self._homes(turns))
+
+    def test_dead_refresh_token_buys_no_turn_and_asks_for_relogin(self):
+        outcomes, turns = self._run()
+        self.assertEqual(outcomes["dead"], "relogin_required")
+        self.assertNotIn("/h/dead", self._homes(turns))
+
+    def test_turn_that_does_not_move_the_token_reports_still_expired(self):
+        outcomes, _ = self._run(heals=())
+        self.assertEqual(outcomes["lapsed"], "still_expired")
+
+    def test_cheap_model_is_tried_first(self):
+        _, turns = self._run()
+        first = turns[0][0]
+        self.assertIn("--model", first)
+        self.assertEqual(first[first.index("--model") + 1],
+                         collect.REFRESH_MODEL)
+
+    def test_one_turn_is_enough_when_the_cheap_model_works(self):
+        # No wasted second turn once the token has moved.
+        _, turns = self._run()
+        lapsed = [a for a, k in turns
+                  if k.get("env", {}).get("CLAUDE_CONFIG_DIR") == "/h/lapsed"]
+        self.assertEqual(len(lapsed), 1, lapsed)
+
+    def test_default_model_is_retried_when_the_cheap_one_does_not_help(self):
+        # A rejected or renamed model alias must not leave a slot permanently
+        # unrefreshable, so the plan default is tried too.
+        _, turns = self._run(heals=())
+        lapsed = [a for a, k in turns
+                  if k.get("env", {}).get("CLAUDE_CONFIG_DIR") == "/h/lapsed"]
+        self.assertTrue(any("--model" not in argv for argv in lapsed), lapsed)
+
+    def test_turn_runs_with_stdin_closed_and_in_the_slot_home(self):
+        with mock.patch.object(collect.os.path, "isdir", return_value=True):
+            _, turns = self._run()
+        _, kwargs = turns[0]
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["cwd"], "/h/lapsed")
+
+    def test_turn_carries_the_slots_config_dir(self):
+        _, turns = self._run()
+        self.assertEqual(turns[0][1]["env"]["CLAUDE_CONFIG_DIR"], "/h/lapsed")
+
+    def test_unpaid_seat_buys_no_turn(self):
+        accounts = [{"name": "unpaid", "provider": "claude",
+                     "home": "/h/lapsed", "status": "unpaid"}]
+        outcomes, turns = self._run(accounts=accounts)
+        self.assertEqual(outcomes, {})
+        self.assertEqual(turns, [])
+
+    def test_missing_cli_reports_rather_than_crashing(self):
+        outcomes, turns = self._run(binary=None)
+        self.assertEqual(outcomes["lapsed"], "no_cli")
+        self.assertEqual(turns, [])
+
+    def test_every_outcome_has_an_operator_facing_note(self):
+        # An outcome with no note would print a bare enum at the operator.
+        for outcome in ("refreshed", "still_expired", "relogin_required",
+                        "no_cli", "no_credential"):
+            self.assertIn(outcome, collect.REFRESH_OUTCOME_NOTES)
+
+
+class CollectRefreshFlag(unittest.TestCase):
+    """A plain collect must never spend inference.
+
+    `headroom serve` collects on a loop. If a bare collect could buy a turn,
+    it would spend quota on a schedule nobody watches.
+    """
+
+    def _main(self, argv):
+        import headroom.__main__ as entry
+        with mock.patch("headroom.collect.run_collect") as run, \
+                mock.patch("headroom.collect._trigger_token_scan"):
+            code = entry.main(argv)
+        return code, run
+
+    def test_plain_collect_does_not_refresh(self):
+        code, run = self._main(["collect"])
+        self.assertEqual(code, 0)
+        self.assertIs(run.call_args.kwargs.get("refresh"), False)
+
+    def test_refresh_and_force_both_opt_in(self):
+        for flag in ("--refresh", "--force"):
+            _, run = self._main(["collect", flag])
+            self.assertIs(run.call_args.kwargs.get("refresh"), True, flag)
+
+    def test_unknown_option_is_refused_rather_than_ignored(self):
+        code, run = self._main(["collect", "--bogus"])
+        self.assertEqual(code, 2)
+        run.assert_not_called()
+
+    def test_run_collect_defaults_to_no_refresh(self):
+        signature = inspect.signature(collect.run_collect)
+        self.assertIs(signature.parameters["refresh"].default, False)
+
+
+class SignedOutSlot(unittest.TestCase):
+    """A signed-out slot is not an unreadable Keychain.
+
+    Logging out leaves the Keychain item in place and BLANKS the strings
+    inside it. The read succeeds and returns a full-shaped blob, so the old
+    claude_credentials_missing note blamed a locked Keychain and sent the
+    operator to unlock something that was never locked. Measured 2026-10-05
+    on two real slots: item present, accessToken "", refreshToken "",
+    expiresAt 0, and `claude auth status` reporting loggedIn false.
+    """
+
+    BLANK = {"accessToken": "", "refreshToken": "", "expiresAt": 0,
+             "refreshTokenExpiresAt": 0, "subscriptionType": "max"}
+
+    def _hold(self, oauth, home="/srv/homes/slot-a"):
+        account = {"id": "a" * 32, "name": "slot-a", "provider": "claude",
+                   "home": home}
+        identity = {"verified": False, "method": "claude_local_metadata",
+                    "email": "e@x.com", "account_fingerprint": "A"}
+        with mock.patch.object(collect, "claude_oauth", return_value=oauth), \
+                mock.patch.object(collect, "claude_identity",
+                                  return_value=dict(identity)), \
+                mock.patch.object(collect, "credential_digest",
+                                  return_value="B"), \
+                mock.patch.object(collect, "claude_plan",
+                                  return_value="Max 20x"), \
+                mock.patch.object(collect, "estate_credential_dir",
+                                  return_value=(None, "home")):
+            return collect.collect([account])["accounts"][0]
+
+    def test_blank_credential_reads_as_signed_out(self):
+        row = self._hold(dict(self.BLANK))
+        self.assertEqual(row["error_code"], "claude_logged_out")
+
+    def test_nothing_readable_at_all_still_reads_as_missing(self):
+        # An empty blob is the ONLY case where the Keychain itself is in
+        # doubt, so that is the only case that keeps the old code and note.
+        row = self._hold({})
+        self.assertEqual(row["error_code"], "claude_credentials_missing")
+
+    def test_signed_out_note_does_not_blame_the_keychain(self):
+        note = self._hold(dict(self.BLANK))["note"]
+        for red_herring in ("Keychain", "unlock", "HEADROOM_CLAUDE_KEYCHAIN"):
+            self.assertNotIn(red_herring, note)
+
+    def test_signed_out_note_names_the_login_command_for_this_slot(self):
+        row = self._hold(dict(self.BLANK))
+        self.assertIn("CLAUDE_CONFIG_DIR=/srv/homes/slot-a", row["note"])
+        self.assertIn("claude auth login", row["note"])
+        self.assertEqual(row["login_command"],
+                         collect.claude_login_command("/srv/homes/slot-a"))
+
+    def test_signed_out_note_does_not_offer_headroom_auth_refresh(self):
+        # `headroom auth refresh` refuses every Keychain-backed slot on
+        # macOS, so offering it here would be the one instruction that
+        # cannot work on the platform where this note is most likely read.
+        self.assertNotIn("headroom auth refresh",
+                         self._hold(dict(self.BLANK))["note"])
+
+    def test_signed_out_note_says_a_refresh_cannot_help(self):
+        self.assertIn("--refresh", self._hold(dict(self.BLANK))["note"])
+
+    def test_signed_out_slot_is_not_routable(self):
+        self.assertIsNot(self._hold(dict(self.BLANK)).get("ok"), True)
+
+
+class LoginExpiryWarning(unittest.TestCase):
+    """The 30-day wall, announced before it is hit rather than after.
+
+    A login's lifetime is fixed at the moment it is made and REFRESHING DOES
+    NOT EXTEND IT: a slot logged in on 2026-09-07 still carried its original
+    refreshTokenExpiresAt on 10-05 after four weeks of successful refreshes.
+    """
+
+    HOME = "/srv/homes/slot-a"
+
+    def _warn(self, days, **kwargs):
+        now = time.time()
+        oauth = {"refreshTokenExpiresAt": (now + days * 86400) * 1000}
+        return collect.relogin_warning("slot-a", self.HOME, oauth, now=now,
+                                       **kwargs)
+
+    def test_a_distant_login_is_not_nagged_about(self):
+        self.assertIsNone(self._warn(28, within_days=3))
+
+    def test_a_login_inside_the_window_warns(self):
+        self.assertIsNotNone(self._warn(2, within_days=3))
+
+    def test_an_already_dead_login_warns(self):
+        self.assertIn("has expired", self._warn(-1, within_days=3))
+
+    def test_warning_names_the_login_command_not_a_refresh(self):
+        warning = self._warn(1, within_days=3)
+        self.assertIn(collect.claude_login_command(self.HOME), warning)
+        self.assertIn("cannot extend", warning)
+
+    def test_remaining_time_never_rounds_up(self):
+        # Rounding up would promise time the slot does not have.
+        self.assertIn("19h", self._warn(19.5 / 24, within_days=3))
+        self.assertIn("47h", self._warn(47 / 24, within_days=3))
+        self.assertIn("3d", self._warn(3.9, within_days=5))
+
+    def test_a_login_with_no_stated_expiry_is_never_nagged_about(self):
+        for oauth in ({}, {"refreshTokenExpiresAt": None},
+                      {"refreshTokenExpiresAt": "soon"}):
+            self.assertIsNone(
+                collect.relogin_warning("slot-a", self.HOME, oauth))
+
+    def test_healthy_rows_carry_the_warning_so_it_lands_before_the_outage(self):
+        now = time.time()
+        account = {"id": "a" * 32, "name": "slot-a", "provider": "claude",
+                   "home": self.HOME}
+        oauth = {"accessToken": "t", "refreshToken": "r",
+                 "expiresAt": (now + 3600) * 1000,
+                 "refreshTokenExpiresAt": (now + 3600) * 1000}
+        identity = {"verified": True, "method": "claude_auth_status",
+                    "email": "e@x.com", "account_fingerprint": "A"}
+        reading = {"windows": {"5h": {"used_percent": 1},
+                               "7d": {"used_percent": 1}}}
+        with mock.patch.object(collect, "claude_oauth", return_value=oauth), \
+                mock.patch.object(collect, "claude_identity",
+                                  return_value=dict(identity)), \
+                mock.patch.object(collect, "credential_digest",
+                                  return_value="B"), \
+                mock.patch.object(collect, "claude_plan",
+                                  return_value="Max 20x"), \
+                mock.patch.object(collect, "estate_credential_dir",
+                                  return_value=(None, "home")), \
+                mock.patch.object(collect, "validate_required_windows"), \
+                mock.patch.object(collect, "claude_limits",
+                                  return_value=reading):
+            row = collect.collect([account])["accounts"][0]
+        self.assertIs(row["ok"], True)          # healthy AND warned
+        self.assertIn("claude auth login", row["relogin_warning"])
 
 
 class ResetTimestampUnits(unittest.TestCase):
