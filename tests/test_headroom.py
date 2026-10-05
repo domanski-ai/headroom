@@ -2079,6 +2079,142 @@ class CollectRefreshFlag(unittest.TestCase):
         self.assertIs(signature.parameters["refresh"].default, False)
 
 
+class SignedOutSlot(unittest.TestCase):
+    """A signed-out slot is not an unreadable Keychain.
+
+    Logging out leaves the Keychain item in place and BLANKS the strings
+    inside it. The read succeeds and returns a full-shaped blob, so the old
+    claude_credentials_missing note blamed a locked Keychain and sent the
+    operator to unlock something that was never locked. Measured 2026-10-05
+    on two real slots: item present, accessToken "", refreshToken "",
+    expiresAt 0, and `claude auth status` reporting loggedIn false.
+    """
+
+    BLANK = {"accessToken": "", "refreshToken": "", "expiresAt": 0,
+             "refreshTokenExpiresAt": 0, "subscriptionType": "max"}
+
+    def _hold(self, oauth, home="/srv/homes/slot-a"):
+        account = {"id": "a" * 32, "name": "slot-a", "provider": "claude",
+                   "home": home}
+        identity = {"verified": False, "method": "claude_local_metadata",
+                    "email": "e@x.com", "account_fingerprint": "A"}
+        with mock.patch.object(collect, "claude_oauth", return_value=oauth), \
+                mock.patch.object(collect, "claude_identity",
+                                  return_value=dict(identity)), \
+                mock.patch.object(collect, "credential_digest",
+                                  return_value="B"), \
+                mock.patch.object(collect, "claude_plan",
+                                  return_value="Max 20x"), \
+                mock.patch.object(collect, "estate_credential_dir",
+                                  return_value=(None, "home")):
+            return collect.collect([account])["accounts"][0]
+
+    def test_blank_credential_reads_as_signed_out(self):
+        row = self._hold(dict(self.BLANK))
+        self.assertEqual(row["error_code"], "claude_logged_out")
+
+    def test_nothing_readable_at_all_still_reads_as_missing(self):
+        # An empty blob is the ONLY case where the Keychain itself is in
+        # doubt, so that is the only case that keeps the old code and note.
+        row = self._hold({})
+        self.assertEqual(row["error_code"], "claude_credentials_missing")
+
+    def test_signed_out_note_does_not_blame_the_keychain(self):
+        note = self._hold(dict(self.BLANK))["note"]
+        for red_herring in ("Keychain", "unlock", "HEADROOM_CLAUDE_KEYCHAIN"):
+            self.assertNotIn(red_herring, note)
+
+    def test_signed_out_note_names_the_login_command_for_this_slot(self):
+        row = self._hold(dict(self.BLANK))
+        self.assertIn("CLAUDE_CONFIG_DIR=/srv/homes/slot-a", row["note"])
+        self.assertIn("claude auth login", row["note"])
+        self.assertEqual(row["login_command"],
+                         collect.claude_login_command("/srv/homes/slot-a"))
+
+    def test_signed_out_note_does_not_offer_headroom_auth_refresh(self):
+        # `headroom auth refresh` refuses every Keychain-backed slot on
+        # macOS, so offering it here would be the one instruction that
+        # cannot work on the platform where this note is most likely read.
+        self.assertNotIn("headroom auth refresh",
+                         self._hold(dict(self.BLANK))["note"])
+
+    def test_signed_out_note_says_a_refresh_cannot_help(self):
+        self.assertIn("--refresh", self._hold(dict(self.BLANK))["note"])
+
+    def test_signed_out_slot_is_not_routable(self):
+        self.assertIsNot(self._hold(dict(self.BLANK)).get("ok"), True)
+
+
+class LoginExpiryWarning(unittest.TestCase):
+    """The 30-day wall, announced before it is hit rather than after.
+
+    A login's lifetime is fixed at the moment it is made and REFRESHING DOES
+    NOT EXTEND IT: a slot logged in on 2026-09-07 still carried its original
+    refreshTokenExpiresAt on 10-05 after four weeks of successful refreshes.
+    """
+
+    HOME = "/srv/homes/slot-a"
+
+    def _warn(self, days, **kwargs):
+        now = time.time()
+        oauth = {"refreshTokenExpiresAt": (now + days * 86400) * 1000}
+        return collect.relogin_warning("slot-a", self.HOME, oauth, now=now,
+                                       **kwargs)
+
+    def test_a_distant_login_is_not_nagged_about(self):
+        self.assertIsNone(self._warn(28, within_days=3))
+
+    def test_a_login_inside_the_window_warns(self):
+        self.assertIsNotNone(self._warn(2, within_days=3))
+
+    def test_an_already_dead_login_warns(self):
+        self.assertIn("has expired", self._warn(-1, within_days=3))
+
+    def test_warning_names_the_login_command_not_a_refresh(self):
+        warning = self._warn(1, within_days=3)
+        self.assertIn(collect.claude_login_command(self.HOME), warning)
+        self.assertIn("cannot extend", warning)
+
+    def test_remaining_time_never_rounds_up(self):
+        # Rounding up would promise time the slot does not have.
+        self.assertIn("19h", self._warn(19.5 / 24, within_days=3))
+        self.assertIn("47h", self._warn(47 / 24, within_days=3))
+        self.assertIn("3d", self._warn(3.9, within_days=5))
+
+    def test_a_login_with_no_stated_expiry_is_never_nagged_about(self):
+        for oauth in ({}, {"refreshTokenExpiresAt": None},
+                      {"refreshTokenExpiresAt": "soon"}):
+            self.assertIsNone(
+                collect.relogin_warning("slot-a", self.HOME, oauth))
+
+    def test_healthy_rows_carry_the_warning_so_it_lands_before_the_outage(self):
+        now = time.time()
+        account = {"id": "a" * 32, "name": "slot-a", "provider": "claude",
+                   "home": self.HOME}
+        oauth = {"accessToken": "t", "refreshToken": "r",
+                 "expiresAt": (now + 3600) * 1000,
+                 "refreshTokenExpiresAt": (now + 3600) * 1000}
+        identity = {"verified": True, "method": "claude_auth_status",
+                    "email": "e@x.com", "account_fingerprint": "A"}
+        reading = {"windows": {"5h": {"used_percent": 1},
+                               "7d": {"used_percent": 1}}}
+        with mock.patch.object(collect, "claude_oauth", return_value=oauth), \
+                mock.patch.object(collect, "claude_identity",
+                                  return_value=dict(identity)), \
+                mock.patch.object(collect, "credential_digest",
+                                  return_value="B"), \
+                mock.patch.object(collect, "claude_plan",
+                                  return_value="Max 20x"), \
+                mock.patch.object(collect, "estate_credential_dir",
+                                  return_value=(None, "home")), \
+                mock.patch.object(collect, "validate_required_windows"), \
+                mock.patch.object(collect, "claude_limits",
+                                  return_value=reading):
+            row = collect.collect([account])["accounts"][0]
+        self.assertIs(row["ok"], True)          # healthy AND warned
+        self.assertIn("claude auth login", row["relogin_warning"])
+
+
 class ResetTimestampUnits(unittest.TestCase):
     """`iso_ep` is the one door every provider timestamp enters through, and
     it used to return `int(value)` for any number at all.

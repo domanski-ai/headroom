@@ -515,6 +515,86 @@ def claude_plan(home):
 CLAUDE_DEFAULT_HOME = "~/.claude"
 
 
+def _claude_config_dir_prefix(home):
+    """``CLAUDE_CONFIG_DIR=<home> `` for a slot, or "" for the default home.
+
+    Shared by every command headroom prints, so the refresh command and the
+    login command can never disagree about how to aim at a slot.
+    """
+    # A blank home must never reach os.path.abspath: it resolves to the CURRENT
+    # DIRECTORY, which would print a confident command pointing at whatever
+    # directory the collector happened to run from. Registry homes are always
+    # absolute, so this is unreachable in practice and stays a guard.
+    if not str(home or "").strip():
+        return ""
+    home = os.path.abspath(os.path.expanduser(str(home)))
+    if home == os.path.abspath(os.path.expanduser(CLAUDE_DEFAULT_HOME)):
+        return ""
+    display = shlex.quote(home)
+    user_home = os.path.expanduser("~")
+    if home == user_home or home.startswith(user_home + os.sep):
+        # Abbreviate to ~ for readability, but `~` must stay UNQUOTED or the
+        # shell will not expand it — so test the remainder, not the whole
+        # string (shlex.quote always quotes a leading ~, which would make this
+        # branch dead code and every home print in full).
+        tail = home[len(user_home):]
+        if not tail or shlex.quote(tail) == tail:
+            display = "~" + tail
+    return "CLAUDE_CONFIG_DIR=%s " % display
+
+
+# How close a login may get to its wall before the collector starts saying so.
+# A login lasts about 30 days from the day it was made and REFRESHING DOES NOT
+# EXTEND IT: measured 2026-10-05, a slot logged in on 09-07 still carried its
+# original refreshTokenExpiresAt after four weeks of successful refreshes. So
+# every slot needs a human roughly monthly, and the only question is whether it
+# is warned about beforehand or discovered as a dead seat afterwards.
+RELOGIN_WARN_DAYS = paths.env_int("HEADROOM_RELOGIN_WARN_DAYS", 3)
+
+
+def claude_login_expiry(oauth):
+    """When this login itself dies, in epoch seconds, or None if unstated."""
+    return _epoch_seconds((oauth or {}).get("refreshTokenExpiresAt"))
+
+
+def relogin_warning(name, home, oauth, now=None, within_days=None):
+    """A human-facing warning when this slot's LOGIN is about to lapse.
+
+    Distinct from an expired access token in the one way that matters: no
+    command headroom can run will help, because only a person can sign in.
+    """
+    expires = claude_login_expiry(oauth)
+    if expires is None:
+        return None
+    now = time.time() if now is None else now
+    within = RELOGIN_WARN_DAYS if within_days is None else within_days
+    remaining = expires - now
+    if remaining > within * 86400:
+        return None
+    # Hours up to two days, then whole days. Always rounds DOWN, so the
+    # warning can never promise more time than the slot actually has
+    # ("1d" for 47h would be an understatement; "2d" would be a lie).
+    if remaining <= 0:
+        when = "has expired"
+    elif remaining < 2 * 86400:
+        when = "expires in %dh" % max(1, int(remaining // 3600))
+    else:
+        when = "expires in %dd" % int(remaining // 86400)
+    return ("%s login %s — run `%s` (a refresh cannot extend it)"
+            % (name, when, claude_login_command(home)))
+
+
+def claude_login_command(home):
+    """The exact command to RE-LOGIN this slot.
+
+    `headroom auth refresh <slot>` cannot do this on macOS — it refuses any
+    Keychain-backed slot, because a failed or mismatched Keychain login cannot
+    be rolled back — so a note that offers only that leaves a macOS operator
+    with no working instruction at all.
+    """
+    return _claude_config_dir_prefix(home) + "claude auth login"
+
+
 def claude_refresh_command(home):
     """The exact shell command an operator can paste to refresh THIS slot's
     access token.
@@ -531,27 +611,7 @@ def claude_refresh_command(home):
     `</dev/null` is not decoration: without it the CLI waits on stdin and
     prints a "no stdin data received in 3s" warning before proceeding.
     """
-    turn = "claude -p ok </dev/null"
-    # A blank home must never reach os.path.abspath: it resolves to the CURRENT
-    # DIRECTORY, which would print a confident command pointing at whatever
-    # directory the collector happened to run from. Registry homes are always
-    # absolute, so this is unreachable in practice and stays a guard.
-    if not str(home or "").strip():
-        return turn
-    home = os.path.abspath(os.path.expanduser(str(home)))
-    if home == os.path.abspath(os.path.expanduser(CLAUDE_DEFAULT_HOME)):
-        return turn
-    display = shlex.quote(home)
-    user_home = os.path.expanduser("~")
-    if home == user_home or home.startswith(user_home + os.sep):
-        # Abbreviate to ~ for readability, but `~` must stay UNQUOTED or the
-        # shell will not expand it — so test the remainder, not the whole
-        # string (shlex.quote always quotes a leading ~, which would make this
-        # branch dead code and every home print in full).
-        tail = home[len(user_home):]
-        if not tail or shlex.quote(tail) == tail:
-            display = "~" + tail
-    return "CLAUDE_CONFIG_DIR=%s %s" % (display, turn)
+    return _claude_config_dir_prefix(home) + "claude -p ok </dev/null"
 
 
 def _epoch_seconds(value):
@@ -1551,6 +1611,16 @@ def external_codex_limits(name, expected_email, now):
 def claude_limits(home, expected_fingerprint, opener=open_authenticated):
     oauth = claude_oauth(home) or {}
     if not oauth.get("accessToken"):
+        # TWO DIFFERENT FAULTS, ONE OLD CODE (2026-10-05). A logged-out slot
+        # leaves its Keychain item in place and merely BLANKS the strings
+        # inside it (accessToken "", refreshToken "", expiresAt 0), so the
+        # read succeeds and returns a full-shaped blob. That used to arrive
+        # as claude_credentials_missing, whose note blames a locked Keychain
+        # and sends the operator to unlock something that was never locked.
+        # A blob we could parse is proof the Keychain was readable, so the
+        # only thing left to doubt is the login.
+        if oauth:
+            raise IdentityBindingError("claude_logged_out")
         raise IdentityBindingError("claude_credentials_missing")
     # The CACHED access token may have expired since the CLI last refreshed
     # it (headroom never refreshes credentials itself — racing the CLI's own
@@ -2170,6 +2240,13 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                     # underneath was swapped and the slot must be held
                     result["pin_usage_org"] = result["source_identity_fingerprint"]
                 validate_required_windows(result["windows"])
+                # A seat can read perfectly and still be days from needing a
+                # human. Carried on the OK row on purpose: warning only once
+                # the slot is held is warning after the outage.
+                warning = relogin_warning(account["name"], refresh_home,
+                                          claude_oauth(refresh_home))
+                if warning:
+                    result["relogin_warning"] = warning
                 result["ok"] = True
             else:
                 expected = account.get("expected_email")
@@ -2399,6 +2476,18 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                                   "on this seat; if it answers, the account is "
                                   "fine and only the meter is blind"
                                   % error.code[-3:])
+            elif error.code == "claude_logged_out":
+                # Nothing to refresh and nothing to unlock: this slot is
+                # signed out. `headroom auth refresh` is NOT offered here —
+                # on macOS it refuses every Keychain-backed slot, so it would
+                # be the one instruction that cannot work on the platform
+                # where this is most likely to be read.
+                result["note"] = (
+                    "Claude slot is signed out (its stored credential is "
+                    f"empty). Run `{claude_login_command(refresh_home)}` to "
+                    "log back in; readings held until then. A login lasts "
+                    "about 30 days and `--refresh` cannot extend it.")
+                result["login_command"] = claude_login_command(refresh_home)
             elif error.code == "claude_credentials_missing":
                 # verified identity but the token couldn't be read. On macOS the
                 # token is in the login Keychain (headroom reads it via
@@ -2840,6 +2929,8 @@ def print_snapshot(snapshot):
                 display_left(windows.get("5h")),
                 display_left(windows.get("7d")),
                 scoped, " STALE" if account.get("stale") else ""))
+            if account.get("relogin_warning"):
+                print("  ! %s" % account["relogin_warning"])
         else:
             print("%-16s HELD: %s" % (
                 account["name"],

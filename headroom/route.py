@@ -1176,6 +1176,7 @@ UNREADABLE_ERROR_CODES = frozenset({
 MUST_DISARM_ERROR_CODES = frozenset({
     "claude_credentials_missing",       # token unreadable — needs a re-login
     "claude_local_binding_missing",
+    "claude_logged_out",                # signed out; only a human can sign in
     "claude_usage_org_changed",         # the login underneath was swapped
     "claude_usage_org_unverifiable",
     "claude_usage_token_expired",
